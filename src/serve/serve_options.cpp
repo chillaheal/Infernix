@@ -176,6 +176,10 @@ std::string serve_usage_text(const char* argv0) {
            "                             --thinking-budget-message \"Time to stop thinking. I must "
            "act\n"
            "                             now:\")\n"
+           "  --thinking-budget-policy M strict (default), clamp, or ignore: how a request whose\n"
+           "                             thinking budget cannot fit its output capacity is handled;\n"
+           "                             strict rejects it (HTTP 400), clamp lowers the budget to\n"
+           "                             fit, ignore runs it with no thinking budget\n"
            "  --reasoning-loop MODE      off (default), stop or conclude: every 512 thinking\n"
            "                             tokens, check whether 25% of the last 2,000 words\n"
            "                             repeat 12-word passages seen 3 times; stop ends the\n"
@@ -659,6 +663,17 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.thinking_budget_message = require_value("--thinking-budget-message");
             if (options.thinking_budget_message.empty()) {
                 throw std::invalid_argument("--thinking-budget-message must not be empty");
+            }
+        } else if (arg == "--thinking-budget-policy") {
+            const std::string_view value = require_value("--thinking-budget-policy");
+            if (value == "strict") {
+                options.thinking_budget_policy = infernix::ThinkingBudgetPolicy::Strict;
+            } else if (value == "clamp") {
+                options.thinking_budget_policy = infernix::ThinkingBudgetPolicy::Clamp;
+            } else if (value == "ignore") {
+                options.thinking_budget_policy = infernix::ThinkingBudgetPolicy::Ignore;
+            } else {
+                throw std::invalid_argument("--thinking-budget-policy accepts strict, clamp, or ignore");
             }
         } else if (arg == "--reasoning-loop") {
             const std::string_view value = require_value("--reasoning-loop");

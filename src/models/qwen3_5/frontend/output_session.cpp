@@ -810,6 +810,23 @@ void OutputSession::validate_generation_capacity(std::uint32_t effective_output_
     }
 }
 
+std::optional<std::uint32_t> OutputSession::clamp_thinking_budget(std::uint32_t effective_output_tokens) {
+    if (impl_ == nullptr) { return std::nullopt; }
+    if (!impl_->semantic.budget || !impl_->semantic.in_reasoning ||
+        effective_output_tokens <= *impl_->semantic.budget) {
+        return std::nullopt;
+    }
+    const std::uint64_t required =
+        static_cast<std::uint64_t>(impl_->thinking_control_tokens->size()) + 1U;
+    if (effective_output_tokens <= required) { return std::nullopt; }
+    const std::uint64_t max_budget =
+        static_cast<std::uint64_t>(effective_output_tokens) - required;
+    if (max_budget >= *impl_->semantic.budget) { return std::nullopt; }
+    const std::uint32_t clamped = static_cast<std::uint32_t>(max_budget);
+    *impl_->semantic.budget = clamped;
+    return clamped;
+}
+
 runtime::OutputDecision OutputSession::preview_terminal(FinishReason reason) {
     if (impl_ == nullptr) { throw std::logic_error("output session is empty"); }
     if (impl_->state.terminal) { throw std::logic_error("output session is already terminal"); }

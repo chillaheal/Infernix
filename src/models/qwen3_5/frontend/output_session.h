@@ -75,6 +75,10 @@ public:
     [[nodiscard]] runtime::OutputDecision preview_control(std::span<const TokenId> tokens,
                                                           std::uint32_t total_budget_remaining);
     void validate_generation_capacity(std::uint32_t effective_output_tokens) const;
+    // Clamp the thinking budget in place to fit the output capacity so the control suffix and
+    // one post-close token fit. Returns the new budget if reduced, nullopt if unchanged.
+    [[nodiscard]] std::optional<std::uint32_t>
+    clamp_thinking_budget(std::uint32_t effective_output_tokens);
     [[nodiscard]] runtime::OutputDecision preview_terminal(FinishReason reason);
     [[nodiscard]] PublishedOutput commit_preview();
     void discard_preview();

@@ -81,6 +81,10 @@ struct ServeOptions {
     // End-of-thinking message fed to the model when it hits the thinking budget; empty
     // preserves the model's built-in control suffix.
     std::string thinking_budget_message;
+    // --thinking-budget-policy strict|clamp|ignore: how a request whose thinking budget cannot
+    // fit its output capacity is handled (strict rejects with 400; clamp lowers it to fit;
+    // ignore drops it).
+    infernix::ThinkingBudgetPolicy thinking_budget_policy = infernix::ThinkingBudgetPolicy::Strict;
     // --reasoning-loop off|stop|conclude: the reasoning-loop guard for thinking requests without a
     // token constraint (off by default).
     infernix::ReasoningLoopAction reasoning_loop = infernix::ReasoningLoopAction::Off;

@@ -81,6 +81,7 @@ public:
 
     EngineCore(Instance& instance, DeviceContext& device, const EngineOptions& options)
         : instance_(instance), device_(device), max_context_(options.max_context),
+          thinking_budget_policy_(options.thinking_budget_policy),
           max_concurrency_(options.max_concurrency),
           max_outstanding_(static_cast<std::size_t>(options.max_concurrency) +
                            options.max_pending_requests),
@@ -252,6 +253,9 @@ public:
                 options.execution.sampling.seed ^=
                     (static_cast<std::uint64_t>(entropy()) << 32) ^ entropy();
             }
+            if (thinking_budget_policy_ == ThinkingBudgetPolicy::Ignore) {
+                options.execution.thinking.budget = std::nullopt;
+            }
             const auto constraint_started = observation.phase_timings ? Clock::now() : submitted;
             auto output                   = instance_.frontend.make_output_session(
                 prompt, options.stop, options.output, options.execution.thinking,
@@ -262,9 +266,20 @@ public:
             }
             const std::uint32_t capacity_output =
                 max_context_ - prompt_summary.prompt_tokens + static_cast<std::uint32_t>(1);
+            const std::uint32_t effective_output =
+                std::min(options.execution.requested_output_tokens, capacity_output);
+            if (thinking_budget_policy_ == ThinkingBudgetPolicy::Clamp) {
+                if (auto clamped = output.clamp_thinking_budget(effective_output)) {
+                    options.execution.thinking.budget = *clamped;
+                    publish_diagnostic(
+                        diagnostics_, DiagnosticLevel::Warning,
+                        "thinking budget clamped to fit output capacity: requested max_tokens=%u, "
+                        "clamped budget=%u",
+                        options.execution.requested_output_tokens, *clamped);
+                }
+            }
             try {
-                output.validate_generation_capacity(
-                    std::min(options.execution.requested_output_tokens, capacity_output));
+                output.validate_generation_capacity(effective_output);
             } catch (const std::invalid_argument& error) {
                 throw RequestError(RequestErrorKind::ThinkingBudgetCapacityInsufficient,
                                    error.what());
@@ -2329,6 +2344,7 @@ private:
     Instance& instance_;
     DeviceContext& device_;
     const std::uint32_t max_context_;
+    const ThinkingBudgetPolicy thinking_budget_policy_;
     const std::uint32_t max_concurrency_;
     const std::size_t max_outstanding_;
     const std::chrono::milliseconds pending_timeout_;
