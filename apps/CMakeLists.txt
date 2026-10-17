@@ -56,3 +56,10 @@ target_link_libraries(infernix-perplexity PRIVATE
 add_dependencies(infernix-perplexity infernix_build_id_stamp)
 target_sources(infernix-perplexity PRIVATE ${INFERNIX_BUILD_ID_HEADER})
 infernix_stage_runtime_dlls(infernix-perplexity)
+
+# On-demand image generation sidecar (IMAGE_ADR §0b). Separate executable so building or running it
+# never forces infernix-serve to relink. Links the artifact reader for now; DiT/VAE attach later.
+add_executable(infernix_image image/main.cpp)
+infernix_internal_includes(infernix_image)
+target_link_libraries(infernix_image PRIVATE infernix_artifact)
+infernix_stage_runtime_dlls(infernix_image)
