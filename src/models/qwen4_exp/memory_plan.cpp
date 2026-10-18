@@ -14,6 +14,10 @@ std::uint64_t with_lock_overhead(std::uint64_t pinned, double fraction) {
 
 std::uint64_t saturating_sub(std::uint64_t a, std::uint64_t b) { return a > b ? a - b : 0; }
 
+std::uint64_t ceil_div(std::uint64_t a, std::uint64_t b) { return b == 0 ? 0 : (a + b - 1) / b; }
+
+std::uint64_t ceil_to_chunk(std::uint64_t bytes, std::uint64_t chunk) { return ceil_div(bytes, chunk) * chunk; }
+
 double gib(std::uint64_t bytes) { return static_cast<double>(bytes) / static_cast<double>(kLedgerGiB); }
 
 } // namespace
@@ -119,6 +123,57 @@ VramSizing size_expert_frames(const VramSnapshot& snapshot, const VramDemand& de
         const std::uint64_t frames = static_cast<std::uint64_t>(out.frame_bytes) / demand.frame_bytes;
         out.frames = static_cast<std::uint32_t>(std::min<std::uint64_t>(frames, demand.max_frames));
     }
+    return out;
+}
+
+ImageYieldPlan plan_image_yield(const ImageYieldRequest& req) {
+    ImageYieldPlan out;
+    const std::uint64_t need = req.target_bytes + req.margin_bytes;
+    out.frames_after    = req.frames;
+    out.kv_mapped_after = req.kv_mapped;
+    if (need == 0) {
+        out.verdict = ImageYieldPlan::Verdict::Granted; // nothing asked for; leave the pools as they are
+        return out;
+    }
+
+    // 1. Expert frames first, on the frame pool's chunk grid. The pool may not fall below its floor's
+    //    footprint; a loan in hand (or no frames to move) freezes it, so nothing frees there.
+    const bool frames_movable = !req.lease_held && req.frame_stride > 0 && req.frame_chunk > 0 && req.frames > 0;
+    std::uint64_t frames_freed = 0;
+    if (frames_movable) {
+        const std::uint64_t pool_chunks  = req.pool_bytes / req.frame_chunk;
+        const std::uint64_t floor_chunks = ceil_to_chunk(static_cast<std::uint64_t>(req.frames_floor) * req.frame_stride,
+                                                         req.frame_chunk) /
+                                           req.frame_chunk;
+        const std::uint64_t freeable = saturating_sub(pool_chunks, floor_chunks);
+        // Release whole chunks, but no more than the need, then name the largest frame count that still
+        // fits the bytes left, floored at frames_floor and capped at the current count.
+        const std::uint64_t take     = std::min(freeable, ceil_div(need, req.frame_chunk));
+        const std::uint64_t cap      = pool_chunks - take; // take <= freeable <= pool_chunks
+        const std::uint64_t fits     = cap * req.frame_chunk / req.frame_stride;
+        out.frames_after = static_cast<std::uint32_t>(
+            std::min<std::uint64_t>(std::max<std::uint64_t>(fits, req.frames_floor), req.frames));
+        // The bytes resize() really unmaps: down to the whole chunks frames_after needs, never below it.
+        frames_freed = saturating_sub(req.pool_bytes, ceil_to_chunk(static_cast<std::uint64_t>(out.frames_after) *
+                                                                                        req.frame_stride,
+                                                                                    req.frame_chunk));
+    }
+
+    // 2. Whatever is still missing comes from the elastic KV pool, on its chunk grid, to its floor.
+    const std::uint64_t remaining = saturating_sub(need, frames_freed);
+    std::uint64_t kv_freed = 0;
+    if (req.kv_chunk > 0 && req.kv_mapped > req.kv_floor) {
+        const std::uint64_t avail = (req.kv_mapped - req.kv_floor) / req.kv_chunk;
+        const std::uint64_t take  = std::min(avail, ceil_div(remaining, req.kv_chunk));
+        kv_freed            = take * req.kv_chunk;
+        out.kv_mapped_after = req.kv_mapped - kv_freed;
+    }
+
+    out.frames_freed = frames_freed;
+    out.kv_freed     = kv_freed;
+    out.total_freed  = frames_freed + kv_freed;
+    out.verdict      = out.total_freed >= need            ? ImageYieldPlan::Verdict::Granted
+                       : out.total_freed == 0 ? ImageYieldPlan::Verdict::Denied : ImageYieldPlan::Verdict::Partial;
     return out;
 }
 

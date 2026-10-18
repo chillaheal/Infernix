@@ -23,4 +23,8 @@ extern const Fp8LinearShape kFp8N13312K2560;
 extern const Fp8LinearShape kFp8N2560K6144;
 extern const Fp8LinearShape kFp8N1280K2560;
 extern const Fp8LinearShape kFp8N2560K640;
+// Qwen-Image-2.1 DiT projections (W8A16: A16 routes only).
+extern const Fp8LinearShape kFp8N4096K4096;
+extern const Fp8LinearShape kFp8N12288K4096;
+extern const Fp8LinearShape kFp8N4096K12288;
 } // namespace infernix::ops::detail

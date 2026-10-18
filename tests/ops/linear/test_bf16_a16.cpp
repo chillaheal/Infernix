@@ -516,6 +516,13 @@ constexpr std::array kNewGeometries{
     Geometry{16384, 2560, {1, 8, 32, 64, 128, 256, 512}},
     Geometry{1280, 2560, {1, 8, 64, 128, 384, 512}},
     Geometry{2560, 640, {1, 8, 32, 192, 384, 512}},
+    // Qwen-Image-2.1 DiT projections: to_q/k/v/out [4096,4096], MLP gate/proj [12288,4096], MLP
+    // out [4096,12288], and the patchify img_in [4096,64]. None has a specialised kernel, so each
+    // is served by the general runtime-shape GEMM; qualify the production route at these shapes.
+    Geometry{4096, 4096, {1, 8, 64, 128, 512}},
+    Geometry{12288, 4096, {1, 8, 64, 128, 512}},
+    Geometry{4096, 12288, {1, 8, 64, 128, 512}},
+    Geometry{4096, 64, {1, 8, 64, 128, 256}},
 };
 
 infernix::test::quantized_weight::PackedWeight cancellation_weight(int n, int k, std::uint32_t seed) {

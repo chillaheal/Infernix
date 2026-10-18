@@ -71,6 +71,17 @@ void validate_linear_semantics(const Tensor& x, const Weight& w, const Tensor& o
     if (!aligned_to(x.data, 16) || !aligned_to(out.data, 16)) {
         throw std::invalid_argument("linear: x/out must be non-null and 16-byte aligned");
     }
+    // Contract (linear.h): out must not overlap x. The BF16 A16 GEMM is not in-place safe; aliasing
+    // out onto x yields a data-dependent cross-threadblock WAR hazard that corrupts larger-magnitude
+    // inputs run-to-run (silent non-determinism, no trap). Enforce the no-alias contract so a
+    // violation fails loudly instead of corrupting silently.
+    const std::uintptr_t xbase = reinterpret_cast<std::uintptr_t>(x.data);
+    const std::uintptr_t obase = reinterpret_cast<std::uintptr_t>(out.data);
+    const std::uint64_t xbytes = (std::uint64_t)checked_numel(x, "x") * 2u;
+    const std::uint64_t obytes = (std::uint64_t)checked_numel(out, "out") * 2u;
+    if (xbase < obase + obytes && obase < xbase + xbytes) {
+        throw std::invalid_argument("linear: out must not overlap x (in-place is unsupported)");
+    }
     validate_linear_policy(policy);
 }
 

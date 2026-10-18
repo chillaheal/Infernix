@@ -18,9 +18,14 @@ ResumeState::~ResumeState()                                 = default;
 std::uint32_t ResumeState::frontier() const noexcept { return impl_ ? impl_->target : 0U; }
 
 Program::Program(const execution::Parameters& parameters, DeviceContext& device, ProgramOptions options)
-    : impl_(std::make_unique<detail::ProgramImpl>(parameters, device, std::move(options))) {}
+    : impl_(std::make_unique<detail::ProgramImpl>(parameters, device, std::move(options))) {
+    detail::ProgramImpl::set_active(impl_.get()); // fully built: safe for the coexistence test to reach
+}
 
-Program::~Program() noexcept = default;
+Program::~Program() noexcept {
+    detail::ProgramImpl::set_active(nullptr);
+    impl_.reset();
+}
 
 ProgramDevicePlan Program::plan_device(const ProgramOptions& options, const Config& config,
                                        std::uint32_t public_tokens) {
@@ -140,6 +145,10 @@ PhysicalUsageSnapshot Program::physical_usage() const noexcept { return impl_->u
 
 MemorySummary Program::memory_summary() const noexcept { return impl_->memory(); }
 
+namespace detail {
+ProgramImpl* ProgramImpl::active_ = nullptr; // the live Program, registered/cleared by Program
+} // namespace detail
+
 namespace testing {
 
 namespace {
@@ -154,6 +163,18 @@ bool take_expert_fault() noexcept {
         if (g_expert_fault.compare_exchange_weak(left, left - 1)) { return left == 1; }
     }
     return false;
+}
+
+bool has_image_yield_program() noexcept { return detail::ProgramImpl::has_active(); }
+
+std::uint64_t yield_image_vram(std::uint64_t target_bytes, std::uint64_t margin_bytes, std::uintptr_t& lease) {
+    lease = 0;
+    if (!detail::ProgramImpl::has_active()) { return 0; }
+    return detail::ProgramImpl::yield_testing(target_bytes, margin_bytes, &lease);
+}
+
+void release_image_vram(std::uintptr_t lease) {
+    if (lease != 0) { detail::ProgramImpl::release_testing(lease); }
 }
 
 } // namespace testing

@@ -114,6 +114,12 @@ enum class LinearPolicy : std::uint8_t {
  * @param[in] w Logical weight matrix `[N,K]` in a registered persistent format and layout.
  * @param[out] out Contiguous, non-null, 16-byte-aligned BF16 output matrix `[N,T]`. It must not
  * overlap `x` or any weight plane.
+ *
+ * @warning `out` MUST NOT alias `x` (in-place `out == x` is unsupported). The BF16 A16 GEMM is not
+ * in-place safe: with `out` aliased onto `x` a data-dependent cross-threadblock write-after-read
+ * hazard corrupts larger-magnitude inputs run-to-run (observed at M=K=4096, N=11). This does not
+ * trap; it yields silent run-to-run non-determinism. Callers must supply a distinct output buffer.
+ *
  * @param[in] policy Permitted private activation-compute profiles.
  * @param[in,out] workspace Caller-owned transient arena.
  * @param[in] stream CUDA stream on which execution is enqueued.

@@ -375,6 +375,98 @@ void test_control_law() {
     require(control.decide(trimmed, pool, frames, 200.0, false).shrink, "an exceeded budget shrinks the pool");
 }
 
+// ---------------------------------------------------------------- coexistence yield
+
+void test_image_yield() {
+    const std::uint64_t stride   = kRecord; // 2,764,800 B: one expert frame
+    const std::uint64_t chunk    = kChunk;  // 64 MiB: the frame pool's release grid
+    const std::uint64_t kvChunk  = 2 * kMiB; // the elastic KV pool's release grid
+
+    auto req = [&](std::uint64_t pool_chunks, std::uint32_t frames_floor, std::uint64_t kv_mapped,
+                   std::uint64_t kv_floor, bool lease, std::uint64_t target, std::uint64_t margin = 0) {
+        ImageYieldRequest r;
+        r.pool_bytes    = pool_chunks * chunk;
+        r.frames        = static_cast<std::uint32_t>(r.pool_bytes / stride);
+        r.frame_stride  = stride;
+        r.frame_chunk   = chunk;
+        r.frames_floor  = frames_floor;
+        r.kv_mapped     = kv_mapped * kvChunk;
+        r.kv_floor      = kv_floor * kvChunk;
+        r.kv_chunk      = kvChunk;
+        r.lease_held    = lease;
+        r.target_bytes  = target;
+        r.margin_bytes  = margin;
+        return r;
+    };
+    const std::uint32_t full_frames = static_cast<std::uint32_t>(100 * chunk / stride);
+
+    // A frame-only grant, serving keeps frames: frames drain on their grid, KV untouched, the release
+    // equals resize()'s whole-chunk result and frames_after is the largest count that still fits.
+    {
+        const auto p = plan_image_yield(req(100, 10, 40, 10, /*lease*/ false, 30 * chunk));
+        require(p.verdict == ImageYieldPlan::Verdict::Granted, "frames alone meet the need");
+        require(p.kv_freed == 0 && p.kv_mapped_after == 40 * kvChunk, "KV untouched when frames suffice");
+        require(p.frames_freed % chunk == 0 && p.total_freed >= 30 * chunk, "frames free whole chunks, at least the need");
+        require(static_cast<std::uint64_t>(p.frames_after) * stride <= 100 * chunk - p.frames_freed &&
+                    (static_cast<std::uint64_t>(p.frames_after) + 1) * stride > 100 * chunk - p.frames_freed,
+                "frames_after is the largest frame count that fits the shrunken pool");
+        require(p.frames_after >= 10 && p.frames_after <= full_frames, "frames_after stays in [floor, now]");
+        require(100 * chunk - p.frames_freed ==
+                    (static_cast<std::uint64_t>(p.frames_after) * stride + chunk - 1) / chunk * chunk,
+                "the freed bytes equal resize()'s whole-chunk release to frames_after");
+    }
+
+    // Frames to their floor, then the KV pool on its own grid: both drained, KV left above its floor.
+    {
+        const auto p = plan_image_yield(req(100, 0, 500, 10, false, 110 * chunk));
+        require(p.verdict == ImageYieldPlan::Verdict::Granted, "frames and KV together meet a big need");
+        require(p.frames_after == 0 && p.frames_freed == 100 * chunk, "every frame goes when the floor is 0");
+        require(p.kv_freed == 10 * chunk && p.kv_mapped_after == 500 * kvChunk - 10 * chunk,
+                "the KV pool covers the 640 MiB the frames could not");
+        require(p.kv_mapped_after >= 10 * kvChunk, "KV stays at or above its floor");
+        require(p.total_freed == 100 * chunk + 10 * chunk, "the total is the sum of both releases");
+    }
+
+    // A frame loan in hand: the pool is frozen, only the KV margin yields, and it is not enough -> Partial.
+    {
+        const auto p = plan_image_yield(req(100, 0, 12, 10, /*lease*/ true, 50 * chunk));
+        require(p.verdict == ImageYieldPlan::Verdict::Partial, "with a lease held and short KV the grant is partial");
+        require(p.frames_after == full_frames && p.frames_freed == 0, "a loan freezes the frame pool");
+        require(p.kv_freed == 2 * kvChunk && p.kv_mapped_after == 10 * kvChunk,
+                "KV yields its whole margin down to the floor");
+        require(p.total_freed == 2 * kvChunk, "only the KV margin was freed");
+    }
+
+    // Nothing to give: a lease held and the KV pool already at its floor -> Denied, pools unchanged.
+    {
+        const auto p = plan_image_yield(req(100, 0, 20, 20, true, 10 * chunk));
+        require(p.verdict == ImageYieldPlan::Verdict::Denied, "no movable frame pool and KV at floor denies");
+        require(p.total_freed == 0 && p.frames_after == full_frames && p.kv_mapped_after == 20 * kvChunk,
+                "a denial leaves both pools exactly as they were");
+    }
+
+    // Nothing asked for: granted with no change, even while a loan is held.
+    {
+        const auto p = plan_image_yield(req(50, 5, 10, 5, true, 0, 0));
+        require(p.verdict == ImageYieldPlan::Verdict::Granted && p.total_freed == 0,
+                "a zero need is granted with no change");
+        require(p.frames_after == 50 * chunk / stride && p.kv_mapped_after == 10 * kvChunk,
+                "the zero grant is a no-op on both pools");
+    }
+
+    // The margin counts against the need: a target the frames alone cover, once the margin is added,
+    // drains the pool dry and still falls short -> Partial (not Denied: bytes were freed).
+    {
+        const auto tight       = plan_image_yield(req(20, 0, 0, 0, false, 15 * chunk));
+        const auto with_margin = plan_image_yield(req(20, 0, 0, 0, false, 15 * chunk, 6 * chunk));
+        require(tight.verdict == ImageYieldPlan::Verdict::Granted && tight.frames_after == 5 * chunk / stride,
+                "a 20-chunk pool frees 15 to the need and keeps 5");
+        require(with_margin.verdict == ImageYieldPlan::Verdict::Partial && with_margin.total_freed == 20 * chunk &&
+                    with_margin.frames_after == 0,
+                "target plus margin drains the same pool dry yet stays short: a partial grant");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -391,6 +483,7 @@ int main() {
         test_sizing();
         test_spill();
         test_control_law();
+        test_image_yield();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;

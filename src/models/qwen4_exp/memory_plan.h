@@ -173,4 +173,45 @@ private:
     double grow_since_ = -1.0; // when the target first stood two chunks above the pool; < 0: not now
 };
 
+// The one-shot VRAM yield that lets the image pipeline run beside a live LLM (coexistence). From the
+// live expert-frame pool and elastic KV pool, how far each must shrink to free `target_bytes` plus a
+// `margin_bytes` kept below the headroom, down to their floors. Pure and single-threaded: the Program
+// takes vram_mutex_, reaches a safe point, then applies the result (residency_->resize(frames_after),
+// shrink the KV mapping to at most kv_mapped_after) and restores by the counts it saved beforehand.
+// The expert frames drain before the KV: cache locality is cheaper to give back than prefix state. The
+// bytes are on each pool's own release grid, so frames_freed is what ExpertResidency::resize actually
+// unmaps (whole chunks), not an estimate. With `lease_held` the frame pool cannot move (resize refuses
+// while a frame loan is outstanding, e.g. Vision's), so only the KV pool may yield.
+struct ImageYieldRequest {
+    std::uint64_t pool_bytes;   // expert-frame pool mapped now (ExpertResidency::pool_bytes, chunk grid)
+    std::uint32_t frames;       // expert frames resident now
+    std::uint64_t frame_stride; // one frame's bytes (ExpertResidency::frame_stride)
+    std::uint64_t frame_chunk;  // frame pool release granularity (ExpertResidency::kChunkBytes)
+    std::uint32_t frames_floor; // frames serving keeps during the image job (0: every frame may go)
+
+    std::uint64_t kv_mapped; // elastic KV pool mapped now (kv_mapped_bytes(plan_, backed_pages), chunk grid)
+    std::uint64_t kv_floor;  // its floor (kv_mapped_bytes(plan_, plan_.kv_base_pages))
+    std::uint64_t kv_chunk;  // KV release granularity (kKvChunkBytes)
+
+    bool lease_held;            // a frame loan is outstanding: the pool cannot move
+    std::uint64_t target_bytes; // the image job's peak device need
+    std::uint64_t margin_bytes; // free memory still kept below the headroom
+};
+
+struct ImageYieldPlan {
+    enum class Verdict : std::uint8_t { Granted, Partial, Denied };
+    Verdict verdict = Verdict::Denied;
+    std::uint32_t frames_after    = 0; // resize the frame pool to this (the current count when it cannot move)
+    std::uint64_t kv_mapped_after = 0; // shrink the KV mapping to at most this
+    std::uint64_t frames_freed    = 0;
+    std::uint64_t kv_freed        = 0;
+    std::uint64_t total_freed     = 0; // frames_freed + kv_freed; the amount actually released
+};
+
+// `frames_after` is the largest frame count whose (chunk-rounded) footprint fits the bytes left after
+// the requested release, clamped to [frames_floor, frames]; `kv_mapped_after` likewise on the KV grid.
+// Verdict: Granted when total_freed reaches the need, Denied when nothing can be freed, else Partial
+// (the caller decides whether a partial grant is enough for the image job).
+[[nodiscard]] ImageYieldPlan plan_image_yield(const ImageYieldRequest& req);
+
 } // namespace infernix::models::qwen4_exp

@@ -4082,6 +4082,120 @@ private:
         diagnostic("KV pool shrank to " + std::to_string(target) + " pages; expert cache " + std::to_string(frames) +
                    " -> " + std::to_string(residency_->frames()) + " frames");
     }
+public:
+    // ---- LLM<->image VRAM coexistence ----------------------------------------------------------
+    // The two elastic pools are this process's whole device footprint (the sizing authority splits one
+    // budget between them); the image pipeline runs kernels in this same CUDA context and needs free
+    // physical memory. This frees it by unmapping the pools at a safe point, and restores them after.
+    struct ImageYieldLease {
+        std::uint32_t frames_before   = 0; // expert frames resident when the yield began
+        std::uint32_t kv_pages_before = 0; // elastic KV backed pages when the yield began
+        std::uint64_t freed_bytes     = 0; // the physical bytes the yield actually released
+        bool active = false;               // something was freed and must be given back
+    };
+
+    // Frees physical VRAM for an image job that runs in this same context. Call at a safe point: every
+    // lane Phase::Free and no kernels in flight (the caller quiesces admissions first). Shrinks the
+    // expert-frame pool and the elastic KV pool toward their floors to free `target_bytes` plus a
+    // `margin_bytes` kept below the headroom, and returns the bytes actually released; the lease
+    // carries what to restore. The caller allocates the image's scratch in the freed region and calls
+    // release_from_yield when done (success, cancel or CUDA failure alike). It works on the pools
+    // directly, so it does not re-enter shrink_kv/grow_kv (which take the same lock).
+    ImageYieldLease yield_for_image(std::uint64_t target_bytes, std::uint64_t margin_bytes) {
+        ImageYieldLease lease;
+        const std::lock_guard<std::mutex> lock(vram_mutex_);
+        device_.synchronize();
+        lease.frames_before   = residency_->frames();
+        lease.kv_pages_before = pool_ ? pool_->backed_pages() : 0;
+        const std::uint64_t before = residency_->pool_bytes() + (kv_vmm_ ? kv_vmm_->mapped_bytes() : 0);
+
+        ImageYieldRequest req;
+        req.pool_bytes    = residency_->pool_bytes();
+        req.frames        = lease.frames_before;
+        req.frame_stride  = residency_->frame_stride();
+        req.frame_chunk   = ExpertResidency::kChunkBytes;
+        req.frames_floor  = 0; // the image may take every frame (the LLM is paused during the job)
+        req.kv_mapped     = kv_vmm_ ? kv_vmm_->mapped_bytes() : 0;
+        req.kv_floor      = kv_vmm_ ? kv_mapped_bytes(plan_, plan_.kv_base_pages) : 0;
+        req.kv_chunk      = kKvChunkBytes;
+        req.lease_held    = residency_->lendable() == 0 && residency_->frames() != 0; // a loan freezes the pool
+        req.target_bytes  = target_bytes;
+        req.margin_bytes  = margin_bytes;
+        const auto plan = plan_image_yield(req);
+
+        if (kv_vmm_ && plan.kv_mapped_after < req.kv_mapped) {
+            // Free whole KV chunks off the top, down to the page count the plan leaves mapped.
+            std::uint32_t pages = plan_.kv_base_pages;
+            while (pages + kKvGrowPages <= lease.kv_pages_before &&
+                   kv_mapped_bytes(plan_, pages + kKvGrowPages) <= plan.kv_mapped_after) {
+                pages += kKvGrowPages;
+            }
+            if (pages < lease.kv_pages_before) {
+                pool_->set_backed_pages(pages);
+                const auto need = kv_chunks(plan_, pages);
+                for (std::size_t c = 0; c < need.size(); ++c) {
+                    if (!need[c] && kv_vmm_->mapped(c)) { kv_vmm_->unmap(c); }
+                }
+                kv_grown_.store(pages > plan_.kv_base_pages);
+            }
+        }
+        if (plan.frames_after < lease.frames_before) {
+            (void)residency_->resize(plan.frames_after, device_.stream, *vram_);
+        }
+
+        const std::uint64_t after = residency_->pool_bytes() + (kv_vmm_ ? kv_vmm_->mapped_bytes() : 0);
+        lease.freed_bytes = before > after ? before - after : 0;
+        lease.active      = lease.freed_bytes != 0;
+        diagnostic("yielded " + std::to_string(lease.freed_bytes >> 20) + " MiB to the image job: expert cache " +
+                       std::to_string(lease.frames_before) + " -> " + std::to_string(residency_->frames()) +
+                       " frames, KV " + std::to_string(lease.kv_pages_before) + " -> " +
+                       std::to_string(pool_ ? pool_->backed_pages() : 0) + " pages",
+                   DiagnosticLevel::Info);
+        return lease;
+    }
+
+    // Returns everything yield_for_image took: grow the KV pool back to its saved page count (taking the
+    // frames it needs, via the elastic grow), then restore the frame count. Idempotent; safe after a
+    // CUDA failure. The image's own scratch must already be freed by the caller.
+    void release_from_yield(const ImageYieldLease& lease) {
+        if (!lease.active) { return; }
+        const std::lock_guard<std::mutex> lock(vram_mutex_);
+        device_.synchronize();
+        if (pool_ && lease.kv_pages_before > pool_->backed_pages()) {
+            (void)map_kv(lease.kv_pages_before);
+            if (pool_->backed_pages() < lease.kv_pages_before) { pool_->set_backed_pages(lease.kv_pages_before); }
+            kv_grown_.store(lease.kv_pages_before > plan_.kv_base_pages);
+        }
+        if (residency_->frames() < lease.frames_before) {
+            (void)residency_->resize(lease.frames_before, device_.stream, *vram_);
+        }
+        frames_now_ = residency_->frames();
+        pool_now_   = residency_->pool_bytes();
+    }
+
+    // The live Program, so a coexistence test can drive yield_for_image/release_from_yield on it:
+    // Engine holds no Program accessor and its Program is private. Program registers this after the
+    // ProgramImpl is fully constructed and clears it in its destructor (Program is a member of
+    // Program, so it reaches the private set_active). A lone test registry: no other caller.
+    static bool has_active() noexcept { return active_ != nullptr; }
+    static std::uint64_t yield_testing(std::uint64_t target, std::uint64_t margin, std::uintptr_t* lease_out) {
+        ImageYieldLease lease = active_->yield_for_image(target, margin);
+        if (lease_out) { *lease_out = reinterpret_cast<std::uintptr_t>(new ImageYieldLease(lease)); }
+        return lease.freed_bytes;
+    }
+    static void release_testing(std::uintptr_t lease) {
+        if (lease == 0) { return; }
+        ImageYieldLease* p = reinterpret_cast<ImageYieldLease*>(lease);
+        if (active_ != nullptr) { active_->release_from_yield(*p); } // run the real restore, then drop the token
+        delete p;
+    }
+
+private:
+    static ProgramImpl* active_;
+    static void set_active(ProgramImpl* p) noexcept { active_ = p; }
+
+    friend class Program;
+
     DeviceBuffer io_device_, logits32_, logits16_, sampled_, sample_pos_, configs_, token_counts_;
 
     // ---- /v1/decide (constraint.cpp) ----

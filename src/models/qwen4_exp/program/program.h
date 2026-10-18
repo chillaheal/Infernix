@@ -555,6 +555,15 @@ namespace testing {
 void set_expert_fault(std::uint32_t checks) noexcept;
 // Consumes one check; true on the armed one.
 [[nodiscard]] bool take_expert_fault() noexcept;
+
+// LLM<->image VRAM coexistence: drive the live Program's one-shot yield for a coexistence test (Engine
+// holds no Program accessor). has_image_yield_program(): a Program is loaded to yield from.
+// yield_image_vram frees physical VRAM toward the image job's need (bytes, plus a margin kept below the
+// headroom), returns what it actually released, and sets `lease` to the token release_image_vram gives
+// back to the pools. 0 bytes freed leaves `lease` null (nothing to restore).
+[[nodiscard]] bool has_image_yield_program() noexcept;
+std::uint64_t yield_image_vram(std::uint64_t target_bytes, std::uint64_t margin_bytes, std::uintptr_t& lease);
+void release_image_vram(std::uintptr_t lease);
 } // namespace testing
 
 } // namespace infernix::models::qwen4_exp

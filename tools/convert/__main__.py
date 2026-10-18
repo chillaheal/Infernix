@@ -14,6 +14,7 @@ from .official_recipes import RECIPES
 from .pipeline import convert
 from .proposal import DEFAULT_RANKING, add_official_proposal
 from . import qwen4_exp
+from . import qwen_image
 from .qwen3_5 import build_model
 from .recipe import Recipe
 from .sources.safetensors import SafetensorsSource
@@ -170,8 +171,14 @@ def main(argv=None):
     with ExitStack() as stack:
         base = stack.enter_context(SafetensorsSource(args.model))
         sources = SourceInputs(base, paths, stack)
-        qwen4 = qwen4_exp.is_qwen4_exp(base.config)
-        if qwen4:
+        if qwen_image.is_qwen_image(base):
+            qwen4 = False
+            ngram_out = None
+            model = qwen_image.build_model(
+                base, components=components, resource_overrides=overrides
+            )
+        elif qwen4_exp.is_qwen4_exp(base.config):
+            qwen4 = True
             model = qwen4_exp.build_model(
                 base, components=components, resource_overrides=overrides
             )
@@ -188,6 +195,7 @@ def main(argv=None):
                     raise FileExistsError(f"n-gram volume already exists: {ngram_out}")
                 model.config["ngram_table"]["volume_id"] = os.urandom(16).hex()
         else:
+            qwen4 = False
             if args.ngram_out is not None:
                 raise ValueError("--ngram-out applies only to Qwen4Exp sources")
             companions = {

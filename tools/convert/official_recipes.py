@@ -10,6 +10,7 @@ from .methods import (
     import_encoded,
     nvfp4_mse,
 )
+from .qwen_image import qwen_image_fp8
 
 Q4 = "q4_g64_fp16"
 Q5 = "q5_g64_fp16"
@@ -419,4 +420,5 @@ RECIPES = {
     "qwen3_8_flash_next_nvfp4": qwen3_8_flash_next_nvfp4,
     "qwen3_8_flash_next_nvfp4_dense8": qwen3_8_flash_next_nvfp4_dense8,
     "qwen3_8_flash_next_nvfp4_orcarouter": qwen3_8_flash_next_nvfp4_orcarouter,
+    "qwen_image_fp8": qwen_image_fp8,
 }
