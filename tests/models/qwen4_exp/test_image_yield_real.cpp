@@ -100,11 +100,22 @@ int main() {
         const auto baseline = engine.generate(engine.prepare(story()), greedy(kTokens)).generated_token_ids;
         check(baseline.size() == kTokens, "baseline generated " + std::to_string(baseline.size()) + " tokens");
 
+        // A round has captured its CUDA graph by now. The physical yield is now legal ONLY from the Quiesced
+        // interlude state, so the full production interlude is: close the door, drain every LLM stream, render
+        // every captured graph inert, THEN yield; release gives the pools back (door still closed); end
+        // reopens the door and the graphs recapture lazily, so a later generation is undisturbed.
         const std::uint64_t free_full = device_free_bytes(); // serving state: expert cache full, driver free low
-        std::uintptr_t lease          = 0;
-        const std::uint64_t freed = infernix::models::qwen4_exp::testing::yield_image_vram(8 * kGiB, 0, lease);
+        const std::uint64_t epoch     = infernix::models::qwen4_exp::testing::begin_image_quiesce();
+        check(epoch != 0, "begin_image_quiesce returned an execution epoch");
+        check(infernix::models::qwen4_exp::testing::image_interlude_state() == 2, "the Program is Quiesced");
+        check(!infernix::models::qwen4_exp::testing::image_interlude_submit_open(), "the LLM submit door is closed");
+        check(infernix::models::qwen4_exp::testing::image_interlude_graphs_inert(), "every captured graph is invalidated");
 
+        std::uintptr_t lease = 0;
+        std::uint64_t freed  = 0;
         try {
+            freed = infernix::models::qwen4_exp::testing::yield_image_vram(8 * kGiB, 0, lease);
+            check(infernix::models::qwen4_exp::testing::image_interlude_state() == 3, "the yield moved the Program to Leased");
             check(freed > 0, "the yield freed " + std::to_string(freed >> 20) + " MiB toward the image job");
             check(lease != 0, "the yield returned a lease to restore");
             const std::uint64_t free_peak = device_free_bytes(); // after unmap: driver free at its high point
@@ -121,24 +132,14 @@ int main() {
             check(recovered > kGiB / 2, "the release gave the memory back to the serving cache (driver free fell)");
         } catch (...) {
             infernix::models::qwen4_exp::testing::release_image_vram(lease); // always give it back
+            infernix::models::qwen4_exp::testing::end_image_quiesce();      // recover the door on any failure
             throw;
         }
-        const auto after = engine.generate(engine.prepare(story()), greedy(kTokens)).generated_token_ids;
-        check(after == baseline, "ids after the yield/restore equal the undisturbed run");
-
-        // Execution interlude quiescence: a round has captured its CUDA graph by now. Quiescing must close the
-        // LLM submit door, drain every LLM stream, and render every captured graph inert; releasing the
-        // interlude reopens the door and the graphs recapture lazily, so a later generation is undisturbed.
-        const std::uint64_t epoch = infernix::models::qwen4_exp::testing::begin_image_quiesce();
-        check(epoch != 0, "begin_image_quiesce returned an execution epoch");
-        check(infernix::models::qwen4_exp::testing::image_interlude_state() == 2, "the Program is Quiesced");
-        check(!infernix::models::qwen4_exp::testing::image_interlude_submit_open(), "the LLM submit door is closed");
-        check(infernix::models::qwen4_exp::testing::image_interlude_graphs_inert(), "every captured graph is invalidated");
         infernix::models::qwen4_exp::testing::end_image_quiesce();
         check(infernix::models::qwen4_exp::testing::image_interlude_state() == 0, "the Program returned to Running");
         check(infernix::models::qwen4_exp::testing::image_interlude_submit_open(), "the LLM submit door reopened");
-        const auto after_quiesce = engine.generate(engine.prepare(story()), greedy(kTokens)).generated_token_ids;
-        check(after_quiesce == baseline, "ids after quiesce/restore equal the undisturbed run (graphs recaptured)");
+        const auto after = engine.generate(engine.prepare(story()), greedy(kTokens)).generated_token_ids;
+        check(after == baseline, "ids after the interlude equal the undisturbed run (graphs recaptured)");
 
         infernix::testing::set_vram_budget_source({});
         result = failures == 0 ? 0 : 1;

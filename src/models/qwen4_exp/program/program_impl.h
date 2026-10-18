@@ -4094,6 +4094,11 @@ public:
         std::uint32_t kv_pages_before = 0; // elastic KV backed pages when the yield began
         std::uint64_t freed_bytes     = 0; // the physical bytes the yield actually released
         bool active = false;               // something was freed and must be given back
+        // The execution-state snapshot taken at the yield, so release_from_yield can reject a lease the
+        // Program has moved past (a stale yield from a superseded interlude must not restore these pools).
+        std::uint64_t execution_epoch  = 0;
+        std::uint64_t device_epoch     = 0;
+        std::uint64_t graph_generation = 0;
     };
 
     // Frees physical VRAM for an image job that runs in this same context. Call at a safe point: every
@@ -4105,6 +4110,15 @@ public:
     // directly, so it does not re-enter shrink_kv/grow_kv (which take the same lock).
     ImageYieldLease yield_for_image(std::uint64_t target_bytes, std::uint64_t margin_bytes) {
         ImageYieldLease lease;
+        {
+            const std::lock_guard<std::mutex> qlock(execution_mu_);
+            if (execution_state_ != ExecutionState::Quiesced) {
+                throw std::logic_error("Qwen4Exp: yield_for_image is legal only from the Quiesced interlude state");
+            }
+            lease.execution_epoch  = execution_epoch_;
+            lease.device_epoch     = device_epoch_;
+            lease.graph_generation = graph_generation_;
+        }
         const std::lock_guard<std::mutex> lock(vram_mutex_);
         device_.synchronize();
         lease.frames_before   = residency_->frames();
@@ -4153,6 +4167,7 @@ public:
                        " frames, KV " + std::to_string(lease.kv_pages_before) + " -> " +
                        std::to_string(pool_ ? pool_->backed_pages() : 0) + " pages",
                    DiagnosticLevel::Info);
+        { const std::lock_guard<std::mutex> slock(execution_mu_); execution_state_ = ExecutionState::Leased; }
         return lease;
     }
 
@@ -4161,6 +4176,16 @@ public:
     // CUDA failure. The image's own scratch must already be freed by the caller.
     void release_from_yield(const ImageYieldLease& lease) {
         if (!lease.active) { return; }
+        {
+            const std::lock_guard<std::mutex> qlock(execution_mu_);
+            if (execution_state_ != ExecutionState::Leased) {
+                throw std::logic_error("Qwen4Exp: release_from_yield is legal only from the Leased interlude state");
+            }
+            if (lease.execution_epoch != execution_epoch_ || lease.device_epoch != device_epoch_ ||
+                lease.graph_generation != graph_generation_) {
+                throw std::logic_error("Qwen4Exp: yield lease is stale; the execution state moved during the lease");
+            }
+        }
         const std::lock_guard<std::mutex> lock(vram_mutex_);
         device_.synchronize();
         if (pool_ && lease.kv_pages_before > pool_->backed_pages()) {
@@ -4173,6 +4198,8 @@ public:
         }
         frames_now_ = residency_->frames();
         pool_now_   = residency_->pool_bytes();
+        // Pools restored but the door stays closed; end_image_quiesce returns the Program to Running.
+        { const std::lock_guard<std::mutex> slock(execution_mu_); execution_state_ = ExecutionState::Quiesced; }
     }
 
     // The live Program, so a coexistence test can drive yield_for_image/release_from_yield on it:
@@ -4258,6 +4285,9 @@ public:
     // Reopen the door and return to Running once an interlude's work is complete and its VRAM restored.
     void end_image_quiesce() {
         std::lock_guard<std::mutex> lock(execution_mu_);
+        if (execution_state_ != ExecutionState::Quiesced && execution_state_ != ExecutionState::Leased) {
+            throw std::logic_error("Qwen4Exp: end_image_quiesce is legal only from the Quiesced or Leased interlude state");
+        }
         ++device_epoch_;
         execution_state_            = ExecutionState::Running;
         prefix_cache_mutation_open_ = true;
