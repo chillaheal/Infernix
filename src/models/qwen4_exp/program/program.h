@@ -564,6 +564,18 @@ void set_expert_fault(std::uint32_t checks) noexcept;
 [[nodiscard]] bool has_image_yield_program() noexcept;
 std::uint64_t yield_image_vram(std::uint64_t target_bytes, std::uint64_t margin_bytes, std::uintptr_t& lease);
 void release_image_vram(std::uintptr_t lease);
+
+// Execution interlude quiescence (coexistence track): drive the live Program's quiesce state machine for a
+// test. begin_image_quiesce() closes the LLM submit door, drains every LLM stream, and invalidates every
+// captured CUDA graph, leaving the Program Quiesced; it returns the new execution epoch (0 if no Program is
+// loaded). end_image_quiesce() reopens the door and returns to Running. image_interlude_state() reports the
+// state as an int (0 Running, 1 Quiescing, 2 Quiesced, 3 Leased; -1 no Program). image_interlude_graphs_inert()
+// is true when every decode/verify/mtp graph executable is reset. image_interlude_submit_open() reports the door.
+std::uint64_t begin_image_quiesce();
+void end_image_quiesce();
+int image_interlude_state() noexcept;
+[[nodiscard]] bool image_interlude_graphs_inert() noexcept;
+[[nodiscard]] bool image_interlude_submit_open() noexcept;
 } // namespace testing
 
 } // namespace infernix::models::qwen4_exp

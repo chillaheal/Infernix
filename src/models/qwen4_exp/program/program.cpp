@@ -177,6 +177,27 @@ void release_image_vram(std::uintptr_t lease) {
     if (lease != 0) { detail::ProgramImpl::release_testing(lease); }
 }
 
+std::uint64_t begin_image_quiesce() {
+    if (!detail::ProgramImpl::has_active()) { return 0; }
+    return detail::ProgramImpl::begin_quiesce_testing();
+}
+
+void end_image_quiesce() {
+    if (detail::ProgramImpl::has_active()) { detail::ProgramImpl::end_quiesce_testing(); }
+}
+
+int image_interlude_state() noexcept {
+    return detail::ProgramImpl::has_active() ? detail::ProgramImpl::state_testing() : -1;
+}
+
+bool image_interlude_graphs_inert() noexcept {
+    return detail::ProgramImpl::has_active() && detail::ProgramImpl::graphs_inert_testing();
+}
+
+bool image_interlude_submit_open() noexcept {
+    return !detail::ProgramImpl::has_active() || detail::ProgramImpl::submit_open_testing();
+}
+
 } // namespace testing
 
 } // namespace infernix::models::qwen4_exp

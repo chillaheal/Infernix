@@ -126,6 +126,20 @@ int main() {
         const auto after = engine.generate(engine.prepare(story()), greedy(kTokens)).generated_token_ids;
         check(after == baseline, "ids after the yield/restore equal the undisturbed run");
 
+        // Execution interlude quiescence: a round has captured its CUDA graph by now. Quiescing must close the
+        // LLM submit door, drain every LLM stream, and render every captured graph inert; releasing the
+        // interlude reopens the door and the graphs recapture lazily, so a later generation is undisturbed.
+        const std::uint64_t epoch = infernix::models::qwen4_exp::testing::begin_image_quiesce();
+        check(epoch != 0, "begin_image_quiesce returned an execution epoch");
+        check(infernix::models::qwen4_exp::testing::image_interlude_state() == 2, "the Program is Quiesced");
+        check(!infernix::models::qwen4_exp::testing::image_interlude_submit_open(), "the LLM submit door is closed");
+        check(infernix::models::qwen4_exp::testing::image_interlude_graphs_inert(), "every captured graph is invalidated");
+        infernix::models::qwen4_exp::testing::end_image_quiesce();
+        check(infernix::models::qwen4_exp::testing::image_interlude_state() == 0, "the Program returned to Running");
+        check(infernix::models::qwen4_exp::testing::image_interlude_submit_open(), "the LLM submit door reopened");
+        const auto after_quiesce = engine.generate(engine.prepare(story()), greedy(kTokens)).generated_token_ids;
+        check(after_quiesce == baseline, "ids after quiesce/restore equal the undisturbed run (graphs recaptured)");
+
         infernix::testing::set_vram_budget_source({});
         result = failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

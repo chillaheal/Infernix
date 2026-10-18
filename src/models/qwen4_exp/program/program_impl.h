@@ -60,6 +60,7 @@
 #include <cstring>
 #include <functional>
 #include <mutex>
+#include <condition_variable>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -3056,6 +3057,7 @@ private:
     // first round of a size runs eagerly (it also performs the Ops' one-time setup); the next is
     // captured and later rounds replay it.
     void run_decode(std::int32_t batch) {
+        if (!submit_open()) { return; } // coexistence: an image interlude holds the device; the scheduler retries
         const cudaStream_t s = device_.stream;
         upload_pinned(io_device_.p, io_host_.data(), io_layout_.ngram, s);
         if (cpu_service_) { cpu_service_->wake(); } // its first request comes within this round
@@ -4189,6 +4191,106 @@ public:
         if (active_ != nullptr) { active_->release_from_yield(*p); } // run the real restore, then drop the token
         delete p;
     }
+
+    // ---- Execution interlude quiescence (coexistence track) -----------------------------------------
+    // The image pipeline runs kernels in THIS CUDA context on the shared device. Before it may hold leased
+    // VRAM the LLM must reach a safe point: stop accepting new GPU submissions, drain work already enqueued
+    // on every LLM stream, and drop every captured CUDA graph (its recorded device pointers go stale once the
+    // pools move; the next replay() recaptures lazily). All this state belongs to the one Program -- there is
+    // no shared lease registry, because Programs share no mutable state or device allocation. The submit door
+    // is an atomic so the per-round hot path is a single relaxed load; the mutex guards the state machine and
+    // the in-flight count only. Until an interlude is dispatched (a later commit) the door stays open, so the
+    // serving hot path is byte-identical to today.
+    enum class ExecutionState : std::uint8_t { Running, Quiescing, Quiesced, Leased };
+
+    [[nodiscard]] bool submit_open() const noexcept { return llm_submit_open_.load(std::memory_order_relaxed); }
+
+    // Close the submission door and enter Quiescing. Legal only from Running.
+    void begin_quiesce() {
+        std::lock_guard<std::mutex> lock(execution_mu_);
+        if (execution_state_ != ExecutionState::Running) {
+            throw std::logic_error("Qwen4Exp: image interlude quiesce from a non-running state");
+        }
+        execution_state_            = ExecutionState::Quiescing;
+        llm_submit_open_.store(false, std::memory_order_release);
+        prefix_cache_mutation_open_ = false;
+        ++execution_epoch_;
+    }
+
+    // Drain every stream the LLM may have enqueued work on. The events are recorded AFTER the door is closed,
+    // so each bounds all submissions made before the quiesce (not work submitted after). The device
+    // synchronize inside yield_for_image remains the physical-free catch-all.
+    void drain_llm_frontier() {
+        cudaEvent_t ev[3] = {nullptr, nullptr, nullptr};
+        for (cudaEvent_t& e : ev) { CUDA_CHECK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming)); }
+        CUDA_CHECK(cudaEventRecord(ev[0], device_.stream));
+        CUDA_CHECK(cudaEventRecord(ev[1], overlap_.stream));
+        const bool has_expert_stream = expert_stream_ != nullptr;
+        if (has_expert_stream) { CUDA_CHECK(cudaEventRecord(ev[2], expert_stream_->stream())); }
+        CUDA_CHECK(cudaEventSynchronize(ev[0]));
+        CUDA_CHECK(cudaEventSynchronize(ev[1]));
+        if (has_expert_stream) { CUDA_CHECK(cudaEventSynchronize(ev[2])); }
+        for (cudaEvent_t& e : ev) { if (e != nullptr) { cudaEventDestroy(e); } }
+    }
+
+    // Drop every captured decode/verify/mtp graph. reset() frees the cudaGraph_t / cudaGraphExec_t and clears
+    // warmed, so the next replay() of that batch size recaptures against the post-restore device layout.
+    void invalidate_decode_graphs() {
+        auto drop = [](DecodeGraph& g) { g.definition.reset(); g.executable.reset(); g.warmed = false; };
+        for (auto& g : graphs_)           { drop(g); }
+        for (auto& g : verify_graphs_)    { drop(g); }
+        for (auto& g : mtp_draft_graphs_) { drop(g); }
+        for (auto& g : mtp_catch_graphs_) { drop(g); }
+        ++graph_generation_;
+    }
+
+    // Quiesce to the safe point WITHOUT yielding VRAM (this commit's scope): close the door, drain, invalidate.
+    // The physical yield and the full interlude land in later commits; the caller pairs this with
+    // end_image_quiesce().
+    void begin_image_quiesce() {
+        begin_quiesce();
+        drain_llm_frontier();
+        invalidate_decode_graphs();
+        std::lock_guard<std::mutex> lock(execution_mu_);
+        execution_state_ = ExecutionState::Quiesced;
+    }
+
+    // Reopen the door and return to Running once an interlude's work is complete and its VRAM restored.
+    void end_image_quiesce() {
+        std::lock_guard<std::mutex> lock(execution_mu_);
+        ++device_epoch_;
+        execution_state_            = ExecutionState::Running;
+        prefix_cache_mutation_open_ = true;
+        llm_submit_open_.store(true, std::memory_order_release);
+        execution_cv_.notify_all();
+    }
+
+    // Whether every graph executable is inert (test hook: confirms invalidation took).
+    [[nodiscard]] bool graphs_inert() const noexcept {
+        for (const auto& g : graphs_)           { if (g.executable.ready()) { return false; } }
+        for (const auto& g : verify_graphs_)    { if (g.executable.ready()) { return false; } }
+        for (const auto& g : mtp_draft_graphs_) { if (g.executable.ready()) { return false; } }
+        for (const auto& g : mtp_catch_graphs_) { if (g.executable.ready()) { return false; } }
+        return true;
+    }
+
+    // Test-registry additions on the same single-owner active_ (mirror has_active/yield_testing/release_testing).
+    static std::uint64_t begin_quiesce_testing() { active_->begin_image_quiesce(); return active_->execution_epoch_; }
+    static void end_quiesce_testing() { active_->end_image_quiesce(); }
+    static int state_testing() noexcept { return static_cast<int>(active_->execution_state_); }
+    static bool graphs_inert_testing() noexcept { return active_->graphs_inert(); }
+    static bool submit_open_testing() noexcept { return active_->submit_open(); }
+
+    // Quiescence state (declared here; the inline methods above use them through the complete-class context).
+    std::mutex execution_mu_;
+    std::condition_variable execution_cv_;
+    ExecutionState execution_state_ = ExecutionState::Running;
+    std::atomic<bool> llm_submit_open_{true};
+    std::atomic<std::uint32_t> llm_inflight_submissions_{0};
+    bool prefix_cache_mutation_open_ = true;
+    std::uint64_t execution_epoch_  = 0;
+    std::uint64_t device_epoch_     = 0;
+    std::uint64_t graph_generation_ = 0;
 
 private:
     static ProgramImpl* active_;
