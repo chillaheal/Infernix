@@ -277,12 +277,25 @@ std::uint64_t image_device_bytes_peak() noexcept { return g_image_device_peak.lo
 void reset_image_device_peak() noexcept { g_image_device_peak.store(g_image_device_live.load()); }
 
 GeneratedImage run_image_job(artifact::Reader& reader, const DiTWeights& dit, const VaeWeights& vae,
-                             const ImageJobInputs& inputs, cudaStream_t stream) {
-    const auto log_mem = [](const char* stage) {
-        std::fprintf(stderr, "image job: %s | ledger live %llu MiB peak %llu MiB\n", stage,
-                     static_cast<unsigned long long>(g_image_device_live.load() / (1024 * 1024)),
-                     static_cast<unsigned long long>(g_image_device_peak.load() / (1024 * 1024)));
+                             const ImageJobInputs& inputs, cudaStream_t stream,
+                             ImageJobProgressView* progress,
+                             std::function<void(const std::string&)> log_line) {
+    // The stage telemetry goes through the caller's sink (the serving route's logger, serialized
+    // against the console's stats panel); with no sink the certified route prints nothing.
+    const auto log_mem = [&](const char* stage) {
+        if (!log_line) { return; }
+        log_line("image job: " + std::string(stage) + " | ledger live " +
+                 std::to_string(g_image_device_live.load() / (1024 * 1024)) + " MiB peak " +
+                 std::to_string(g_image_device_peak.load() / (1024 * 1024)) + " MiB");
     };
+    const std::size_t progress_units = inputs.timesteps.size() + 1;  // + the VAE decode unit
+    const auto step    = [&](std::size_t units_done) {
+        if (progress && !progress->step(units_done, progress_units)) {
+            throw std::runtime_error("image job: stalled, flagged by the serving watchdog");
+        }
+    };
+    // A stalled throw unwinds the same RAII buffers as any other failure: the job's device
+    // memory is freed before the interlude restores the LLM's pools.
     ImageStreamScope stream_scope(stream);
     cudaMemPool_t pool = nullptr;
     if (cudaDeviceGetDefaultMemPool(&pool, 0) == cudaSuccess && pool != nullptr) {
@@ -570,6 +583,7 @@ GeneratedImage run_image_job(artifact::Reader& reader, const DiTWeights& dit, co
         }
         { const auto bits = bits_of(new_lat); h2d(d_latent, bits.data(), bits.size() * 2); }
         cuda_ok(cudaStreamSynchronize(stream), "scheduler upload did not complete");
+        step(i + 1);
     }
 
     log_mem("DiT loop done");
@@ -651,6 +665,7 @@ GeneratedImage run_image_job(artifact::Reader& reader, const DiTWeights& dit, co
         vg.retire(n);
         cuda_ok(cudaStreamSynchronize(stream), "VAE decode did not complete");
         log_mem("VAE decode done");
+        step(progress_units);
         const std::size_t fout = 4 * static_cast<std::size_t>(Hh) * Ww;
         std::vector<std::uint16_t> fin_bits(fout);
         cuda_ok(cudaMemcpy(fin_bits.data(), fin, fout * 2, cudaMemcpyDeviceToHost), "image D2H");

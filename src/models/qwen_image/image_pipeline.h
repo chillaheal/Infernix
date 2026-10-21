@@ -19,6 +19,8 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <functional>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -102,8 +104,21 @@ void reset_image_device_peak() noexcept;
 // The 32 blocks' weights are read from the artifact once per job into a host cache (peak ~ one
 // block's roles x layers) and streamed H2D per block per step, so the 40-step loop never re-reads
 // them from disk and the device working set peaks at ~one block.
+// What the serving caller passes to observe a running job (the models layer must not know serve
+// types): one call per completed unit -- each denoise step, then the VAE decode -- and a line sink
+// for the job's stage telemetry. `step` returns false when the caller's watchdog has flagged the
+// job; the loop then throws so the interlude unwinds and restores the LLM. Both default to
+// nothing: the certified route is bit-identical when they are absent.
+class ImageJobProgressView {
+public:
+    virtual ~ImageJobProgressView() = default;
+    [[nodiscard]] virtual bool step(std::size_t units_done, std::size_t units_total) = 0;
+};
+
 [[nodiscard]] GeneratedImage run_image_job(artifact::Reader& reader, const DiTWeights& dit,
                                            const VaeWeights& vae, const ImageJobInputs& inputs,
-                                           cudaStream_t stream);
+                                           cudaStream_t stream,
+                                           ImageJobProgressView* progress = nullptr,
+                                           std::function<void(const std::string&)> log_line = {});
 
 } // namespace infernix::models::qwen_image
