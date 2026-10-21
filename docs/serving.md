@@ -91,7 +91,7 @@ tier must be saved. Before the server is ready, one Ctrl+C ends startup at once.
 | `POST /v1/messages/count_tokens` | Engine-native expanded input-token count |
 | `POST /v1/decide` (alias `/v1/systemone`) | typed decisions read from the next-token distribution, with nothing generated ([Decisions](#decisions)) |
 | `POST /v1/images/generations` | Synchronous text-to-image generation over the image interlude, returned as base64 PNG or as a URL served by this process ([OpenAI Images](#openai-images)) |
-| `GET /v1/images/{id}` | the PNG of a finished generation, by the artifact id its response returned ([OpenAI Images](#openai-images)) |
+| `GET /v1/images/{id}` | the PNG of a finished generation, or a status object while it runs ([OpenAI Images](#openai-images)) |
 
 Anthropic SDKs append `/v1/messages` to their base URL, so their base URL is
 `http://127.0.0.1:8080`, while OpenAI SDKs take `http://127.0.0.1:8080/v1`. A client given the
@@ -120,7 +120,10 @@ error responses. Anthropic endpoints use their separate `request-id` contract.
 
 All three generation SSE endpoints emit the standard `: keep-alive` comment after five seconds
 without a protocol event. The comment is transport-only: SSE clients ignore it, and it does not
-change generated text, event ordering, usage, stored Responses, or request logs. Accepted
+change generated text, event ordering, usage, stored Responses, or request logs. While a
+server-executed image round draws a picture ([chat auto-image](#openai-images)), the same comment
+carries the job's percent (`: image 45%`), so a client that waits on the stream sees the generation
+progressing instead of an idle socket. Accepted
 connections also use TCP keepalive and a 15-second retransmission limit (`TCP_USER_TIMEOUT` on
 Linux, `TCP_MAXRTMS` on Windows); together with the heartbeat,
 a dead or unacknowledging peer is normally cancelled within about 20 seconds, including while the
@@ -1055,7 +1058,21 @@ Every failure names its code in the standard OpenAI error envelope:
 | 503 | `image_engine_degraded` | the interlude could not confirm the model's VRAM was restored |
 | 500 | `image_generation_failed` | the job started and then failed |
 | 503 | `image_interlude_failed` | the interlude failed before the job started |
-| 404 | `image_not_found` | on `GET /v1/images/{id}`: that id is not a finished artifact — wrong shape, or nothing on disk behind it |
+| 404 | `image_not_found` | on `GET /v1/images/{id}`: that id names no job at all (wrong shape, or a job the store never held) |
+
+### Reading a running job
+
+A stored id that has no picture file yet answers `200` with a status object instead of the PNG:
+
+```json
+{"id": "img-1770000000-1", "status": "running", "progress_percent": 45}
+```
+
+`status` is `running` while the job is queued, drawing or restoring, then the terminal state name
+(`succeeded`, `failed`, `cancelled`, `failed_engine_degraded`). `progress_percent` is `-1` until the
+pipeline reports its first step, then the job's last reported step (a `succeeded` job reads `100`;
+a failed one keeps the step it died at). A job whose percent stops moving for 60 seconds is flagged
+stalled and fails at its next step boundary, so the interlude never holds the yielded VRAM forever.
 
 ## Capabilities
 
