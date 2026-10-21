@@ -211,6 +211,16 @@ infernix_add_op_test(infernix_image_pipeline_prod_cuda_test
   LIBRARIES infernix_ops infernix_qwen_image infernix_qwen_image_runtime)
 set_tests_properties(infernix_image_pipeline_prod_cuda_test PROPERTIES SKIP_RETURN_CODE 77)
 
+# Qualification of image_device_need() against the module's own device ledger: the measured high-water
+# mark of five real jobs (512, 768, 768 + a reference, 768 + true CFG, 1024) must never exceed the
+# number the serving layer refuses on. Zero-filled inputs: the arithmetic is trivial, the allocations
+# are the job's. Runs the real pipeline on the GPU, so it must not overlap a live serve. Skips (77)
+# without INFERNIX_TEST_ARTIFACT; returns 2 with no CUDA device.
+infernix_add_op_test(infernix_image_need_ledger_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_image_need_ledger_real.cu"
+  LIBRARIES infernix_ops infernix_qwen_image infernix_qwen_image_runtime)
+set_tests_properties(infernix_image_need_ledger_real_test PROPERTIES SKIP_RETURN_CODE 77)
+
 # CPU-oracle qualification of the BF16 linear's small-token (skinny GEMV) path (tokens <= 8), the
 # route the Qwen-Image time-embedding linears use. Independent of any model/oracle data.
 infernix_add_op_test(infernix_image_skinny_linear_test
