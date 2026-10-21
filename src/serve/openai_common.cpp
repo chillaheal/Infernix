@@ -202,21 +202,35 @@ Json make_model_object_json(const std::string& model_id, std::int64_t created,
                       {"ftype", metadata.weights_id}}}};
 }
 
+// The image pipeline's entry. It is a routeable resource (POST /v1/images/generations with this id,
+// GET /v1/images/<id> for its pictures), not a claim that the chat model emits images, so it carries
+// only what an OpenAI model object is defined to carry.
+Json make_image_model_object_json(std::string_view image_model_id, std::int64_t created) {
+    return Json{{"id", image_model_id},
+                {"object", "model"},
+                {"created", created},
+                {"owned_by", "infernix"}};
+}
+
 } // namespace
 
 std::string make_models_list(const std::string& model_id, std::int64_t created,
-                             std::uint32_t max_model_len, const ModelMetadata& metadata) {
+                             std::uint32_t max_model_len, const ModelMetadata& metadata,
+                             std::string_view image_model_id) {
     // vLLM/llama.cpp-compatible discovery metadata for the configured per-request context limit.
-    const Json payload = {
-        {"object", "list"},
-        {"data",
-         Json::array({make_model_object_json(model_id, created, max_model_len, metadata)})}};
+    Json data = Json::array({make_model_object_json(model_id, created, max_model_len, metadata)});
+    if (!image_model_id.empty()) { data.push_back(make_image_model_object_json(image_model_id, created)); }
+    const Json payload = {{"object", "list"}, {"data", std::move(data)}};
     return payload.dump();
 }
 
 std::string make_model_object(const std::string& model_id, std::int64_t created,
                               std::uint32_t max_model_len, const ModelMetadata& metadata) {
     return make_model_object_json(model_id, created, max_model_len, metadata).dump();
+}
+
+std::string make_image_model_object(std::string_view image_model_id, std::int64_t created) {
+    return make_image_model_object_json(image_model_id, created).dump();
 }
 
 std::string make_error_body(const ApiError& error) {
@@ -232,8 +246,11 @@ std::int64_t unix_time_now() {
         .count();
 }
 
-void validate_openai_model(std::string_view requested, std::string_view available) {
-    if (requested == available) { return; }
+void validate_openai_model(std::string_view requested,
+                           std::initializer_list<std::string_view> available) {
+    for (const std::string_view known : available) {
+        if (known == requested) { return; }
+    }
     ApiError error;
     error.status  = 404;
     error.type    = "invalid_request_error";

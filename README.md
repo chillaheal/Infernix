@@ -71,6 +71,12 @@ Setup and tuning: the [Qwen3.8-Flash-Next guide](docs/qwen3_8-flash-next.md).
 - **Speculative decoding**: MTP, DFlash, DFlash2 and n-gram drafting, with exact sampling.
 - **Every KV format**: `int8`, `bf16`, `fp8`, `nvfp4`, `k8v4`, `vq2` and `k4v2`.
 - **Vision**: images and video, with the vision encoder optionally in system RAM.
+- **Image generation**: `POST /v1/images/generations` on the same server as chat, from a Qwen-Image-2.1
+  artifact, at any side from 32 to 2048 pixels (multiples of 32) with 2 to 100 denoise steps, and an
+  optional `image` field that conditions the result on a reference picture. The picture comes back inline or
+  as a URL this server serves, and `GET /v1/capabilities` tells a client which surfaces a session has.
+  A chat request needs no tool call of its own: the server runs a hidden `generate_image` tool, so "draw me
+  a fox" answers with the picture's URL.
 - **Conversion tools**: Hugging Face, NVIDIA ModelOpt, Quasar and GGUF sources, with recipes for
   Q4-Q8, FP8, NVFP4 and mixed artifacts.
 - **Windows and Linux**: native MSVC and GCC builds, WSL2 included.

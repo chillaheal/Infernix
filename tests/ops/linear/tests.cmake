@@ -54,3 +54,11 @@ infernix_add_op_test(infernix_projection_fp32_test
 infernix_add_op_test(infernix_resident_moe_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_resident_moe.cpp"
   LIBRARIES infernix_linear_test_support)
+
+# ops::linear no-alias contract: `out` overlapping `x` (in-place unsupported) must be refused with
+# std::invalid_argument. The guard fires in host validation before dispatch_linear and before any CUDA
+# call, so this is a device-less host test (no 77 skip, no cuda_available gate): it runs everywhere and
+# protects the WAR-hazard guard against silent regression.
+infernix_add_op_test(infernix_linear_noalias_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_linear_noalias.cpp"
+  LIBRARIES infernix_ops)

@@ -14,6 +14,13 @@ add_library(infernix_serve STATIC
   anthropic_messages_response.cpp
   anthropic_messages_http.cpp
   openai_responses_store.cpp
+  image_job_store.cpp
+  openai_images.cpp
+  reference_image.cpp
+  openai_images_http.cpp
+  chat_image_tool.cpp
+  image_generation_service.cpp
+  image_text_tower.cpp
   translate.cpp
   generation_service.cpp
   request_events.cpp
@@ -29,4 +36,5 @@ add_library(infernix_serve STATIC
 infernix_internal_includes(infernix_serve)
 target_link_libraries(infernix_serve
   PUBLIC infernix_engine Threads::Threads infernix::json infernix::httplib
-  PRIVATE infernix_media_acquire infernix_product_logging infernix_grammar infernix_cuda_runtime)
+  PRIVATE infernix_media_acquire infernix_media_decode infernix_product_logging infernix_grammar infernix_cuda_runtime
+          infernix_qwen_image infernix_qwen_image_runtime infernix_media_encode)

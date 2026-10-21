@@ -22,7 +22,7 @@ namespace infernix::ops {
  *
  * Logical shapes:
  *   x and out are same-shaped contiguous BF16 channel-first [D,S,1,1] with the D channels fastest.
- *   mod is contiguous BF16 [M,2,1,1] with M a multiple-of-or-at-least col_off + D. S is 1..16384,
+ *   mod is contiguous BF16 [M,2,1,1] with M a multiple-of-or-at-least col_off + D. S is 1..20480,
  *   D is 1..65536, col_off is 0..M-D, text_prefix is 0..S.
  *
  * Supported domain:
@@ -52,7 +52,7 @@ void adaln_scale(const Tensor& x, const Tensor& mod, std::int32_t col_off, std::
  *
  * Logical shapes:
  *   residual, branch and out are same-shaped contiguous BF16 channel-first [D,S,1,1]. mod is
- *   contiguous BF16 [M,2,1,1]. S is 1..16384, D is 1..65536, col_off is 0..M-D, text_prefix is 0..S.
+ *   contiguous BF16 [M,2,1,1]. S is 1..20480, D is 1..65536, col_off is 0..M-D, text_prefix is 0..S.
  *
  * Supported domain:
  *   BF16 storage, FP32 arithmetic (tanh in FP32), contiguous and 4-byte-aligned operands.

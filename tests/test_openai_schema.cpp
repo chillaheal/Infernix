@@ -1109,6 +1109,39 @@ int test_common_objects() {
         ApiError{.status = 400, .message = "bad", .param = "messages", .code = "invalid"}));
     failures += check(error["error"]["param"] == "messages" && error["error"]["code"] == "invalid",
                       "OpenAI common error shape remains stable");
+
+    // The image resource is advertised only when the image route is configured, and then as its own
+    // entry: a plain OpenAI model object, with no chat context or llama.cpp meta to mislead about it.
+    failures += check(Json::parse(make_models_list("qwen", 7, 240000, metadata))["data"].size() == 1U,
+                      "no image artifact means one advertised model");
+    const Json with_image =
+        Json::parse(make_models_list("qwen", 7, 240000, metadata, "Qwen-Image-2.1-FP8-v3"));
+    failures += check(with_image["data"].size() == 2U &&
+                          with_image["data"][1]["id"] == "Qwen-Image-2.1-FP8-v3" &&
+                          with_image["data"][1]["object"] == "model" &&
+                          with_image["data"][1]["owned_by"] == "infernix",
+                      "the image resource is listed beside the chat model");
+    failures += check(!with_image["data"][1].contains("max_model_len") &&
+                          !with_image["data"][1].contains("meta"),
+                      "the image entry claims no language-model capabilities");
+    failures += check(with_image["data"][0]["meta"]["n_ctx"] == 240000,
+                      "the chat entry keeps its full meta next to the image entry");
+
+    const Json single = Json::parse(make_image_model_object("img-artifact", 99));
+    failures += check(single["id"] == "img-artifact" && single["created"] == 99 &&
+                          single["object"] == "model" && single.size() == 4U,
+                      "the image model object carries only the defined model fields");
+
+    // The gate is per-surface value equality: the image id is routeable, an unknown id is never.
+    failures += check(api_error([&] {
+                          validate_openai_model("qwen", {"qwen", "Qwen-Image-2.1-FP8-v3"});
+                      }).status == 0,
+                      "either advertised id passes the gate");
+    const ApiError unknown = api_error([&] {
+        validate_openai_model("Qwen-Image-2.1-FP8-v3", {"qwen"});
+    });
+    failures += check(unknown.status == 404 && unknown.code == "model_not_found",
+                      "the image id is rejected where only the chat model is legal");
     return failures;
 }
 

@@ -8,6 +8,7 @@
 #include <nlohmann/json.hpp>
 
 #include <cstdint>
+#include <initializer_list>
 #include <string>
 #include <string_view>
 
@@ -28,14 +29,21 @@ struct OpenAIPromptCachePolicy {
 [[nodiscard]] OpenAIPromptCachePolicy parse_openai_prompt_cache_policy(const RequestJson& body);
 void apply_openai_prompt_cache_policy(GenerationRequest& request, OpenAIPromptCachePolicy policy);
 
+// The /v1/models list. `image_model_id` is the image resource's public id, empty when no image
+// pipeline is attached. It is listed as a bare model object because the fields that describe a
+// language model (max_model_len, n_ctx, ftype) say nothing true about a diffusion pipeline.
 std::string make_models_list(const std::string& model_id, std::int64_t created,
-                             std::uint32_t max_model_len, const ModelMetadata& metadata);
+                             std::uint32_t max_model_len, const ModelMetadata& metadata,
+                             std::string_view image_model_id = {});
 std::string make_model_object(const std::string& model_id, std::int64_t created,
                               std::uint32_t max_model_len, const ModelMetadata& metadata);
+std::string make_image_model_object(std::string_view image_model_id, std::int64_t created);
 std::string make_error_body(const ApiError& error);
 std::int64_t unix_time_now();
 
-void validate_openai_model(std::string_view requested, std::string_view available);
+// 404 model_not_found unless `requested` names one of the ids this process actually serves.
+void validate_openai_model(std::string_view requested,
+                           std::initializer_list<std::string_view> available);
 
 std::string new_openai_chat_completion_id();
 std::string new_openai_chat_tool_call_id();

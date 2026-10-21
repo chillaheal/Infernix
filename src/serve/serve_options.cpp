@@ -176,6 +176,10 @@ std::string serve_usage_text(const char* argv0) {
            "                             --thinking-budget-message \"Time to stop thinking. I must "
            "act\n"
            "                             now:\")\n"
+           "  --thinking-budget-policy M strict (default), clamp, or ignore: how a request whose\n"
+           "                             thinking budget cannot fit its output capacity is handled;\n"
+           "                             strict rejects it (HTTP 400), clamp lowers the budget to\n"
+           "                             fit, ignore runs it with no thinking budget\n"
            "  --reasoning-loop MODE      off (default), stop or conclude: every 512 thinking\n"
            "                             tokens, check whether 25% of the last 2,000 words\n"
            "                             repeat 12-word passages seen 3 times; stop ends the\n"
@@ -342,6 +346,14 @@ std::string serve_usage_text(const char* argv0) {
            "  --request-log-keep N       rotated files kept, 0-1000 (default 4)\n"
            "  --response-store-max-records N Responses-state record cap (default 1024)\n"
            "  --response-store-max-mib N      Responses-state byte cap in MiB (default 256)\n"
+           "  --image-artifact PATH      .infernix image artifact for the synchronous\n"
+           "                             POST /v1/images/generations (default: the route\n"
+           "                             answers 503 image_generation_not_configured)\n"
+           "  --image-text-processor PATH\n"
+           "                             HF Qwen3-VL processor directory (tokenizer.json,\n"
+           "                             tokenizer_config.json, chat_template.jinja) that\n"
+           "                             turns the raw prompt into the tower conditioning\n"
+           "                             (default: the route stays 503 not_configured)\n"
            "  --log-stats-interval-ms N  throughput-log interval in ms\n"
            "                             (default 5000; 0 disables)\n"
            "  --log-colours on|off       colour the console stats lines (default off; on\n"
@@ -595,6 +607,16 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 throw std::invalid_argument("--response-store-max-mib is out of range");
             }
             options.response_store_max_bytes = static_cast<std::size_t>(mib << 20);
+        } else if (arg == "--image-artifact") {
+            options.image_artifact_path = require_value("--image-artifact");
+            if (options.image_artifact_path.empty()) {
+                throw std::invalid_argument("--image-artifact must not be empty");
+            }
+        } else if (arg == "--image-text-processor") {
+            options.image_text_processor_path = require_value("--image-text-processor");
+            if (options.image_text_processor_path.empty()) {
+                throw std::invalid_argument("--image-text-processor must not be empty");
+            }
         } else if (arg == "--device") {
             options.device = parse_nonnegative_int(require_value("--device"), "device");
         } else if (arg == "--ram-headroom-mib") {
@@ -659,6 +681,18 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.thinking_budget_message = require_value("--thinking-budget-message");
             if (options.thinking_budget_message.empty()) {
                 throw std::invalid_argument("--thinking-budget-message must not be empty");
+            }
+        } else if (arg == "--thinking-budget-policy") {
+            const std::string_view value = require_value("--thinking-budget-policy");
+            if (value == "strict") {
+                options.thinking_budget_policy = infernix::ThinkingBudgetPolicy::Strict;
+            } else if (value == "clamp") {
+                options.thinking_budget_policy = infernix::ThinkingBudgetPolicy::Clamp;
+            } else if (value == "ignore") {
+                options.thinking_budget_policy = infernix::ThinkingBudgetPolicy::Ignore;
+            } else {
+                throw std::invalid_argument(
+                    "--thinking-budget-policy must be strict, clamp or ignore");
             }
         } else if (arg == "--reasoning-loop") {
             const std::string_view value = require_value("--reasoning-loop");

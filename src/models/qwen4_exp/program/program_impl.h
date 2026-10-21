@@ -64,6 +64,7 @@
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <thread>
 
 namespace infernix::models::qwen4_exp {
 namespace detail {
@@ -1051,6 +1052,7 @@ public:
     // falls back to the next source (the root).
     runtime::ResourceReservation start_binding(const RequestBasePlan& base, runtime::LaneId destination,
                                                const SourceCandidate& source, ResumeState* resume) {
+        LlmEntryScope entry{*this};
         if (source.hybrid == nullptr) { throw std::logic_error("Qwen4Exp: a binding source carries no quote"); }
         if (resume != nullptr && resume->impl_ == nullptr) { throw std::logic_error("Qwen4Exp: a resume carries no state"); }
         const QuoteImpl& q = *source.hybrid;
@@ -1373,6 +1375,7 @@ public:
     // lane's blocks and its state at the frontier, exactly as a consistent abort leaves them, the
     // lane is released and a Pause transaction hands the Engine the ResumeState.
     bool start_pause(SequenceHandle sequence) {
+        LlmEntryScope entry{*this};
         if (in_transaction() || pending_transaction_ != 0) {
             diagnostic(std::string("Qwen4Exp: pause refused: ") +
                            (in_transaction() ? "a context transaction is open" : "a round awaits its commit"),
@@ -1425,6 +1428,7 @@ public:
     // extent. A shortage cached blocks and the elastic pool cannot cover is reported, and the Engine
     // reclaims or pauses the youngest resident.
     runtime::ResourceReservation reserve_units(std::span<const ExecutionUnit> units) {
+        LlmEntryScope entry{*this};
         runtime::ResourceReservation out;
         for (const ExecutionUnit& unit : units) {
             const std::uint32_t index = lane_of(unit.sequence);
@@ -1467,6 +1471,7 @@ public:
     // Advances the binding: a media prompt's encode window one step per call (design §19.3.2; other
     // lanes run between steps), then the lane is published.
     ContextProgress poll_context(runtime::CancellationFlagView cancellation) {
+        LlmEntryScope entry{*this};
         if (pause_) {
             ContextProgress out{.kind = ContextOperationKind::Pause};
             out.advanced  = true;
@@ -1519,6 +1524,7 @@ public:
 
     // The Engine's reclaim for a binding shortage: evict cached Device blocks until it is covered.
     bool hybrid_reclaim(runtime::ContextResourceUsage shortage) {
+        LlmEntryScope entry{*this};
         if (!prefix_ || shortage.main_kv_pages == 0) { return false; }
         const std::uint32_t before = pool_->available_pages();
         pc_make_room(before + shortage.main_kv_pages);
@@ -1532,6 +1538,7 @@ public:
 
     // ---------------------------------------------------------------- execution
     PrefillProgress advance_prefill(SequenceHandle sequence, runtime::TokenMaskProvider* masks) {
+        LlmEntryScope entry{*this};
         const GrammarScope grammar(*this, masks);
         const auto start  = Clock::now();
         const auto index  = lane_of(sequence);
@@ -1662,6 +1669,7 @@ public:
 
     PendingBatch decode(std::span<const SequenceHandle> sequences, std::span<const runtime::RoundBudget> budgets,
                         runtime::TokenMaskProvider* masks) {
+        LlmEntryScope entry{*this};
         const GrammarScope grammar(*this, masks);
         const auto start = Clock::now();
         const auto batch = static_cast<std::int32_t>(sequences.size());
@@ -1798,6 +1806,7 @@ public:
 
     runtime::ExecutionTiming append_forced(std::span<const SequenceHandle> sequences, std::span<const TokenId> tokens,
                                            std::uint32_t stride) {
+        LlmEntryScope entry{*this};
         const auto start = Clock::now();
         if (stride == 0 || tokens.size() != static_cast<std::size_t>(stride) * sequences.size()) {
             throw std::invalid_argument("Qwen4Exp: forced tokens do not match their rows");
@@ -1845,6 +1854,7 @@ public:
     }
 
     CommitResult commit(PendingBatch&& pending, std::span<const runtime::CommitDecision> decisions) {
+        LlmEntryScope entry{*this};
         if (ContractAccess::owner(pending) != this || ContractAccess::transaction(pending) != pending_transaction_ ||
             pending_transaction_ == 0) {
             throw std::logic_error("Qwen4Exp: commit of a foreign or stale pending batch");
@@ -1937,6 +1947,7 @@ public:
     }
 
     FinishResult finish(SequenceHandle sequence) noexcept {
+        LlmEntryScope entry{*this};
         FinishResult out;
         try {
             const auto index = lane_of(sequence);
@@ -1970,6 +1981,7 @@ public:
     }
 
     AbortResult abort(SequenceHandle sequence) noexcept {
+        LlmEntryScope entry{*this};
         AbortResult out;
         try {
             const auto index = lane_of(sequence);
@@ -2167,6 +2179,14 @@ public:
     void set_maintenance_waker(std::function<void()> waker) {
         const std::lock_guard<std::mutex> lock(vram_mutex_);
         waker_ = std::move(waker);
+    }
+
+    // Maintenance is a device-doing entry (VRAM retarget, expert-state save): it counts for the
+    // interlude drain exactly like the execution entries.
+    void maintain_all() {
+        LlmEntryScope entry{*this};
+        apply_vram_target(true);
+        maintain_expert_state();
     }
 
     // ---- warm start (design §19.3.5 S4b) ----
@@ -3057,7 +3077,6 @@ private:
     // first round of a size runs eagerly (it also performs the Ops' one-time setup); the next is
     // captured and later rounds replay it.
     void run_decode(std::int32_t batch) {
-        if (!submit_open()) { return; } // coexistence: an image interlude holds the device; the scheduler retries
         const cudaStream_t s = device_.stream;
         upload_pinned(io_device_.p, io_host_.data(), io_layout_.ngram, s);
         if (cpu_service_) { cpu_service_->wake(); } // its first request comes within this round
@@ -4124,6 +4143,11 @@ public:
         lease.frames_before   = residency_->frames();
         lease.kv_pages_before = pool_ ? pool_->backed_pages() : 0;
         const std::uint64_t before = residency_->pool_bytes() + (kv_vmm_ ? kv_vmm_->mapped_bytes() : 0);
+        diagnostic("yield: device synchronized; pool+kv " + std::to_string(before >> 20) + " MiB, frames " +
+                       std::to_string(residency_->frames()) + ", lendable " + std::to_string(residency_->lendable()) +
+                       ", target " + std::to_string(target_bytes >> 20) + " MiB, margin " +
+                       std::to_string(margin_bytes >> 20) + " MiB",
+                   DiagnosticLevel::Info);
 
         ImageYieldRequest req;
         req.pool_bytes    = residency_->pool_bytes();
@@ -4138,25 +4162,55 @@ public:
         req.target_bytes  = target_bytes;
         req.margin_bytes  = margin_bytes;
         const auto plan = plan_image_yield(req);
+        diagnostic("yield: plan lease_held=" + std::to_string(req.lease_held) + ", frames " +
+                       std::to_string(req.frames) + " -> " + std::to_string(plan.frames_after) + ", kv_mapped_after " +
+                       std::to_string(plan.kv_mapped_after >> 20) + " MiB (was " +
+                       std::to_string(req.kv_mapped >> 20) + " MiB)",
+                   DiagnosticLevel::Info);
 
-        if (kv_vmm_ && plan.kv_mapped_after < req.kv_mapped) {
-            // Free whole KV chunks off the top, down to the page count the plan leaves mapped.
-            std::uint32_t pages = plan_.kv_base_pages;
-            while (pages + kKvGrowPages <= lease.kv_pages_before &&
-                   kv_mapped_bytes(plan_, pages + kKvGrowPages) <= plan.kv_mapped_after) {
-                pages += kKvGrowPages;
-            }
-            if (pages < lease.kv_pages_before) {
-                pool_->set_backed_pages(pages);
-                const auto need = kv_chunks(plan_, pages);
-                for (std::size_t c = 0; c < need.size(); ++c) {
-                    if (!need[c] && kv_vmm_->mapped(c)) { kv_vmm_->unmap(c); }
+        try {
+            if (kv_vmm_ && plan.kv_mapped_after < req.kv_mapped) {
+                // Free whole KV chunks off the top, down to the page count the plan leaves mapped.
+                std::uint32_t pages = plan_.kv_base_pages;
+                while (pages + kKvGrowPages <= lease.kv_pages_before &&
+                       kv_mapped_bytes(plan_, pages + kKvGrowPages) <= plan.kv_mapped_after) {
+                    pages += kKvGrowPages;
                 }
-                kv_grown_.store(pages > plan_.kv_base_pages);
+                // The KV top only frees as the contiguous free run above every allocated/reserved page. On
+                // a warmed server a retained prefix-cache block or an idle context pins the top pages, so
+                // the byte-derived target is not can_back-able. Raise the limit (free LESS KV) to the
+                // smallest chunk-aligned limit can_back accepts; the expert frames carry the rest of the
+                // target. This never throws: a pinned top soft-fails the image job (insufficient yield), it
+                // must not Degraded the whole engine.
+                while (pages < lease.kv_pages_before && !pool_->can_back(pages)) { pages += kKvGrowPages; }
+                if (pages < lease.kv_pages_before) {
+                    pool_->set_backed_pages(pages);
+                    const auto need = kv_chunks(plan_, pages);
+                    for (std::size_t c = 0; c < need.size(); ++c) {
+                        if (!need[c] && kv_vmm_->mapped(c)) { kv_vmm_->unmap(c); }
+                    }
+                    kv_grown_.store(pages > plan_.kv_base_pages);
+                }
             }
-        }
-        if (plan.frames_after < lease.frames_before) {
-            (void)residency_->resize(plan.frames_after, device_.stream, *vram_);
+            diagnostic("yield: KV shrink applied", DiagnosticLevel::Info);
+            if (plan.frames_after < lease.frames_before) {
+                (void)residency_->resize(plan.frames_after, device_.stream, *vram_);
+            }
+            diagnostic("yield: frame resize applied", DiagnosticLevel::Info);
+        } catch (const std::exception& yield_failure) {
+            // The yield moved pools and threw. The image leased nothing, so unwind the pools to their
+            // pre-yield snapshot; a failed yield must leave a cleanly Quiesced, reopenable Program. If the
+            // unwind itself throws, the device state is genuinely unrestorable -- let it reach the caller.
+            diagnostic(std::string("yield: FAILED -- ") + yield_failure.what() +
+                           "; unwinding the pools to their pre-yield state",
+                       DiagnosticLevel::Error);
+            rollback_failed_yield(lease.frames_before, lease.kv_pages_before);
+            throw;
+        } catch (...) {
+            diagnostic("yield: FAILED (non-standard); unwinding the pools to their pre-yield state",
+                       DiagnosticLevel::Error);
+            rollback_failed_yield(lease.frames_before, lease.kv_pages_before);
+            throw;
         }
 
         const std::uint64_t after = residency_->pool_bytes() + (kv_vmm_ ? kv_vmm_->mapped_bytes() : 0);
@@ -4169,6 +4223,25 @@ public:
                    DiagnosticLevel::Info);
         { const std::lock_guard<std::mutex> slock(execution_mu_); execution_state_ = ExecutionState::Leased; }
         return lease;
+    }
+
+    // Unwind a yield that threw after it had already moved pools. The image leased nothing, so this is
+    // release_from_yield's restore blocks run straight: remap + re-raise the KV limit, then resize the
+    // expert frames back to the count taken before the yield. The caller holds vram_mutex_ and the state
+    // is still Quiesced (Leased is set only after a clean yield). Throws if the device cannot be restored
+    // -- the one case that legitimately drives the Program Degraded.
+    void rollback_failed_yield(std::uint32_t frames_before, std::uint32_t kv_pages_before) {
+        device_.synchronize();
+        if (pool_ && kv_pages_before > pool_->backed_pages()) {
+            (void)map_kv(kv_pages_before);
+            if (pool_->backed_pages() < kv_pages_before) { pool_->set_backed_pages(kv_pages_before); }
+            kv_grown_.store(kv_pages_before > plan_.kv_base_pages);
+        }
+        if (residency_->frames() < frames_before) {
+            (void)residency_->resize(frames_before, device_.stream, *vram_);
+        }
+        frames_now_ = residency_->frames();
+        pool_now_   = residency_->pool_bytes();
     }
 
     // Returns everything yield_for_image took: grow the KV pool back to its saved page count (taking the
@@ -4185,6 +4258,9 @@ public:
                 lease.graph_generation != graph_generation_) {
                 throw std::logic_error("Qwen4Exp: yield lease is stale; the execution state moved during the lease");
             }
+        }
+        if (take_image_restore_fault()) {
+            throw std::runtime_error("Qwen4Exp: the image yield restoration is faulted (injected)");
         }
         const std::lock_guard<std::mutex> lock(vram_mutex_);
         device_.synchronize();
@@ -4228,9 +4304,62 @@ public:
     // is an atomic so the per-round hot path is a single relaxed load; the mutex guards the state machine and
     // the in-flight count only. Until an interlude is dispatched (a later commit) the door stays open, so the
     // serving hot path is byte-identical to today.
-    enum class ExecutionState : std::uint8_t { Running, Quiescing, Quiesced, Leased };
+    // Degraded is reached only when an interlude's restoration could not be confirmed: the submit door
+    // stays closed (admission never silently reopens on unconfirmed device state) and the process is
+    // the recovery unit. There is no transition out; begin_quiesce's Running-only rule enforces it.
+    enum class ExecutionState : std::uint8_t { Running, Quiescing, Quiesced, Leased, Degraded };
 
     [[nodiscard]] bool submit_open() const noexcept { return llm_submit_open_.load(std::memory_order_relaxed); }
+
+    [[nodiscard]] bool interlude_degraded() noexcept {
+        std::lock_guard<std::mutex> lock(execution_mu_);
+        return execution_state_ == ExecutionState::Degraded;
+    }
+
+    // Worker-side image-interlude preemption handshake. The Program (image HTTP thread) sets
+    // interlude_preempt_epoch_ to the current execution epoch and asks the Engine worker to pause every
+    // Prefill lane until the residency ring is back; the worker acks interlude_quiesced_epoch_ once an
+    // image yield would no longer freeze the expert pool. Both counters advance only with execution_epoch_
+    // (bumped in begin_quiesce), so a stale ack can never satisfy a newer quiesce.
+    void request_interlude_preempt(std::uint64_t epoch) noexcept {
+        interlude_preempt_epoch_.store(epoch, std::memory_order_release);
+    }
+    [[nodiscard]] std::uint64_t interlude_preempt_epoch() const noexcept {
+        return interlude_preempt_epoch_.load(std::memory_order_acquire);
+    }
+    [[nodiscard]] bool interlude_preempt_outstanding() const noexcept {
+        const auto want = interlude_preempt_epoch_.load(std::memory_order_acquire);
+        return want != 0 && interlude_quiesced_epoch_.load(std::memory_order_acquire) < want;
+    }
+    // The worker calls this (NEVER holding the Program's execution_mu_) once preemption has returned the
+    // residency ring, so yield_for_image will not freeze the expert pool.
+    void signal_interlude_quiesced(std::uint64_t epoch) noexcept {
+        interlude_quiesced_epoch_.store(epoch, std::memory_order_release);
+        execution_cv_.notify_all();
+    }
+    // Whether yield_for_image right now would actually free expert frames. resize() frees NOTHING while
+    // any frame is on loan (it early-returns while loaned_frames()!=0), and the only LLM loan is the
+    // prefill's stream_lease_; a live walk will re-lease on its next step. So a yield is productive only
+    // once the walk is abandoned AND its stream lease returned -- a merely-partial lease (some frames
+    // lendable) still blocks the whole free, so lendable()!=0 is NOT a sufficient signal. Read only from a
+    // quiesced window (the door is closed and only the worker executes the LLM): the worker under its
+    // execution lock, or the Program after the ack.
+    [[nodiscard]] bool interlude_yieldable() noexcept {
+        return residency_->frames() == 0 || (!stream_lease_.valid() && !walk_.active);
+    }
+
+    // Counts one live LLM execution entry (see drain_llm_frontier). The Engine loop's door check makes
+    // a body starting after the close impossible beyond the one already past its check; entry-side
+    // no-ops are therefore NOT taken -- a body whose door raced open runs its real, bounded work, and
+    // the drain counts it.
+    struct LlmEntryScope {
+        explicit LlmEntryScope(ProgramImpl& impl) : impl_(impl) {
+            ++impl_.llm_entries_started_;
+            ++impl_.llm_in_flight_;
+        }
+        ~LlmEntryScope() { --impl_.llm_in_flight_; }
+        ProgramImpl& impl_;
+    };
 
     // Close the submission door and enter Quiescing. Legal only from Running.
     void begin_quiesce() {
@@ -4244,20 +4373,53 @@ public:
         ++execution_epoch_;
     }
 
-    // Drain every stream the LLM may have enqueued work on. The events are recorded AFTER the door is closed,
-    // so each bounds all submissions made before the quiesce (not work submitted after). The device
-    // synchronize inside yield_for_image remains the physical-free catch-all.
-    void drain_llm_frontier() {
+    // Drain every stream the LLM may have enqueued work on, then prove the LLM stopped submitting.
+    // A worker that passed the Engine loop's door check before the close can still run ONE execution
+    // body whose submissions postdate the door: LlmEntryScope counts those entries, so a drain pass is
+    // stable only when (a) no entry is in flight, (b) every stream event recorded after the entries
+    // retired has completed, and (c) no new entry started while the events settled. The door's engine
+    // side then starts at most one more body, after which no entry can begin -- so this converges.
+    // The device synchronize inside yield_for_image remains the physical-free catch-all.
+    // `deadline_ms` bounds the wait (0 waits forever); false means the frontier did not drain in time
+    // and NOTHING has been moved yet, so the caller unwinds the quiesce and the LLM resumes healthy.
+    [[nodiscard]] bool drain_llm_frontier(std::uint64_t deadline_ms) {
+        const auto deadline = deadline_ms == 0
+                                  ? std::chrono::steady_clock::time_point::max()
+                                  : std::chrono::steady_clock::now() + std::chrono::milliseconds(deadline_ms);
         cudaEvent_t ev[3] = {nullptr, nullptr, nullptr};
         for (cudaEvent_t& e : ev) { CUDA_CHECK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming)); }
-        CUDA_CHECK(cudaEventRecord(ev[0], device_.stream));
-        CUDA_CHECK(cudaEventRecord(ev[1], overlap_.stream));
         const bool has_expert_stream = expert_stream_ != nullptr;
-        if (has_expert_stream) { CUDA_CHECK(cudaEventRecord(ev[2], expert_stream_->stream())); }
-        CUDA_CHECK(cudaEventSynchronize(ev[0]));
-        CUDA_CHECK(cudaEventSynchronize(ev[1]));
-        if (has_expert_stream) { CUDA_CHECK(cudaEventSynchronize(ev[2])); }
+        bool drained   = false;
+        bool timed_out = false;
+        cudaError_t hard_error = cudaSuccess;
+        while (!drained && !timed_out) {
+            while (llm_in_flight_.load(std::memory_order_acquire) != 0 &&
+                   std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            if (llm_in_flight_.load(std::memory_order_acquire) != 0) { timed_out = true; break; }
+            const auto entries_before = llm_entries_started_.load(std::memory_order_acquire);
+            CUDA_CHECK(cudaEventRecord(ev[0], device_.stream));
+            CUDA_CHECK(cudaEventRecord(ev[1], overlap_.stream));
+            if (has_expert_stream) { CUDA_CHECK(cudaEventRecord(ev[2], expert_stream_->stream())); }
+            bool settled = true;
+            for (cudaEvent_t e : ev) {
+                if (e == nullptr) { continue; }
+                while (true) {
+                    const cudaError_t status = cudaEventQuery(e);
+                    if (status == cudaSuccess) { break; }
+                    if (status != cudaErrorNotReady) { hard_error = status; settled = false; timed_out = false; break; }
+                    if (std::chrono::steady_clock::now() >= deadline) { settled = false; timed_out = true; break; }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+                if (!settled) { break; }
+            }
+            drained = settled && llm_entries_started_.load(std::memory_order_acquire) == entries_before &&
+                      llm_in_flight_.load(std::memory_order_acquire) == 0;
+        }
         for (cudaEvent_t& e : ev) { if (e != nullptr) { cudaEventDestroy(e); } }
+        CUDA_CHECK(hard_error); // a real stream fault propagates; a deadline miss is a clean false
+        return drained;
     }
 
     // Drop every captured decode/verify/mtp graph. reset() frees the cudaGraph_t / cudaGraphExec_t and clears
@@ -4271,28 +4433,128 @@ public:
         ++graph_generation_;
     }
 
-    // Quiesce to the safe point WITHOUT yielding VRAM (this commit's scope): close the door, drain, invalidate.
-    // The physical yield and the full interlude land in later commits; the caller pairs this with
-    // end_image_quiesce().
-    void begin_image_quiesce() {
+    // Quiesce to the safe point WITHOUT yielding VRAM: close the door, drain the frontier within
+    // `drain_deadline_ms` (0 waits forever), invalidate the graphs. False means the frontier missed the
+    // deadline: at that point no graph and no pool has moved, so the quiesce is cleanly unwound (the
+    // door reopens, back to Running) and the caller fails only the image job. The caller pairs a true
+    // return with end_image_quiesce().
+    [[nodiscard]] bool begin_image_quiesce(std::uint64_t drain_deadline_ms = 0) {
         begin_quiesce();
-        drain_llm_frontier();
+        std::uint64_t epoch = 0;
+        { const std::lock_guard<std::mutex> lock(execution_mu_); epoch = execution_epoch_; }
+
+        // Ask the Engine worker to preempt the in-flight prefill replay-safe (abandon the walk, return the
+        // residency ring) and nudge it out of its door wait. It acks interlude_quiesced_epoch_ once an image
+        // yield would no longer freeze the expert pool. Poll WITHOUT holding execution_mu_ -- the worker must
+        // never need the Program's execution lock to make the ack. The submit door stays CLOSED throughout:
+        // admission is bounded for the whole handoff, so no new LLM work re-enters mid-preemption.
+        const auto deadline = drain_deadline_ms == 0
+                                  ? std::chrono::steady_clock::time_point::max()
+                                  : std::chrono::steady_clock::now() + std::chrono::milliseconds(drain_deadline_ms);
+        request_interlude_preempt(epoch);
+        wake_llm_worker();
+        while (interlude_quiesced_epoch_.load(std::memory_order_acquire) < epoch &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+
+        // Soft-fail (never Degraded): the LLM did not reach a yieldable point in time. The quiesce unwinds,
+        // the door reopens, the in-flight prefill resumes via replay -- only this image job is rejected.
+        if (interlude_quiesced_epoch_.load(std::memory_order_acquire) < epoch) {
+            abort_quiesce_to_running();
+            diagnostic("image interlude: the LLM did not reach a yieldable point within the deadline; the "
+                       "quiesce was unwound and the LLM keeps running",
+                       DiagnosticLevel::Warning);
+            return false;
+        }
+
+        // The worker abandoned the walk and returned the ring before acking, so the frontier is genuinely
+        // drained (paused lanes retired; the closed door admits nothing new). Bound the drain by what's left;
+        // never let an elapsed budget degrade to "0", which drain_llm_frontier reads as "wait forever".
+        const std::uint64_t drain_ms = [&] {
+            if (drain_deadline_ms == 0) { return std::uint64_t{0}; }
+            const auto rem = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 deadline - std::chrono::steady_clock::now()).count();
+            return rem > 0 ? static_cast<std::uint64_t>(rem) : std::uint64_t{1};
+        }();
+        if (!drain_llm_frontier(drain_ms)) {
+            abort_quiesce_to_running();
+            diagnostic("image interlude: the LLM frontier did not drain within the deadline; the quiesce "
+                       "was unwound and the LLM keeps running",
+                       DiagnosticLevel::Warning);
+            return false;
+        }
+
+        // Defense-in-depth: the ack already guarantees this and nothing moves the residency state now (the
+        // worker is parked at the closed door). If it somehow does not hold, unwind rather than yield onto a
+        // frozen pool -- a soft-fail, never Degraded.
+        if (!interlude_yieldable()) {
+            abort_quiesce_to_running();
+            diagnostic("image interlude: the residency ring is still held after the preemption; the quiesce "
+                       "was unwound and the LLM keeps running",
+                       DiagnosticLevel::Warning);
+            return false;
+        }
         invalidate_decode_graphs();
         std::lock_guard<std::mutex> lock(execution_mu_);
         execution_state_ = ExecutionState::Quiesced;
+        return true;
+    }
+
+    // The door flipped open: nudge the Engine worker out of its interlude door wait (the maintenance
+    // waker notifies the Engine queue). Fired only after execution_mu_ is released -- the waker takes
+    // Engine locks, which must not nest under the Program's execution lock.
+    void wake_llm_worker() {
+        std::function<void()> waker;
+        { const std::lock_guard<std::mutex> lock(vram_mutex_); waker = waker_; }
+        if (waker) { waker(); }
+    }
+
+    // Unwind a Quiescing back to Running. Legal only while nothing has been moved: no graph was
+    // invalidated and no pool was yielded, so captured device pointers are still valid.
+    void abort_quiesce_to_running() {
+        {
+            std::lock_guard<std::mutex> lock(execution_mu_);
+            if (execution_state_ != ExecutionState::Quiescing) {
+                throw std::logic_error("Qwen4Exp: quiesce abort is legal only from the Quiescing state");
+            }
+            execution_state_            = ExecutionState::Running;
+            interlude_preempt_epoch_.store(0, std::memory_order_release);
+            interlude_quiesced_epoch_.store(0, std::memory_order_release);
+            prefix_cache_mutation_open_ = true;
+            llm_submit_open_.store(true, std::memory_order_release);
+            execution_cv_.notify_all();
+        }
+        wake_llm_worker();
+    }
+
+    // The interlude's restoration could not be confirmed: park the Program with the door closed. This
+    // is terminal -- the process is the recovery unit, and every later interlude entry throws from
+    // begin_quiesce's Running-only rule.
+    void mark_interlude_degraded() {
+        std::lock_guard<std::mutex> lock(execution_mu_);
+        execution_state_ = ExecutionState::Degraded;
+        diagnostic("image interlude restoration failed: the Program is Degraded; the LLM submit door stays "
+                   "closed and the process must be restarted",
+                   DiagnosticLevel::Error);
     }
 
     // Reopen the door and return to Running once an interlude's work is complete and its VRAM restored.
     void end_image_quiesce() {
-        std::lock_guard<std::mutex> lock(execution_mu_);
-        if (execution_state_ != ExecutionState::Quiesced && execution_state_ != ExecutionState::Leased) {
-            throw std::logic_error("Qwen4Exp: end_image_quiesce is legal only from the Quiesced or Leased interlude state");
+        {
+            std::lock_guard<std::mutex> lock(execution_mu_);
+            if (execution_state_ != ExecutionState::Quiesced && execution_state_ != ExecutionState::Leased) {
+                throw std::logic_error("Qwen4Exp: end_image_quiesce is legal only from the Quiesced or Leased interlude state");
+            }
+            ++device_epoch_;
+            execution_state_            = ExecutionState::Running;
+            interlude_preempt_epoch_.store(0, std::memory_order_release);
+            interlude_quiesced_epoch_.store(0, std::memory_order_release);
+            prefix_cache_mutation_open_ = true;
+            llm_submit_open_.store(true, std::memory_order_release);
+            execution_cv_.notify_all();
         }
-        ++device_epoch_;
-        execution_state_            = ExecutionState::Running;
-        prefix_cache_mutation_open_ = true;
-        llm_submit_open_.store(true, std::memory_order_release);
-        execution_cv_.notify_all();
+        wake_llm_worker();
     }
 
     // Whether every graph executable is inert (test hook: confirms invalidation took).
@@ -4305,18 +4567,30 @@ public:
     }
 
     // Test-registry additions on the same single-owner active_ (mirror has_active/yield_testing/release_testing).
-    static std::uint64_t begin_quiesce_testing() { active_->begin_image_quiesce(); return active_->execution_epoch_; }
+    static std::uint64_t begin_quiesce_testing() {
+        if (!active_->begin_image_quiesce(/*drain_deadline_ms=*/0)) {
+            throw std::runtime_error("Qwen4Exp: the untimed test quiesce cannot miss its deadline");
+        }
+        return active_->execution_epoch_;
+    }
     static void end_quiesce_testing() { active_->end_image_quiesce(); }
     static int state_testing() noexcept { return static_cast<int>(active_->execution_state_); }
+    // Defined in program.cpp next to the other testing fault atomics: consumes one injected
+    // restoration failure; the faulted release_from_yield throws before touching the pools.
+    [[nodiscard]] static bool take_image_restore_fault() noexcept;
     static bool graphs_inert_testing() noexcept { return active_->graphs_inert(); }
     static bool submit_open_testing() noexcept { return active_->submit_open(); }
 
     // Quiescence state (declared here; the inline methods above use them through the complete-class context).
     std::mutex execution_mu_;
     std::condition_variable execution_cv_;
+    std::mutex interlude_mu_; // single-flight gate: one image interlude at a time; serving queues in front
     ExecutionState execution_state_ = ExecutionState::Running;
     std::atomic<bool> llm_submit_open_{true};
-    std::atomic<std::uint32_t> llm_inflight_submissions_{0};
+    std::atomic<std::uint64_t> llm_entries_started_{0}; // cumulative LLM execution entries (drain stability)
+    std::atomic<std::uint32_t> llm_in_flight_{0};       // live LlmEntryScopes
+    std::atomic<std::uint64_t> interlude_preempt_epoch_{0};  // Program asks the worker to preempt to epoch
+    std::atomic<std::uint64_t> interlude_quiesced_epoch_{0}; // worker acks this epoch became yieldable
     bool prefix_cache_mutation_open_ = true;
     std::uint64_t execution_epoch_  = 0;
     std::uint64_t device_epoch_     = 0;

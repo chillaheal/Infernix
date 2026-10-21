@@ -2,6 +2,12 @@ infernix_add_test(infernix_media_decode_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_media_decode.cpp"
   LIBRARIES infernix_media_decode)
 
+# PNG encoder round trip through the engine's own decoder (opaque pixels byte-exact, multi-block
+# stored DEFLATE, negative sizes).
+infernix_add_test(infernix_media_encode_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_media_encode.cpp"
+  LIBRARIES infernix_media_encode infernix_media_decode)
+
 infernix_add_test(infernix_prompt_input_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_prompt_input.cpp"
   LIBRARIES infernix_product_prompt_input)
@@ -39,6 +45,25 @@ infernix_add_test(infernix_openai_responses_test
 
 infernix_add_test(infernix_openai_responses_store_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_openai_responses_store.cpp"
+  LIBRARIES infernix_serve)
+
+infernix_add_test(infernix_image_job_store_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_image_job_store.cpp"
+  LIBRARIES infernix_serve)
+
+infernix_add_test(infernix_openai_images_schema_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_openai_images_schema.cpp"
+  LIBRARIES infernix_serve)
+
+# Synchronous image route service: failure mapping -> ApiException surface and store terminals.
+infernix_add_test(infernix_image_generation_service_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_image_generation_service.cpp"
+  LIBRARIES infernix_serve)
+
+# Server-executed chat image tool: injection gating, round feedback shape, caps and error surface,
+# and the round loop's end contract of exactly one answer that carries every URL.
+infernix_add_test(infernix_chat_image_tool_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_chat_image_tool.cpp"
   LIBRARIES infernix_serve)
 
 infernix_add_test(infernix_decide_schema_test

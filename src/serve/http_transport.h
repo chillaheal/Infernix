@@ -74,6 +74,11 @@ void render_and_write(SseTransport& transport, Render&& render) {
 }
 
 RequestJson parse_json_body(const httplib::Request& request);
+
+// The absolute prefix this request's generated-image artifacts are reachable at. Every route that
+// hands out an image URL builds it here, so a chat answer and an images response name the same GET.
+[[nodiscard]] std::string artifact_url_base(const httplib::Request& request,
+                                           const ServeOptions& options);
 [[nodiscard]] bool client_disconnected(const httplib::Request& request);
 
 void prepare_sse_response(httplib::Response& response);

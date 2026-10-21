@@ -26,7 +26,7 @@ namespace infernix::ops {
  *
  * All three operands and the output use the channel-first head layout [head_dim, heads, S, 1] with
  * head_dim (128) fastest, then heads, then the token. head_dim is fixed at 128; a caller dispatches
- * here only for a 128-wide head. heads is 1..40 and S is 1..16384. text_prefix is 0..S: 0 makes the
+ * here only for a 128-wide head. heads is 1..40 and S is 1..20480. text_prefix is 0..S: 0 makes the
  * whole sequence one bidirectional image block, S makes it fully causal text. q, k, v, out are
  * BF16, contiguous and 4-byte aligned; out is a separate buffer that must not overlap q, k or v.
  * q, k and v may alias each other only if the caller has already written them.

@@ -212,6 +212,73 @@ void parse_chunks(std::span<const std::uint8_t> bytes, Parse& out) {
                                      255);
 }
 
+// A PNG verified down to unfiltered scanlines: the shared front half of every pixel mapping.
+struct RawImage {
+    Parse parse;
+    std::vector<std::uint8_t> recon;
+    int row_bytes       = 0;
+    int bytes_per_sample = 1;
+
+    // Full-precision sample (0 .. (1<<bit_depth)-1) at pixel (x,y), channel s.
+    [[nodiscard]] std::uint32_t value(int x, int y, int s) const {
+        const int bit_depth = parse.header.bit_depth;
+        const int samples   = samples_per_pixel(parse.header.color_type);
+        if (bit_depth >= 8) {
+            const std::uint8_t* base =
+                recon.data() + static_cast<std::size_t>(y) * row_bytes +
+                static_cast<std::size_t>(x) * static_cast<std::size_t>(samples) *
+                    bytes_per_sample +
+                static_cast<std::size_t>(s) * bytes_per_sample;
+            if (bit_depth == 16) {
+                return (static_cast<std::uint32_t>(base[0]) << 8) | static_cast<std::uint32_t>(base[1]);
+            }
+            return base[0];
+        }
+        const int bitpos = (x * samples + s) * bit_depth;
+        const int byte   = bitpos >> 3;
+        const int shift  = 7 - (bitpos & 7) - (bit_depth - 1);
+        const std::uint8_t b = recon[static_cast<std::size_t>(y) * row_bytes + byte];
+        return (static_cast<int>(b) >> shift) & ((1 << bit_depth) - 1);
+    }
+};
+
+RawImage decode_png_raw(std::span<const std::uint8_t> bytes, std::uint64_t max_decoded_pixels) {
+    if (!is_png(bytes)) { throw std::invalid_argument("not a png image"); }
+    RawImage raw;
+    parse_chunks(bytes, raw.parse);
+    const int width      = raw.parse.header.width;
+    const int height     = raw.parse.header.height;
+    const int bit_depth  = raw.parse.header.bit_depth;
+    const int color_type = raw.parse.header.color_type;
+    const int samples    = samples_per_pixel(color_type);
+    if (samples == 0) { throw std::invalid_argument("png has an unsupported color type"); }
+    if (color_type == 3 && raw.parse.palette.rgb.empty()) {
+        throw std::invalid_argument("png palette image is missing its PLTE chunk");
+    }
+    const std::uint64_t pixels = static_cast<std::uint64_t>(width) * static_cast<std::uint64_t>(height);
+    if (pixels > max_decoded_pixels) {
+        throw Error(ErrorKind::BudgetExceeded, "decoded media pixels exceed processor limit");
+    }
+    raw.bytes_per_sample = bit_depth >= 8 ? bit_depth / 8 : 1;
+    // Row geometry feeds 32-bit `int` offsets below, so bound the row width in 64-bit first.
+    // A crafted 33,554,432x2 RGBA-16 image passes the 64-bit pixel budget with exactly this
+    // product at 2^31 bits and would otherwise wrap `row_bytes` negative.
+    const std::uint64_t row_bits = static_cast<std::uint64_t>(width) * static_cast<std::uint64_t>(samples) *
+                                   static_cast<std::uint64_t>(bit_depth);
+    if (row_bits == 0) { throw std::invalid_argument("png row width is invalid"); }
+    if (row_bits > 32ULL * 1024ULL * 1024ULL) {
+        throw Error(ErrorKind::BudgetExceeded, "png row width exceeds the decode buffer limit");
+    }
+    raw.row_bytes = static_cast<int>((row_bits + 7) / 8);
+    const std::size_t raw_size = static_cast<std::size_t>(height) * static_cast<std::size_t>(raw.row_bytes + 1);
+    const std::vector<std::uint8_t> compressed = inflate_zlib(raw.parse.idat, raw_size);
+    // The Sub/Avg/Paeth filters reference the previous sample (pixel-aligned, x-bpp); the
+    // reconstruction adds the predictor back. This is correct for every bit depth.
+    raw.recon = unfilter(compressed, height, raw.row_bytes,
+                         std::max(1, samples * raw.bytes_per_sample));
+    return raw;
+}
+
 } // namespace
 
 bool is_png(std::span<const std::uint8_t> bytes) {
@@ -231,60 +298,70 @@ ImageInfo png_image_info(std::span<const std::uint8_t> bytes, std::uint64_t max_
     return ImageInfo{.width = parse.header.width, .height = parse.header.height};
 }
 
-Image decode_png(std::span<const std::uint8_t> bytes, std::uint64_t max_decoded_pixels) {
-    if (!is_png(bytes)) { throw std::invalid_argument("not a png image"); }
-    Parse parse;
-    parse_chunks(bytes, parse);
+RgbaImage decode_png_rgba(std::span<const std::uint8_t> bytes, std::uint64_t max_decoded_pixels) {
+    RawImage raw = decode_png_raw(bytes, max_decoded_pixels);
+    Parse& parse   = raw.parse;
     const int width      = parse.header.width;
     const int height     = parse.header.height;
     const int bit_depth  = parse.header.bit_depth;
     const int color_type = parse.header.color_type;
-    const int samples    = samples_per_pixel(color_type);
-    if (samples == 0) { throw std::invalid_argument("png has an unsupported color type"); }
-    if (color_type == 3 && parse.palette.rgb.empty()) {
-        throw std::invalid_argument("png palette image is missing its PLTE chunk");
-    }
-    const std::uint64_t pixels = static_cast<std::uint64_t>(width) * static_cast<std::uint64_t>(height);
-    if (pixels > max_decoded_pixels) {
-        throw Error(ErrorKind::BudgetExceeded, "decoded media pixels exceed processor limit");
-    }
-    const int bytes_per_sample = bit_depth >= 8 ? bit_depth / 8 : 1;
-    // Row geometry feeds 32-bit `int` offsets below, so bound the row width in 64-bit first.
-    // A crafted 33,554,432x2 RGBA-16 image passes the 64-bit pixel budget with exactly this
-    // product at 2^31 bits and would otherwise wrap `row_bytes` negative.
-    const std::uint64_t row_bits = static_cast<std::uint64_t>(width) * static_cast<std::uint64_t>(samples) *
-                                   static_cast<std::uint64_t>(bit_depth);
-    if (row_bits == 0) { throw std::invalid_argument("png row width is invalid"); }
-    if (row_bits > 32ULL * 1024ULL * 1024ULL) {
-        throw Error(ErrorKind::BudgetExceeded, "png row width exceeds the decode buffer limit");
-    }
-    const int row_bytes = static_cast<int>((row_bits + 7) / 8);
-    const std::size_t raw_size = static_cast<std::size_t>(height) * static_cast<std::size_t>(row_bytes + 1);
-    const std::vector<std::uint8_t> compressed = inflate_zlib(parse.idat, raw_size);
-    // The Sub/Avg/Paeth filters reference the previous sample (pixel-aligned, x-bpp); the
-    // reconstruction adds the predictor back. This is correct for every bit depth.
-    const std::vector<std::uint8_t> recon =
-        unfilter(compressed, height, row_bytes, std::max(1, samples * bytes_per_sample));
 
-    // Full-precision sample (0 .. (1<<bit_depth)-1) at pixel (x,y), channel s.
-    auto raw_value = [&](int x, int y, int s) -> std::uint32_t {
-        if (bit_depth >= 8) {
-            const std::uint8_t* base =
-                recon.data() + static_cast<std::size_t>(y) * row_bytes +
-                static_cast<std::size_t>(x) * static_cast<std::size_t>(samples) *
-                    bytes_per_sample +
-                static_cast<std::size_t>(s) * bytes_per_sample;
-            if (bit_depth == 16) {
-                return (static_cast<std::uint32_t>(base[0]) << 8) | static_cast<std::uint32_t>(base[1]);
+    RgbaImage out;
+    out.width  = width;
+    out.height = height;
+    out.rgba.resize(static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4);
+    std::uint8_t* px = out.rgba.data();
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            std::uint8_t r = 0, g = 0, b = 0, a = 255;
+            switch (color_type) {
+                case 0: r = g = b = to8(raw.value(x, y, 0), bit_depth); break;
+                case 2:
+                    r = to8(raw.value(x, y, 0), bit_depth);
+                    g = to8(raw.value(x, y, 1), bit_depth);
+                    b = to8(raw.value(x, y, 2), bit_depth);
+                    break;
+                case 3: {
+                    const std::uint32_t idx = raw.value(x, y, 0);
+                    if (idx >= parse.palette.rgb.size()) {
+                        throw std::invalid_argument("png palette index is out of range");
+                    }
+                    r = parse.palette.rgb[idx][0];
+                    g = parse.palette.rgb[idx][1];
+                    b = parse.palette.rgb[idx][2];
+                    // The tRNS alpha is the pixel's real alpha here, not a composite hint.
+                    if (parse.palette.has_alpha) { a = parse.palette.alpha[idx]; }
+                    break;
+                }
+                case 4:
+                    r = g = b = to8(raw.value(x, y, 0), bit_depth);
+                    a         = to8(raw.value(x, y, 1), bit_depth);
+                    break;
+                case 6:
+                    r = to8(raw.value(x, y, 0), bit_depth);
+                    g = to8(raw.value(x, y, 1), bit_depth);
+                    b = to8(raw.value(x, y, 2), bit_depth);
+                    a = to8(raw.value(x, y, 3), bit_depth);
+                    break;
             }
-            return base[0];
+            px[0] = r;
+            px[1] = g;
+            px[2] = b;
+            px[3] = a;
+            px += 4;
         }
-        const int bitpos = (x * samples + s) * bit_depth;
-        const int byte   = bitpos >> 3;
-        const int shift  = 7 - (bitpos & 7) - (bit_depth - 1);
-        const std::uint8_t b = recon[static_cast<std::size_t>(y) * row_bytes + byte];
-        return (static_cast<int>(b) >> shift) & ((1 << bit_depth) - 1);
-    };
+    }
+    return out;
+}
+
+Image decode_png(std::span<const std::uint8_t> bytes, std::uint64_t max_decoded_pixels) {
+    RawImage raw = decode_png_raw(bytes, max_decoded_pixels);
+    const Parse& parse  = raw.parse;
+    const int width     = parse.header.width;
+    const int height    = parse.header.height;
+    const int bit_depth = parse.header.bit_depth;
+    const int color_type = parse.header.color_type;
+    const auto raw_value = [&](int x, int y, int s) { return raw.value(x, y, s); };
 
     Image out;
     out.width  = width;

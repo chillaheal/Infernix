@@ -23,6 +23,8 @@
 
 namespace infernix::serve {
 
+class ImageGenerationService;
+
 void write_openai_error(httplib::Response& response, const ApiError& error);
 void write_anthropic_error(httplib::Response& response, const ApiError& error,
                            const std::string& request_id);
@@ -36,6 +38,15 @@ httplib::Server::HandlerResponse handle_unrendered_http_error(const ServeOptions
 
 [[nodiscard]] bool matches_bearer_credential(std::string_view authorization,
                                              std::string_view api_key) noexcept;
+
+// GET /v1/capabilities: what this process actually serves. The OpenAI model object has no capability
+// field, so a client that needs to know whether an image route exists (and under which id) asks here.
+// This is a documented Infernix extension, not an OpenAI or Anthropic object; clients are free to
+// ignore it. `image_model_id` is empty when the image pipeline is not attached, which reports the
+// image surface as absent rather than as an endpoint that always answers 503.
+[[nodiscard]] std::string make_capabilities_json(const ServeOptions& options,
+                                                 std::string_view chat_model_id,
+                                                 std::string_view image_model_id);
 
 // Anthropic SDKs append /v1/<endpoint> to their base URL, so a client given the OpenAI-style base
 // URL that already ends in /v1 requests /v1/v1/<endpoint>. Every API route also answers there:
@@ -55,6 +66,9 @@ public:
     // Engine is ready, then listen() enters the blocking accept loop on the already-bound socket.
     bool bind();
     void attach(GenerationService& service);
+    // The synchronous image route serves 503 image_generation_not_configured until this is called
+    // (serve started without --image-artifact, or the pipeline is still incomplete).
+    void attach_images(ImageGenerationService& images);
     bool listen();
     // Closes the listening socket and stops the attached service's Engine, whose queued and
     // running requests then fail, so listen() returns within about one unit of Engine work.
@@ -62,6 +76,8 @@ public:
     void stop();
 
     [[nodiscard]] const std::string& public_model_id() const noexcept { return public_model_id_; }
+    // The image resource's public id, or empty while no image pipeline is attached.
+    [[nodiscard]] std::string image_model_id() const;
 
 private:
     class RequestLifecycle {
@@ -92,6 +108,7 @@ private:
 
     void register_routes();
     void handle_chat_completions(const httplib::Request& req, httplib::Response& res);
+    void handle_images_generations(const httplib::Request& req, httplib::Response& res);
     void handle_messages(const httplib::Request& req, httplib::Response& res);
     void handle_count_tokens(const httplib::Request& req, httplib::Response& res);
     void handle_decide(const httplib::Request& req, httplib::Response& res);
@@ -104,6 +121,8 @@ private:
     void handle_response_compact(const httplib::Request& req, httplib::Response& res);
     void handle_models(const httplib::Request& req, httplib::Response& res) const;
     void handle_model(const httplib::Request& req, httplib::Response& res) const;
+    void handle_capabilities(const httplib::Request& req, httplib::Response& res) const;
+    void handle_image_artifact(const httplib::Request& req, httplib::Response& res) const;
 
     void record_request_start(const RequestLogContext& context);
     [[nodiscard]] infernix::GenerationSchedulingObserver
@@ -118,6 +137,7 @@ private:
     void stop_stats_reporter();
 
     GenerationService* service_ = nullptr;
+    ImageGenerationService* images_ = nullptr;
     ServeOptions options_;
     std::string public_model_id_;
     infernix::ModelMetadata model_metadata_;

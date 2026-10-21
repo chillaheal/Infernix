@@ -18,3 +18,8 @@ if(WIN32)
   target_link_libraries(infernix_media_decode PRIVATE infernix_zlib)
   target_compile_definitions(infernix_media_decode PUBLIC INFERNIX_MEDIA_NATIVE_PNG)
 endif()
+
+add_library(infernix_media_encode STATIC
+  encode/png_encode.cpp
+)
+infernix_internal_includes(infernix_media_encode)

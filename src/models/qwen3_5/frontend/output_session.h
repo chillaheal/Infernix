@@ -75,6 +75,8 @@ public:
     [[nodiscard]] runtime::OutputDecision preview_control(std::span<const TokenId> tokens,
                                                           std::uint32_t total_budget_remaining);
     void validate_generation_capacity(std::uint32_t effective_output_tokens) const;
+    // Canonical thinking-close control tokens the open thinking phase must emit to close it.
+    [[nodiscard]] std::uint32_t thinking_control_suffix_size() const noexcept;
     [[nodiscard]] runtime::OutputDecision preview_terminal(FinishReason reason);
     [[nodiscard]] PublishedOutput commit_preview();
     void discard_preview();

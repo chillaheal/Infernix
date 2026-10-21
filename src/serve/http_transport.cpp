@@ -1,5 +1,6 @@
 #include "serve/http_transport.h"
 
+#include "serve/openai_images.h"
 #include "serve/request_validation.h"
 #include "text/json_input.h"
 
@@ -233,6 +234,16 @@ void set_owned_json_content(httplib::Response& response, std::string body,
                             std::shared_ptr<RequestLifetime> lifetime) {
     response.set_content(std::move(body), "application/json");
     response.user_data.set("infernix.request_lifetime", std::move(lifetime));
+}
+
+// The Host header is the address the client actually used, so a renamed, port-forwarded or
+// containerized deployment hands back a URL that resolves from where that client is; only a request
+// with no Host falls back to the bound address. The scheme is the deployment's, which is plain HTTP:
+// this server has no TLS listener.
+std::string artifact_url_base(const httplib::Request& request, const ServeOptions& options) {
+    std::string host(request.get_header_value("Host"));
+    if (host.empty()) { host = options.host + ":" + std::to_string(options.port); }
+    return "http://" + host + std::string(kImageArtifactRoutePrefix);
 }
 
 } // namespace infernix::serve

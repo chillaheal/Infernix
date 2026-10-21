@@ -1,6 +1,11 @@
 #include "models/qwen4_exp/program/program_impl.h"
 
+#include <cuda_runtime.h>
+
 #include <atomic>
+#include <chrono>
+#include <stdexcept>
+#include <thread>
 
 namespace infernix::models::qwen4_exp {
 
@@ -38,10 +43,19 @@ const VramSizing& Program::vram_sizing() const noexcept { return impl_->vram_siz
 
 void Program::set_maintenance_waker(std::function<void()> waker) { impl_->set_maintenance_waker(std::move(waker)); }
 
-void Program::maintain() {
-    impl_->apply_vram_target(true);
-    impl_->maintain_expert_state();
-}
+void Program::maintain() { impl_->maintain_all(); }
+
+bool Program::submit_door_open() const noexcept { return impl_->submit_open(); }
+
+bool Program::interlude_degraded() const noexcept { return impl_->interlude_degraded(); }
+
+bool Program::interlude_preempt_outstanding() const noexcept { return impl_->interlude_preempt_outstanding(); }
+
+std::uint64_t Program::interlude_preempt_epoch() const noexcept { return impl_->interlude_preempt_epoch(); }
+
+void Program::signal_interlude_quiesced(std::uint64_t epoch) noexcept { impl_->signal_interlude_quiesced(epoch); }
+
+bool Program::interlude_yieldable() noexcept { return impl_->interlude_yieldable(); }
 
 HybridPrefixCacheStats Program::hybrid_stats() const noexcept { return impl_->prefix_stats(); }
 
@@ -137,6 +151,105 @@ PrefixCachePersistence Program::attach_prefix_cache_file(const std::filesystem::
 
 std::optional<PrefixCachePersistence> Program::prefix_shutdown_save() const { return impl_->prefix_shutdown_save(); }
 
+std::uint64_t Program::run_image_interlude(std::uint64_t target_bytes, std::uint64_t margin_bytes,
+                                           const std::function<bool(const ImageInterludeContext&)>& job,
+                                           std::uint64_t drain_deadline_ms) {
+    // Single-flight: one interlude per Program. The serving layer's bounded FIFO queues in front of
+    // this gate; a caller that reaches it concurrently is told so, never silently serialized.
+    if (!impl_->interlude_mu_.try_lock()) {
+        throw std::runtime_error("image interlude: another interlude is already in flight");
+    }
+    const std::lock_guard<std::mutex> flight(impl_->interlude_mu_, std::adopt_lock);
+
+    // Reach a YIELDABLE frontier in ONE attempt: begin_image_quiesce closes the door, drains within
+    // `drain_deadline_ms`, and checks the LLM is not holding the residency ring. The door stays CLOSED for
+    // the whole handoff -- reopening between attempts would admit new LLM work exactly where the handoff
+    // must be bounded. A false return means begin_image_quiesce cleanly unwound (door reopened, nothing
+    // moved), so we fail ONLY this image job: the LLM keeps serving (never Degraded).
+    if (!impl_->begin_image_quiesce(drain_deadline_ms)) {
+        throw std::runtime_error("image interlude: no yieldable LLM frontier within the deadline; "
+                                 "the image job was rejected and the LLM resumed");
+    }
+
+    detail::ProgramImpl::ImageYieldLease lease;
+    try {
+        lease = impl_->yield_for_image(target_bytes, margin_bytes);
+    } catch (...) {
+        // yield_for_image is transactional: it unwound its own pools back to the pre-yield snapshot, so the
+        // Program is still cleanly Quiesced and the image leased nothing. Reopen the door and reject ONLY
+        // this image job -- the LLM keeps serving. An image request must never take the engine down; park
+        // Degraded only if even reopening proves the device state unrestorable.
+        std::string yield_message = "the image yield failed";
+        try {
+            std::rethrow_exception(std::current_exception());
+        } catch (const std::exception& failure) {
+            yield_message = failure.what();
+        }
+        try {
+            impl_->end_image_quiesce();
+        } catch (const std::exception& reopen_failure) {
+            impl_->mark_interlude_degraded();
+            throw std::runtime_error("image interlude: " + yield_message + "; the engine could not be reopened (" +
+                                     reopen_failure.what() + "); the Program is Degraded until process restart");
+        }
+        throw; // recovered cleanly: only this image job is rejected, the LLM resumed
+    }
+
+    // The explicit, reportable interlude exit: returns "" once the restoration is CONFIRMED and the
+    // door reopened; otherwise parks the Program Degraded (door closed, process = recovery unit)
+    // and returns the failure text to fold into the thrown error.
+    auto restore_and_reopen = [&]() -> std::string {
+        try {
+            impl_->release_from_yield(lease);
+        } catch (const std::exception& failure) {
+            impl_->mark_interlude_degraded();
+            return std::string("restoration failed: ") + failure.what();
+        }
+        try {
+            impl_->end_image_quiesce();
+            return {};
+        } catch (const std::exception& failure) {
+            impl_->mark_interlude_degraded();
+            return std::string("the submit door did not reopen: ") + failure.what();
+        }
+    };
+
+    cudaStream_t image_stream = nullptr;
+    // Blocking stream (not cudaStreamNonBlocking): the legacy default stream orders against it, so
+    // image work the job submits on either route stays sequenced without cross-stream events.
+    if (cudaStreamCreate(&image_stream) != cudaSuccess) {
+        const std::string restoration = restore_and_reopen();
+        throw std::runtime_error("image interlude: the image stream could not be created; " +
+                                 (restoration.empty() ? std::string("the LLM pools were restored") : restoration));
+    }
+    ImageInterludeContext context{lease.freed_bytes, image_stream};
+    try {
+        job(context);
+    } catch (...) {
+        cudaStreamDestroy(image_stream);
+        std::string job_message = "non-standard job exception";
+        try {
+            std::rethrow_exception(std::current_exception());
+        } catch (const std::exception& failure) {
+            job_message = failure.what();
+        }
+        const std::string restoration = restore_and_reopen();
+        if (restoration.empty()) {
+            throw; // job failed but healthy: the job's own exception propagates, the LLM resumed
+        }
+        // The store of record keeps BOTH failures; so does the thrown error.
+        throw std::runtime_error("image interlude job failed: " + job_message + "; " + restoration +
+                                 "; the Program is Degraded until process restart");
+    }
+    cudaStreamDestroy(image_stream);
+    // Success is never published before the restoration is confirmed.
+    if (const std::string restoration = restore_and_reopen(); !restoration.empty()) {
+        throw std::runtime_error("image interlude job completed but: " + restoration +
+                                 "; the Program is Degraded until process restart");
+    }
+    return lease.freed_bytes;
+}
+
 std::optional<PrefixCachePersistence> Program::save_prefix_cache_now(const CancellationView& abandoned) {
     return impl_->save_prefix_cache_now(abandoned);
 }
@@ -145,8 +258,20 @@ PhysicalUsageSnapshot Program::physical_usage() const noexcept { return impl_->u
 
 MemorySummary Program::memory_summary() const noexcept { return impl_->memory(); }
 
+namespace {
+std::atomic<std::uint32_t> g_restore_fault{0}; // consumed by ProgramImpl::take_image_restore_fault
+} // namespace
+
 namespace detail {
 ProgramImpl* ProgramImpl::active_ = nullptr; // the live Program, registered/cleared by Program
+
+bool ProgramImpl::take_image_restore_fault() noexcept {
+    std::uint32_t left = g_restore_fault.load(std::memory_order_relaxed);
+    while (left != 0) {
+        if (g_restore_fault.compare_exchange_weak(left, left - 1)) { return left == 1; }
+    }
+    return false;
+}
 } // namespace detail
 
 namespace testing {
@@ -154,6 +279,8 @@ namespace testing {
 namespace {
 std::atomic<std::uint32_t> g_expert_fault{0};
 } // namespace
+
+void set_image_restore_fault(std::uint32_t checks) noexcept { g_restore_fault.store(checks); }
 
 void set_expert_fault(std::uint32_t checks) noexcept { g_expert_fault.store(checks); }
 

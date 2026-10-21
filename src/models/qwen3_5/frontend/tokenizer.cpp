@@ -26,8 +26,20 @@ namespace uni = infernix::text::unicode_internal;
 
 constexpr std::int64_t kMaxTokenId = 1'000'000;
 
+// The Qwen3.5-LLM pre-tokenizer split the encode path implements: the letter run includes the
+// Unicode Mark class ([\p{L}\p{M}]+) and the "other" run excludes it ([^\s\p{L}\p{M}\p{N}]).
 constexpr std::string_view kQwenSplitPattern =
     R"qwen((?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+)qwen";
+
+// The Qwen3-VL text processor's tokenizer.json declares the mark-EXCLUSIVE variant (letter run
+// \p{L}+, other run [^\s\p{L}\p{N}]). Both are accepted by validate_pipeline below. They are
+// BEHAVIORALLY IDENTICAL for the Qwen vocab: no merge token contains a combining mark (the corpus
+// was NFC-normalized before BPE training -- verified: 0 of 151669 vocab tokens contain a \p{M}
+// codepoint), so a mark always falls to isolated byte-level tokens and the two word-groupings
+// yield the same ids for every input. The scanner implements the mark-inclusive form; its output is
+// provably identical to the mark-exclusive form, so loading a VL descriptor needs no encode change.
+constexpr std::string_view kQwenSplitPatternVL =
+    R"qwen((?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+)qwen";
 
 void validate_pipeline(const Json& root, const Json& model) {
     const auto require = [](bool valid, const char* field) {
@@ -49,8 +61,14 @@ void validate_pipeline(const Json& root, const Json& model) {
                 "pre_tokenizer");
         const auto& split = pre["pretokenizers"][0];
         const auto& bytes = pre["pretokenizers"][1];
-        require(type(split, "Split") && split.contains("pattern") && split["pattern"].is_object() &&
-                    split["pattern"].value("Regex", std::string{}) == kQwenSplitPattern &&
+        const std::string split_regex =
+            (split.is_object() && split.contains("pattern") && split["pattern"].is_object())
+                ? split["pattern"].value("Regex", std::string{})
+                : std::string{};
+        // Accept either the mark-inclusive (Qwen3.5-LLM) or mark-exclusive (Qwen3-VL) declared form;
+        // they are behaviorally identical for this vocab (see kQwenSplitPatternVL).
+        require(type(split, "Split") &&
+                    (split_regex == kQwenSplitPattern || split_regex == kQwenSplitPatternVL) &&
                     split.value("behavior", std::string{}) == "Isolated" &&
                     split.value("invert", Json(false)) == false,
                 "pre_tokenizer.Split");

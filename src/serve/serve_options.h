@@ -63,6 +63,13 @@ struct ServeOptions {
     std::uint32_t media_preprocess_threads = 0;
     std::size_t response_store_max_records = kDefaultResponseStoreRecords;
     std::size_t response_store_max_bytes   = kDefaultResponseStoreBytes;
+    // --image-artifact PATH: the .infernix image artifact served by the synchronous
+    // POST /v1/images/generations. Empty => the route answers 503 image_generation_not_configured.
+    std::string image_artifact_path;
+    // --image-text-processor PATH: the HF Qwen3-VL processor directory (tokenizer.json,
+    // tokenizer_config.json, chat_template.jinja) behind the raw-prompt text tower. Empty =>
+    // the route keeps answering 503 image_generation_not_configured.
+    std::string image_text_processor_path;
     int device                             = 0;
     KvCacheStorage kv_cache                = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
@@ -81,6 +88,9 @@ struct ServeOptions {
     // End-of-thinking message fed to the model when it hits the thinking budget; empty
     // preserves the model's built-in control suffix.
     std::string thinking_budget_message;
+    // --thinking-budget-policy strict|clamp|ignore: how a request whose thinking budget cannot fit
+    // its output capacity is handled (strict default rejects it with HTTP 400).
+    infernix::ThinkingBudgetPolicy thinking_budget_policy = infernix::ThinkingBudgetPolicy::Strict;
     // --reasoning-loop off|stop|conclude: the reasoning-loop guard for thinking requests without a
     // token constraint (off by default).
     infernix::ReasoningLoopAction reasoning_loop = infernix::ReasoningLoopAction::Off;

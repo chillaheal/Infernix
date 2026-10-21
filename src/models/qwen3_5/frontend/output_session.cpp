@@ -810,6 +810,12 @@ void OutputSession::validate_generation_capacity(std::uint32_t effective_output_
     }
 }
 
+std::uint32_t OutputSession::thinking_control_suffix_size() const noexcept {
+    return impl_ == nullptr
+               ? 0U
+               : static_cast<std::uint32_t>(impl_->thinking_control_tokens->size());
+}
+
 runtime::OutputDecision OutputSession::preview_terminal(FinishReason reason) {
     if (impl_ == nullptr) { throw std::logic_error("output session is empty"); }
     if (impl_->state.terminal) { throw std::logic_error("output session is already terminal"); }

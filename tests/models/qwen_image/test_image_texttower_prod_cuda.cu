@@ -47,6 +47,7 @@
 #include "core/weight.h"
 #include "core/device.h"
 #include "models/qwen_image/qwen_image_oracle_ref.h"
+#include "models/qwen_image/text_embeds.h"
 
 #include <cuda_runtime.h>
 
@@ -472,8 +473,36 @@ int run() {
     std::printf("final host   vs pre_norm    rel_fro=%.3e  (bf16-act rounding)\n", e_host_pren);
     std::fflush(stdout);
 
+    // ---- COMPOSITION BRIDGE: device tower output -> production prompt_embeds conditioning ----
+    // Proves the qualified 36-layer DEVICE forward feeds the PRODUCTION build_prompt_embeds module to
+    // reproduce the model's OWN DiT prompt_embeds (the exact conditioning the DiT consumed) -- not a
+    // dumped prompt_embeds.npy. Gate is the SAME a-priori tower tolerance TOL_GATE (device bf16 output
+    // != the f32 dump the .npy was derived from, so not bit-exact -- cf. the forward gate). The single
+    // text-only oracle item is all-valid (no padding), so drop_idx = (valid tokens S) - (kept length) is
+    // recovered from the observable prompt_embeds length; 11 = 25 - 14 also validates the all-valid mask.
+    double e_pe = 0.0;
+    bool pe_link_ok = false;
+    {
+        qo::NpyArray pe_a = qo::read_npy(qo::join(TT, "prompt_embeds.npy"));
+        const std::vector<float> want_pe = pe_a.floats();
+        const int pe_len = static_cast<int>(pe_a.shape[1]);
+        const int drop = static_cast<int>(S) - pe_len;
+        std::vector<int> mask(static_cast<std::size_t>(S), 1);
+        const infernix::models::qwen_image::TextEmbeds tpe =
+            infernix::models::qwen_image::build_prompt_embeds(
+                dev_resid[LAYERS - 1].data(), 1, static_cast<int>(S), D, mask.data(), drop);
+        e_pe = qo::rel_fro(tpe.prompt_embeds, want_pe);
+        pe_link_ok = (tpe.max_len == pe_len) && (static_cast<int>(tpe.batch) == 1) &&
+                     (tpe.encoder_attention_mask.size() == static_cast<std::size_t>(pe_len)) &&
+                     std::isfinite(e_pe) && (e_pe < TOL_GATE);
+        std::printf("prompt_embeds  dev-tower->prod module vs model  rel_fro=%.3e (tol %.0e)  "
+                    "max_len=%d oracle=%d drop=%d  <-- COMPOSITION GATE\n",
+                    e_pe, TOL_GATE, tpe.max_len, pe_len, drop);
+        std::fflush(stdout);
+    }
+
     const bool ok = std::isfinite(e_dev_pren) && std::isfinite(e_dev_host) &&
-                    (e_dev_pren < TOL_GATE) && (e_dev_host < TOL_LOCAL);
+                    (e_dev_pren < TOL_GATE) && (e_dev_host < TOL_LOCAL) && pe_link_ok;
 
     cudaFree(dx); cudaFree(dh); cudaFree(dq); cudaFree(dk); cudaFree(dv); cudaFree(dqn); cudaFree(dkn);
     cudaFree(dk32); cudaFree(dv32); cudaFree(dattn); cudaFree(dop); cudaFree(dh2);

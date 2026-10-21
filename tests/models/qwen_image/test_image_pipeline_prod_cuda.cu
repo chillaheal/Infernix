@@ -46,6 +46,11 @@
 #include "core/tensor.h"
 #include "core/weight.h"
 #include "models/qwen_image/qwen_image_oracle_ref.h"
+#include "models/qwen_image/image_job.h"
+#include "models/qwen_image/scheduler.h"
+#include "models/qwen_image/rope.h"
+#include "models/qwen_image/noise.h"
+#include "models/qwen_image/dit_block.h"
 
 #include <cuda_runtime.h>
 
@@ -58,10 +63,12 @@
 #include <fstream>
 #include <map>
 #include <memory>
+#include <span>
 #include <string>
 #include <vector>
 
 namespace qo = qioracle;
+namespace qi = infernix::models::qwen_image;
 using infernix::Tensor;
 using infernix::DType;
 using infernix::Weight;
@@ -181,64 +188,14 @@ struct BfWeight {
     BfWeight& operator=(const BfWeight&) = delete;
 };
 
-// DiT per-block scratch (allocated once, reused every block and every step).
-struct WS {
-    void *dln1, *dmod1, *dq, *dk, *dv, *dqr, *dkr, *dattn, *dattn_out, *dx1, *dln2, *dmod2,
-         *dproj, *dgate, *dhidden, *dmlp_out;
-};
+// DiT per-block scratch: the shared module owns the layout (one code path with the interlude/service).
+using WS = qi::DiTWorkspace;
 
 // One DiT block forward through the production ops (BF16 linears, BF16 everything else). din/dout
 // are the running joint hidden (viewed [Di, Si] = Si tokens x Di features). Identical 18-op sequence
 // to the qualified single/depth-block tests.
-void run_block(void* din, void* dout,
-               const Weight& Wq, const Weight& Wk, const Weight& Wv, const Weight& Wout,
-               const Weight& Wproj, const Weight& Wgate, const Weight& Wmlpout,
-               void* d_nq, void* d_nk,
-               void* dmod, void* drot, void* d_ones, void* d_zeros, WS& ws,
-               int Si, int Di, int Hi, int Mi, int tp, float eps) {
-    Tensor nq = view(d_nq, 128, 1, 1), nk = view(d_nk, 128, 1, 1);
-    Tensor onev = view(d_ones, Di, 1, 1), zerov = view(d_zeros, Di, 1, 1);
-    Tensor modv = view(dmod, 4 * Di, 2);   // [4D,2] table, row selected by text_prefix (s<tp -> text row)
-    Tensor rotv = view(drot, 128, 1, Si);  // [128,1,S] interleaved cis pairs
-
-    Tensor x_in = view(din, Di, Si);
-    Tensor ln1 = view(ws.dln1, Di, Si), mod1 = view(ws.dmod1, Di, Si);
-    ops::layer_norm(x_in, onev, zerov, eps, ln1, 0);
-    ops::adaln_scale(ln1, modv, 0, tp, mod1, 0);
-
-    Tensor q = view(ws.dq, Di, Si), k = view(ws.dk, Di, Si), v = view(ws.dv, Di, Si);
-    ops::linear(mod1, Wq, q, 0);
-    ops::linear(mod1, Wk, k, 0);
-    ops::linear(mod1, Wv, v, 0);
-
-    Tensor qh = view(ws.dq, 128, Hi * Si), kh = view(ws.dk, 128, Hi * Si);
-    Tensor qhr = view(ws.dqr, 128, Hi * Si), khr = view(ws.dkr, 128, Hi * Si);
-    ops::rmsnorm(qh, nq, eps, /*unit_offset=*/false, qhr, 0);
-    ops::rmsnorm(kh, nk, eps, /*unit_offset=*/false, khr, 0);
-    Tensor q3 = view(ws.dqr, 128, Hi, Si), k3 = view(ws.dkr, 128, Hi, Si), v3 = view(ws.dv, 128, Hi, Si);
-    ops::rope_c64(rotv, q3, 0);
-    ops::rope_c64(rotv, k3, 0);
-
-    Tensor attn3 = view(ws.dattn, 128, Hi, Si);
-    ops::attn_dit_joint(q3, k3, v3, tp, attn3, 0);
-    Tensor attn2 = view(ws.dattn, Di, Si), attn_out = view(ws.dattn_out, Di, Si);
-    ops::linear(attn2, Wout, attn_out, 0);
-
-    Tensor x1 = view(ws.dx1, Di, Si);
-    ops::adaln_gate_add(x_in, attn_out, modv, Di, tp, x1, 0);
-    Tensor ln2 = view(ws.dln2, Di, Si), mod2 = view(ws.dmod2, Di, Si);
-    ops::layer_norm(x1, onev, zerov, eps, ln2, 0);
-    ops::adaln_scale(ln2, modv, 2 * Di, tp, mod2, 0);
-
-    Tensor proj = view(ws.dproj, Mi, Si), gate = view(ws.dgate, Mi, Si), hidden = view(ws.dhidden, Mi, Si);
-    ops::linear(mod2, Wproj, proj, 0);
-    ops::linear(mod2, Wgate, gate, 0);
-    ops::silu_mul(gate, proj, hidden, 0);
-    Tensor mlp_out = view(ws.dmlp_out, Di, Si);
-    ops::linear(hidden, Wmlpout, mlp_out, 0);
-    Tensor out = view(dout, Di, Si);
-    ops::adaln_gate_add(x1, mlp_out, modv, 3 * Di, tp, out, 0);
-}
+// One DiT block forward: shared module function (verbatim move from this test).
+using qi::run_block;
 
 std::string bwf(int l, const char* role) {
     std::string s = "blk"; s += std::to_string(l); s += "_"; s += role; s += ".npy";
@@ -280,41 +237,102 @@ int main() {
         const double time_factor = 1000.0;
         const float eps = 1e-6F;
 
-        // ---- geometry derived from the reference tensors (any 16-multiple size, e.g. 256 or 512) ----
-        qo::NpyArray pe_a = qo::read_npy(qo::join(TP, "prompt_embeds.npy"));
+        // ---- geometry: from the reference tensors, or a general-resolution override (no dump) ----
+        qo::NpyArray pe_a = qo::read_npy(qo::join(TP, "prompt_embeds.npy"));   // text cond is resolution-independent
         qo::require(pe_a.shape.size() == 3 && pe_a.shape[0] == 1 && pe_a.shape[2] == (int)D,
                     "prompt_embeds not [1,?,4096]");
         const std::size_t tp = (std::size_t)pe_a.shape[1];         // text prefix length (variable)
         const T prompt_embeds = represent(pe_a.floats());          // [tp,4096] token-major
-        qo::NpyArray img_a = qo::read_npy(qo::join(TP, "image.npy"));
-        qo::require(img_a.shape.size() == 4 && img_a.shape[0] == 1 && img_a.shape[1] == 4 &&
-                    (int)img_a.shape[2] % 16 == 0 && (int)img_a.shape[3] % 16 == 0,
-                    "image.npy not [1,4,H,W] (H,W multiples of 16)");
-        const int H = (int)img_a.shape[2], W = (int)img_a.shape[3];   // image spatial
+        std::uint64_t seed_val = 0;
+        bool seeded = false;
+        if (const char* se = std::getenv("INFERNIX_IMAGE_SEED"); se && *se) {
+            seeded = true;
+            seed_val = std::strtoull(se, nullptr, 10);
+        }
+        // A seeded run needs no reference final/image; INFERNIX_IMAGE_SIZE=HxW then sizes the job from the
+        // env instead of image.npy, proving generation at a resolution that has NO oracle dump (#37 size+seed).
+        int ovH = 0, ovW = 0;
+        bool geom_override = false;
+        if (seeded)
+            if (const char* z = std::getenv("INFERNIX_IMAGE_SIZE"); z && *z) {
+                int a = 0, b = 0;
+                if (std::sscanf(z, "%dx%d", &a, &b) == 2 && a > 0 && b > 0 && a % 16 == 0 && b % 16 == 0) {
+                    ovH = a; ovW = b; geom_override = true;
+                }
+            }
+        const bool oracle_geom = !geom_override;   // the dumped 256x256 reference tensors are valid comparisons
+        int H = 0, W = 0;
+        T img_ref;
+        if (geom_override) {
+            H = ovH; W = ovW;
+            std::printf("GEOMETRY_OVERRIDE HxW=%dx%d from INFERNIX_IMAGE_SIZE (no reference dump at this geometry)\n", H, W);
+        } else {
+            qo::NpyArray img_a = qo::read_npy(qo::join(TP, "image.npy"));
+            qo::require(img_a.shape.size() == 4 && img_a.shape[0] == 1 && img_a.shape[1] == 4 &&
+                        (int)img_a.shape[2] % 16 == 0 && (int)img_a.shape[3] % 16 == 0,
+                        "image.npy not [1,4,H,W] (H,W multiples of 16)");
+            H = (int)img_a.shape[2]; W = (int)img_a.shape[3];      // image spatial
+            img_ref = img_a.floats();                              // [1,4,H,W]
+        }
         const std::size_t Hl = (std::size_t)H / 16, Wl = (std::size_t)W / 16;  // latent spatial (16x)
         const std::size_t img_tokens = Hl * Wl;
         const std::size_t S = tp + img_tokens;
-        const T img_ref = img_a.floats();                            // [1,4,H,W]
 
-        // ---- inputs ----
-        qo::NpyArray li_a = qo::read_npy(qo::join(TP, "latents_init.npy"));
-        qo::require(li_a.shape.size() == 3 && li_a.shape[1] == (int)img_tokens && li_a.shape[2] == 64,
-                    "latents_init not [1,img_tokens,64]");
-        const T lat_init = represent(li_a.floats());               // [img_tokens,64] token-major
-        const T timesteps = F(TP, "timesteps.npy");                // [40]
-        const T sigmas = F(TP, "sigmas.npy");                      // [41]
-        const std::size_t n_steps = timesteps.size();
-        qo::require(n_steps == 40 && sigmas.size() == n_steps + 1, "timesteps/sigmas len mismatch");
-        const T lat_final_ref = F(TP, "latents_final.npy");        // [img_tokens,64]
-        const T lat_mean = F(TP, "latents_mean.npy");              // [64]
+        // ---- init latent (seeded runs draw it from fill_normal; seed parsed above) ----
+        T lat_init;
+        if (seeded) {
+            lat_init.assign(img_tokens * 64, 0.0F);
+            qi::fill_normal(seed_val, std::span<float>(lat_init));
+            lat_init = represent(lat_init);                        // bf16-represent, matches the stored f32->bf16 init
+            std::printf("SEED_WIRING init latent from fill_normal(seed=%llu) count=%zu (NOT bit-comparable to latents_init.npy)\n",
+                        (unsigned long long)seed_val, lat_init.size());
+        } else {
+            qo::NpyArray li_a = qo::read_npy(qo::join(TP, "latents_init.npy"));
+            qo::require(li_a.shape.size() == 3 && li_a.shape[1] == (int)img_tokens && li_a.shape[2] == 64,
+                        "latents_init not [1,img_tokens,64]");
+            lat_init = represent(li_a.floats());                   // [img_tokens,64] token-major
+        }
+        // WIRED (variable-input #37): the denoise schedule is COMPUTED from the production scheduler
+        // module (resolution-dependent shift mu from this job's geometry token count), not read from a
+        // fixed .npy. The dumped sigmas.npy/timesteps.npy are kept as the parity reference to prove the
+        // module is a drop-in; the loop then consumes the COMPUTED schedule.
+        const qi::ImageGeometry geom = qi::ImageGeometry::derive((std::uint32_t)H, (std::uint32_t)W);
+        const qi::SchedulerConfig scfg;
+        const double mu = qi::calculate_shift(scfg, geom.tokens);
+        std::size_t n_steps = 40;
+        qi::Schedule sched;
+        if (oracle_geom) {
+            const T timesteps_ref = F(TP, "timesteps.npy");        // [40] reference
+            const T sigmas_ref = F(TP, "sigmas.npy");             // [41] reference
+            n_steps = timesteps_ref.size();
+            qo::require(n_steps == 40 && sigmas_ref.size() == n_steps + 1, "timesteps/sigmas len mismatch");
+            sched = qi::build_schedule(scfg, n_steps, mu);
+            const double s_par = sched.sigmas.size() == sigmas_ref.size() ? qo::rel_fro(sched.sigmas, sigmas_ref) : 1e9;
+            const double t_par = sched.timesteps.size() == timesteps_ref.size() ? qo::rel_fro(sched.timesteps, timesteps_ref) : 1e9;
+            std::printf("SCHEDULER_WIRING HxW=%dx%d tokens=%u steps=%zu mu=%.8f sigmas_rel=%.3e timesteps_rel=%.3e %s\n",
+                        H, W, geom.tokens, n_steps, mu, s_par, t_par, (s_par < 2e-5 && t_par < 2e-5) ? "OK" : "CHECK");
+            qo::require(s_par < 2e-5 && t_par < 2e-5, "production scheduler module must reproduce the dumped schedule");
+        } else {
+            if (const char* st = std::getenv("INFERNIX_IMAGE_STEPS"); st && *st) { const int v = std::atoi(st); if (v > 0) n_steps = (std::size_t)v; }
+            sched = qi::build_schedule(scfg, n_steps, mu);
+            std::printf("SCHEDULER_COMPUTE HxW=%dx%d tokens=%u steps=%zu mu=%.8f (computed at an un-dumped geometry)\n",
+                        H, W, geom.tokens, n_steps, mu);
+        }
+        const T timesteps = sched.timesteps;                       // the sampler consumes the COMPUTED values
+        const T sigmas = sched.sigmas;
+        const T lat_mean = F(TP, "latents_mean.npy");              // [64] resolution-independent, needed for decode
         const T lat_std = F(TP, "latents_std.npy");                // [64]
-        qo::require(lat_final_ref.size() == img_tokens * 64, "latents_final size");
-        qo::require(img_ref.size() == (std::size_t)4 * H * W, "image.npy size");
-        // step-0 localization references (debug: isolate DiT-forward vs scheduler accumulation)
-        const T noise_ref0 = F(TP, "noise_pred_step0.npy");          // [256,64] step-0 velocity, image tokens
-        qo::require(noise_ref0.size() == img_tokens * 64, "noise_pred_step0 size");
-        const T traj_full = F(TP, "latent_traj.npy");                // [40,256,64]
-        const std::vector<float> traj0_ref(traj_full.begin(), traj_full.begin() + img_tokens * 64);
+        qo::require(lat_mean.size() == 64 && lat_std.size() == 64, "latents_mean/std size");
+        T lat_final_ref, noise_ref0, traj_full, traj0_ref;         // [img_tokens,64]-sized: only the dump geometry has them
+        if (oracle_geom) {
+            lat_final_ref = F(TP, "latents_final.npy");            // [img_tokens,64]
+            qo::require(lat_final_ref.size() == img_tokens * 64, "latents_final size");
+            qo::require(img_ref.size() == (std::size_t)4 * H * W, "image.npy size");
+            noise_ref0 = F(TP, "noise_pred_step0.npy");            // [img_tokens,64] step-0 velocity, image tokens
+            qo::require(noise_ref0.size() == img_tokens * 64, "noise_pred_step0 size");
+            traj_full = F(TP, "latent_traj.npy");                  // [steps,img_tokens,64]
+            traj0_ref.assign(traj_full.begin(), traj_full.begin() + img_tokens * 64);
+        }
         // step-0 localization refs from the single-forward dumper (splits the step-0 DiT divergence
         // into front-end hidden [b0_in] vs 32-block stack [b31_out] vs post-block output [sample_full]).
         // Loaded only if present so the primary/secondary gates still evaluate when the dumper is absent.
@@ -416,7 +434,17 @@ int main() {
         void* d_zeros = upload(zeros);
         void* d_tnorm = upload(w_tnorm);
         // RoPE for this geometry: build_rope(11,16,16) -> [S,64] re/im interleaved -> [128,1,S] device.
-        const std::vector<float> rot = qo::build_rope(tp, Hl, Wl);
+        // WIRED (variable-input #37): the DiT rotary comes from the production build_joint_rope module
+        // (identical 3-axis formula to the oracle-ref build_rope); verified equal so the assembled pipeline
+        // consumes the module, and resolution enters through (Hl,Wl) rather than a per-geometry .npy.
+        const std::vector<float> rot = qi::build_joint_rope((int)tp, (int)Hl, (int)Wl);
+        {
+            const std::vector<float> rot_oracle = qo::build_rope(tp, Hl, Wl);
+            const double r_par = qo::rel_fro(rot, rot_oracle);
+            std::printf("ROPE_WIRING build_joint_rope(%u,%u,%u) vs oracle-ref rel_fro=%.3e %s\n",
+                        (unsigned)tp, (unsigned)Hl, (unsigned)Wl, r_par, (r_par < 1e-6) ? "OK" : "CHECK");
+            qo::require(r_par < 1e-6, "production build_joint_rope must equal the oracle-ref rope");
+        }
         void* drot = upload(rot);
         if (have_rot) {
             const double er = (rot_ref.size() == rot.size()) ? qo::rel_fro(rot, rot_ref) : 1e9;
@@ -595,7 +623,7 @@ int main() {
             const double ds = (sigma_next - sigma);
             for (std::size_t p = 0; p < new_lat.size(); ++p)
                 new_lat[p] = (float)((double)lat_f[p] + ds * (double)noise_f[p]);
-            if (i == 0) {  // localize: DiT forward vs scheduler accumulation
+            if (i == 0 && !seeded) {  // localize (oracle-init only): DiT forward vs scheduler accumulation
                 if (have_hsimg)  std::printf("STEP0 hs_img     rel_fro=%.4e (vs hs_img.npy)\n", qo::rel_fro(hsimg_mine, hsimg_ref));
                 if (have_hstxt)  std::printf("STEP0 hs_txt     rel_fro=%.4e (vs hs_txt.npy)\n", qo::rel_fro(hstxt_mine, hstxt_ref));
                 if (have_temb)   std::printf("STEP0 temb       rel_fro=%.4e (vs temb.npy)\n", qo::rel_fro(temb_mine, temb_ref));
@@ -631,7 +659,7 @@ int main() {
                 CUDA_CHECK(cudaMemcpy(d_latent, bits.data(), img_tokens * 64 * 2, cudaMemcpyHostToDevice));
             }
             CUDA_CHECK(cudaGetLastError());
-            {
+            if (!seeded) {
                 // Free-running state error E_x(i) vs the reference trajectory: separates a smooth
                 // chaotic accumulation (transformer fine; E_x climbs) from a step-specific spike
                 // (systematic defect). latent_traj[i] = the reference state after step i.
@@ -653,12 +681,19 @@ int main() {
 
         CUDA_CHECK(cudaDeviceSynchronize());
 
-        // ---- PRIMARY GATE: final latent vs the reference final latent ----
+        // ---- final latent (PRIMARY gate vs the reference; informational under a seeded init) ----
         const T lat_got = download(d_latent, img_tokens * 64);
-        const double e_lat = qo::rel_fro(lat_got, lat_final_ref);
+        bool lat_got_finite = true;
+        for (float v : lat_got) if (!std::isfinite(v)) lat_got_finite = false;
+        const double e_lat = (oracle_geom && lat_final_ref.size() == lat_got.size())
+                                 ? qo::rel_fro(lat_got, lat_final_ref) : 0.0;   // 0 = no dump at this geometry
         const double tol_lat = 0.5;
-        std::printf("FINAL_LATENT rel_fro=%.3e (vs latents_final.npy) tol=%.1e %s\n",
-                    e_lat, tol_lat, (e_lat < tol_lat ? "OK" : "FAIL"));
+        if (seeded)
+            std::printf("FINAL_LATENT(seeded) finite=%d  rel_to_torch_ref=%.3e (informational; seeded init differs by design)\n",
+                        (int)lat_got_finite, e_lat);
+        else
+            std::printf("FINAL_LATENT rel_fro=%.3e (vs latents_final.npy) tol=%.1e %s\n",
+                        e_lat, tol_lat, (e_lat < tol_lat ? "OK" : "FAIL"));
 
         // ---- TRAJECTORY-FORCE pass (decisive per-step velocity check) ----
         // Free-running drift (E_x above) conflates two things: (a) a fixable per-step SYSTEMATIC
@@ -669,8 +704,11 @@ int main() {
         // latent_traj[i]. A large one-step error at some step = systematic defect (fix it); a small
         // one (~bf16 floor) at every sampled step = velocity field correct, free-running drift is
         // pure ODE-sensitivity accumulation. Sampled (not all 40) to bound runtime under the watchdog.
-        std::printf("=== TRAJECTORY-FORCE (one-step at reference states) ===\n");
-        for (int si : {0, 5, 10, 15, 20, 25, 30, 39}) {
+        const std::vector<int> force_steps = seeded ? std::vector<int>{}
+                                                    : std::vector<int>{0, 5, 10, 15, 20, 25, 30, 39};
+        if (!force_steps.empty())
+            std::printf("=== TRAJECTORY-FORCE (one-step at reference states) ===\n");
+        for (int si : force_steps) {
             const std::size_t i = (std::size_t)si;
             const T in = (i == 0) ? lat_init
                                   : T(traj_full.begin() + (std::size_t)(i - 1) * img_tokens * 64,
@@ -942,6 +980,7 @@ int main() {
 
         // run the decode at H0=W0=16
         double e_img = 0.0;
+        bool img_finite = true, img_nondeg = false;   // outer scope: the seeded verdict reads these
         const double tol_img = 0.3;
         void* vx = d_vae;  // [64,16,16] channel-major
         {
@@ -980,22 +1019,32 @@ int main() {
             CUDA_CHECK(cudaDeviceSynchronize());
             const std::size_t fout = 4 * (std::size_t)Hh * Ww;
             T dev_final = download(fin, fout);
+            for (float v : dev_final) if (!std::isfinite(v)) img_finite = false;   // finiteness BEFORE clamp
             for (auto& v : dev_final) v = std::max(-1.0F, std::min(1.0F, v));
-            e_img = qo::rel_fro(dev_final, img_ref);
-            std::printf("FINAL_IMAGE  rel_fro=%.3e (vs image.npy) tol=%.1e %s  (Hh=%d Ww=%d)\n",
-                        e_img, tol_img, (e_img < tol_img ? "OK" : "FAIL"), Hh, Ww);
+            if (oracle_geom && img_ref.size() == dev_final.size()) e_img = qo::rel_fro(dev_final, img_ref);
+            if (seeded)
+                std::printf("FINAL_IMAGE(seeded) finite=%d  rel_to_torch_ref=%.3e (informational)  (Hh=%d Ww=%d)\n",
+                            (int)img_finite, e_img, Hh, Ww);
+            else
+                std::printf("FINAL_IMAGE  rel_fro=%.3e (vs image.npy) tol=%.1e %s  (Hh=%d Ww=%d)\n",
+                            e_img, tol_img, (e_img < tol_img ? "OK" : "FAIL"), Hh, Ww);
             // per-channel stats for disclosure
             double mn = 1e30, mx = -1e30;
             for (auto v : dev_final) { mn = std::min(mn, (double)v); mx = std::max(mx, (double)v); }
-            std::printf("image range [%.3f, %.3f]  (ref range reported by dumper: [-1,1])\n", mn, mx);
+            img_nondeg = img_finite && (mx - mn) > 0.05;   // not a flat / collapsed image
+            std::printf("image range [%.3f, %.3f]  %s  (ref range reported by dumper: [-1,1])\n",
+                        mn, mx, img_nondeg ? "non-degenerate" : "DEGENERATE");
             // Dump the generated image (channels 0,1,2 -> RGB) as a P6 PPM so it is viewable.
             // (Matches the reference convention: ch3 is the constant ~1.0 alpha channel.)
             {
                 const std::size_t HW = (std::size_t)Hh * Ww;
                 const char* ppm_env = std::getenv("INFERNIX_IMAGE_OUT_PPM");
-                const char* ppath = (ppm_env && *ppm_env)
-                                        ? ppm_env
-                                        : "C:/Users/Micke/Documents/Kodprojekt/Qwen Flash Next/image-spike/e2e_mine.ppm";
+                std::string ppath_s;
+                if (ppm_env && *ppm_env) ppath_s = ppm_env;
+                else if (seeded) ppath_s = "C:/Users/Micke/Documents/Kodprojekt/Qwen Flash Next/image-spike/e2e_mine_seed" +
+                                           std::to_string((unsigned long long)seed_val) + ".ppm";
+                else ppath_s = "C:/Users/Micke/Documents/Kodprojekt/Qwen Flash Next/image-spike/e2e_mine.ppm";
+                const char* ppath = ppath_s.c_str();
                 FILE* pf = fopen(ppath, "wb");
                 if (pf) {
                     std::fprintf(pf, "P6\n%d %d\n255\n", Ww, Hh);
@@ -1020,7 +1069,12 @@ int main() {
         }
 
         // ---- verdict ----
-        const bool ok = (e_lat < tol_lat) && std::isfinite(e_lat) && (e_img < tol_img) && std::isfinite(e_img);
+        // Oracle mode: the reference-comparison gates (unchanged).
+        // Seeded mode: BEHAVIOURAL gate -- the pipeline ran to completion, the final latent and decoded
+        // image are finite, and the image is non-degenerate (a real generated picture). Deliberately NOT
+        // the reference tolerance: the seeded init is a different RNG draw than the torch-seeded reference.
+        const bool ok = seeded ? (lat_got_finite && img_finite && img_nondeg && std::isfinite(e_img))
+                               : ((e_lat < tol_lat) && std::isfinite(e_lat) && (e_img < tol_img) && std::isfinite(e_img));
         // free everything
         for (void* p : galloc) cudaFree(p);
         cudaFree(d_vae);
@@ -1032,8 +1086,10 @@ int main() {
         cudaFree(d_ones); cudaFree(d_zeros); cudaFree(d_tnorm); cudaFree(drot); cudaFree(d_pe);
         for (auto& b : blocks) { if (b.d_nq) cudaFree(b.d_nq); if (b.d_nk) cudaFree(b.d_nk); }
 
-        std::printf(ok ? "IMAGE_PIPELINE_PROD_TEST: PASS (latent=%.3e img=%.3e)\n" :
-                         "IMAGE_PIPELINE_PROD_TEST: FAIL (latent=%.3e img=%.3e)\n", e_lat, e_img);
+        std::printf("%s %s (latent=%.3e img=%.3e)\n",
+                    seeded ? "SEEDED" : "ORACLE",
+                    ok ? "IMAGE_PIPELINE_PROD_TEST: PASS" : "IMAGE_PIPELINE_PROD_TEST: FAIL",
+                    e_lat, e_img);
         std::fflush(stdout);
         return ok ? 0 : 1;
     } catch (const std::exception& e) {

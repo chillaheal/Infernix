@@ -124,8 +124,30 @@ int run_fp8_a16() {
     for (auto [n, k] : {std::pair{14336, 5120}, std::pair{16384, 5120}, std::pair{34816, 5120},
                         std::pair{248320, 5120}, std::pair{5120, 6144}, std::pair{5120, 17408},
                         std::pair{16384, 2560}, std::pair{13312, 2560}, std::pair{2560, 6144},
-                        std::pair{1280, 2560}, std::pair{2560, 640}}) {
+                        std::pair{1280, 2560}, std::pair{2560, 640}, std::pair{4096, 4096},
+                        std::pair{12288, 4096}, std::pair{4096, 12288}, std::pair{1024, 4096}}) {
         failures += verify_workspace_envelopes(QType::FP8_E4M3FN_ROW_BF16, n, k);
+    }
+    return failures;
+}
+
+// Qwen-Image-2.1: the DiT dense projections and the Qwen3-VL text tower's q/o, k/v and MLP, against
+// the FP64 oracle at every A16 route boundary. Templated image prompts run 25-33 tokens, so the
+// T32/T64 boundary at 32/33 is the production point; the full ladder covers the other routes.
+int run_qwen_image_fp8_a16() {
+    int failures   = 0;
+    std::uint32_t seed = 991U;
+    for (const auto& [n, k] : {std::pair{4096, 4096}, std::pair{12288, 4096}, std::pair{4096, 12288},
+                               std::pair{1024, 4096}}) {
+        std::vector<Invocation> calls;
+        for (int t = 1; t <= 33; ++t) calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only});
+        for (int t : {48, 63, 64, 65, 96, 97, 127, 128, 129, 256, 257, 512, 1024})
+            calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only});
+        for (int t : {3, 9, 17, 33})
+            calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only, true});
+        calls.push_back({1, CallForm::A16Convenience});
+        failures += run_shape("FP8_A16 Qwen-Image", ActivationCompute::A16, make_fp8_weight,
+                              {n, k, seed++, Comparison::Sampled, true, calls});
     }
     return failures;
 }
@@ -225,7 +247,8 @@ int main() {
         return 77;
     }
     try {
-        const int failures = run_fp8_a16() + run_flash_next_fp8_a16() + fp8_a16_column_invariance();
+        const int failures =
+            run_fp8_a16() + run_flash_next_fp8_a16() + run_qwen_image_fp8_a16() + fp8_a16_column_invariance();
         std::cout << (failures == 0 ? "OK" : "FAIL") << " FP8 A16 Linear\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

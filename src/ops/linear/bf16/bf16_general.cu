@@ -43,8 +43,11 @@ void bf16_general_gemm(const Tensor& x, const Weight& weight, Tensor& out, cudaS
     const std::int32_t N = weight.n;
     const std::int32_t K = weight.k;
     const std::int32_t T = x.ne[1];
-    const dim3 grid(static_cast<unsigned>((N + kTileN - 1) / kTileN),
-                    static_cast<unsigned>((T + kTileT - 1) / kTileT));
+    // One flattened x-grid: the VAE decode's full-res planes are millions of tokens, and grid.y
+    // caps at 65535 tiles (2048x2048 = 4.2M tokens = 131072 T-tiles).
+    const std::int64_t tiles = static_cast<std::int64_t>((N + kTileN - 1) / kTileN) *
+                               ((T + kTileT - 1) / kTileT);
+    const dim3 grid(static_cast<unsigned>(tiles));
     bf16_general_gemm_kernel<<<grid, kThreads, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), static_cast<const __nv_bfloat16*>(weight.qdata),
         static_cast<__nv_bfloat16*>(out.data), N, K, T);

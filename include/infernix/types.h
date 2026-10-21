@@ -297,6 +297,13 @@ struct ContextCostOptions {
     std::filesystem::path preset_path;
 };
 
+// How a request whose thinking budget cannot fit its remaining output capacity is handled.
+enum class ThinkingBudgetPolicy : std::uint8_t {
+    Strict, // reject the request (HTTP 400)
+    Clamp,  // lower the thinking budget so the open thinking phase still fits
+    Ignore, // run with no thinking budget (unbounded model-origin thinking)
+};
+
 struct EngineOptions {
     std::filesystem::path artifact_path;
     std::filesystem::path chat_template_path;
@@ -311,6 +318,9 @@ struct EngineOptions {
     // </think> close the frontend appends when the message lacks it. Empty preserves the
     // model's built-in end-of-thinking control suffix.
     std::string thinking_budget_message;
+    // How a request whose thinking budget cannot fit its output capacity is handled
+    // (--thinking-budget-policy); default Strict rejects it.
+    ThinkingBudgetPolicy thinking_budget_policy = ThinkingBudgetPolicy::Strict;
     EnginePurpose purpose              = EnginePurpose::Generation;
     int device                         = 0;
     std::uint32_t max_context          = 2048; // Logical ceiling of one request or score window.
@@ -1293,6 +1303,16 @@ struct ScoreResult {
     std::vector<float> top_logprobs;
     // Position-major (scored positions x candidates_per_position), in the candidates' order.
     std::vector<float> candidate_logprobs;
+};
+
+// What a running image interlude hands its job: the physical VRAM bytes the yield freed, and the
+// image's dedicated CUDA stream, carried as a void* because the public header has no CUDA include
+// (it is a cudaStream_t created for the interlude and destroyed when the job returns). The stream
+// is blocking, so the legacy default stream orders against it: image work submitted on either
+// route stays correctly sequenced without the job owning cross-stream synchronization.
+struct ImageInterludeContext {
+    std::uint64_t freed_bytes = 0;
+    void* image_stream        = nullptr;
 };
 
 struct MemorySummary {

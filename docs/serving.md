@@ -75,8 +75,9 @@ tier must be saved. Before the server is ready, one Ctrl+C ends startup at once.
 |---|---|
 | `GET /health` | Engine readiness |
 | `GET /metrics` | Prometheus counters, gauges and latency histograms |
-| `GET /v1/models` | configured OpenAI model alias, effective `max_model_len`, and a llama.cpp-compatible `meta` object |
-| `GET /v1/models/{id}` | lookup of the configured alias, `max_model_len`, and `meta` object |
+| `GET /v1/models` | configured OpenAI model alias, effective `max_model_len`, and a llama.cpp-compatible `meta` object; plus one entry for the image resource when the image route is configured |
+| `GET /v1/models/{id}` | lookup of the configured alias, `max_model_len`, and `meta` object, or of the image resource id |
+| `GET /v1/capabilities` | which surfaces this process actually serves: chat and image model ids, vision input, and the accepted image request bounds ([Capabilities](#capabilities)) |
 | `POST /v1/chat/completions` | OpenAI-style chat generation |
 | `POST /v1/responses` | OpenAI Responses Core generation, state, typed Items, and SSE |
 | `POST /v1/responses/input_tokens` | Responses prompt-token count without generation |
@@ -86,6 +87,8 @@ tier must be saved. Before the server is ready, one Ctrl+C ends startup at once.
 | `POST /v1/messages` | Anthropic-style message generation |
 | `POST /v1/messages/count_tokens` | Engine-native expanded input-token count |
 | `POST /v1/decide` (alias `/v1/systemone`) | typed decisions read from the next-token distribution, with nothing generated ([Decisions](#decisions)) |
+| `POST /v1/images/generations` | Synchronous text-to-image generation over the image interlude, returned as base64 PNG or as a URL served by this process ([OpenAI Images](#openai-images)) |
+| `GET /v1/images/{id}` | the PNG of a finished generation, by the artifact id its response returned ([OpenAI Images](#openai-images)) |
 
 Anthropic SDKs append `/v1/messages` to their base URL, so their base URL is
 `http://127.0.0.1:8080`, while OpenAI SDKs take `http://127.0.0.1:8080/v1`. A client given the
@@ -926,6 +929,171 @@ compaction, files/audio, and OpenAI-hosted/MCP tools. Except for the two explici
 documented placeholders, these are compatibility boundaries rather than silently accepted
 approximations.
 
+## OpenAI Images
+
+```bash
+curl http://127.0.0.1:8080/v1/images/generations \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "qwen3.8-27b",
+    "prompt": "a black cat on a windowsill at dusk",
+    "size": "1024x1024",
+    "steps": 40,
+    "response_format": "b64_json",
+    "seed": 1234
+  }'
+```
+
+The route is synchronous: it returns the finished image in one response. It is configured only when the
+server starts with both `--image-artifact` and `--image-text-processor`; without them it answers
+`503 image_generation_not_configured`. Generation runs over the image interlude: the resident model yields
+its working VRAM to the image lane, one DiT-plus-VAE job runs on its own CUDA stream, and the model's VRAM
+is restored afterward, so chat traffic resumes unchanged. Only one image job runs at a time, and the amount
+of VRAM the model yields scales with the requested `size`.
+
+Accepted request fields are exactly `model`, `prompt`, `n`, `size`, `steps`, `response_format`, `user`,
+`seed`, `image`, `negative_prompt` and `true_cfg_scale`; any other field is rejected as
+`unsupported_parameter` rather than silently ignored.
+
+| Field | Behavior |
+|---|---|
+| `model` | must equal the configured public model alias, or the image resource's own id from `GET /v1/models` (that id is only accepted here, never by the chat routes) |
+| `prompt` | required non-empty string, at most 4096 bytes; rendered by the Qwen-VL text tower, not the chat sampler |
+| `size` | `<width>x<height>`; each side an integer multiple of 32 in `[32, 2048]`; default `768x768` |
+| `steps` | denoise steps (one DiT forward each), integer in `[2, 100]`; default `40`. The floor is 2 because the schedule divides by `steps - 1`; the ceiling bounds how long one request may hold the yielded VRAM |
+| `n` | only `1` (one image per request); any other value is rejected |
+| `response_format` | `b64_json` (the default) or `url`; any other value is rejected |
+| `seed` | optional non-negative integer; when omitted the Engine picks one |
+| `user` | opaque client tag, never echoed back |
+| `image` | optional base64 reference image (product extension, no OpenAI counterpart): PNG keeps its alpha, other formats get an opaque one; an optional `data:…;base64,` prefix is accepted, an `http(s)://` URL is not, decoded payload at most 16 MiB |
+| `negative_prompt` | optional string, at most 4096 bytes: what to steer away from. Required when `true_cfg_scale` is above 1; ignored at 1 |
+| `true_cfg_scale` | guidance scale, number in `[1, 20]`; default `1`, which is a single DiT forward per step. Above 1 every step runs a second forward over the negative prompt, so the step cost roughly doubles |
+
+The step schedule itself (sigmas, timesteps) is derived by the Engine from the request resolution and
+`steps`; it is not a request field.
+
+With `image`, the decoded plane is snapped to the reference geometry the pipeline computes from the source
+aspect ratio at a 1024² pixel budget (rounded to multiples of 32) and resized with the reference
+pipeline's bilinear mapping; alpha is carried raw, never composited. The VAE encoder turns that plane into
+the constant reference block of the joint DiT sequence, while the generated image keeps the requested
+`size`. The decode, budget check and resize are host work finished before the interlude yields VRAM, so an
+undecodable or oversized reference answers `400` without touching the resident model.
+
+Above `true_cfg_scale` 1 each step runs the DiT twice — once over `prompt`, once over `negative_prompt`,
+each with its own text length and position table — and the velocity becomes
+`neg + true_cfg_scale * (cond - neg)`, as the reference pipeline's true-CFG branch does. That is what makes
+the pair mandatory: a scale above 1 with no negative prompt would silently mean "no steering", so it answers
+`400 image_negative_prompt_required` instead.
+
+A successful response is the OpenAI image object, one entry per image with an opaque alpha channel. The
+default `b64_json` carries the PNG inline:
+
+```json
+{"created": 1770000000, "data": [{"b64_json": "<base64 PNG>"}]}
+```
+
+`"response_format": "url"` replaces the payload with an address on this same server:
+
+```json
+{"created": 1770000000, "data": [{"url": "http://127.0.0.1:8080/v1/images/img-1770000000-1"}]}
+```
+
+The URL is built from the request's `Host` header, so it resolves from wherever that client reached the
+server (renamed, port-forwarded or containerized included), and it is served by
+`GET /v1/images/{id}` with `Content-Type: image/png`. Nothing expires it: every image is written into an
+`images` directory under the server's working directory as `img-<created>-<sequence>.png` (`created` is the
+epoch in the response), and the route reads that file back. The artifact id is therefore also the collection
+name on disk, and it is matched only against the strict `img-<digits>-<digits>` shape — an id of any other
+form cannot name a file and answers `404`. No `revised_prompt` is returned in either form.
+
+Every failure names its code in the standard OpenAI error envelope:
+
+| HTTP | Code | When |
+|---|---|---|
+| 400 | `unsupported_parameter`, `image_size_invalid`, `image_steps_invalid`, `image_n_not_supported`, `response_format_not_supported`, `string_above_max_length` | the request asks for behavior outside the accepted subset |
+| 400 | `image_cfg_scale_invalid`, `image_negative_prompt_required` | `true_cfg_scale` is outside `[1, 20]`, or it is above 1 with no `negative_prompt` |
+| 400 | `image_invalid`, `image_too_large`, `image_url_not_supported`, `image_data_uri_not_base64` | the `image` payload is not a decodable image inside the byte budget, is sent as a URL, or is a non-base64 `data:` URI |
+| 503 | `image_generation_not_configured` | the server started without the image options |
+| 503 | `image_interlude_unsupported` | the loaded model has no image interlude (only Qwen3.8-Flash-Next does) |
+| 503 | `engine_unavailable` | the Engine cannot accept work |
+| 429 | `image_interlude_in_flight` | another image generation is running |
+| 503 | `image_engine_degraded` | the interlude could not confirm the model's VRAM was restored |
+| 500 | `image_generation_failed` | the job started and then failed |
+| 503 | `image_interlude_failed` | the interlude failed before the job started |
+| 404 | `image_not_found` | on `GET /v1/images/{id}`: that id is not a finished artifact — wrong shape, or nothing on disk behind it |
+
+## Capabilities
+
+Neither the OpenAI nor the Anthropic wire format has a field where a server says which optional surfaces it
+actually serves: `GET /v1/models` answers with a fixed four-key object, and a client therefore discovers an
+image pipeline only by sending a request that fails. `GET /v1/capabilities` is an explicit **Infernix
+extension** for that discovery — it names no standard, and a client that does not know it simply never calls
+it:
+
+```json
+{
+  "object": "infernix.capabilities",
+  "chat_model": "qwen3.8-27b",
+  "vision_input": true,
+  "image_generation": {
+    "model": "Qwen-Image-2.1-FP8-v3",
+    "endpoint": "/v1/images/generations",
+    "artifact_endpoint": "/v1/images/<id>",
+    "response_formats": ["b64_json", "url"],
+    "dimensions": {"min": 32, "max": 2048},
+    "steps": {"min": 2, "max": 100},
+    "true_cfg_scale": {"min": 1, "max": 20},
+    "reference_image": true,
+    "automatic_from_chat": true,
+    "chat_tool": "generate_image",
+    "chat_max_images_per_request": 4
+  },
+  "endpoints": {
+    "chat_completions": "/v1/chat/completions",
+    "responses": "/v1/responses",
+    "messages": "/v1/messages",
+    "images_generations": "/v1/images/generations"
+  }
+}
+```
+
+Every value is read from the running process, never from a model card: `chat_model` is the public alias,
+`image_generation.model` is the id the configured image artifact is served under, and
+`image_generation` is `null` when the server started without `--image-artifact` and
+`--image-text-processor`. `vision_input` follows `--vision`, and it is a separate surface from
+`reference_image`: the first feeds a picture into the language model, the second conditions a generation on
+a picture through the diffusion pipeline's own vision tower. `automatic_from_chat` says whether the chat
+routes may generate an image on their own initiative, `chat_tool` names the tool they are given for it, and
+`chat_max_images_per_request` is how many pictures one chat request may draw. See
+[Images from a chat request](#images-from-a-chat-request).
+
+## Images from a chat request
+
+A chat request to a server with an image pipeline is given one extra tool, `generate_image`, and this
+process executes it itself. `POST /v1/chat/completions`, `POST /v1/responses` and `POST /v1/messages` all
+behave the same way:
+
+1. The tool is appended to the request's own tool list when the client left tool choice free, so the model
+   can answer "draw me a fox" instead of explaining how it would.
+2. When the model calls it, this process runs the picture through the same pipeline as
+   `POST /v1/images/generations`, inside the same HTTP request, and feeds the finished picture's URL back as
+   the tool result.
+3. The model's next round produces the reply, which quotes that URL. A reply that described the picture
+   instead of quoting it gets the URL appended, so a client always gets a usable reference.
+
+The client sees none of this: no tool in its own list, no tool call, no tool result, no extra round — one
+assistant answer with a URL in it. The extra rounds are counted into the reported token usage, because they
+really ran, and the round after the first cannot put thinking behind text that is already on the wire, so
+only the first round's reasoning is reported.
+
+A request bounds its own damage: `chat_max_images_per_request` pictures at most (each one costs a full
+image interlude, where the language model yields its VRAM and is restored afterwards), and a fixed number of
+internal rounds, so a model that keeps calling the tool with bad arguments ends as an ordinary answer.
+A request that pinned, forced or disabled tools keeps exactly the tool list it sent, and a client that
+declares a tool named `generate_image` keeps its own — the server never takes a client's tool over, and never
+swallows a call to one. A tool call that mixes a client tool with `generate_image` is handed to the client
+untouched.
+
 ## Anthropic Messages
 
 ```bash
@@ -1213,6 +1381,8 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--vision` | enable media input and load Vision GPU allocations | off |
 | `--vision-offload auto\|on\|off` | keep the vision tower in pinned system RAM and borrow Device memory only while encoding; `on` requires `--vision`. `auto` is on for Qwen3.8-Flash-Next (the expert cache lends the encode memory) and off for Qwen3.5 | `auto` |
 | `--vision-max-merged N` | merged vision tokens per image or video, `64..32768` | `32768` |
+| `--image-artifact PATH` | the `.infernix` image artifact (DiT and image VAE) that enables `POST /v1/images/generations`; its weights bind lazily on the first job. Without it the route answers `503 image_generation_not_configured` | off: image route not configured |
+| `--image-text-processor DIR` | the Qwen-VL text-tower/processor directory that renders a prompt string into image embeddings; required together with `--image-artifact` for `POST /v1/images/generations` to configure | off |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-prefix-reuse` | disable the prefix cache: every request prefills from the root, and a paused request recovers by replay; rejected with `--host-context-mib` and the cache options below | prefix reuse on |
 | `--host-context-mib N` | pinned Host budget in decimal MiB that resolve to whole bytes: the slab pool the prefix cache's KV blocks and state snapshots share ([spec](maintainer/hybrid-prefix-cache-spec.md)), split at run time by eviction value. `0` keeps the cache on the Device only, and a nonzero budget below one snapshot is rejected. Qwen3.8-Flash-Next: default 4096 MiB and must be positive (its state snapshots live in this pool). | `8192 MiB` |

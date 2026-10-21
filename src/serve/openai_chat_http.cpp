@@ -1,6 +1,8 @@
 #include "serve/http_server.h"
 
+#include "serve/chat_image_tool.h"
 #include "serve/http_transport.h"
+#include "serve/image_generation_service.h"
 #include "serve/openai_chat.h"
 #include "serve/openai_common.h"
 
@@ -30,30 +32,54 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         const auto body                  = parse_json_body(req);
         request                          = parse_chat_completion_request(body, limits);
         request.generation.ngram_session = resolve_ngram_session(req, body, options_);
-        validate_openai_model(request.model, public_model_id_);
+        // The image resource is not a language model: only the chat id is legal here.
+        validate_openai_model(request.model, {public_model_id_});
     } catch (const ApiException& exception) {
         write_openai_error(res, exception.error());
         return;
     }
+
+    // With an image pipeline in this process the request also carries the server-executed image
+    // tool, so the picture rounds below are the ones a client would otherwise have to run. The URL
+    // base and the model id are read here because a streaming provider runs after this handler has
+    // returned, and the generator is bound to this request's Host so the URL resolves for that client.
+    const bool images_configured = images_ != nullptr;
+    append_chat_image_tool(request.generation, images_configured);
+    const std::string image_url_base =
+        images_configured ? artifact_url_base(req, options_) : std::string();
+    const std::string image_model = image_model_id();
+    const ChatImageGenerator make_picture = [this, url_base = image_url_base](
+                                                const OpenAIImagesRequest& image_request) {
+        return images_->generate(image_request, unix_time_now(), url_base);
+    };
 
     const std::uint64_t req_id = ++request_seq_;
     RequestLogMetadata metadata{.http_request_id        = res.get_header_value("x-request-id"),
                                 .model                  = request.model,
                                 .stream                 = request.stream,
                                 .output_tokens_explicit = request.output_tokens_explicit};
-    PreparedRequest prepared;
-    try {
-        infernix::GenerationObservationOptions observation{
+    // Every round of one request is one HTTP request: the same observation wiring, and the same
+    // request log, so an image round is visible as part of this request rather than as a new one.
+    // Captured by value because a streaming provider runs after this handler has returned.
+    const bool stream_live_timings    = request.stream && request.timings_per_token;
+    const bool stream_prompt_progress = request.stream && request.return_progress;
+    const std::string http_request_id = metadata.http_request_id;
+    const auto make_observation = [this, req_id, http_request_id, stream_live_timings,
+                                   stream_prompt_progress] {
+        return infernix::GenerationObservationOptions{
             .phase_timings   = true,
-            .live_timings    = request.stream && request.timings_per_token,
-            .prompt_progress = request.stream && request.return_progress,
-            .scheduling      = scheduling_observer(req_id, metadata.http_request_id),
+            .live_timings    = stream_live_timings,
+            .prompt_progress = stream_prompt_progress,
+            .scheduling      = scheduling_observer(req_id, http_request_id),
             .first_token     = first_token_observer(),
         };
+    };
+    PreparedRequest prepared;
+    try {
         prepared = service_->prepare(
             request.generation,
             request.stream ? GenerationConsumerMode::Streaming : GenerationConsumerMode::Aggregate,
-            std::move(observation), [&req] { return client_disconnected(req); });
+            make_observation(), [&req] { return client_disconnected(req); });
     } catch (const ApiException& exception) {
         record_request_rejected(make_request_rejection_log_context(
             req_id, "openai_chat_completions", request.generation, metadata, exception.error()));
@@ -79,6 +105,23 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         GenerationOutcome outcome;
         try {
             outcome = service_->run(prepared, nullptr, [&req] { return client_disconnected(req); });
+            if (images_configured && outcome_is_chat_image_tool_round(outcome)) {
+                ChatImageRounds rounds = run_chat_image_rounds(
+                    request.generation, std::move(outcome), image_model, image_url_base,
+                    unix_time_now(), make_picture,
+                    [&] {
+                        // A new round takes over this request's generation, and with it the lifetime
+                        // that keeps media alive until the response is written.
+                        prepared = service_->prepare(request.generation,
+                                                     GenerationConsumerMode::Aggregate,
+                                                     make_observation(),
+                                                     [&req] { return client_disconnected(req); });
+                        return service_->run(prepared, nullptr,
+                                             [&req] { return client_disconnected(req); });
+                    });
+                outcome           = std::move(rounds.answer);
+                outcome.text     += missing_image_url_suffix(outcome.text, rounds.urls);
+            }
         } catch (const ApiException& exception) {
             lifecycle->failure(make_generation_request_failure(exception.error()));
             write_openai_error(res, exception.error());
@@ -114,6 +157,9 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
     try {
         const bool return_progress   = request.return_progress;
         const bool timings_per_token = request.timings_per_token;
+        // The provider runs after this handler returns, so the request its rounds extend has to
+        // outlive the handler. Moving it here is free: the aggregate path returned already.
+        auto generation              = std::make_shared<GenerationRequest>(std::move(request.generation));
         auto stream                  = std::make_shared<HttpGenerationStream>(std::move(prepared));
         auto encoder = std::make_shared<OpenAIChatStream>(identity, request.include_usage,
                                                           timings_per_token, return_progress,
@@ -122,8 +168,9 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         prepare_sse_response(res);
         res.set_chunked_content_provider(
             "text/event-stream",
-            [this, stream, encoder, lifecycle, return_progress,
-             timings_per_token](std::size_t, httplib::DataSink& sink) -> bool {
+            [this, stream, encoder, lifecycle, generation, return_progress, timings_per_token,
+             images_configured, image_model, image_url_base, make_picture,
+             make_observation](std::size_t, httplib::DataSink& sink) -> bool {
                 if (stream->started.exchange(true, std::memory_order_acq_rel)) {
                     sink.done();
                     return true;
@@ -160,36 +207,62 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                     return send_error(error);
                 }
 
+                // `live` is whether this round's events reach the client. A round that only asked
+                // for a picture carries nothing: its prose is not part of the answer, and its start,
+                // prompt-progress and per-token timing would open a second generation inside the one
+                // streamed message. Its text still reaches the client as the answer's tail.
+                const auto run_stream_round = [&](PreparedRequest& slot, bool live) {
+                    StreamSink output;
+                    if (live) {
+                        output.on_start = [&](const infernix::GenerationStart& start) {
+                            encoder->note_start(start);
+                            if (return_progress) {
+                                render_and_write(transport,
+                                                 [&] { return encoder->initial_prompt_progress(); });
+                            }
+                        };
+                        if (return_progress) {
+                            output.on_progress = [&](const infernix::PromptProgress& progress) {
+                                render_and_write(transport,
+                                                 [&] { return encoder->prompt_progress(progress); });
+                            };
+                        }
+                        if (timings_per_token) {
+                            output.on_timing =
+                                [&](const infernix::GenerationTimingObservation& timing) {
+                                    encoder->note_timing(timing);
+                                };
+                        }
+                        output.on_content = [&](const std::string& text) {
+                            render_and_write(transport,
+                                             [&] { return encoder->content_delta(text); });
+                        };
+                        output.on_reasoning = [&](const std::string& text) {
+                            render_and_write(transport,
+                                             [&] { return encoder->reasoning_delta(text); });
+                        };
+                    }
+                    output.is_cancelled = [&] { return transport.poll(); };
+                    return service_->run(slot, &output);
+                };
+
                 GenerationOutcome outcome;
                 try {
-                    StreamSink output;
-                    output.on_start = [&](const infernix::GenerationStart& start) {
-                        encoder->note_start(start);
-                        if (return_progress) {
-                            render_and_write(transport,
-                                             [&] { return encoder->initial_prompt_progress(); });
-                        }
-                    };
-                    if (return_progress) {
-                        output.on_progress = [&](const infernix::PromptProgress& progress) {
-                            render_and_write(transport,
-                                             [&] { return encoder->prompt_progress(progress); });
-                        };
+                    outcome = run_stream_round(stream->prepared, true);
+                    if (images_configured && outcome_is_chat_image_tool_round(outcome)) {
+                        ChatImageRounds rounds = run_chat_image_rounds(
+                            *generation, std::move(outcome), image_model, image_url_base,
+                            unix_time_now(), make_picture,
+                            [&] {
+                                stream->prepared =
+                                    service_->prepare(*generation, GenerationConsumerMode::Streaming,
+                                                      make_observation(),
+                                                      [&] { return transport.poll(); });
+                                return run_stream_round(stream->prepared, false);
+                            });
+                        outcome       = std::move(rounds.answer);
+                        outcome.text += missing_image_url_suffix(outcome.text, rounds.urls);
                     }
-                    if (timings_per_token) {
-                        output.on_timing = [&](const infernix::GenerationTimingObservation& timing) {
-                            encoder->note_timing(timing);
-                        };
-                    }
-                    output.on_content = [&](const std::string& text) {
-                        render_and_write(transport, [&] { return encoder->content_delta(text); });
-                    };
-                    output.on_reasoning = [&](const std::string& text) {
-                        render_and_write(transport, [&] { return encoder->reasoning_delta(text); });
-                    };
-                    output.is_cancelled = [&] { return transport.poll(); };
-
-                    outcome = service_->run(stream->prepared, &output);
                 } catch (const ClientDisconnected&) {
                     lifecycle->failure(
                         make_client_disconnected_failure(RequestFailurePhase::Transport));

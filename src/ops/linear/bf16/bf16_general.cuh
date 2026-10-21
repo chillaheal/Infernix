@@ -27,8 +27,11 @@ __global__ void bf16_general_gemm_kernel(const __nv_bfloat16* __restrict__ x,
     __shared__ __nv_bfloat16 ws[kTileN][kTileK + 1];
     __shared__ __nv_bfloat16 wx[kTileT][kTileK + 1];
 
-    const std::int32_t out_row0 = static_cast<std::int32_t>(blockIdx.x) * kTileN;
-    const std::int32_t token0   = static_cast<std::int32_t>(blockIdx.y) * kTileT;
+    // Flattened grid.x: the N-tiles run fastest, then the token tiles (a 2048x2048 plane's token
+    // tile count exceeds the grid.y limit of 65535).
+    const std::int32_t n_tiles  = (N + kTileN - 1) / kTileN;
+    const std::int32_t out_row0 = static_cast<std::int32_t>(blockIdx.x % n_tiles) * kTileN;
+    const std::int32_t token0   = static_cast<std::int32_t>(blockIdx.x / n_tiles) * kTileT;
     const std::int32_t tid      = static_cast<std::int32_t>(threadIdx.x);
 
     const std::int32_t trow = tid / kThreadCols;  // 0..15

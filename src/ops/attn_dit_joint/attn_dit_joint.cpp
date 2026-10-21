@@ -13,7 +13,7 @@ namespace {
 
 constexpr std::int32_t kHeadDim   = 128;
 constexpr std::int32_t kMaxHeads  = 40;
-constexpr std::int32_t kMaxTokens = 16384;
+constexpr std::int32_t kMaxTokens = 20480;
 
 bool aligned_to(const void* pointer, std::uintptr_t alignment) {
     return pointer != nullptr && (reinterpret_cast<std::uintptr_t>(pointer) & (alignment - 1)) == 0;
@@ -44,7 +44,7 @@ void attn_dit_joint(const Tensor& q, const Tensor& k, const Tensor& v, std::int3
         throw std::invalid_argument("attn_dit_joint: heads must be 1..40");
     }
     if (tokens < 1 || tokens > kMaxTokens) {
-        throw std::invalid_argument("attn_dit_joint: S must be 1..16384");
+        throw std::invalid_argument("attn_dit_joint: S must be 1..20480");
     }
     if (text_prefix < 0 || text_prefix > tokens) {
         throw std::invalid_argument("attn_dit_joint: text_prefix must be 0..S");

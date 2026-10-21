@@ -671,6 +671,32 @@ int main() {
                           response_store.response_store_max_bytes == (8ULL << 20),
                       "Responses store limits did not reach serving options");
 
+    failures += check(response_store.image_artifact_path.empty(),
+                      "--image-artifact must default to the disabled image route");
+    const ServeOptions image_artifact =
+        parse({"infernix-serve", "model.ninfer", "--image-artifact", "out\\image.infernix"});
+    failures += check(image_artifact.image_artifact_path == "out\\image.infernix",
+                      "--image-artifact did not reach serving options");
+    bool empty_image_artifact_rejected = false;
+    try {
+        parse({"infernix-serve", "model.ninfer", "--image-artifact", ""});
+    } catch (const std::invalid_argument&) { empty_image_artifact_rejected = true; }
+    failures += check(empty_image_artifact_rejected, "--image-artifact must reject an empty path");
+
+    failures += check(response_store.image_text_processor_path.empty(),
+                      "--image-text-processor must default to the disabled tower route");
+    const ServeOptions image_processor =
+        parse({"infernix-serve", "model.ninfer", "--image-artifact", "out\\image.infernix",
+               "--image-text-processor", "proc"});
+    failures += check(image_processor.image_text_processor_path == "proc",
+                      "--image-text-processor did not reach serving options");
+    bool empty_image_processor_rejected = false;
+    try {
+        parse({"infernix-serve", "model.ninfer", "--image-text-processor", ""});
+    } catch (const std::invalid_argument&) { empty_image_processor_rejected = true; }
+    failures += check(empty_image_processor_rejected,
+                      "--image-text-processor must reject an empty path");
+
     const ServeOptions sampling =
         parse({"infernix-serve", "model.ninfer", "--temperature", "0", "--top-p", "0.9", "--top-k",
                "20", "--min-p", "0.1", "--presence-penalty", "1.25", "--frequency-penalty", "-0.5",

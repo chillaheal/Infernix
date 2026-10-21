@@ -3,6 +3,9 @@
 #include "product/logging/logging.h"
 #include "product/logging/engine_diagnostics.h"
 #include "product/logging/startup_log.h"
+#include "serve/image_generation_service.h"
+#include "serve/image_job_store.h"
+#include "serve/image_text_tower.h"
 #include "serve/operational_log.h"
 #include "serve/generation_service.h"
 #include "serve/http_server.h"
@@ -312,6 +315,28 @@ int main(int argc, char** argv) {
         operational_log.warmup_complete(
             std::chrono::duration<double>(Clock::now() - warmup_started).count());
         server.attach(service);
+
+        // The synchronous image pipeline: the runner yields the LLM's VRAM through the Engine's
+        // interlude and the executor binds the image artifact's weights on first job. The raw-prompt
+        // route additionally needs --image-text-processor (the Qwen3-VL processor directory that
+        // turns the prompt string into prompt embeds); without either the route answers the
+        // documented 503 image_generation_not_configured.
+        std::unique_ptr<infernix::serve::ImageJobStore> image_jobs;
+        std::unique_ptr<infernix::serve::ImageGenerationService> images;
+        if (!options.image_artifact_path.empty()) {
+            infernix::serve::PromptEmbedsProvider prompt_embeds;
+            if (!options.image_text_processor_path.empty()) {
+                prompt_embeds = infernix::serve::make_tower_prompt_embeds_provider(
+                    options.image_artifact_path, options.image_text_processor_path);
+            }
+            image_jobs = std::make_unique<infernix::serve::ImageJobStore>(64, 256ULL << 20);
+            images     = std::make_unique<infernix::serve::ImageGenerationService>(
+                infernix::serve::make_engine_interlude_runner(service.engine()), *image_jobs,
+                std::move(prompt_embeds),
+                infernix::serve::make_artifact_image_job_executor(options.image_artifact_path));
+            server.attach_images(*images);
+        }
+
         const ServingScope serving_scope(stop_control, server);
 
         serving = true;

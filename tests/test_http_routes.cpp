@@ -70,6 +70,13 @@ int main() {
                    const std::string id = req.matches.size() > 1 ? req.matches[1].str() : "";
                    res.set_content(id, "text/plain");
                });
+    // The artifact capture excludes separators on purpose: a model lookup's greedy (.+) would hand the
+    // handler a multi-segment name for a file.
+    server.Get(api_route_pattern(R"(/images/([^/]+))"),
+               [](const httplib::Request& req, httplib::Response& res) {
+                   const std::string id = req.matches.size() > 1 ? req.matches[1].str() : "";
+                   res.set_content(id, "text/plain");
+               });
     const int port = server.bind_to_any_port("127.0.0.1");
     failures += check(port > 0, "test server could not bind a loopback port");
     if (port > 0) {
@@ -90,9 +97,42 @@ int main() {
         const httplib::Result model = client.Get("/v1/v1/models/qwen3.8-27b");
         failures += check(model && model->status == 200 && model->body == "qwen3.8-27b",
                           "a doubled prefix must not shift the route's capture groups");
+        const httplib::Result artifact = client.Get("/v1/v1/images/img-1770000000-1");
+        failures += check(artifact && artifact->status == 200 && artifact->body == "img-1770000000-1",
+                          "the artifact route answers under both prefixes with its own id");
+        const httplib::Result nested = client.Get("/v1/images/generations/x");
+        failures += check(!nested || nested->status == 404,
+                          "a name with a separator never reaches the artifact handler");
         server.stop();
         listener.join();
     }
+
+    // The capability advertisement is read off the options, so it can never promise a surface the
+    // process does not have.
+    const Json plain =
+        Json::parse(infernix::serve::make_capabilities_json(options, "qwen3.8-27b", {}));
+    failures += check(plain.at("object") == "infernix.capabilities" &&
+                          plain.at("chat_model") == "qwen3.8-27b" && plain.at("image_generation").is_null(),
+                      "without the image options the capability says so instead of guessing");
+    infernix::serve::ServeOptions image_options;
+    image_options.enable_vision = true;
+    const Json configured = Json::parse(
+        infernix::serve::make_capabilities_json(image_options, "qwen3.8-27b", "Qwen-Image-2.1-FP8-v3"));
+    failures += check(configured.at("vision_input") == true &&
+                          configured.at("image_generation").at("model") == "Qwen-Image-2.1-FP8-v3" &&
+                          configured.at("image_generation").at("artifact_endpoint") ==
+                              "/v1/images/<id>" &&
+                          configured.at("image_generation").at("response_formats") ==
+                              Json::array({"b64_json", "url"}) &&
+                          configured.at("image_generation").at("automatic_from_chat") == true &&
+                          configured.at("image_generation").at("chat_tool") == "generate_image" &&
+                          configured.at("image_generation").at("chat_max_images_per_request") == 4,
+                      "the image capability reports its id, artifact route, formats and the chat tool a "
+                      "client would otherwise have to run itself");
+    failures += check(plain.at("endpoints").at("images_generations") == "/v1/images/generations" &&
+                          configured.at("endpoints").at("chat_completions") == "/v1/chat/completions" &&
+                          configured.at("endpoints").at("messages") == "/v1/messages",
+                      "capabilities name the routes a client can actually post to");
 
     if (failures == 0) { std::cout << "http routes tests passed\n"; }
     return failures == 0 ? 0 : 1;

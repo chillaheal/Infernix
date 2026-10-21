@@ -23,7 +23,7 @@ namespace infernix::ops {
  * (non-GQA) attention, so q and k share the same 32-head layout and the same table.
  *
  * The pair form takes q BF16 [128,32,S,1] and k BF16 [128,32,S,1], both overwritten in place; the
- * single form takes one x BF16 [128,heads,S,1] with heads in 1..40. S is 1..16384. head_dim is fixed
+ * single form takes one x BF16 [128,heads,S,1] with heads in 1..40. S is 1..20480. head_dim is fixed
  * at 128 (64 complex pairs); a caller dispatches here only for a 128-wide head. x/q/k must not
  * overlap rot or, in the pair form, each other; rot stays unchanged. All tensors are contiguous and
  * 4-byte aligned. The independent oracle evaluates the formula naively in FP64 from the BF16

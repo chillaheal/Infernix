@@ -366,6 +366,20 @@ Engine::~Engine()                            = default;
 Engine::Engine(Engine&&) noexcept            = default;
 Engine& Engine::operator=(Engine&&) noexcept = default;
 
+bool Engine::supports_image_interlude() const noexcept {
+    return impl_ != nullptr && impl_->qwen4 != nullptr;
+}
+
+std::uint64_t Engine::run_image_interlude(std::uint64_t target_bytes, std::uint64_t margin_bytes,
+                                          const std::function<bool(const ImageInterludeContext&)>& job,
+                                          std::uint64_t drain_deadline_ms) {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    if (impl_->qwen4 == nullptr || impl_->qwen4->program == nullptr) {
+        throw std::logic_error("Engine: this model's Program supports no image interlude");
+    }
+    return impl_->qwen4->program->run_image_interlude(target_bytes, margin_bytes, job, drain_deadline_ms);
+}
+
 PreparedPrompt Engine::prepare(PromptInput input, const PreparationControl& control) const {
     nvtx::ScopedRange prepare_range(nvtx::Name::FrontendPrepare, nvtx::Category::Runtime);
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }

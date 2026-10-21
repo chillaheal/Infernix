@@ -27,4 +27,6 @@ extern const Fp8LinearShape kFp8N2560K640;
 extern const Fp8LinearShape kFp8N4096K4096;
 extern const Fp8LinearShape kFp8N12288K4096;
 extern const Fp8LinearShape kFp8N4096K12288;
+// Qwen3-VL text-tower k_proj/v_proj (W8A16: A16 routes only).
+extern const Fp8LinearShape kFp8N1024K4096;
 } // namespace infernix::ops::detail

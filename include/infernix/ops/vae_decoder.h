@@ -26,6 +26,42 @@ void conv2d(const Tensor& x, const Tensor& w, const Tensor& b, const Tensor* res
             cudaStream_t stream);
 
 /**
+ * 3x3 stride-2 cross-correlation (torch ZeroPad2d((0,1,0,1)) + Conv2d(k 3, stride 2, pad 0)) over a
+ * channel-first feature map, with per-output-channel bias -- the VAE encoder's Resample downsample:
+ *
+ *   ideal[oc,oh,ow] = b[oc] + sum_{ic} sum_{u,v in 0..2, 2*oh+u<H, 2*ow+v<W}
+ *                                          x[ic, 2*oh+u, 2*ow+v] * w[oc, ic, u, v]
+ *
+ * Padding is one column on the right and one row on the BOTTOM only (no left/top pad; the kernel
+ * window starts at the pixel itself). Output extent is torch's floor((H + 1 - 3)/2) + 1 = H/2 for
+ * even H. `x` is contiguous BF16 `[Cin,H,W]` (W fastest, H >= 2, W >= 2); `w` is contiguous BF16
+ * `[Cout,Cin,3,3]` in torch layout; `b` is contiguous BF16 `[Cout]`; `out` is contiguous BF16
+ * `[Cout,(H-2)/2+1,(W-2)/2+1]`. The oracle evaluates `ideal` in FP64 from the represented inputs;
+ * the BF16 out is promoted and compared. `out` must not overlap any input. No workspace.
+ */
+void conv2d_stride2(const Tensor& x, const Tensor& w, const Tensor& b, Tensor& out,
+                    cudaStream_t stream);
+
+/**
+ * QwenImage AvgDown3D residual shortcut for a single image frame: non-overlapping 2x2 spatial mean
+ * with a channel group mix, plus the front zero-pad of the temporal factor:
+ *
+ *   k = ((c*factor_t + ft)*2 + a)*2 + b        (k in [0, Cin*factor_t*4))
+ *   ideal[oc,h,w] = (1/group) * sum_{g=0}^{group-1} (ft >= factor_t-1 ? x[c,2*h+a,2*w+b] : 0)
+ *   where group = Cin*factor_t*4 / Cout and, for k = oc*group + g:
+ *   c = k/(factor_t*4), r = k%(factor_t*4), ft = r/4, a = (r%4)/2, b = r%2.
+ *
+ * The temporal padding (T=1 padded to factor_t by FRONT zeros) puts the single real frame in the LAST
+ * temporal slot, so every ft < factor_t-1 term is zero. At the production group of 4 that zeroes
+ * every even output channel and leaves the odd ones the plain 2x2 mean of one input channel -- it is
+ * not a uniform halving of the factor_t=1 result. `x` is contiguous BF16 `[Cin,H,W]` (H, W even);
+ * `out` is contiguous BF16 `[Cout,H/2,W/2]`; `factor_t` is 1 or 2 and Cin*factor_t*4 is divisible by
+ * Cout. The oracle evaluates `ideal` in FP64 from the represented input; the BF16 out is promoted
+ * and compared. `out` must not overlap `x`. No workspace.
+ */
+void avg_down(const Tensor& x, std::int32_t factor_t, Tensor& out, cudaStream_t stream);
+
+/**
  * Applies SiLU elementwise in place. For z = x[i]:
  *
  *   ideal[i] = z / (1 + exp(-z)).
@@ -81,9 +117,11 @@ void dupup3d(const Tensor& x, std::int32_t factor_t, Tensor& out, cudaStream_t s
  *   ideal[c,n] = sum_m P[n,m] * v[c,m] + (residual ? residual[c,n] : 0)
  *
  * `q`, `k`, `v` and `out` are contiguous BF16 `[C,N]` (N fastest); `residual` (optional) is contiguous
- * BF16 `[C,N]`. `scale` is positive and finite. N must be at most 16384 (a block-resident softmax
- * row of N scores in dynamic shared memory; the score and rescale loops tile over N with blockDim
- * threads, so any N up to the bound is covered). The
+ * BF16 `[C,N]`. `scale` is positive and finite. N must be at most 65536 (a full 2048x2048 latent
+ * grid): K and V stream through shared in 256-column tiles under an online softmax, so block memory
+ * is O(C + 256) floats instead of O(N); C must satisfy 2*C + 256 <= 12032 (C at most 5888) so the
+ * staged query column and accumulator fit in dynamic shared memory below the 48-KiB per-block cap.
+ * The
  * oracle evaluates `ideal` in FP64 from the represented inputs; the BF16 out is promoted and compared.
  * `out` must not overlap any input. No workspace or persistent state.
  */

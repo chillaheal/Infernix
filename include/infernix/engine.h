@@ -3,6 +3,7 @@
 #include "infernix/types.h"
 
 #include <chrono>
+#include <functional>
 #include <memory>
 #include <string_view>
 #include <vector>
@@ -109,6 +110,24 @@ public:
     [[nodiscard]] RuntimeStats runtime_stats() const;
     [[nodiscard]] MediaCacheSummary media_cache_summary() const;
     [[nodiscard]] bool is_available() const;
+
+    // LLM<->image VRAM coexistence: whether the loaded model supports an image interlude (today the
+    // qwen4_exp Program). run_image_interlude suspends generation, yields physical VRAM toward the
+    // image job's `target_bytes` plus a `margin_bytes` kept below the headroom, runs `job` with the
+    // LLM unable to execute (it receives the ImageInterludeContext: the bytes actually freed and
+    // its dedicated CUDA stream, and allocates the image's scratch in the freed region), then
+    // restores the pools and resumes generation. The interlude's stream is destroyed when `job`
+    // returns or throws. `drain_deadline_ms` bounds the wait for the LLM frontier to drain before
+    // anything is moved; on a miss the job fails and the LLM keeps serving (0 waits forever).
+    // Exception-safe: a failed job with confirmed restoration rethrows the job's own exception;
+    // only an uncertain restoration parks the model Degraded (process restart is the recovery
+    // unit). One interlude at a time; a concurrent caller is told another is in flight. Success is
+    // published only after restoration is confirmed. Returns the bytes freed. Throws
+    // std::logic_error when the Engine is moved from or its model supports no interlude.
+    [[nodiscard]] bool supports_image_interlude() const noexcept;
+    std::uint64_t run_image_interlude(std::uint64_t target_bytes, std::uint64_t margin_bytes,
+                                      const std::function<bool(const ImageInterludeContext&)>& job,
+                                      std::uint64_t drain_deadline_ms = 60000);
 
     void reset_memory_peaks() noexcept;
 

@@ -2,8 +2,11 @@
 
 #include "product/logging/logging.h"
 #include "serve/anthropic_messages.h"
+#include "serve/chat_image_tool.h"
 #include "serve/http_transport.h"
+#include "serve/image_generation_service.h"
 #include "serve/openai_common.h"
+#include "serve/openai_images.h"
 #include "serve/request_log.h"
 
 #include <nlohmann/json.hpp>
@@ -11,6 +14,9 @@
 
 #include <chrono>
 #include <exception>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -464,6 +470,20 @@ void HttpServer::register_routes() {
                  [this](const httplib::Request& req, httplib::Response& res) {
                      handle_chat_completions(req, res);
                  });
+    server_.Post(api_route_pattern("/images/generations"),
+                 [this](const httplib::Request& req, httplib::Response& res) {
+                     handle_images_generations(req, res);
+                 });
+    // The finished picture, addressed by the artifact id the generation returned. The id is validated
+    // against its stored shape before any path is built, so a request cannot name a file.
+    server_.Get(api_route_pattern(R"(/images/([^/]+))"),
+                [this](const httplib::Request& req, httplib::Response& res) {
+                    handle_image_artifact(req, res);
+                });
+    server_.Get(api_route_pattern("/capabilities"),
+                [this](const httplib::Request& req, httplib::Response& res) {
+                    handle_capabilities(req, res);
+                });
     server_.Post(api_route_pattern("/responses"),
                  [this](const httplib::Request& req, httplib::Response& res) {
                      handle_responses(req, res);
@@ -509,14 +529,83 @@ void HttpServer::register_routes() {
     }
 }
 
+std::string HttpServer::image_model_id() const {
+    if (images_ == nullptr || !images_->is_configured()) { return {}; }
+    return image_model_id_from_artifact(options_.image_artifact_path);
+}
+
 void HttpServer::handle_models(const httplib::Request&, httplib::Response& res) const {
     res.set_content(make_models_list(public_model_id_, unix_time_now(), options_.max_context,
-                                     model_metadata_),
+                                     model_metadata_, image_model_id()),
                     "application/json");
+}
+
+void HttpServer::handle_capabilities(const httplib::Request&, httplib::Response& res) const {
+    res.set_content(make_capabilities_json(options_, public_model_id_, image_model_id()),
+                    "application/json");
+}
+
+std::string make_capabilities_json(const ServeOptions& options, std::string_view chat_model_id,
+                                   std::string_view image_model_id) {
+    using Json = nlohmann::json;
+    Json image = Json(nullptr);
+    if (!image_model_id.empty()) {
+        image = Json{{"model", image_model_id},
+                     {"endpoint", "/v1/images/generations"},
+                     {"artifact_endpoint", std::string(kImageArtifactRoutePrefix) + "<id>"},
+                     {"response_formats", Json::array({"b64_json", "url"})},
+                     {"dimensions",
+                      Json{{"min", kMinimumImageDimension}, {"max", kMaximumImageDimension}}},
+                     {"steps", Json{{"min", kMinimumImageSteps}, {"max", kMaximumImageSteps}}},
+                     {"true_cfg_scale",
+                      Json{{"min", kMinimumImageCFGScale}, {"max", kMaximumImageCFGScale}}},
+                     // Reference-image conditioning runs on the diffusion pipeline's own vision tower,
+                     // which sees only the picture being edited; --vision is a separate surface.
+                     {"reference_image", true},
+                     // A chat request to this process is given the tool below and the picture is
+                     // drawn inside that same request, so a client needs no tool call of its own.
+                     {"automatic_from_chat", true},
+                     {"chat_tool", std::string(kChatImageToolName)},
+                     {"chat_max_images_per_request", kMaximumChatImageGenerations}};
+    }
+    const Json payload = {
+        {"object", "infernix.capabilities"},
+        {"chat_model", chat_model_id},
+        {"vision_input", options.enable_vision},
+        {"image_generation", std::move(image)},
+        {"endpoints", Json{{"chat_completions", "/v1/chat/completions"},
+                           {"responses", "/v1/responses"},
+                           {"messages", "/v1/messages"},
+                           {"images_generations", "/v1/images/generations"}}}};
+    return payload.dump();
+}
+
+void HttpServer::handle_image_artifact(const httplib::Request& req, httplib::Response& res) const {
+    const std::string id             = req.matches.size() > 1 ? req.matches[1].str() : std::string();
+    const std::filesystem::path path = generated_image_path(id);
+    std::ifstream input(path, std::ios::binary);
+    if (!path.empty() && input) {
+        std::string body{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+        if (input.bad()) { body.clear(); }
+        if (!body.empty()) {
+            res.set_header("Cache-Control", "no-store");
+            res.set_content(std::move(body), "image/png");
+            return;
+        }
+    }
+    write_openai_error(res, ApiError{.status  = 404,
+                                     .type    = "invalid_request_error",
+                                     .message = "image '" + id + "' not found",
+                                     .param   = "id",
+                                     .code    = "image_not_found"});
 }
 
 void HttpServer::handle_model(const httplib::Request& req, httplib::Response& res) const {
     const std::string id = req.matches.size() > 1 ? req.matches[1].str() : std::string();
+    if (const std::string image_id = image_model_id(); !image_id.empty() && id == image_id) {
+        res.set_content(make_image_model_object(image_id, unix_time_now()), "application/json");
+        return;
+    }
     if (id != public_model_id_) {
         ApiError error;
         error.status  = 404;
@@ -549,6 +638,13 @@ void HttpServer::attach(GenerationService& service) {
     metrics_.configure(public_model_id_, service.engine_options(), memory, baseline);
     request_jsonl_.write_server_start(options_, service.engine_options(),
                                       service.sampling_defaults(), public_model_id_, load, memory);
+}
+
+void HttpServer::attach_images(ImageGenerationService& images) {
+    if (images_ != nullptr) {
+        throw std::logic_error("HTTP image generation service is already attached");
+    }
+    images_ = &images;
 }
 
 bool HttpServer::listen() {

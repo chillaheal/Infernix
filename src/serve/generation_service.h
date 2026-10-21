@@ -158,6 +158,10 @@ public:
 
     [[nodiscard]] bool is_available() const { return engine_->is_available(); }
 
+    // The loaded Engine, for the image interlude runner the serving main attaches alongside this
+    // service (the interlude is Engine-owned, not protocol-owned).
+    [[nodiscard]] infernix::Engine& engine() noexcept { return *engine_; }
+
     [[nodiscard]] infernix::MediaCacheSummary media_cache_summary() const {
         return engine_->media_cache_summary();
     }

@@ -76,6 +76,7 @@ PrefixCachePersistence ProgramImpl::attach_prefix_cache_file(const std::filesyst
 }
 
 std::optional<PrefixCachePersistence> ProgramImpl::save_prefix_cache_now(const CancellationView& abandoned) {
+    LlmEntryScope entry{*this};
     if (!prefix_ || prefix_file_.empty() || prefix_->counters().host_write_bytes == prefix_saved_writes_) {
         return std::nullopt;
     }
@@ -271,6 +272,7 @@ std::optional<PrefixSelection> ProgramImpl::prefix_select(const qwen3_5::Prepare
 // Host-backed cached blocks, least recently used first, so a prefetch never waits for a transfer,
 // never grows the pool into the expert frames, and never drops a block's last copy.
 std::optional<std::uint32_t> ProgramImpl::hybrid_prefetch(const RequestBasePlan& base) {
+    LlmEntryScope entry{*this};
     if (!prefix_ || !prefix_->host_tier() || base.impl_ == nullptr || !base.impl_->reuse || !base.impl_->prompt) {
         return 0U;
     }

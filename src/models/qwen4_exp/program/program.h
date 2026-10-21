@@ -426,6 +426,22 @@ public:
     // worker, between rounds and under its execution lock. An empty waker detaches the engine.
     void set_maintenance_waker(std::function<void()> waker);
     void maintain();
+
+    // The image interlude's submit door, read by the Engine loop before it starts any execution
+    // work: closed while the Program quiesces for (or runs) an interlude, and permanently closed
+    // when Degraded (a failed restoration -- process restart is the recovery unit).
+    [[nodiscard]] bool submit_door_open() const noexcept;
+    [[nodiscard]] bool interlude_degraded() const noexcept;
+
+    // Worker-side image-interlude preemption handshake (see program_impl.h). Under the closed submit door
+    // the Engine loop pauses every Prefill lane until the residency ring is back -- so a pending image
+    // yield will not freeze the expert pool -- then acks the epoch. The Program polls the ack before it
+    // quiesces; it never infers quiescence from the frontier alone.
+    [[nodiscard]] bool interlude_preempt_outstanding() const noexcept;
+    [[nodiscard]] std::uint64_t interlude_preempt_epoch() const noexcept;
+    void signal_interlude_quiesced(std::uint64_t epoch) noexcept;
+    [[nodiscard]] bool interlude_yieldable() noexcept;
+
     Program(const Program&)            = delete;
     Program& operator=(const Program&) = delete;
 
@@ -520,6 +536,30 @@ public:
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
     void reset_memory_peaks() noexcept {}
 
+    // LLM<->image VRAM coexistence (production driver over the interlude methods the device tests
+    // qualified): ONE interlude in flight (a concurrent caller gets "another interlude is already in
+    // flight" -- the serving layer's bounded FIFO queues in front of this gate). Closes the LLM submit
+    // door, drains every LLM stream within `drain_deadline_ms` and invalidates the captured graphs
+    // (Quiesced), yields physical VRAM toward the image job's `target_bytes` plus a `margin_bytes`
+    // kept below the headroom (Leased), creates the image's dedicated CUDA stream, runs `job` with
+    // the LLM unable to execute (it receives the ImageInterludeContext: the bytes actually freed and
+    // that stream, and allocates the image's scratch in the freed region), then destroys the stream,
+    // restores the pools and reopens the door (Running) BEFORE returning success. The stream is
+    // blocking, so the legacy default stream orders against it and image work submitted on either
+    // route stays sequenced. The three CUDA-failure outcomes:
+    //  - drain deadline: the quiesce is unwound to Running (nothing was moved yet), the job throws
+    //    and the Engine stays healthy;
+    //  - `job` throws but the restoration succeeds: the pools are restored, the door reopens, and
+    //    the job's own exception propagates -- job failed, Engine healthy;
+    //  - the restoration itself fails (or the yield half-moved the pools and threw): the door STAYS
+    //    closed, the Program is Degraded until process restart, and the thrown error names BOTH the
+    //    job failure and the restoration failure. Success is never published before the
+    //    restoration is confirmed.
+    // A job reporting false still restores everything. Returns the bytes freed.
+    std::uint64_t run_image_interlude(std::uint64_t target_bytes, std::uint64_t margin_bytes,
+                                      const std::function<bool(const ImageInterludeContext&)>& job,
+                                      std::uint64_t drain_deadline_ms = 60000);
+
 private:
     std::unique_ptr<detail::ProgramImpl> impl_;
 };
@@ -569,13 +609,19 @@ void release_image_vram(std::uintptr_t lease);
 // test. begin_image_quiesce() closes the LLM submit door, drains every LLM stream, and invalidates every
 // captured CUDA graph, leaving the Program Quiesced; it returns the new execution epoch (0 if no Program is
 // loaded). end_image_quiesce() reopens the door and returns to Running. image_interlude_state() reports the
-// state as an int (0 Running, 1 Quiescing, 2 Quiesced, 3 Leased; -1 no Program). image_interlude_graphs_inert()
+// state as an int (0 Running, 1 Quiescing, 2 Quiesced, 3 Leased, 4 Degraded; -1 no Program). A Degraded
+// interlude keeps the submit door closed forever: the restoration could not be confirmed, so the process
+// is the recovery unit (the Engine stays up for diagnostics, device admission never reopens).
+// image_interlude_graphs_inert()
 // is true when every decode/verify/mtp graph executable is reset. image_interlude_submit_open() reports the door.
 std::uint64_t begin_image_quiesce();
 void end_image_quiesce();
 int image_interlude_state() noexcept;
 [[nodiscard]] bool image_interlude_graphs_inert() noexcept;
 [[nodiscard]] bool image_interlude_submit_open() noexcept;
+// Fault injection for the failure-trichotomy device test: the next `checks`-th release_from_yield
+// throws before touching the pools (simulating an uncertain restoration). 0 disarms.
+void set_image_restore_fault(std::uint32_t checks) noexcept;
 } // namespace testing
 
 } // namespace infernix::models::qwen4_exp

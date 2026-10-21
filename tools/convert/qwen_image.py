@@ -50,12 +50,21 @@ def _load_config(path: Path) -> dict:
     return json.loads(path.read_text())
 
 
-def _add(model, name, store, source_name, shape, *, inputs=(), direct="bf16"):
+def _add(model, name, store, source_name, shape, *, inputs=(), direct="bf16",
+         source_shape=None, offset_row=0):
+    """Declare one logical parameter from a source tensor, or a row band of a wider one.
+
+    `source_shape`/`offset_row` select a band of `offset_row` whole rows from a source stored under a
+    larger shape (the fused `attn.qkv` of the vision blocks, whose Q/K/V are three separate roles).
+    """
     shape = tuple(shape)
+    expected = shape if source_shape is None else tuple(source_shape)
     real = tuple(store.describe(source_name).shape)
-    if real != shape:
-        raise ValueError(f"{name}: declared {shape}, source {source_name} is {real}")
-    source = tensor_source(store, source_name, shape)
+    if real != expected:
+        raise ValueError(f"{name}: declared {expected}, source {source_name} is {real}")
+    stride = prod(expected) // expected[0]
+    source = tensor_source(store, source_name, shape, offset=offset_row * stride,
+                           source_shape=source_shape)
     model.add(
         Parameter(
             name,
@@ -133,6 +142,9 @@ def _build_text_encoder(model, store, cfg):
     for i in range(text["num_hidden_layers"]):
         p = f"text/layers/{i}/"
         sp = f"model.language_model.layers.{i}."
+        _add(model, p + "input_norm", store, sp + "input_layernorm.weight", (hidden,))
+        _add(model, p + "post_attention_norm", store, sp + "post_attention_layernorm.weight",
+             (hidden,))
         mixer_in = p + "norm1_output"
         for role, field in (("query", "q_proj"), ("key", "k_proj"), ("value", "v_proj")):
             width = q if role == "query" else k
@@ -149,6 +161,60 @@ def _build_text_encoder(model, store, cfg):
                  (intermediate, hidden), inputs=(mlp_in,))
         _add(model, p + "mlp/down", store, sp + "mlp.down_proj.weight",
              (hidden, intermediate), inputs=(p + "mlp_product",))
+
+
+def _build_vision(model, store, cfg):
+    """The Qwen3-VL vision tower inside the pipeline's text encoder.
+
+    Qwen-Image 2.1 conditions an edit on the condition image through this tower: the prompt template
+    puts the image's `<|image_pad|>` slots in the same sequence as the text, so the DiT's context is
+    those hidden states and `image_pad_mask` marks the image positions. Role and activation names are
+    exactly models/qwen3_5/load/vision.cpp, the shared tower the LLM route already runs.
+
+    The checkpoint's `deepstack_merger_list` mergers are not converted: nothing binds them yet, and
+    the image text tower has no deepstack injection. Disclosed as a fidelity gap for edit conditioning.
+    """
+    vision = cfg["vision_config"]
+    h, intermediate = vision["hidden_size"], vision["intermediate_size"]
+    patch, temporal = vision["patch_size"], vision["temporal_patch_size"]
+    merger = vision["spatial_merge_size"] ** 2 * h
+    out_width = vision["out_hidden_size"]
+
+    _add(model, "vision/patch_embedding", store, "model.visual.patch_embed.proj.weight",
+         (h, 3 * temporal * patch * patch), source_shape=(h, 3, temporal, patch, patch),
+         inputs=("vision/patch_input",))
+    _add(model, "vision/patch_embedding_bias", store, "model.visual.patch_embed.proj.bias", (h,))
+    _add(model, "vision/position_embedding", store, "model.visual.pos_embed.weight",
+         (vision["num_position_embeddings"], h))
+    for i in range(vision["depth"]):
+        p, sp = f"vision/layers/{i}/", f"model.visual.blocks.{i}."
+        for role in ("norm1", "norm2"):
+            for kind in ("weight", "bias"):
+                _add(model, p + role + "_" + kind, store, sp + role + "." + kind, (h,))
+        for number, role in enumerate(("query", "key", "value")):
+            _add(model, p + "attention/" + role, store, sp + "attn.qkv.weight", (h, h),
+                 source_shape=(3 * h, h), offset_row=number * h, inputs=(p + "attention_input",))
+            _add(model, p + "attention/" + role + "_bias", store, sp + "attn.qkv.bias", (h,),
+                 source_shape=(3 * h,), offset_row=number * h)
+        _add(model, p + "attention/output", store, sp + "attn.proj.weight", (h, h),
+             inputs=(p + "attention_output",))
+        _add(model, p + "attention/output_bias", store, sp + "attn.proj.bias", (h,))
+        _add(model, p + "mlp/fc1", store, sp + "mlp.linear_fc1.weight", (intermediate, h),
+             inputs=(p + "mlp_input",))
+        _add(model, p + "mlp/fc1_bias", store, sp + "mlp.linear_fc1.bias", (intermediate,))
+        _add(model, p + "mlp/fc2", store, sp + "mlp.linear_fc2.weight", (h, intermediate),
+             inputs=(p + "mlp_activation",))
+        _add(model, p + "mlp/fc2_bias", store, sp + "mlp.linear_fc2.bias", (h,))
+    for role, field, dims, inputs in (
+        ("norm_weight", "norm.weight", (h,), ()),
+        ("norm_bias", "norm.bias", (h,), ()),
+        ("fc1", "linear_fc1.weight", (merger, merger), ("vision/merger/input",)),
+        ("fc1_bias", "linear_fc1.bias", (merger,), ()),
+        ("fc2", "linear_fc2.weight", (out_width, merger), ("vision/merger/activation",)),
+        ("fc2_bias", "linear_fc2.bias", (out_width,), ()),
+    ):
+        _add(model, "vision/merger/" + role, store, "model.visual.merger." + field, dims,
+             inputs=inputs)
 
 
 def _build_vae(model, store):
@@ -178,12 +244,18 @@ def build_model(base: SafetensorsSource, *, components=("dit", "text"),
         )
     if not records:
         raise ValueError("select at least one of dit,encoder")
+    if "vision" in components and "text" not in components:
+        # The vision tower lives in the text encoder's shards, and its geometry (and the merger's
+        # output width) is read from that component's config, so it is never converted alone.
+        raise ValueError("vision requires the text component")
 
     model = Model(components=records)
     if "dit" in components:
         _build_dit(model, sources["dit"], records["dit"]["config"])
     if "text" in components:
         _build_text_encoder(model, sources["text"], records["text"]["config"])
+    if "vision" in components:
+        _build_vision(model, sources["text"], records["text"]["config"])
     if "vae" in components:
         _build_vae(model, sources["vae"])
     return model
