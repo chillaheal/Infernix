@@ -66,7 +66,8 @@ PromptEmbedsProvider fixed_provider() {
 
 ImageJobExecutor fixed_executor() {
     return [](const OpenAIImagesRequest&, std::uint64_t, std::span<const std::uint16_t>,
-              std::span<const std::uint16_t>, const ReferencePixels*, void*) {
+              std::span<const std::uint16_t>, const ReferencePixels*, void*,
+              const std::shared_ptr<ImageJobProgress>&) {
         return std::vector<std::uint8_t>{0x01U, 0x02U};
     };
 }
@@ -74,7 +75,7 @@ ImageJobExecutor fixed_executor() {
 ImageJobExecutor throwing_executor() {
     return [](const OpenAIImagesRequest&, std::uint64_t, std::span<const std::uint16_t>,
               std::span<const std::uint16_t>, const ReferencePixels*,
-              void*) -> std::vector<std::uint8_t> {
+              void*, const std::shared_ptr<ImageJobProgress>&) -> std::vector<std::uint8_t> {
         throw std::runtime_error("image job exploded");
     };
 }
@@ -253,7 +254,9 @@ int main() {
         float       alpha_min = 0.F, alpha_max = 0.F;
         ImageJobExecutor capture = [&](const OpenAIImagesRequest&, std::uint64_t,
                                        std::span<const std::uint16_t>, std::span<const std::uint16_t>,
-                                       const ReferencePixels* ref, void*) -> std::vector<std::uint8_t> {
+                                       const ReferencePixels* ref, void*,
+                                       const std::shared_ptr<ImageJobProgress>&)
+            -> std::vector<std::uint8_t> {
             saw_reference = ref != nullptr;
             if (ref != nullptr) {
                 plane_floats = ref->pixels.size();
@@ -304,7 +307,8 @@ int main() {
         ImageJobExecutor capture = [&](const OpenAIImagesRequest& request, std::uint64_t,
                                        std::span<const std::uint16_t>,
                                        std::span<const std::uint16_t> negative,
-                                       const ReferencePixels*, void*) -> std::vector<std::uint8_t> {
+                                       const ReferencePixels*, void*, const std::shared_ptr<ImageJobProgress>&)
+            -> std::vector<std::uint8_t> {
             neg_size   = negative.size();
             seen_scale = request.true_cfg_scale;
             return std::vector<std::uint8_t>{0x01U};
@@ -339,7 +343,8 @@ int main() {
         const std::vector<std::uint8_t> picture{0x89U, 'P', 'N', 'G', 0x0AU};
         ImageJobExecutor writer = [&](const OpenAIImagesRequest&, std::uint64_t,
                                       std::span<const std::uint16_t>, std::span<const std::uint16_t>,
-                                      const ReferencePixels*, void*) -> std::vector<std::uint8_t> {
+                                      const ReferencePixels*, void*, const std::shared_ptr<ImageJobProgress>&)
+            -> std::vector<std::uint8_t> {
             return picture;
         };
         ImageJobStore store(8, 1 << 20);
@@ -365,7 +370,8 @@ int main() {
         const std::vector<std::uint8_t> picture{0x89U, 'P', 'N', 'G', 0x0DU};
         ImageJobExecutor writer = [&](const OpenAIImagesRequest&, std::uint64_t,
                                       std::span<const std::uint16_t>, std::span<const std::uint16_t>,
-                                      const ReferencePixels*, void*) -> std::vector<std::uint8_t> {
+                                      const ReferencePixels*, void*, const std::shared_ptr<ImageJobProgress>&)
+            -> std::vector<std::uint8_t> {
             return picture;
         };
         ImageJobStore store(8, 1 << 20);
@@ -399,6 +405,56 @@ int main() {
                   record->response["data"][0]["url"].get<std::string>() == url,
               "url delivery stores the response the client actually received");
         std::filesystem::remove(file);
+    }
+
+    // The job's live progress: the executor advances the shared state the record carries, the
+    // service names the newest job's state for the streaming handlers' ticker, and a watchdog-
+    // flagged job fails terminally with the pipeline's stall message.
+    {
+        ImageJobExecutor stepping = [](const OpenAIImagesRequest&, std::uint64_t,
+                                       std::span<const std::uint16_t>, std::span<const std::uint16_t>,
+                                       const ReferencePixels*, void*,
+                                       const std::shared_ptr<ImageJobProgress>& progress)
+            -> std::vector<std::uint8_t> {
+            progress->advance(24);
+            progress->advance(97);
+            return std::vector<std::uint8_t>{0x01U};
+        };
+        ImageJobStore store(8, 1 << 20);
+        ImageGenerationService service(std::make_unique<FakeRunner>(), store, fixed_provider(),
+                                       stepping);
+        (void)service.generate(sample_request(), 4000);
+        const auto live = service.last_job_progress();
+        check(live != nullptr && live->percent.load() == 100,
+              "the service does not name the finished job's progress at 100");
+        const auto record = store.get("img-4000-1");
+        check(record != nullptr && record->progress == live && live->percent.load() == 100,
+              "the stored record does not share the job's progress state");
+
+        ImageJobExecutor stalled = [](const OpenAIImagesRequest&, std::uint64_t,
+                                      std::span<const std::uint16_t>, std::span<const std::uint16_t>,
+                                      const ReferencePixels*, void*,
+                                      const std::shared_ptr<ImageJobProgress>& progress)
+            -> std::vector<std::uint8_t> {
+            progress->stalled = true;
+            if (!progress->advance(50)) {
+                throw std::runtime_error("image job: stalled, flagged by the serving watchdog");
+            }
+            return std::vector<std::uint8_t>{0x01U};
+        };
+        ImageJobStore stalled_store(8, 1 << 20);
+        ImageGenerationService stalled_service(std::make_unique<FakeRunner>(), stalled_store,
+                                               fixed_provider(), stalled);
+        bool threw = false;
+        try {
+            (void)stalled_service.generate(sample_request(), 5000);
+        } catch (const ApiException& error) {
+            threw = error.error().code == "image_generation_failed";
+        }
+        const auto failed = stalled_store.get("img-5000-1");
+        check(threw && failed != nullptr && failed->state == ImageJobState::Failed &&
+                  failed->error["message"].get<std::string>().find("stalled") != std::string::npos,
+              "a watchdog-flagged job does not fail terminally with its stall message");
     }
 
     // Every check that reached a job wrote its picture into the working directory; leave nothing behind.

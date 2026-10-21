@@ -205,6 +205,31 @@ int test_lru_recency_and_delete() {
     return failures;
 }
 
+int test_job_progress_rides_the_record() {
+    int failures = 0;
+    ImageJobStore store(8, 1U << 20);
+    StoredImageJob value   = job("img-progress");
+    value.progress         = std::make_shared<ImageJobProgress>();
+    value.progress->percent = 25;
+    store.put(value);
+    const auto record = store.get("img-progress");
+    failures += check(record->progress != nullptr && record->progress->percent.load() == 25,
+                      "the stored record did not carry the job's live progress state");
+    value.progress->percent = 50;  // the job thread writes through the same shared state
+    failures += check(record->progress->percent.load() == 50,
+                      "the stored progress was a copy, not the job's shared state");
+
+    ImageJobProgress progress;
+    const long long first = progress.last_progress.load();
+    failures += check(progress.percent.load() == -1, "fresh progress did not start unknown");
+    failures += check(progress.advance(70), "advance failed a job the watchdog never flagged");
+    failures += check(progress.percent.load() == 70 && progress.last_progress.load() >= first,
+                      "advance did not record the step and its time");
+    progress.stalled = true;
+    failures += check(!progress.advance(72), "advance accepted a step past the stall flag");
+    return failures;
+}
+
 int test_oversized_record() {
     ImageJobStore store(4, 256);
     StoredImageJob large = job("img_large");
@@ -232,6 +257,7 @@ int main() {
     failures += test_eviction_only_evicts_terminal();
     failures += test_prune_expired_touches_only_terminals();
     failures += test_lru_recency_and_delete();
+    failures += test_job_progress_rides_the_record();
     failures += test_oversized_record();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

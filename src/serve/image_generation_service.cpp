@@ -94,9 +94,21 @@ public:
     std::vector<std::uint8_t> operator()(const OpenAIImagesRequest& request, std::uint64_t seed,
                                          std::span<const std::uint16_t> prompt_embeds,
                                          std::span<const std::uint16_t> negative_embeds,
-                                         const ReferencePixels* reference, void* image_stream) {
+                                         const ReferencePixels* reference, void* image_stream,
+                                         const std::shared_ptr<ImageJobProgress>& progress) {
         std::lock_guard lock(mutex_);
         ensure_locked();
+
+        // The pipeline's units (steps + VAE) map onto the job's 0-100; the PNG encode's unit is
+        // this executor's own, below. A null progress (a caller without a stored job) simply
+        // certifies the route unchanged.
+        struct ProgressAdapter final : qi::ImageJobProgressView {
+            explicit ProgressAdapter(ImageJobProgress* state) : state_(state) {}
+            [[nodiscard]] bool step(std::size_t units_done, std::size_t units_total) override {
+                return state_->advance(static_cast<int>(units_done * 100 / units_total));
+            }
+            ImageJobProgress* state_;
+        } view(progress.get());
 
         qi::ImageJob desc;
         desc.height     = request.height;
@@ -141,7 +153,8 @@ public:
         }
 
         const qi::GeneratedImage out = qi::run_image_job(
-            *reader_, dit_, vae_, inputs, static_cast<cudaStream_t>(image_stream));
+            *reader_, dit_, vae_, inputs, static_cast<cudaStream_t>(image_stream),
+            progress ? &view : nullptr);
 
         // The certified route composites the decoded image's first three channels as RGB and
         // emits opaque alpha.
@@ -236,8 +249,9 @@ ImageJobExecutor make_artifact_image_job_executor(const std::string& image_artif
     return [executor](const OpenAIImagesRequest& request, std::uint64_t seed,
                       std::span<const std::uint16_t> prompt_embeds,
                       std::span<const std::uint16_t> negative_embeds, const ReferencePixels* reference,
-                      void* image_stream) {
-        return (*executor)(request, seed, prompt_embeds, negative_embeds, reference, image_stream);
+                      void* image_stream, const std::shared_ptr<ImageJobProgress>& progress) {
+        return (*executor)(request, seed, prompt_embeds, negative_embeds, reference, image_stream,
+                           progress);
     };
 }
 
@@ -288,6 +302,11 @@ std::string ImageGenerationService::next_job_id(std::int64_t created) {
     return "img-" + std::to_string(created) + "-" + std::to_string(++sequence_);
 }
 
+std::shared_ptr<ImageJobProgress> ImageGenerationService::last_job_progress() const {
+    const std::lock_guard lock(progress_mutex_);
+    return last_progress_;
+}
+
 RequestJson ImageGenerationService::generate(const OpenAIImagesRequest& request, std::int64_t now,
                                              std::string_view artifact_url_base) {
     if (!is_configured()) {
@@ -322,14 +341,19 @@ RequestJson ImageGenerationService::generate(const OpenAIImagesRequest& request,
     }
 
     StoredImageJob record;
-    record.id      = next_job_id(now);
-    record.state   = ImageJobState::Queued;
-    record.created = now;
-    record.request = nlohmann::json{{"prompt", request.prompt},
-                                    {"width", request.width},
-                                    {"height", request.height},
-                                    {"steps", request.steps}};
+    record.id       = next_job_id(now);
+    record.state    = ImageJobState::Queued;
+    record.created  = now;
+    record.progress = std::make_shared<ImageJobProgress>();
+    record.request  = nlohmann::json{{"prompt", request.prompt},
+                                     {"width", request.width},
+                                     {"height", request.height},
+                                     {"steps", request.steps}};
     store_.put(record);
+    {
+        const std::lock_guard lock(progress_mutex_);
+        last_progress_ = record.progress;
+    }
 
     std::atomic<bool> job_started{false};
     RequestJson response;
@@ -354,7 +378,11 @@ RequestJson ImageGenerationService::generate(const OpenAIImagesRequest& request,
                                  : std::vector<std::uint16_t>{};
                          const auto png = job_executor_(
                              request, seed, prompt_embeds_(request.prompt), negative,
-                             reference.has_value() ? &*reference : nullptr, context.image_stream);
+                             reference.has_value() ? &*reference : nullptr, context.image_stream,
+                             record.progress);
+                         // The pipeline reported (steps + VAE)/100; the encoded PNG is the job's
+                         // last unit and the picture is complete.
+                         if (record.progress) { record.progress->advance(100); }
                          save_generated_image(record.id, png);
                          response = request.response_format == ImageResponseFormat::Url
                                       ? make_openai_image_url_response(

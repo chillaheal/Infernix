@@ -9,6 +9,7 @@
 // jobs only, so an active job can never be silently dropped. get() refreshes LRU recency; returned
 // immutable records remain valid if a later insert evicts or prunes their public entry.
 
+#include "serve/image_job_progress.h"
 #include "serve/request.h"
 
 #include <nlohmann/json.hpp>
@@ -42,6 +43,10 @@ struct StoredImageJob {
     nlohmann::json response;              // the OpenAI images response object once Succeeded
     nlohmann::json error;                 // the pipeline failure (Failed / FailedEngineDegraded)
     nlohmann::json restoration_error;     // FailedEngineDegraded keeps BOTH failures, never one overwriting the other
+    // The job's live progress, shared with the record: constness of the record protects the
+    // terminal fields only, the atomics inside stay writable by the job thread. Null for records
+    // admitted without an execution (a rejected request).
+    std::shared_ptr<ImageJobProgress> progress;
 };
 
 // One validated lifecycle move. `now` is caller-supplied (epoch seconds) so tests and the serving

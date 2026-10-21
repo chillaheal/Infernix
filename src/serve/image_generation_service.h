@@ -53,11 +53,14 @@ public:
 // `reference` carries the host-prepared reference-image plane (#75) whenever the request had an
 // `image` field; nullptr is plain text-to-image. `negative_embeds` carries the negative prompt's
 // BF16 bits when `request.true_cfg_scale` is above 1 (true CFG); empty means the single-forward route.
+// `progress` is the stored job's live progress state: the executor's pipeline reports each step
+// through it and honors its stall flag; a fake executor may ignore it.
 using ImageJobExecutor =
     std::function<std::vector<std::uint8_t>(const OpenAIImagesRequest& request, std::uint64_t seed,
                                             std::span<const std::uint16_t> prompt_embeds,
                                             std::span<const std::uint16_t> negative_embeds,
-                                            const ReferencePixels* reference, void* image_stream)>;
+                                            const ReferencePixels* reference, void* image_stream,
+                                            const std::shared_ptr<ImageJobProgress>& progress)>;
 
 // prompt -> the DiT's token-major BF16 prompt_embeds bits ([text_tokens * hidden]).
 using PromptEmbedsProvider = std::function<std::vector<std::uint16_t>(const std::string& prompt)>;
@@ -102,6 +105,12 @@ public:
     // Process-unique stored-job id: img-<created>-<sequence>.
     [[nodiscard]] std::string next_job_id(std::int64_t created);
 
+    // The most recently accepted job's live progress state, or null before the first job. The
+    // streaming chat handlers poll it from their HeartbeatTicker while the picture is drawn (the
+    // hidden tool round runs before the response, so the request that triggered the job is the
+    // one ticker this can ever name).
+    [[nodiscard]] std::shared_ptr<ImageJobProgress> last_job_progress() const;
+
 private:
     std::unique_ptr<ImageInterludeRunner> runner_;
     ImageJobStore& store_;
@@ -109,6 +118,8 @@ private:
     ImageJobExecutor job_executor_;
     std::mutex sequence_mutex_;
     std::uint64_t sequence_ = 0;
+    mutable std::mutex progress_mutex_;
+    std::shared_ptr<ImageJobProgress> last_progress_;
 };
 
 } // namespace infernix::serve
