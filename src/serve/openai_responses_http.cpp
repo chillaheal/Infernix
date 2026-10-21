@@ -482,7 +482,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                         // stream's only traffic while it runs, and it carries the job's real
                         // percent as an SSE comment.
                         HeartbeatTicker ticker(
-                            transport, [this] -> std::string {
+                            transport, [this]() -> std::string {
                                 const auto progress =
                                     images_ != nullptr ? images_->last_job_progress() : nullptr;
                                 if (progress == nullptr) { return {}; }
