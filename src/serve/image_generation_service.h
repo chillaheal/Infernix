@@ -34,6 +34,10 @@
 #include <string_view>
 #include <vector>
 
+namespace spdlog {
+class logger;
+}
+
 namespace infernix::serve {
 
 // Seam over Engine's image interlude; the host test runs the job inline on a fake context.
@@ -69,8 +73,11 @@ using PromptEmbedsProvider = std::function<std::vector<std::uint16_t>(const std:
 
 // The production executor: lazy-binds the DiT + VAE weights and the VAE denormalization constants
 // from one .infernix image artifact (one streamed-only plan) and runs the merged pipeline entry
-// on the caller's stream. A bad artifact throws std::runtime_error on first use.
-[[nodiscard]] ImageJobExecutor make_artifact_image_job_executor(const std::string& image_artifact_path);
+// on the caller's stream. A bad artifact throws std::runtime_error on first use. `logger` receives
+// the job's stage telemetry: the application logger owns the terminal panel, so its lines land
+// above the stats panel instead of raw stderr text that would collide with the panel repaint.
+[[nodiscard]] ImageJobExecutor make_artifact_image_job_executor(
+    const std::string& image_artifact_path, std::shared_ptr<spdlog::logger> logger = nullptr);
 
 // Standard-alphabet base64 (no line breaks), shared by the image route and its tests.
 [[nodiscard]] std::string base64_encode_bytes(std::span<const std::uint8_t> bytes);

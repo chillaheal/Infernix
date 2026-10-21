@@ -337,7 +337,8 @@ int main(int argc, char** argv) {
             images     = std::make_unique<infernix::serve::ImageGenerationService>(
                 infernix::serve::make_engine_interlude_runner(service.engine()), *image_jobs,
                 std::move(prompt_embeds),
-                infernix::serve::make_artifact_image_job_executor(options.image_artifact_path));
+                infernix::serve::make_artifact_image_job_executor(options.image_artifact_path,
+                                                                  logger));
             server.attach_images(*images);
         }
 

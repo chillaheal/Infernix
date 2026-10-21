@@ -8,6 +8,8 @@
 #include "models/qwen_image/image_weights.h"
 #include "models/qwen_image/noise.h"
 
+#include <spdlog/logger.h>
+
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -89,7 +91,15 @@ private:
 // route reads the 32 blocks' weights from the artifact once per job from this live reader).
 class ArtifactImageJobExecutor {
 public:
-    explicit ArtifactImageJobExecutor(std::string artifact_path) : path_(std::move(artifact_path)) {}
+    explicit ArtifactImageJobExecutor(std::string artifact_path,
+                                      std::shared_ptr<spdlog::logger> logger = nullptr)
+        : path_(std::move(artifact_path)), logger_(std::move(logger)) {}
+
+    [[nodiscard]] std::function<void(const std::string&)> stage_logger() const {
+        auto logger = logger_;
+        if (logger == nullptr) { return {}; }
+        return [logger](const std::string& line) { logger->info("{}", line); };
+    }
 
     std::vector<std::uint8_t> operator()(const OpenAIImagesRequest& request, std::uint64_t seed,
                                          std::span<const std::uint16_t> prompt_embeds,
@@ -154,7 +164,7 @@ public:
 
         const qi::GeneratedImage out = qi::run_image_job(
             *reader_, dit_, vae_, inputs, static_cast<cudaStream_t>(image_stream),
-            progress ? &view : nullptr);
+            progress ? &view : nullptr, stage_logger());
 
         // The certified route composites the decoded image's first three channels as RGB and
         // emits opaque alpha.
@@ -211,6 +221,7 @@ private:
     };
 
     std::string path_;
+    std::shared_ptr<spdlog::logger> logger_;
     std::mutex mutex_;
     std::unique_ptr<artifact::Reader> reader_;
     std::unique_ptr<artifact::Binder> binder_;
@@ -244,8 +255,10 @@ std::unique_ptr<ImageInterludeRunner> make_engine_interlude_runner(infernix::Eng
     return std::make_unique<EngineInterludeRunner>(engine);
 }
 
-ImageJobExecutor make_artifact_image_job_executor(const std::string& image_artifact_path) {
-    auto executor = std::make_shared<ArtifactImageJobExecutor>(image_artifact_path);
+ImageJobExecutor make_artifact_image_job_executor(const std::string& image_artifact_path,
+                                                   std::shared_ptr<spdlog::logger> logger) {
+    auto executor =
+        std::make_shared<ArtifactImageJobExecutor>(image_artifact_path, std::move(logger));
     return [executor](const OpenAIImagesRequest& request, std::uint64_t seed,
                       std::span<const std::uint16_t> prompt_embeds,
                       std::span<const std::uint16_t> negative_embeds, const ReferencePixels* reference,
@@ -253,6 +266,7 @@ ImageJobExecutor make_artifact_image_job_executor(const std::string& image_artif
         return (*executor)(request, seed, prompt_embeds, negative_embeds, reference, image_stream,
                            progress);
     };
+
 }
 
 std::string base64_encode_bytes(std::span<const std::uint8_t> bytes) {
