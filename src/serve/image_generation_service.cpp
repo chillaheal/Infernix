@@ -3,6 +3,7 @@
 #include "artifact/reader.h"
 #include "media/decode/decode.h"
 #include "media/encode/png_encode.h"
+#include "models/qwen_image/image_device_need.h"
 #include "models/qwen_image/image_job.h"
 #include "models/qwen_image/image_pipeline.h"
 #include "models/qwen_image/image_weights.h"
@@ -32,25 +33,43 @@ namespace {
 
 namespace qi = models::qwen_image;
 
-// The interlude hands the quiesced LLM's pools to the image job and restores them on return, so the
-// job may take far more than the LLM's baseline free. The job's device footprint grows with
-// latent-token count (~ width*height): the certified 512x512 production route peaked at 6183 MiB
-// (interlude_s8dprod_test.out.log). Size the yield to the requested area with a margin for the
-// attention's super-linear terms so 1024x1024 and larger get the headroom their activations need;
-// clamp to [7 GiB, 26 GiB] on the 32 GiB card.
-constexpr std::uint64_t kInterludeMarginBytes = 0;
-std::uint64_t image_yield_target(std::int64_t width, std::int64_t height) {
-    constexpr std::uint64_t kMiB = 1024ULL * 1024ULL;
-    constexpr std::uint64_t baseline_bytes = 6183ULL * kMiB;          // measured 512x512 peak
-    constexpr std::uint64_t baseline_area  = 512ULL * 512ULL;
-    constexpr std::uint64_t floor_bytes    = 7ULL * 1024ULL * kMiB;   // 7 GiB
-    constexpr std::uint64_t cap_bytes      = 26ULL * 1024ULL * kMiB;  // 26 GiB
-    const std::uint64_t area = static_cast<std::uint64_t>(width) * static_cast<std::uint64_t>(height);
-    std::uint64_t bytes = baseline_bytes * area / baseline_area;
-    bytes = (bytes * 8ULL) / 5ULL; // +60% margin for super-linear attention terms
-    if (bytes < floor_bytes) { bytes = floor_bytes; }
-    if (bytes > cap_bytes) { bytes = cap_bytes; }
-    return bytes;
+constexpr std::uint64_t kMiB = 1024ULL * 1024ULL;
+
+// The free VRAM an image job leaves below what it takes. A yield that lands a hair short of the job's
+// need is the failure mode that hurts: the allocation throws inside the interlude, and (depending on
+// where) the restoration is the thing that fails. Half a GiB is the price of not finding out.
+constexpr std::uint64_t kInterludeMarginBytes = 512ULL * kMiB;
+
+// The job's device-memory need, from the pipeline's own buffer inventory (models/qwen_image). The
+// serving layer asks for it before it probes the yield, so the reference block and the longer of the
+// two CFG passes are already inside the number.
+std::uint64_t image_need_bytes(std::int64_t width, std::int64_t height, std::size_t text_tokens,
+                              std::size_t negative_tokens, std::size_t ref_tokens,
+                              const qi::DiTDims& dims) {
+    qi::ImageDeviceNeedRequest req;
+    req.geometry        = qi::ImageGeometry::derive(static_cast<std::uint32_t>(height),
+                                                   static_cast<std::uint32_t>(width));
+    req.dims            = dims;
+    req.text_tokens     = static_cast<std::uint32_t>(text_tokens);
+    req.negative_tokens = static_cast<std::uint32_t>(negative_tokens);
+    req.ref_tokens      = static_cast<std::uint32_t>(ref_tokens);
+    req.blocks_resident = 1; // the streamed route holds one block resident at a time
+    return qi::image_device_need(req).total();
+}
+
+// The one refusal the request can be told about in its own words: what the job needs, what the model
+// could give, and what was already free. A retry with a smaller size or without true CFG is the fix,
+// so this is 503 (the answer changes with the device's state), not 400 (the size is never forbidden).
+[[noreturn]] void throw_vram_insufficient(std::uint64_t need, const ImageInterludeRunner::Fit& fit) {
+    throw ApiException{ApiError{503, "server_error",
+                                "the image job needs " + std::to_string(need / kMiB) +
+                                    " MiB; the model can yield " +
+                                    std::to_string(fit.freed_bytes_expected / kMiB) + " MiB with " +
+                                    std::to_string(fit.device_free_bytes / kMiB) +
+                                    " MiB already free and " +
+                                    std::to_string(fit.headroom_bytes / kMiB) +
+                                    " MiB reserved below the headroom",
+                                "size", "image_vram_insufficient"}};
 }
 
 std::uint16_t to_bf16(float value) {
@@ -76,10 +95,27 @@ public:
     }
     [[nodiscard]] bool is_available() const noexcept override { return engine_.is_available(); }
 
+    [[nodiscard]] Fit probe(std::uint64_t target_bytes, std::uint64_t margin_bytes) override {
+        const infernix::ImageYieldProbe probe = engine_.probe_image_yield(target_bytes, margin_bytes);
+        return Fit{.fits = probe.fits,
+                   .freed_bytes_expected = probe.freed_bytes_expected,
+                   .device_free_bytes    = probe.device_free_bytes,
+                   .headroom_bytes       = probe.headroom_bytes};
+    }
+
     std::uint64_t
     run(std::uint64_t target_bytes, std::uint64_t margin_bytes,
         const std::function<bool(const infernix::ImageInterludeContext&)>& job) override {
-        return engine_.run_image_interlude(target_bytes, margin_bytes, job);
+        // The Program's single-flight gate answers with a message; the HTTP contract must not depend on
+        // its words, so it is translated to a type here, at the only place that reads the Engine.
+        try {
+            return engine_.run_image_interlude(target_bytes, margin_bytes, job);
+        } catch (const std::runtime_error& error) {
+            if (std::string_view(error.what()).find("already in flight") != std::string_view::npos) {
+                throw ImageInterludeInFlight{};
+            }
+            throw;
+        }
     }
 
 private:
@@ -300,15 +336,37 @@ std::filesystem::path save_generated_image(const std::string& id, std::span<cons
 
 ImageGenerationService::ImageGenerationService(std::unique_ptr<ImageInterludeRunner> runner,
                                                ImageJobStore& store,
+                                               PromptRendererProvider prompt_renderer,
                                                PromptEmbedsProvider prompt_embeds,
+                                               DiTDimsProvider dit_dims,
                                                ImageJobExecutor job_executor)
     : runner_(std::move(runner)),
       store_(store),
+      prompt_renderer_(std::move(prompt_renderer)),
       prompt_embeds_(std::move(prompt_embeds)),
+      dit_dims_(std::move(dit_dims)),
       job_executor_(std::move(job_executor)) {}
 
 bool ImageGenerationService::is_configured() const noexcept {
-    return runner_ != nullptr && prompt_embeds_ != nullptr && job_executor_ != nullptr;
+    return runner_ != nullptr && prompt_renderer_ != nullptr && prompt_embeds_ != nullptr &&
+           dit_dims_ != nullptr && job_executor_ != nullptr;
+}
+
+// The DiT dimensions from the artifact's component config: host work, opened once and cached. It is
+// deliberately not the device-side binding -- the admission reads it before any VRAM is yielded.
+DiTDimsProvider make_artifact_dit_dims_provider(const std::string& image_artifact_path) {
+    auto cached = std::make_shared<std::optional<qi::DiTDims>>();
+    auto guard  = std::make_shared<std::mutex>();
+    return [path = image_artifact_path, cached, guard]() -> qi::DiTDims {
+        const std::lock_guard lock(*guard);
+        if (cached->has_value()) { return **cached; }
+        artifact::Reader reader(path);
+        artifact::Binder binder(reader);
+        const qi::DiTDims dims = qi::bind_dit(binder).dims;
+        (void)std::move(binder).finish();
+        *cached = dims;
+        return dims;
+    };
 }
 
 std::string ImageGenerationService::next_job_id(std::int64_t created) {
@@ -364,6 +422,27 @@ RequestJson ImageGenerationService::generate(const OpenAIImagesRequest& request,
         }
     }
 
+    // Admission, entirely before the LLM is touched. Rendering is host work, so the token counts the
+    // need is built from are the counts the job will run with; the probe then answers from the live
+    // pools without quiescing anything. A request that cannot fit gets its 503 here -- no stored job,
+    // no closed submit door, no other request waiting behind a job that could never run.
+    const TowerPrompt prompt = prompt_renderer_(request.prompt);
+    const TowerPrompt negative_prompt =
+        request.true_cfg_scale > kMinimumImageCFGScale ? prompt_renderer_(request.negative_prompt)
+                                                      : TowerPrompt{};
+    // The reference's latent tokens follow from the snapped plane prepare_reference_image produced:
+    // (height/16) * (width/16), the same count its VAE encode will return inside the job.
+    const std::size_t ref_tokens =
+        reference.has_value()
+            ? static_cast<std::size_t>(reference->height_px / qi::ImageGeometry::downscale()) *
+                  (static_cast<std::size_t>(reference->width_px) / qi::ImageGeometry::downscale())
+            : 0ULL;
+    const std::uint64_t need =
+        image_need_bytes(request.width, request.height, prompt.tokens(), negative_prompt.tokens(),
+                         ref_tokens, dit_dims_());
+    const auto fit = runner_->probe(need, kInterludeMarginBytes);
+    if (!fit.fits) { throw_vram_insufficient(need, fit); }
+
     StoredImageJob record;
     record.id       = next_job_id(now);
     record.state    = ImageJobState::Queued;
@@ -383,8 +462,22 @@ RequestJson ImageGenerationService::generate(const OpenAIImagesRequest& request,
     RequestJson response;
     try {
         store_.advance(record.id, JobUpdate{.to = ImageJobState::WaitingForFrontier, .now = now});
-        runner_->run(image_yield_target(request.width, request.height), kInterludeMarginBytes,
+        runner_->run(need, kInterludeMarginBytes,
                      [&](const infernix::ImageInterludeContext& context) -> bool {
+                         // What the yield actually unmapped, against the same number the probe was
+                         // asked about. A shortfall here stops the job BEFORE its first allocation:
+                         // the LLM restores through the ordinary failed-job path and stays healthy,
+                         // instead of the job discovering the shortage in a kernel.
+                         if (context.freed_bytes + fit.device_free_bytes <
+                             need + kInterludeMarginBytes + fit.headroom_bytes) {
+                             throw_vram_insufficient(
+                                 need, ImageInterludeRunner::Fit{.fits = false,
+                                                                  .freed_bytes_expected =
+                                                                      context.freed_bytes,
+                                                                  .device_free_bytes =
+                                                                      fit.device_free_bytes,
+                                                                  .headroom_bytes = fit.headroom_bytes});
+                         }
                          store_.advance(record.id, JobUpdate{.to = ImageJobState::Running, .now = now});
                          job_started = true;
                          std::uint64_t seed = 0;
@@ -394,14 +487,14 @@ RequestJson ImageGenerationService::generate(const OpenAIImagesRequest& request,
                              std::random_device random;
                              seed = (static_cast<std::uint64_t>(random()) << 32U) | random();
                          }
-                         // The negative prompt goes through the same device text tower as the prompt,
-                         // only when the request actually asked to steer with it.
+                         // Both prompts were already rendered (host work, before the probe); only the
+                         // tower forward -- the half that needs device memory -- runs here.
                          const std::vector<std::uint16_t> negative =
                              request.true_cfg_scale > kMinimumImageCFGScale
-                                 ? prompt_embeds_(request.negative_prompt)
+                                 ? prompt_embeds_(negative_prompt)
                                  : std::vector<std::uint16_t>{};
                          const auto png = job_executor_(
-                             request, seed, prompt_embeds_(request.prompt), negative,
+                             request, seed, prompt_embeds_(prompt), negative,
                              reference.has_value() ? &*reference : nullptr, context.image_stream,
                              record.progress);
                          // The pipeline reported (steps + VAE)/100; the encoded PNG is the job's
@@ -424,7 +517,19 @@ RequestJson ImageGenerationService::generate(const OpenAIImagesRequest& request,
         const std::string message  = error.what();
         const auto failure         = nlohmann::json{{"message", message}};
         const bool degraded        = !runner_->is_available();
-        const bool in_flight_claim = message.find("already in flight") != std::string::npos;
+        // A refusal that already carries its own public code (the post-yield vram check) is the
+        // client's answer as it stands: renaming it to "the job failed" would hide the fix.
+        if (const auto* api = dynamic_cast<const ApiException*>(&error);
+            api != nullptr && api->error().code == "image_vram_insufficient") {
+            try {
+                store_.advance(record.id,
+                              JobUpdate{.to = ImageJobState::Failed, .now = now, .error = failure});
+            } catch (const ApiException&) {
+                // A terminal race: the stored terminal state wins, the client still gets the refusal.
+            }
+            throw;
+        }
+        const bool in_flight_claim = dynamic_cast<const ImageInterludeInFlight*>(&error) != nullptr;
         try {
             if (in_flight_claim) {
                 store_.advance(record.id, JobUpdate{.to = ImageJobState::Failed, .now = now,

@@ -352,8 +352,10 @@ int run() {
 
     const std::string oracle(ora_env);
     std::printf("provider artifact=%s\n", art_env);
-    const auto provider = sv::make_tower_prompt_embeds_provider(art_env, proc_env);
+    // The route is two seams now: the renderer is host work the service runs BEFORE it probes the
+    // yield, the provider takes its output and is the half that needs the yielded VRAM.
     const auto renderer = sv::make_tower_prompt_renderer(proc_env);
+    const auto provider = sv::make_tower_prompt_embeds_provider(art_env);
 
     art::Reader reader(art_env);
     art::Binder binder(reader);
@@ -411,7 +413,7 @@ int run() {
 
         const std::uint64_t before = qi::image_device_bytes_live();
         check(item.label + " ledger idle before", before == 0, "live=" + std::to_string(before));
-        item.bits = provider(item.prompt);
+        item.bits = provider(rendered);
         const std::uint64_t after = qi::image_device_bytes_live();
         check(item.label + " ledger released after", after == 0, "live=" + std::to_string(after));
 

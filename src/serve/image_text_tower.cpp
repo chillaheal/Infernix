@@ -100,15 +100,16 @@ private:
     std::size_t drop_rows_ = 0;
 };
 
+// The device half of the tower route: an ALREADY RENDERED prompt (the service rendered it on the host,
+// before it probed the yield) becomes the DiT's conditioning. The forward is what needs device memory,
+// so this is the half that runs inside the interlude.
 class TowerProvider {
 public:
-    TowerProvider(std::string artifact_path, std::shared_ptr<PromptRenderer> renderer)
-        : path_(std::move(artifact_path)), renderer_(std::move(renderer)) {}
+    explicit TowerProvider(std::string artifact_path) : path_(std::move(artifact_path)) {}
 
-    std::vector<std::uint16_t> operator()(const std::string& prompt) {
+    std::vector<std::uint16_t> operator()(const TowerPrompt& rendered) {
         std::lock_guard lock(mutex_);
         ensure_locked();
-        const TowerPrompt rendered = (*renderer_)(prompt);
         return qi::run_text_tower(*reader_, tower_, embed_table_, rendered.ids, rendered.drop_rows);
     }
 
@@ -160,7 +161,6 @@ private:
     }
 
     std::string path_;
-    std::shared_ptr<PromptRenderer> renderer_;
     std::mutex mutex_;
     std::unique_ptr<artifact::Reader> reader_;
     std::unique_ptr<artifact::Binder> binder_;
@@ -170,16 +170,14 @@ private:
 
 } // namespace
 
-std::function<TowerPrompt(const std::string&)> make_tower_prompt_renderer(const std::string& processor_dir) {
+PromptRendererProvider make_tower_prompt_renderer(const std::string& processor_dir) {
     auto renderer = std::make_shared<PromptRenderer>(processor_dir);
     return [renderer](const std::string& prompt) { return (*renderer)(prompt); };
 }
 
-PromptEmbedsProvider make_tower_prompt_embeds_provider(const std::string& image_artifact_path,
-                                                       const std::string& processor_dir) {
-    auto state = std::make_shared<TowerProvider>(image_artifact_path,
-                                                 std::make_shared<PromptRenderer>(processor_dir));
-    return [state](const std::string& prompt) { return (*state)(prompt); };
+PromptEmbedsProvider make_tower_prompt_embeds_provider(const std::string& image_artifact_path) {
+    auto state = std::make_shared<TowerProvider>(image_artifact_path);
+    return [state](const TowerPrompt& rendered) { return (*state)(rendered); };
 }
 
 } // namespace infernix::serve

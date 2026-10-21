@@ -9,12 +9,15 @@
 //
 // Host-testable seams: the interlude behind ImageInterludeRunner (production: infernix::Engine),
 // the device job behind ImageJobExecutor (production: the artifact's streamed weights +
-// run_image_job + PNG encode), and prompt -> prompt_embeds behind PromptEmbedsProvider (the raw
-// prompt enters through the device text tower; the provider is its route seam). A second
-// concurrent request is told the interlude is already in flight (429); a Degraded engine answers
-// 503 until the process restarts (the recovery unit the C5 state machine defines).
+// run_image_job + PNG encode), and the prompt behind PromptRendererProvider (host: tokenizer + chat
+// template) and PromptEmbedsProvider (device: the text tower forward). Every request is first sized
+// against the model's own buffer inventory and probed against the yield it would need: a job that
+// cannot fit is refused BEFORE the LLM quiesces. A second concurrent request is told the interlude is
+// already in flight (429); a Degraded engine answers 503 until the process restarts (the recovery unit
+// the C5 state machine defines).
 
 #include "infernix/engine.h"
+#include "models/qwen_image/image_weights.h"
 
 #include <nlohmann/json.hpp>
 
@@ -40,12 +43,43 @@ class logger;
 
 namespace infernix::serve {
 
+// The exact templated prompt the text tower will run: the rendered text, its full causal ids, and the
+// leading system-prefix rows the DiT lane drops. Producing it is PURE HOST WORK (tokenizer + chat
+// template), which is why it is its own seam: the service needs the token COUNT before it asks
+// whether the job fits, and that count only exists once the prompt is rendered.
+struct TowerPrompt {
+    std::string rendered;
+    std::vector<int> ids;
+    std::size_t drop_rows = 0;
+
+    // The rows the joint sequence actually carries.
+    [[nodiscard]] std::size_t tokens() const noexcept { return ids.size() - drop_rows; }
+};
+
+// Thrown when another interlude already owns the VRAM yield. A type, not a message match: the HTTP
+// surface (429 image_interlude_in_flight) must not depend on the words a Program happens to use.
+struct ImageInterludeInFlight : std::runtime_error {
+    ImageInterludeInFlight() : std::runtime_error("image interlude: another interlude is already in flight") {}
+};
+
 // Seam over Engine's image interlude; the host test runs the job inline on a fake context.
 class ImageInterludeRunner {
 public:
     virtual ~ImageInterludeRunner() = default;
     [[nodiscard]] virtual bool supports_interlude() const noexcept = 0;
     [[nodiscard]] virtual bool is_available() const noexcept       = 0;
+
+    // Whether a job needing `target_bytes` (+ `margin_bytes`) fits, answered WITHOUT quiescing the LLM.
+    // The service refuses on this before the submit door closes, and keeps `freed_bytes_expected` to
+    // check what the yield actually delivered against what the plan promised.
+    struct Fit {
+        bool fits = false;
+        std::uint64_t freed_bytes_expected = 0;
+        std::uint64_t device_free_bytes    = 0;
+        std::uint64_t headroom_bytes       = 0;
+    };
+    [[nodiscard]] virtual Fit probe(std::uint64_t target_bytes, std::uint64_t margin_bytes) = 0;
+
     virtual std::uint64_t
     run(std::uint64_t target_bytes, std::uint64_t margin_bytes,
         const std::function<bool(const infernix::ImageInterludeContext&)>& job) = 0;
@@ -68,8 +102,15 @@ using ImageJobExecutor =
                                             const ReferencePixels* reference, void* image_stream,
                                             const std::shared_ptr<ImageJobProgress>& progress)>;
 
-// prompt -> the DiT's token-major BF16 prompt_embeds bits ([text_tokens * hidden]).
-using PromptEmbedsProvider = std::function<std::vector<std::uint16_t>(const std::string& prompt)>;
+// prompt -> prompt_embeds, split in the two halves the VRAM handoff needs: rendering is host work the
+// service does BEFORE it probes the yield, the tower forward needs device memory and runs inside it.
+using PromptRendererProvider = std::function<TowerPrompt(const std::string& prompt)>;
+using PromptEmbedsProvider   = std::function<std::vector<std::uint16_t>(const TowerPrompt& rendered)>;
+
+// The bound DiT's dimensions, which the need calculation reads. Host-side (the artifact's component
+// config), lazy and cached by the caller: it must be readable before any yield, so it can never come
+// from the device-side weight binding.
+using DiTDimsProvider = std::function<infernix::models::qwen_image::DiTDims()>;
 
 // The production executor: lazy-binds the DiT + VAE weights and the VAE denormalization constants
 // from one .infernix image artifact (one streamed-only plan) and runs the merged pipeline entry
@@ -78,6 +119,11 @@ using PromptEmbedsProvider = std::function<std::vector<std::uint16_t>(const std:
 // above the stats panel instead of raw stderr text that would collide with the panel repaint.
 [[nodiscard]] ImageJobExecutor make_artifact_image_job_executor(
     const std::string& image_artifact_path, std::shared_ptr<spdlog::logger> logger = nullptr);
+
+// The host-side DiT dimensions of one .infernix image artifact, read from its component config through
+// the same binding the job uses. Called OUTSIDE any interlude (it is host work the admission needs
+// before the yield) and cached by the service, so the artifact opens once per process.
+[[nodiscard]] DiTDimsProvider make_artifact_dit_dims_provider(const std::string& image_artifact_path);
 
 // Standard-alphabet base64 (no line breaks), shared by the image route and its tests.
 [[nodiscard]] std::string base64_encode_bytes(std::span<const std::uint8_t> bytes);
@@ -91,7 +137,8 @@ using PromptEmbedsProvider = std::function<std::vector<std::uint16_t>(const std:
 class ImageGenerationService {
 public:
     ImageGenerationService(std::unique_ptr<ImageInterludeRunner> runner, ImageJobStore& store,
-                           PromptEmbedsProvider prompt_embeds, ImageJobExecutor job_executor);
+                           PromptRendererProvider prompt_renderer, PromptEmbedsProvider prompt_embeds,
+                           DiTDimsProvider dit_dims, ImageJobExecutor job_executor);
 
     // False when serve started without the image pipeline: the route answers a documented 503.
     [[nodiscard]] bool is_configured() const noexcept;
@@ -130,8 +177,12 @@ public:
 private:
     std::unique_ptr<ImageInterludeRunner> runner_;
     ImageJobStore& store_;
+    PromptRendererProvider prompt_renderer_;
     PromptEmbedsProvider prompt_embeds_;
+    DiTDimsProvider dit_dims_;
     ImageJobExecutor job_executor_;
+    std::mutex dims_mutex_;
+    infernix::models::qwen_image::DiTDims dims_cache_;
     std::mutex sequence_mutex_;
     std::uint64_t sequence_ = 0;
     mutable std::mutex progress_mutex_;

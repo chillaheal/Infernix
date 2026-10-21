@@ -36,32 +36,84 @@ public:
     [[nodiscard]] bool supports_interlude() const noexcept override { return supports; }
     [[nodiscard]] bool is_available() const noexcept override { return available; }
 
+    // The admission question, answered from fields the test sets. A refusal must be visible here
+    // BEFORE run() is ever entered: that is the whole point of probing -- a job that cannot fit never
+    // closes the LLM's submit door.
+    [[nodiscard]] Fit probe(std::uint64_t target_bytes, std::uint64_t margin_bytes) override {
+        ++probes;
+        probed_target = target_bytes;
+        probed_margin = margin_bytes;
+        return probe_answer;
+    }
+
     std::uint64_t
-    run(std::uint64_t, std::uint64_t,
+    run(std::uint64_t target_bytes, std::uint64_t margin_bytes,
         const std::function<bool(const infernix::ImageInterludeContext&)>& job) override {
+        ++runs;
+        probed_target = target_bytes; // the shortfall check below reads what the run was asked for
+        run_margin    = margin_bytes;
         if (mode_ == Mode::InFlight) {
-            throw std::runtime_error("image interlude: another interlude is already in flight");
+            // The seam's contract: the runner translates the Program's single-flight refusal into a
+            // type, so the HTTP mapping cannot depend on the words the Program chose.
+            throw ImageInterludeInFlight{};
         }
         if (mode_ == Mode::DrainFail) {
             throw std::runtime_error("image interlude: the LLM frontier did not drain in time");
         }
-        job(infernix::ImageInterludeContext{.freed_bytes = 8ULL << 30, .image_stream = nullptr});
+        job(infernix::ImageInterludeContext{.freed_bytes = freed, .image_stream = nullptr});
         if (mode_ == Mode::RestorationFault) {
             available = false;
             throw std::runtime_error("image interlude: pool restoration was not confirmed");
         }
-        return 8ULL << 30;
+        return freed;
     }
 
     bool supports = true;
     bool available = true;
+    // Generous by default so the guard every existing case walks through stays satisfied: the
+    // admission compares these against its own computed need plus the margin.
+    static constexpr std::uint64_t kGiB = 1024ULL * 1024ULL * 1024ULL;
+    std::uint64_t freed      = 24ULL * kGiB;
+    Fit probe_answer{.fits = true, .freed_bytes_expected = 24ULL * kGiB, .device_free_bytes = 4ULL * kGiB};
+    int probes       = 0;
+    int runs         = 0;
+    std::uint64_t probed_target = 0;
+    std::uint64_t probed_margin = 0;
+    std::uint64_t run_margin    = 0;
 
 private:
     Mode mode_;
 };
 
+// Rendering is the host half of the tower seam: a fixed four-token prompt, with the drop-row count
+// non-zero so a mistake (counting the dropped rows as conditioning) changes the need and shows up.
+PromptRendererProvider fixed_renderer() {
+    return [](const std::string& prompt) {
+        TowerPrompt rendered;
+        rendered.rendered   = prompt;
+        rendered.ids        = std::vector<int>(8, 1);
+        rendered.drop_rows  = 4;
+        return rendered;
+    };
+}
+
 PromptEmbedsProvider fixed_provider() {
-    return [](const std::string&) { return std::vector<std::uint16_t>(4U, 0U); };
+    return [](const TowerPrompt&) { return std::vector<std::uint16_t>(4U, 0U); };
+}
+
+// The dimensions the need is built from: the shipped Qwen-Image recipe's numbers, without an artifact.
+DiTDimsProvider fixed_dims() {
+    return [] {
+        infernix::models::qwen_image::DiTDims dims;
+        dims.layers       = 32;
+        dims.heads        = 32;
+        dims.head_dim     = 128;
+        dims.hidden       = 4096;
+        dims.intermediate = 12288;
+        dims.image_in     = 64;
+        dims.image_out    = 64;
+        return dims;
+    };
 }
 
 ImageJobExecutor fixed_executor() {
@@ -138,7 +190,7 @@ int main() {
     // Not configured: no runner, no provider, no executor -> no stored job at all.
     {
         ImageJobStore store(8, 1 << 20);
-        ImageGenerationService service(nullptr, store, PromptEmbedsProvider{}, ImageJobExecutor{});
+        ImageGenerationService service(nullptr, store, PromptRendererProvider{}, PromptEmbedsProvider{}, DiTDimsProvider{}, ImageJobExecutor{});
         check(!service.is_configured(), "empty service is not configured");
         expect_precheck("not configured", 503, "image_generation_not_configured", service);
         check(store.size() == 0U, "not-configured stores nothing");
@@ -146,7 +198,7 @@ int main() {
 
     {
         ImageJobStore store(8, 1 << 20);
-        ImageGenerationService service(std::make_unique<FakeRunner>(), store, fixed_provider(),
+        ImageGenerationService service(std::make_unique<FakeRunner>(), store, fixed_renderer(), fixed_provider(), fixed_dims(),
                                        fixed_executor());
         check(service.is_configured(), "full service is configured");
         const auto response = service.generate(sample_request(), 1000);
@@ -164,7 +216,7 @@ int main() {
         auto runner = std::make_unique<FakeRunner>();
         runner->supports = false;
         ImageJobStore store(8, 1 << 20);
-        ImageGenerationService service(std::move(runner), store, fixed_provider(), fixed_executor());
+        ImageGenerationService service(std::move(runner), store, fixed_renderer(), fixed_provider(), fixed_dims(), fixed_executor());
         expect_precheck("interlude unsupported", 503, "image_interlude_unsupported", service);
         check(store.size() == 0U, "unsupported stores nothing");
     }
@@ -173,7 +225,7 @@ int main() {
         auto runner = std::make_unique<FakeRunner>();
         runner->available = false;
         ImageJobStore store(8, 1 << 20);
-        ImageGenerationService service(std::move(runner), store, fixed_provider(), fixed_executor());
+        ImageGenerationService service(std::move(runner), store, fixed_renderer(), fixed_provider(), fixed_dims(), fixed_executor());
         expect_precheck("engine unavailable", 503, "engine_unavailable", service);
         check(store.size() == 0U, "unavailable stores nothing");
     }
@@ -181,7 +233,7 @@ int main() {
     // The job itself fails while the interlude restores cleanly.
     {
         ImageJobStore store(8, 1 << 20);
-        ImageGenerationService service(std::make_unique<FakeRunner>(), store, fixed_provider(),
+        ImageGenerationService service(std::make_unique<FakeRunner>(), store, fixed_renderer(), fixed_provider(), fixed_dims(),
                                        throwing_executor());
         const auto outcome = attempt([&] { return service.generate(sample_request(), 1000); });
         check(outcome.threw && outcome.status == 500 && outcome.code == "image_generation_failed",
@@ -197,7 +249,7 @@ int main() {
     {
         ImageJobStore store(8, 1 << 20);
         ImageGenerationService service(std::make_unique<FakeRunner>(FakeRunner::Mode::InFlight),
-                                       store, fixed_provider(), fixed_executor());
+                                       store, fixed_renderer(), fixed_provider(), fixed_dims(), fixed_executor());
         const auto outcome = attempt([&] { return service.generate(sample_request(), 1000); });
         check(outcome.threw && outcome.status == 429 && outcome.code == "image_interlude_in_flight",
               "in flight -> 429 image_interlude_in_flight");
@@ -209,8 +261,50 @@ int main() {
     // Drain-deadline miss: the job never ran, the LLM kept serving.
     {
         ImageJobStore store(8, 1 << 20);
+    // The admission refuses before the interlude: a probe that answers "no" must never reach run(), so
+    // the LLM's submit door stays open for everyone else.
+    {
+        ImageJobStore store(8, 8ULL << 20);
+        auto          runner = std::make_unique<FakeRunner>();
+        FakeRunner*   eyes   = runner.get();
+        eyes->probe_answer   = FakeRunner::Fit{.fits = false, .freed_bytes_expected = 1ULL << 30};
+        ImageGenerationService service(std::move(runner), store, fixed_renderer(), fixed_provider(),
+                                       fixed_dims(), fixed_executor());
+        const auto refusal = attempt([&] { return service.generate(sample_request(), 1700); });
+        check(refusal.threw && refusal.status == 503 &&
+                  refusal.code == "image_vram_insufficient",
+              "a yield that cannot cover the need refuses the request");
+        check(eyes->probes == 1 && eyes->runs == 0, "the refusal happens before anything is yielded");
+    }
+
+    // What the yield actually unmapped is what the job trusts: a grant short of the computed need
+    // stops the job before its first allocation, with the model healthy and the code intact.
+    {
+        ImageJobStore store(8, 8ULL << 20);
+        auto          runner = std::make_unique<FakeRunner>();
+        FakeRunner*   eyes   = runner.get();
+        eyes->freed          = 1ULL << 30;
+        eyes->probe_answer   = FakeRunner::Fit{.fits = true, .freed_bytes_expected = 24ULL << 30,
+                                               .device_free_bytes = 0};
+        bool executor_ran    = false;
+        ImageJobExecutor watch =
+            [&executor_ran](const OpenAIImagesRequest&, std::uint64_t, std::span<const std::uint16_t>,
+                            std::span<const std::uint16_t>, const ReferencePixels*, void*,
+                            const std::shared_ptr<ImageJobProgress>&) {
+                executor_ran = true;
+                return std::vector<std::uint8_t>{0x01U};
+            };
+        ImageGenerationService service(std::move(runner), store, fixed_renderer(), fixed_provider(),
+                                       fixed_dims(), watch);
+        const auto refusal = attempt([&] { return service.generate(sample_request(), 1800); });
+        check(refusal.threw && refusal.code == "image_vram_insufficient",
+              "a short grant is reported as the same refusal, not as a failed draw");
+        check(eyes->runs == 1 && !executor_ran, "the job stops before its first allocation");
+        check(eyes->run_margin == 512ULL * 1024ULL * 1024ULL, "the yield is asked for a real margin");
+    }
+
         ImageGenerationService service(std::make_unique<FakeRunner>(FakeRunner::Mode::DrainFail),
-                                       store, fixed_provider(), fixed_executor());
+                                       store, fixed_renderer(), fixed_provider(), fixed_dims(), fixed_executor());
         const auto outcome = attempt([&] { return service.generate(sample_request(), 1000); });
         check(outcome.threw && outcome.status == 503 && outcome.code == "image_interlude_failed",
               "drain miss -> 503 image_interlude_failed");
@@ -224,7 +318,7 @@ int main() {
         ImageJobStore store(8, 1 << 20);
         ImageGenerationService service(
             std::make_unique<FakeRunner>(FakeRunner::Mode::RestorationFault), store,
-            fixed_provider(), fixed_executor());
+            fixed_renderer(), fixed_provider(), fixed_dims(), fixed_executor());
         const auto outcome = attempt([&] { return service.generate(sample_request(), 1000); });
         check(outcome.threw && outcome.status == 503 && outcome.code == "image_engine_degraded",
               "restoration fault -> 503 image_engine_degraded");
@@ -272,7 +366,7 @@ int main() {
         };
 
         ImageJobStore store(8, 1 << 20);
-        ImageGenerationService service(std::make_unique<FakeRunner>(), store, fixed_provider(),
+        ImageGenerationService service(std::make_unique<FakeRunner>(), store, fixed_renderer(), fixed_provider(), fixed_dims(),
                                        capture);
         OpenAIImagesRequest request = sample_request();
         request.image               = payload;
@@ -284,7 +378,7 @@ int main() {
 
         ImageJobStore bad_store(8, 1 << 20);
         ImageGenerationService bad_service(std::make_unique<FakeRunner>(), bad_store,
-                                           fixed_provider(), capture);
+                                           fixed_renderer(), fixed_provider(), fixed_dims(), capture);
         OpenAIImagesRequest bad = sample_request();
         bad.image               = "not base64 at all!!";
         const auto outcome      = attempt([&] { return bad_service.generate(bad, 1000); });
@@ -298,8 +392,8 @@ int main() {
     // negative prompt never reaches the text tower.
     {
         std::vector<std::string> asked;
-        PromptEmbedsProvider recording = [&](const std::string& prompt) {
-            asked.push_back(prompt);
+        PromptEmbedsProvider recording = [&](const TowerPrompt& rendered) {
+            asked.push_back(rendered.rendered);
             return std::vector<std::uint16_t>(8U, 7U);
         };
         std::size_t neg_size = 0;
@@ -315,7 +409,7 @@ int main() {
         };
 
         ImageJobStore store(8, 1 << 20);
-        ImageGenerationService service(std::make_unique<FakeRunner>(), store, recording, capture);
+        ImageGenerationService service(std::make_unique<FakeRunner>(), store, fixed_renderer(), recording, fixed_dims(), capture);
         OpenAIImagesRequest steered     = sample_request();
         steered.true_cfg_scale          = 3.5;
         steered.negative_prompt         = "blurry, low quality";
@@ -339,7 +433,7 @@ int main() {
     {
         // Every generated image is also collected in an `images` directory under the working directory,
         // named after the stored job id (img-<created>-<sequence>), which is the served picture itself.
-        PromptEmbedsProvider embeds = [](const std::string&) { return std::vector<std::uint16_t>(4U, 9U); };
+        PromptEmbedsProvider embeds = [](const TowerPrompt&) { return std::vector<std::uint16_t>(4U, 9U); };
         const std::vector<std::uint8_t> picture{0x89U, 'P', 'N', 'G', 0x0AU};
         ImageJobExecutor writer = [&](const OpenAIImagesRequest&, std::uint64_t,
                                       std::span<const std::uint16_t>, std::span<const std::uint16_t>,
@@ -348,7 +442,7 @@ int main() {
             return picture;
         };
         ImageJobStore store(8, 1 << 20);
-        ImageGenerationService service(std::make_unique<FakeRunner>(), store, embeds, writer);
+        ImageGenerationService service(std::make_unique<FakeRunner>(), store, fixed_renderer(), embeds, fixed_dims(), writer);
 
         const std::filesystem::path saved =
             std::filesystem::current_path() / "images" / "img-2000-1.png";
@@ -375,7 +469,7 @@ int main() {
             return picture;
         };
         ImageJobStore store(8, 1 << 20);
-        ImageGenerationService service(std::make_unique<FakeRunner>(), store, fixed_provider(), writer);
+        ImageGenerationService service(std::make_unique<FakeRunner>(), store, fixed_renderer(), fixed_provider(), fixed_dims(), writer);
 
         OpenAIImagesRequest request = sample_request();
         request.response_format     = ImageResponseFormat::Url;
@@ -421,7 +515,7 @@ int main() {
             return std::vector<std::uint8_t>{0x01U};
         };
         ImageJobStore store(8, 1 << 20);
-        ImageGenerationService service(std::make_unique<FakeRunner>(), store, fixed_provider(),
+        ImageGenerationService service(std::make_unique<FakeRunner>(), store, fixed_renderer(), fixed_provider(), fixed_dims(),
                                        stepping);
         (void)service.generate(sample_request(), 4000);
         const auto live = service.last_job_progress();
@@ -444,7 +538,7 @@ int main() {
         };
         ImageJobStore stalled_store(8, 1 << 20);
         ImageGenerationService stalled_service(std::make_unique<FakeRunner>(), stalled_store,
-                                               fixed_provider(), stalled);
+                                               fixed_renderer(), fixed_provider(), fixed_dims(), stalled);
         bool threw = false;
         try {
             (void)stalled_service.generate(sample_request(), 5000);

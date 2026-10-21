@@ -328,15 +328,21 @@ int main(int argc, char** argv) {
         std::unique_ptr<infernix::serve::ImageJobStore> image_jobs;
         std::unique_ptr<infernix::serve::ImageGenerationService> images;
         if (!options.image_artifact_path.empty()) {
+            infernix::serve::PromptRendererProvider prompt_renderer;
             infernix::serve::PromptEmbedsProvider prompt_embeds;
             if (!options.image_text_processor_path.empty()) {
-                prompt_embeds = infernix::serve::make_tower_prompt_embeds_provider(
-                    options.image_artifact_path, options.image_text_processor_path);
+                // Two halves of one route: rendering the prompt is host work the service does before it
+                // probes the yield; the tower forward needs the yielded VRAM.
+                prompt_renderer = infernix::serve::make_tower_prompt_renderer(
+                    options.image_text_processor_path);
+                prompt_embeds   = infernix::serve::make_tower_prompt_embeds_provider(
+                    options.image_artifact_path);
             }
             image_jobs = std::make_unique<infernix::serve::ImageJobStore>(64, 256ULL << 20);
             images     = std::make_unique<infernix::serve::ImageGenerationService>(
                 infernix::serve::make_engine_interlude_runner(service.engine()), *image_jobs,
-                std::move(prompt_embeds),
+                std::move(prompt_renderer), std::move(prompt_embeds),
+                infernix::serve::make_artifact_dit_dims_provider(options.image_artifact_path),
                 infernix::serve::make_artifact_image_job_executor(options.image_artifact_path,
                                                                   logger));
             server.attach_images(*images);

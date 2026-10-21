@@ -17,23 +17,19 @@
 
 namespace infernix::serve {
 
-// The device-free prompt half of the production route, shared with the provider: the exact rendered
-// text the tokenizer sees, its full templated ids (causal), and the leading system-prefix rows the
-// DiT lane drops. Exposed so the host gate proves the production rendering and tokenization against
-// the oracle without touching the device.
-struct TowerPrompt {
-    std::string rendered;
-    std::vector<int> ids;
-    std::size_t drop_rows = 0;
-};
+// `TowerPrompt` (the rendered text, its templated ids, the dropped system rows) is declared in
+// serve/image_generation_service.h: the service needs it for the token COUNT before it probes the
+// yield, so it is part of the route's seam rather than of this module.
 
+// The device-free prompt half of the production route: the tokenizer and chat template only, no
+// device and no artifact. The service calls it before it asks whether the job fits.
 // `processor_dir` holds tokenizer.json, tokenizer_config.json and chat_template.jinja (the HF
 // Qwen3-VL processor directory). Lazy: the files load on the first prompt.
-[[nodiscard]] std::function<TowerPrompt(const std::string&)> make_tower_prompt_renderer(const std::string& processor_dir);
+[[nodiscard]] PromptRendererProvider make_tower_prompt_renderer(const std::string& processor_dir);
 
 // `image_artifact_path` is the same .infernix artifact the job executor streams (its "text"
-// component supplies the tower).
-[[nodiscard]] PromptEmbedsProvider make_tower_prompt_embeds_provider(const std::string& image_artifact_path,
-                                                                     const std::string& processor_dir);
+// component supplies the tower). Takes the already-rendered prompt: the forward is the half that
+// needs the yielded VRAM.
+[[nodiscard]] PromptEmbedsProvider make_tower_prompt_embeds_provider(const std::string& image_artifact_path);
 
 } // namespace infernix::serve
