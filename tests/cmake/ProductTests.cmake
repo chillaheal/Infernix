@@ -60,6 +60,12 @@ infernix_add_test(infernix_image_generation_service_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_image_generation_service.cpp"
   LIBRARIES infernix_serve)
 
+# The image job's computed device-memory need: the number the serving layer refuses on before the LLM
+# yields anything, qualified here against the certified route's measured peak.
+infernix_add_test(infernix_image_device_need_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_image_device_need.cpp"
+  LIBRARIES infernix_qwen_image)
+
 # Server-executed chat image tool: injection gating, round feedback shape, caps and error surface,
 # and the round loop's end contract of exactly one answer that carries every URL.
 infernix_add_test(infernix_chat_image_tool_test
