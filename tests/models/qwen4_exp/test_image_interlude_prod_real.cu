@@ -237,6 +237,18 @@ int main() {
         qi::reset_image_device_peak();
         const std::uint64_t free_full = device_free_bytes();
 
+        // The serving layer admits or refuses on this answer before anything is yielded, so it has to be
+        // the answer the interlude then acts on -- and asking it must not disturb a serving Engine.
+        const infernix::ImageYieldProbe probe = engine.probe_image_yield(8 * kGiB, 0);
+        check(probe.freed_bytes_expected > 0,
+              "the probe predicts a yield of " + std::to_string(probe.freed_bytes_expected >> 20) + " MiB");
+        check(probe.device_free_bytes + kGiB / 4 >= device_free_bytes(),
+              "the probe reads the free memory the job would start from");
+        check(infernix::models::qwen4_exp::testing::image_interlude_state() == 0,
+              "probing leaves the Program Running");
+        check(infernix::models::qwen4_exp::testing::image_interlude_submit_open(),
+              "probing never closes the LLM submit door");
+
         const std::uint64_t freed = engine.run_image_interlude(
             8 * kGiB, 0, [&](const infernix::ImageInterludeContext& ctx) -> bool {
                 check(ctx.freed_bytes > 0, "the interlude yield freed "
@@ -321,6 +333,12 @@ int main() {
                 return true;
             });
         check(freed > 0, "run_image_interlude reports " + std::to_string(freed >> 20) + " MiB freed and restored");
+        // The yield can free LESS than the plan promises (a KV top some retained block pins raises the
+        // limit rather than throwing), and never more: so a request refused on the probe's number was
+        // refused for the right reason.
+        check(freed <= probe.freed_bytes_expected + kGiB / 1024,
+              "the yield freed no more than the probe predicted (" + std::to_string(freed >> 20) +
+                  " MiB against " + std::to_string(probe.freed_bytes_expected >> 20) + " MiB)");
         ledger("after restoration (LLM pools back)");
 
         check(infernix::models::qwen4_exp::testing::image_interlude_state() == 0, "the Program returned to Running");
