@@ -617,8 +617,9 @@ public:
     void reset_memory_peaks() noexcept {}
 
     // LLM<->image VRAM coexistence (production driver over the interlude methods the device tests
-    // qualified): ONE interlude in flight (a concurrent caller gets "another interlude is already in
-    // flight" -- the serving layer's bounded FIFO queues in front of this gate). Closes the LLM submit
+    // qualified): ONE interlude in flight, and nothing waits behind this gate -- a concurrent caller
+    // gets "another interlude is already in flight", which the serving layer answers with 429. Closes
+    // the LLM submit
     // door, drains every LLM stream within `drain_deadline_ms` and invalidates the captured graphs
     // (Quiesced), yields physical VRAM toward the image job's `target_bytes` plus a `margin_bytes`
     // kept below the headroom (Leased), creates the image's dedicated CUDA stream, runs `job` with
@@ -708,6 +709,12 @@ int image_interlude_state() noexcept;
 // Fault injection for the failure-trichotomy device test: the next `checks`-th release_from_yield
 // throws before touching the pools (simulating an uncertain restoration). 0 disarms.
 void set_image_restore_fault(std::uint32_t checks) noexcept;
+// Fault injection for the soft restoration path: the next `checks`-th KV remap stops one chunk short,
+// exactly what a driver short of physical memory leaves behind. 0 disarms.
+void set_kv_remap_fault(std::uint32_t checks) noexcept;
+// The elastic KV pool's limit in pages, so a test can see a remap shortfall the Engine reports only in
+// its diagnostics. 0 when no Program is loaded.
+std::uint32_t kv_backed_pages() noexcept;
 } // namespace testing
 
 } // namespace infernix::models::qwen4_exp

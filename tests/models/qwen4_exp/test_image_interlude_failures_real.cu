@@ -1,6 +1,6 @@
 // C5b+C5c certification: the interlude failure-state machine and the submit-door coverage, on the
 // real Engine (no image weights needed -- every job here is tiny real device work on the
-// interlude's stream). Six scenarios in order:
+// interlude's stream). Seven scenarios in order:
 //   S1 success route re-verified: yield frees, the Program is Leased with the door closed during
 //      the job, restoration confirms, the door reopens, the LLM resumes with baseline ids.
 //   S2 drain deadline: while a generation is mid-decode, a 1 ms drain deadline cannot settle the
@@ -11,7 +11,10 @@
 //   S5 door gate under load (C5c): a generation runs against an interlude whose job keeps the door
 //      closed; the worker starts no execution body across the yield and the request still
 //      completes at baseline ids (paused, never corrupted).
-//   S6 restoration fault -> Degraded (terminal, LAST): the thrown error names BOTH failures, the
+//   S6 incomplete KV remap: with the restore's remap one chunk short, the pool stays at the size the
+//      yield left it (the unbacked pages never enter its limit), the door reopens and a later
+//      generation runs at baseline -- a shortfall is a smaller elastic pool, not a parked engine.
+//   S7 restoration fault -> Degraded (terminal, LAST): the thrown error names BOTH failures, the
 //      active request fails with the Degraded message, the door stays closed, is_available() is
 //      false, further submissions are refused and a second interlude throws. Process restart is
 //      the recovery unit -- this test must run last in the blackout batch.
@@ -286,8 +289,38 @@ int main() {
             check_llm_healthy(engine, baseline);
         }
 
-        // ---- S6: restoration fault -> Degraded (terminal; last scenario) ----
-        std::printf("[S6] restoration fault parks the engine Degraded\n");
+        // ---- S6: a KV remap the device cannot finish is a smaller pool, not a parked engine ----
+        std::printf("[S6] incomplete KV remap restores softly\n");
+        {
+            const std::uint32_t pages_before = state_ns::kv_backed_pages();
+            (void)state_ns::begin_image_quiesce();
+            std::uintptr_t lease = 0;
+            const std::uint64_t freed = state_ns::yield_image_vram(8 * kGiB, 0, lease);
+            check(lease != 0 && freed > 0, "the yield took VRAM from the Quiesced Program");
+            check(state_ns::kv_backed_pages() < pages_before,
+                  "the yield unmapped KV pages, which is what the shortfall below injects against");
+            // The next remap stops one chunk short, which is what a driver out of physical memory leaves
+            // behind. The pages past that point are not backed, so the pool must not claim them -- and
+            // the Program must stay servable rather than park itself Degraded.
+            state_ns::set_kv_remap_fault(1);
+            state_ns::release_image_vram(lease);
+            state_ns::set_kv_remap_fault(0);
+            state_ns::end_image_quiesce();
+
+            const std::uint32_t pages_after = state_ns::kv_backed_pages();
+            check(pages_after < pages_before,
+                  "the unbacked pages stayed out of the pool's limit (" + std::to_string(pages_after) +
+                      " of " + std::to_string(pages_before) + " pages)");
+            check(state_ns::image_interlude_state() == 0,
+                  "the Program returned to Running across the shortfall");
+            check(state_ns::image_interlude_submit_open(),
+                  "the door reopened: an incomplete remap is a smaller pool, not an unconfirmed device "
+                  "state");
+            check_llm_healthy(engine, baseline);
+        }
+
+        // ---- S7: restoration fault -> Degraded (terminal; last scenario) ----
+        std::printf("[S7] restoration fault parks the engine Degraded\n");
         {
             LlmRun run;
             start_llm_run(engine, run, 600);

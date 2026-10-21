@@ -159,8 +159,9 @@ ImageYieldProbe Program::probe_image_yield(std::uint64_t target_bytes, std::uint
 std::uint64_t Program::run_image_interlude(std::uint64_t target_bytes, std::uint64_t margin_bytes,
                                            const std::function<bool(const ImageInterludeContext&)>& job,
                                            std::uint64_t drain_deadline_ms) {
-    // Single-flight: one interlude per Program. The serving layer's bounded FIFO queues in front of
-    // this gate; a caller that reaches it concurrently is told so, never silently serialized.
+    // Single-flight: one interlude per Program, and nothing waits behind this gate -- a caller that
+    // reaches it concurrently is told so, never silently serialized, and the serving layer turns that
+    // into 429 image_interlude_in_flight for the request.
     if (!impl_->interlude_mu_.try_lock()) {
         throw std::runtime_error("image interlude: another interlude is already in flight");
     }
@@ -269,6 +270,7 @@ MemorySummary Program::memory_summary() const noexcept { return impl_->memory();
 
 namespace {
 std::atomic<std::uint32_t> g_restore_fault{0}; // consumed by ProgramImpl::take_image_restore_fault
+std::atomic<std::uint32_t> g_kv_remap_fault{0}; // consumed by ProgramImpl::take_kv_remap_fault
 } // namespace
 
 namespace detail {
@@ -281,6 +283,14 @@ bool ProgramImpl::take_image_restore_fault() noexcept {
     }
     return false;
 }
+
+bool ProgramImpl::take_kv_remap_fault() noexcept {
+    std::uint32_t left = g_kv_remap_fault.load(std::memory_order_relaxed);
+    while (left != 0) {
+        if (g_kv_remap_fault.compare_exchange_weak(left, left - 1)) { return left == 1; }
+    }
+    return false;
+}
 } // namespace detail
 
 namespace testing {
@@ -290,6 +300,12 @@ std::atomic<std::uint32_t> g_expert_fault{0};
 } // namespace
 
 void set_image_restore_fault(std::uint32_t checks) noexcept { g_restore_fault.store(checks); }
+
+void set_kv_remap_fault(std::uint32_t checks) noexcept { g_kv_remap_fault.store(checks); }
+
+std::uint32_t kv_backed_pages() noexcept {
+    return detail::ProgramImpl::has_active() ? detail::ProgramImpl::kv_backed_pages_testing() : 0;
+}
 
 void set_expert_fault(std::uint32_t checks) noexcept { g_expert_fault.store(checks); }
 

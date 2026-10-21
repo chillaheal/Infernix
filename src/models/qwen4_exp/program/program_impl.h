@@ -4944,13 +4944,17 @@ private:
     // Maps (and zeroes) the chunks pages [0, pages) need; false when the device has no memory.
     bool map_kv(std::uint32_t pages) {
         const auto need = kv_chunks(plan_, pages);
-        for (std::size_t c = 0; c < need.size(); ++c) {
+        // An armed check leaves the last needed chunk unmapped, which is what a driver short of physical
+        // memory leaves behind: every chunk below the failed one is backed, no chunk above it is.
+        const std::size_t chunks =
+            take_kv_remap_fault() && need.size() > 1 ? need.size() - 1 : need.size();
+        for (std::size_t c = 0; c < chunks; ++c) {
             if (!need[c] || kv_vmm_->mapped(c)) { continue; }
             if (!kv_vmm_->map(c)) { return false; }
             CUDA_CHECK(cudaMemsetAsync(static_cast<std::byte*>(kv_vmm_->base()) + c * kKvChunkBytes, 0, kKvChunkBytes,
                                        device_.stream));
         }
-        return true;
+        return chunks == need.size();
     }
 
     // Raises the pool's backed pages so `need` pages are available, taking the memory from the expert
@@ -5192,18 +5196,27 @@ public:
         return lease;
     }
 
+    // Bring the elastic KV pool back to `pages`: map the chunks that count needs, then raise the pool's
+    // limit over the pages that actually mapped. A driver short of physical memory stops the remap
+    // partway, and the pages past where it stopped are not backed -- raising the limit over them would
+    // hand the allocator page ids whose virtual addresses map to nothing. Leaving the limit where the
+    // remap got to costs a smaller pool until the sizing path grows it back: a smaller serving window,
+    // not a corrupt one. False when the pool stayed below `pages`.
+    bool restore_kv_pages(std::uint32_t pages) {
+        if (!pool_ || pages <= pool_->backed_pages()) { return true; }
+        if (map_kv(pages)) { pool_->set_backed_pages(pages); }
+        kv_grown_.store(pool_->backed_pages() > plan_.kv_base_pages);
+        return pool_->backed_pages() >= pages;
+    }
+
     // Unwind a yield that threw after it had already moved pools. The image leased nothing, so this is
     // release_from_yield's restore blocks run straight: remap + re-raise the KV limit, then resize the
     // expert frames back to the count taken before the yield. The caller holds vram_mutex_ and the state
-    // is still Quiesced (Leased is set only after a clean yield). Throws if the device cannot be restored
-    // -- the one case that legitimately drives the Program Degraded.
+    // is still Quiesced (Leased is set only after a clean yield). The yield's own failure is what reaches
+    // the caller, and the state machine lands the Program wherever that failure leaves it.
     void rollback_failed_yield(std::uint32_t frames_before, std::uint32_t kv_pages_before) {
         device_.synchronize();
-        if (pool_ && kv_pages_before > pool_->backed_pages()) {
-            (void)map_kv(kv_pages_before);
-            if (pool_->backed_pages() < kv_pages_before) { pool_->set_backed_pages(kv_pages_before); }
-            kv_grown_.store(kv_pages_before > plan_.kv_base_pages);
-        }
+        (void)restore_kv_pages(kv_pages_before);
         if (residency_->frames() < frames_before) {
             (void)residency_->resize(frames_before, device_.stream, *vram_);
         }
@@ -5231,10 +5244,15 @@ public:
         }
         const std::lock_guard<std::mutex> lock(vram_mutex_);
         device_.synchronize();
-        if (pool_ && lease.kv_pages_before > pool_->backed_pages()) {
-            (void)map_kv(lease.kv_pages_before);
-            if (pool_->backed_pages() < lease.kv_pages_before) { pool_->set_backed_pages(lease.kv_pages_before); }
-            kv_grown_.store(lease.kv_pages_before > plan_.kv_base_pages);
+        // A remap the device cannot finish leaves the KV pool at the size the yield left it. The job is
+        // over, the pools are consistent, and the shortfall costs a smaller elastic pool until the sizing
+        // path grows it back -- which is a smaller serving window, not an engine that needs a restart. The
+        // pages that did not map stay out of the pool's limit, so no request is ever handed one.
+        if (!restore_kv_pages(lease.kv_pages_before)) {
+            diagnostic("restored: the KV remap fell short, the pool stays at " +
+                           std::to_string(pool_ ? pool_->backed_pages() : 0) + " of " +
+                           std::to_string(lease.kv_pages_before) + " pages",
+                       DiagnosticLevel::Warning);
         }
         if (residency_->frames() < lease.frames_before) {
             (void)residency_->resize(lease.frames_before, device_.stream, *vram_);
@@ -5542,16 +5560,22 @@ public:
     }
     static void end_quiesce_testing() { active_->end_image_quiesce(); }
     static int state_testing() noexcept { return static_cast<int>(active_->execution_state_); }
+    static std::uint32_t kv_backed_pages_testing() noexcept {
+        return active_->pool_ ? active_->pool_->backed_pages() : 0;
+    }
     // Defined in program.cpp next to the other testing fault atomics: consumes one injected
     // restoration failure; the faulted release_from_yield throws before touching the pools.
     [[nodiscard]] static bool take_image_restore_fault() noexcept;
+    // Defined in program.cpp next to the other testing fault atomics: consumes one injected remap
+    // failure; the next map_kv stops one chunk short, as a driver out of physical memory does.
+    [[nodiscard]] static bool take_kv_remap_fault() noexcept;
     static bool graphs_inert_testing() noexcept { return active_->graphs_inert(); }
     static bool submit_open_testing() noexcept { return active_->submit_open(); }
 
     // Quiescence state (declared here; the inline methods above use them through the complete-class context).
     std::mutex execution_mu_;
     std::condition_variable execution_cv_;
-    std::mutex interlude_mu_; // single-flight gate: one image interlude at a time; serving queues in front
+    std::mutex interlude_mu_; // single-flight gate: one image interlude at a time; a second caller is refused
     ExecutionState execution_state_ = ExecutionState::Running;
     std::atomic<bool> llm_submit_open_{true};
     std::atomic<std::uint64_t> llm_entries_started_{0}; // cumulative LLM execution entries (drain stability)
