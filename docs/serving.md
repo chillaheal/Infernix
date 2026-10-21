@@ -986,8 +986,12 @@ The route is synchronous: it returns the finished image in one response. It is c
 server starts with both `--image-artifact` and `--image-text-processor`; without them it answers
 `503 image_generation_not_configured`. Generation runs over the image interlude: the resident model yields
 its working VRAM to the image lane, one DiT-plus-VAE job runs on its own CUDA stream, and the model's VRAM
-is restored afterward, so chat traffic resumes unchanged. Only one image job runs at a time, and the amount
-of VRAM the model yields scales with the requested `size`.
+is restored afterward, so chat traffic resumes unchanged. Only one image job runs at a time: a second
+caller while one is on the device is told `429 image_interlude_in_flight` rather than queued. How much
+VRAM the model yields is computed from the request itself -- its geometry, any reference image, and
+whether `true_cfg_scale` above 1 doubles the batch -- and a request that cannot fit is refused with
+`503 image_vram_insufficient` before the model yields anything, so the LLM keeps serving and the message
+names both the need and what the device could give.
 
 Accepted request fields are exactly `model`, `prompt`, `n`, `size`, `steps`, `response_format`, `user`,
 `seed`, `image`, `negative_prompt` and `true_cfg_scale`; any other field is rejected as
@@ -1053,6 +1057,7 @@ Every failure names its code in the standard OpenAI error envelope:
 | 400 | `image_invalid`, `image_too_large`, `image_url_not_supported`, `image_data_uri_not_base64` | the `image` payload is not a decodable image inside the byte budget, is sent as a URL, or is a non-base64 `data:` URI |
 | 503 | `image_generation_not_configured` | the server started without the image options |
 | 503 | `image_interlude_unsupported` | the loaded model has no image interlude (only Qwen3.8-Flash-Next does) |
+| 503 | `image_vram_insufficient` | the request's size, reference image or CFG pass needs more VRAM than the model can yield right now; refused before anything is yielded, so the message can name the need and what the device could give. Retry a smaller `size`, without `image`, or with `true_cfg_scale` 1 |
 | 503 | `engine_unavailable` | the Engine cannot accept work |
 | 429 | `image_interlude_in_flight` | another image generation is running |
 | 503 | `image_engine_degraded` | the interlude could not confirm the model's VRAM was restored |
@@ -1137,6 +1142,13 @@ The client sees none of this: no tool in its own list, no tool call, no tool res
 assistant answer with a URL in it. The extra rounds are counted into the reported token usage, because they
 really ran, and the round after the first cannot put thinking behind text that is already on the wire, so
 only the first round's reasoning is reported.
+
+A picture that could not be drawn comes back to the model as the tool's own error result, with the reason
+the images route would have given: `image_vram_insufficient` when the device cannot fit that size now,
+`image_interlude_in_flight` while another picture is on it, `image_generation_failed` for a job that fell
+over. What to do with that is the model's call -- retry a smaller size, answer in words, or leave it --
+and the user's request still gets a reply instead of a failed HTTP call. Only a failure outside the
+picture's own path fails the request.
 
 A request bounds its own damage: `chat_max_images_per_request` pictures at most (each one costs a full
 image interlude, where the language model yields its VRAM and is restored afterwards), and a fixed number of

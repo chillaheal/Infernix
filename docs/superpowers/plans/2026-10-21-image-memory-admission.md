@@ -35,7 +35,7 @@
 
 - [ ] **Step 1: Read the inventory this must match**
 
-Read `src/models/qwen_image/image_pipeline.cu:307-342` (the `S`/`s_max` derivation), `:410-456` (the 13 + 3 workspace buffers and every per-step buffer), `:423-446`, `:366-397` (constants and both rope tables), `:399-408` (the resident top-level weights), `:620-665` (the VAE decode's plane sequence). Also read `VaeGraph::dup_up`, `VaeGraph::att`, `VaeGraph::dresnet` and `VaeGraph::drms` (in `src/models/qwen_image/image_pipeline.cu`, the `struct VaeGraph` above line 300) and write down, per call, how many planes it has live at once. Those counts become `kVaePlanesPerStage` in Step 3 — they are copied from that code, not guessed.
+Read `src/models/qwen_image/image_pipeline.cu:307-342` (the `S`/`s_max` derivation), `:410-456` (the 13 + 3 workspace buffers and every per-step buffer), `:423-446`, `:366-397` (constants and both rope tables), `:399-408` (the resident top-level weights), `:620-665` (the VAE decode's plane sequence). Also read `VaeGraph::dup_up`, `VaeGraph::att`, `VaeGraph::dresnet` and `VaeGraph::drms` (in `src/models/qwen_image/image_pipeline.cu`, the `struct VaeGraph` above line 300) and write down, per call, how many planes it has live at once. Those counts become the `VaeStage::planes` values in Step 3 — they are copied from that code, not guessed. (The plan's starting values came from `att:219`, `dup_up:260` and `dresnet:178-192`; Task 2 replaces them with what the ledger measures.)
 
 - [ ] **Step 2: Write the failing host test**
 
@@ -148,14 +148,22 @@ inline constexpr std::uint64_t kImageElementBytes = 2;
 // The VAE decode's widest stage: how many full planes a stage holds live at once, per stage kind,
 // copied from VaeGraph::dup_up/att/dresnet/drms in image_pipeline.cu.
 struct VaeStage {
+    std::uint32_t channels_in;
     std::uint32_t channels_out;
-    std::uint32_t planes; // simultaneous full [C,H,W] planes at that stage's resolution
+    std::uint32_t planes; // simultaneous full [C,H,W] planes at that stage's working resolution
+    bool          doubles_side; // the stage's upsample: the resolution its widest planes live at
 };
 
 // The decoder's fixed five up-stages plus the mid block, as image_pipeline.cu:620-665 runs them.
-inline constexpr VaeStage kVaeMidStage{1152, 4};
+// `planes` is the simultaneous full-plane count the code holds: `att` keeps qkv (3C) + att_buf (C) +
+// x_dev (C) live at the spatial_attn call (image_pipeline.cu:219), `dup_up` holds xup + sc + tfin at
+// the doubled resolution (:260), and `dresnet` holds input + shortcut + t1 + tfin at its own
+// resolution. 3 is the widest of those, evaluated at the stage's post-upsample side with
+// max(cin, cout) channels. Task 2 replaces these with what the ledger measures.
+inline constexpr VaeStage kVaeMidStage{1152, 1152, 5, false};
 inline constexpr VaeStage kVaeUpStages[5] = {
-    {1152, 4}, {1152, 4}, {576, 4}, {288, 4}, {144, 4},
+    {1152, 1152, 3, true}, {1152, 1152, 3, true}, {1152, 576, 3, true},
+    {576, 288, 3, true},   {288, 144, 3, false},
 };
 
 struct ImageDeviceNeedRequest {
@@ -206,24 +214,25 @@ struct ImageDeviceNeed {
     // Interleaved rope tables (S * 64 * 2 floats, BF16 on device) for both passes and the shared
     // ones/zeros/tnorm constants (2 * D each).
     need.rope_and_tables = (s_pos + s_neg) * 64ULL * 2ULL * kImageElementBytes + 5ULL * d * kImageElementBytes;
-    // The widest decoder stage: planes * channels * pixels, at that stage's resolution. Up-stages
-    // double the side, so the last stages are the expensive ones (image_pipeline.cu:620-665).
-    std::uint64_t side = req.geometry.hl > req.geometry.wl ? req.geometry.hl : req.geometry.wl;
-    std::uint64_t hl   = req.geometry.hl, wl = req.geometry.wl;
-    need.vae_peak = kVaeMidStage.planes * static_cast<std::uint64_t>(kVaeMidStage.channels_out) * hl * wl *
-                    kImageElementBytes;
+    // The widest decoder stage: planes * max(cin,cout) * pixels at the resolution that stage works at.
+    // Every up-stage doubles the side before its widest planes exist, so the late low-channel stages
+    // dominate (image_pipeline.cu:620-665).
+    std::uint64_t hl = req.geometry.hl, wl = req.geometry.wl;
+    const auto stage_bytes = [&](const VaeStage& s, std::uint64_t sh, std::uint64_t sw) {
+        const std::uint64_t channels = s.channels_in > s.channels_out ? s.channels_in : s.channels_out;
+        return static_cast<std::uint64_t>(s.planes) * channels * sh * sw * kImageElementBytes;
+    };
+    need.vae_peak = stage_bytes(kVaeMidStage, hl, wl);
     for (const auto& stage : kVaeUpStages) {
-        const std::uint64_t bytes = stage.planes * static_cast<std::uint64_t>(stage.channels_out) * hl * wl *
-                                    kImageElementBytes;
+        if (stage.doubles_side) { hl *= 2; wl *= 2; } // the widest planes exist after the doubling
+        const std::uint64_t bytes = stage_bytes(stage, hl, wl);
         if (bytes > need.vae_peak) { need.vae_peak = bytes; }
-        hl *= 2;
-        wl *= 2;
     }
-    (void)side;
-    // The final 4-channel plane at full pixel resolution, plus the operands held across the loop.
-    const std::uint64_t final_plane = 4ULL * static_cast<std::uint64_t>(req.geometry.height) *
-                                      static_cast<std::uint64_t>(req.geometry.width) * kImageElementBytes;
-    if (final_plane > need.vae_peak) { need.vae_peak = final_plane; }
+    // norm_out + the final 4-channel conv_out plane at full pixel resolution.
+    const std::uint64_t final_planes =
+        (144ULL + 4ULL) * static_cast<std::uint64_t>(req.geometry.height) *
+        static_cast<std::uint64_t>(req.geometry.width) * kImageElementBytes;
+    if (final_planes > need.vae_peak) { need.vae_peak = final_planes; }
     need.resident_weights = kImageWeightResidentBytes * (1ULL + req.blocks_resident) / 2ULL;
     return need;
 }
@@ -663,3 +672,39 @@ git -c user.name="Ian Ranson" -c user.email="ian.ranson@users.noreply.github.com
 - [ ] Host suite: `ctest --test-dir build -C Release -R infernix_ --output-on-failure`, reporting passed/skipped counts and naming every skip that hides a claim this plan made (the ledger qualification in particular).
 - [ ] Confirm the generated picture is unchanged: run the certified 512x512 route's existing comparison (the test named in `src/models/qwen_image/image_pipeline.h:5-10`) and report its verdict.
 - [ ] Report: the need at 512/768/768+ref/1024, what the probe said for each, and — if the artifact was unreachable — that the ledger never qualified the model and the refusal threshold therefore rests on the computed inventory alone.
+
+---
+
+## Execution status (this branch: `image-memory-admission`)
+
+- Task 1 done (`56fbeda`): `image_device_need.h` + `infernix_image_device_need_test` green. Computed need: 512 -> 7517 MiB, 768 -> 8868 MiB, 768+ref -> 9735 MiB, 768+CFG -> 8938 MiB, 1024 -> 10759 MiB, 2048 -> 23728 MiB. The `kImageWeightResidentBytes` allowance still starts at the single measured 512 peak (6183 MiB), so every number is conservative until Task 2 runs.
+- Task 2 code done, measurement NOT run (`cf0751f`): `infernix_image_need_ledger_real_test` compiles, registers and Skips (77) without `INFERNIX_TEST_ARTIFACT`. It runs the real pipeline on the GPU, so it must wait for a window with no live `infernix-serve` -- the allowance is therefore uncalibrated and that is disclosed, not hidden.
+- Build environment gotcha: any `cmake --build` that re-runs configure needs `VCPKG_ROOT`/`VCPKG_TARGET_TRIPLET` in the shell, and the cache must keep `BUILD_TESTING=ON` (`../build-infernix.bat configure` sets it OFF).
+- Task 3 code done (`92a15c6`): `ImageYieldProbe` in `types.h`, `Engine::probe_image_yield`, `Program::probe_image_yield`, `Qwen4ProgramImpl::probe_image_yield` (pure plan + `vram_->query()`, no quiesce, no synchronize). `infernix_model_runtime` and `infernix_engine` compiled clean with it. NOT done: the extra probe cases in `tests/models/qwen4_exp/test_image_interlude_prod_real.cu` (Step 4) -- open.
+- Task 4 done (`585a225`): the tower seam is split into render (host, before the yield) and embeds
+  (device, inside it), the service probes through `ImageInterludeRunner::probe`, the margin is the
+  computed need plus 512 MiB, and a probe that says "no" throws `image_vram_insufficient` (503) before
+  anything is yielded. `infernix_image_generation_service_test` covers the refusal (no `run` call), the
+  render-before-probe order and the post-yield shortfall.
+- Task 5 done (`445ac63`): every image failure inside a hidden chat round (`image_vram_insufficient`,
+  `image_interlude_in_flight`, `image_generation_failed`) returns the tool's error result with the
+  pipeline's code and reason, and the answer continues. `infernix_chat_image_tool_test` replaced the
+  old propagation case with all three codes.
+- Task 6 code + test done: `restore_kv_pages` raises the pool's limit only over the pages that actually
+  mapped, in both restore paths, and a shortfall is logged as a Warning. New device scenario S6 injects
+  a remap one chunk short through `testing::set_kv_remap_fault` and asserts the pool stays smaller, the
+  door reopens and a later generation runs at baseline. NOT RUN: the scenario needs the blackout (server
+  stopped), like the rest of the file.
+- Task 7 done: `docs/serving.md` states the computed yield, the preflight refusal and the 503 row, the
+  chat section says a refused picture returns its reason to the model, and the three comments that
+  attributed a serving FIFO to the Program are gone.
+- Task 8 partial, deliberately: all 270 test projects and every library build clean (the app target is
+  not built, because the deployed `infernix-serve` is running). Host tests around this change pass
+  (35-test serve/image set: 33 passed, 2 environment failures). The full host suite cannot finish in
+  this environment: `infernix_prompt_input_test` and the schema tests do network I/O and run to the
+  900 s ctest timeout, `infernix_chat_templates_test`/`infernix_artifact_flash_next_interop_test`/
+  `infernix_json_schema_oracle_test`/`infernix_qwen3_5_tool_schema_oracle_test` fail on missing Python
+  modules (`jinja2`, `torch`, `jsonschema`), and `infernix_image_skinny_linear_test` ran its CUDA oracle
+  next to the live server and failed (rel_fro 1.0) -- unattributed, and it needs a blackout rerun.
+  The ledger calibration (Task 2) and the interlude cert (Task 6) are still unmeasured for the same
+  reason.
