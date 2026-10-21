@@ -3,8 +3,11 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <iostream>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #if defined(__linux__)
@@ -21,6 +24,7 @@
 namespace {
 
 using infernix::serve::ClientDisconnected;
+using infernix::serve::HeartbeatTicker;
 using infernix::serve::SseTransport;
 
 int check(bool condition, const char* message) {
@@ -361,12 +365,109 @@ int test_inherited_socket_liveness() {
 }
 #endif
 
+int test_sse_beat() {
+    using namespace std::chrono_literals;
+    int failures = 0;
+
+    std::vector<std::string> writes;
+    httplib::DataSink sink;
+    sink.write = [&](const char* data, std::size_t size) {
+        writes.emplace_back(data, size);
+        return true;
+    };
+    sink.is_writable = [] { return true; };
+    std::atomic<bool> cancelled{false};
+    const SseTransport::Clock::time_point start{100s};
+    SseTransport transport(sink, cancelled, 5s, start);
+    transport.beat(start + 4999ms);
+    failures += check(writes.empty() && !cancelled,
+                      "SSE beat emitted a comment before the quiet interval");
+    transport.beat(start + 5s);
+    failures +=
+        check(writes == std::vector<std::string>{std::string(SseTransport::kHeartbeatComment)} &&
+                  !cancelled,
+              "SSE beat did not emit the standard comment on time");
+    transport.beat(start + 9999ms);
+    failures += check(writes.size() == 1, "SSE beat did not reset the quiet interval");
+
+    sink.write = [](const char*, std::size_t) { return false; };
+    std::atomic<bool> failed_cancelled{false};
+    SseTransport failing(sink, failed_cancelled, 5s, start);
+    failing.beat(start + 5s);
+    failures += check(failed_cancelled, "a failed SSE beat did not cancel its request");
+    return failures;
+}
+
+int test_heartbeat_ticker() {
+    using namespace std::chrono_literals;
+    int failures = 0;
+
+    std::mutex writes_mutex;
+    std::vector<std::string> writes;
+    std::condition_variable written;
+    httplib::DataSink sink;
+    sink.write = [&](const char* data, std::size_t size) {
+        std::lock_guard lock(writes_mutex);
+        writes.emplace_back(data, size);
+        written.notify_all();
+        return true;
+    };
+    sink.is_writable = [] { return true; };
+    std::atomic<bool> cancelled{false};
+    SseTransport transport(sink, cancelled, 20ms);
+    {
+        HeartbeatTicker ticker(transport, [] { return std::string(); });
+        std::unique_lock lock(writes_mutex);
+        const auto deadline = std::chrono::steady_clock::now() + 5s;
+        written.wait_until(lock, deadline, [&] { return writes.size() >= 3; });
+        failures += check(writes.size() >= 3, "the heartbeat ticker stopped beating");
+        failures += check(writes.front() == SseTransport::kHeartbeatComment,
+                          "the ticker lost the standard comment for an empty next_comment");
+    }
+    const auto beats_after_join = writes.size();
+    std::this_thread::sleep_for(100ms);
+    failures += check(writes.size() == beats_after_join,
+                      "the heartbeat ticker kept writing after its destructor joined");
+
+    sink.write = [&](const char* data, std::size_t size) {
+        std::lock_guard lock(writes_mutex);
+        writes.emplace_back(data, size);
+        return true;
+    };
+    // A dedicated sink: the ticker outruns the waiting thread, so an index into a buffer the
+    // ticker keeps appending to would race. Its fake records full writes.
+    std::vector<std::string> custom_writes;
+    std::mutex custom_mutex;
+    std::condition_variable custom_written;
+    httplib::DataSink custom_sink;
+    custom_sink.write = [&](const char* data, std::size_t size) {
+        std::lock_guard lock(custom_mutex);
+        custom_writes.emplace_back(data, size);
+        custom_written.notify_all();
+        return true;
+    };
+    custom_sink.is_writable = [] { return true; };
+    std::atomic<bool> custom_cancelled{false};
+    SseTransport custom(custom_sink, custom_cancelled, 10ms);
+    {
+        HeartbeatTicker ticker(custom, [] { return std::string(": image 42%\n\n"); });
+        std::unique_lock lock(custom_mutex);
+        const auto deadline = std::chrono::steady_clock::now() + 5s;
+        const bool enough = custom_written.wait_until(lock, deadline,
+                                                      [&] { return custom_writes.size() >= 2; });
+        failures += check(enough && custom_writes.front() == ": image 42%\n\n" &&
+                              !custom_cancelled,
+                          "the ticker ignored a nonempty next_comment");
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
     int failures = test_ngram_identity() + test_ngram_generation() + test_sse_transport() +
                    test_sse_response_headers() + test_prompt_json_member_order() +
-                   test_schema_number_precision();
+                   test_schema_number_precision() + test_sse_beat() + test_heartbeat_ticker();
 #if defined(__linux__) || defined(_WIN32)
     failures += test_inherited_socket_liveness();
 #endif

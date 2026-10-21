@@ -7,11 +7,15 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <exception>
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -46,6 +50,9 @@ public:
                           Clock::duration heartbeat_interval = kHeartbeatInterval,
                           Clock::time_point now              = Clock::now());
 
+    // The transport is shared between the Engine wait loop and a HeartbeatTicker while a
+    // server-executed image round blocks the handler: every sink write and the quiet-interval
+    // clock are serialized under one mutex.
     void write(std::string_view item, Clock::time_point now = Clock::now());
     void write(const std::vector<std::string>& items, Clock::time_point now = Clock::now());
 
@@ -54,6 +61,16 @@ public:
     // unacknowledged peer. A failed probe marks the request for cancellation.
     [[nodiscard]] bool poll(Clock::time_point now = Clock::now());
 
+    // The ticker's quiet-interval heartbeat: the comment half of poll() without the socket's
+    // writability probe (a ticker running while the Engine loop is idle must not cancel on a
+    // transient !is_writable). A failed write marks the request cancelled, like poll().
+    void beat(Clock::time_point now = Clock::now());
+
+    [[nodiscard]] Clock::duration heartbeat_interval() const noexcept { return heartbeat_interval_; }
+    [[nodiscard]] bool is_cancelled() const noexcept {
+        return cancelled_.load(std::memory_order_acquire);
+    }
+
 private:
     bool mark_cancelled() noexcept;
 
@@ -61,6 +78,30 @@ private:
     std::atomic<bool>& cancelled_;
     Clock::duration heartbeat_interval_;
     Clock::time_point last_write_;
+    std::mutex write_mutex_;
+};
+
+// Beats `transport` from its own thread while the handler is blocked in a server-executed image
+// round: every interval it writes next_comment()'s text when nonempty (an ": image 42%" progress
+// comment), else the transport's standard quiet-interval beat. Destruction stops and joins the
+// thread. A write failure marks the transport's request cancelled, exactly as poll() does.
+class HeartbeatTicker final {
+public:
+    HeartbeatTicker(SseTransport& transport, std::function<std::string()> next_comment);
+    ~HeartbeatTicker();
+
+    HeartbeatTicker(const HeartbeatTicker&)            = delete;
+    HeartbeatTicker& operator=(const HeartbeatTicker&) = delete;
+
+private:
+    void run();
+
+    SseTransport& transport_;
+    std::function<std::string()> next_comment_;
+    std::mutex mutex_;
+    std::condition_variable condition_;
+    bool stopping_ = false;
+    std::thread thread_;
 };
 
 template <class Render>

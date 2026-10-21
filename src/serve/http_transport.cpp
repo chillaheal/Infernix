@@ -178,6 +178,7 @@ bool SseTransport::mark_cancelled() noexcept {
 }
 
 void SseTransport::write(std::string_view item, Clock::time_point now) {
+    const std::lock_guard<std::mutex> lock(write_mutex_);
     if (cancelled_.load(std::memory_order_acquire) || !sink_.write(item.data(), item.size())) {
         mark_cancelled();
         throw ClientDisconnected();
@@ -186,11 +187,20 @@ void SseTransport::write(std::string_view item, Clock::time_point now) {
 }
 
 void SseTransport::write(const std::vector<std::string>& items, Clock::time_point now) {
-    for (const std::string& item : items) { write(item, now); }
+    const std::lock_guard<std::mutex> lock(write_mutex_);
+    if (cancelled_.load(std::memory_order_acquire)) { throw ClientDisconnected(); }
+    for (const std::string& item : items) {
+        if (!sink_.write(item.data(), item.size())) {
+            mark_cancelled();
+            throw ClientDisconnected();
+        }
+        last_write_ = now;
+    }
 }
 
 bool SseTransport::poll(Clock::time_point now) {
     if (cancelled_.load(std::memory_order_acquire)) { return true; }
+    const std::lock_guard<std::mutex> lock(write_mutex_);
     if (sink_.is_writable && !sink_.is_writable()) { return mark_cancelled(); }
     if (now - last_write_ < heartbeat_interval_) { return false; }
     if (!sink_.write(kHeartbeatComment.data(), kHeartbeatComment.size())) {
@@ -198,6 +208,55 @@ bool SseTransport::poll(Clock::time_point now) {
     }
     last_write_ = now;
     return false;
+}
+
+void SseTransport::beat(Clock::time_point now) {
+    if (cancelled_.load(std::memory_order_acquire)) { return; }
+    const std::lock_guard<std::mutex> lock(write_mutex_);
+    if (now - last_write_ < heartbeat_interval_) { return; }
+    if (!sink_.write(kHeartbeatComment.data(), kHeartbeatComment.size())) {
+        mark_cancelled();
+        return;
+    }
+    last_write_ = now;
+}
+
+HeartbeatTicker::HeartbeatTicker(SseTransport& transport, std::function<std::string()> next_comment)
+    : transport_(transport), next_comment_(std::move(next_comment)),
+      thread_([this] { run(); }) {}
+
+HeartbeatTicker::~HeartbeatTicker() {
+    {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        stopping_ = true;
+    }
+    condition_.notify_all();
+    thread_.join();
+}
+
+void HeartbeatTicker::run() {
+    for (;;) {
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            if (condition_.wait_for(lock, transport_.heartbeat_interval(),
+                                    [this] { return stopping_; })) {
+                return;
+            }
+        }
+        // Not poll(): its heartbeat half would write a second comment, and its writability
+        // probe cancels on a transient !is_writable, which must not abort an image round.
+        // Dead peers surface through the write below.
+        if (transport_.is_cancelled()) { return; }
+        const std::string comment = next_comment_ ? next_comment_() : std::string();
+        try {
+            // One comment per interval: the progress comment replaces the standard beat, it
+            // does not join it.
+            transport_.write(comment.empty() ? std::string(SseTransport::kHeartbeatComment)
+                                             : comment);
+        } catch (const ClientDisconnected&) {
+            return;
+        }
+    }
 }
 
 void configure_http_server_socket(socket_t socket) noexcept {
