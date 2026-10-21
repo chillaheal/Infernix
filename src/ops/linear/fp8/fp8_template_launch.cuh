@@ -17,9 +17,9 @@ void launch_fp8_a16_gemv(const Fp8A16Operands& p, Output output, Epilogue epilog
     validate_fp8_operands<Schedule>(p);
     if (p.tokens != 1 || p.rows % Schedule::kBlockRows || p.k % (32 * Schedule::kValuesPerLane))
         throw std::invalid_argument("FP8 GEMV requires T=1 and complete row/K tiles");
-    fp8_a16_gemv_kernel<Schedule><<<p.rows / Schedule::kBlockRows, Schedule::kThreads, 0, stream>>>(
-        p.x, p.codes, p.scales, output, epilogue, rows, p.rows, p.k);
-    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(pdl::launch_consumer({dim3(p.rows / Schedule::kBlockRows), dim3(Schedule::kThreads), 0, stream},
+                                    fp8_a16_gemv_kernel<Schedule, Output, Epilogue, Rows>, p.x, p.codes, p.scales,
+                                    output, epilogue, rows, p.rows, p.k));
 }
 
 template <class Schedule, class Output, class Epilogue, class Rows = Fp8IdentityRows>
@@ -98,6 +98,10 @@ void launch_fp8_a8_mma(const Fp8A8Operands& p, Output output, Epilogue epilogue,
     if (p.rows % Schedule::kBlockRows || p.k % Schedule::kBlockK ||
         p.k / Schedule::kBlockK < Schedule::kStages)
         throw std::invalid_argument("FP8 A8 MMA requires complete row/K tiles and enough K stages");
+    if constexpr (requires { Schedule::kTerms; }) {
+        if ((Schedule::kTerms > 1) != (p.x_residual != nullptr))
+            throw std::invalid_argument("FP8 A8 MMA: activation planes do not match the schedule");
+    }
     for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
         const int blocks  = p.rows / Schedule::kBlockRows * div_up(count, Schedule::kBlockTokens);
         const auto launch = [&]<bool Full>() {

@@ -139,6 +139,7 @@ void Program::fail_all_cleanup() noexcept { impl_->release_all(); }
 bool Program::recover_after_failure() noexcept { return impl_->recover_after_failure(); }
 
 void Program::shutdown_cleanup() noexcept {
+    impl_->report_cache_layers();
     impl_->release_all();
     impl_->save_expert_state();
     impl_->save_prefix_cache_for_shutdown();
@@ -252,6 +253,10 @@ std::uint64_t Program::run_image_interlude(std::uint64_t target_bytes, std::uint
 
 std::optional<PrefixCachePersistence> Program::save_prefix_cache_now(const CancellationView& abandoned) {
     return impl_->save_prefix_cache_now(abandoned);
+}
+
+ScoreResult Program::causal_score(PreparedPrompt&& prompt, std::uint32_t first_target, const ScoreOptions& options) {
+    return impl_->causal_score(std::move(prompt), first_target, options);
 }
 
 PhysicalUsageSnapshot Program::physical_usage() const noexcept { return impl_->usage(); }

@@ -187,6 +187,8 @@ int main() {
         check(server.at("engine").at("log_stats_interval_ms") == 2500, "stats interval missing");
     failures += check(server.at("server").at("request_log_jsonl") == "requests.jsonl",
                       "request log path missing");
+    failures += check(server.at("server").at("thinking_answer_room") == true,
+                      "server_start did not record the thinking answer room");
     failures += check(server.at("server").at("default_thinking_budget") == 512,
                       "server thinking budget missing");
     failures += check(server.at("engine").at("kv_cache") == "fp8-e4m3-row256", "KV type missing");
@@ -243,6 +245,8 @@ int main() {
         "resolved context-cache configuration missing");
     failures += check(server.at("server").at("default_preserve_thinking") == true,
                       "server preserve-thinking default missing");
+    failures += check(server.at("server").at("claude_code_prompt") == "as-sent",
+                      "server Claude Code prompt setting missing");
     failures +=
         check(server.at("sampling_defaults").at("thinking").at("temperature") == 1.0 &&
                   server.at("sampling_defaults").at("non_thinking").at("presence_penalty") == 1.5,
@@ -276,6 +280,19 @@ int main() {
                       "server JSON leaked the API key");
     failures += check(server.at("argv").at(3) == "<redacted>",
                       "server argv did not retain the redaction marker");
+    failures += check(server.at("config").is_null(), "server_start reports a config file it was not given");
+    {
+        ServeOptions configured     = options;
+        configured.config_path      = "serve.toml";
+        configured.config_arguments = {"--port", "9000", "--api-key", "<redacted>"};
+        const Json with_config      = Json::parse(format_server_start_json(
+            "serve-test", 1000, configured, engine_options, sampling_defaults, "deployment-alias", load, memory,
+            environment, std::uint64_t{123456}));
+        failures += check(with_config.at("config").at("path") == "serve.toml" &&
+                              with_config.at("config").at("arguments").size() == 4 &&
+                              with_config.at("config").at("arguments").at(3) == "<redacted>",
+                          "server_start does not record the config file and its redacted options");
+    }
 
     GenerationRequest request;
     request.max_tokens = 4096;

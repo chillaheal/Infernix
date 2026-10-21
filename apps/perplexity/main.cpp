@@ -51,6 +51,7 @@ struct Options {
     std::optional<std::filesystem::path> output;
     std::optional<std::filesystem::path> save_top_tokens;
     std::optional<std::filesystem::path> kl_reference;
+    std::filesystem::path expert_stripe; // Qwen3.8-Flash-Next's record tails on a second drive
     float rope_yarn_factor              = 1.0F;
     std::uint32_t context               = 4096;
     std::uint32_t stride                = 2048;
@@ -59,9 +60,11 @@ struct Options {
     infernix::KvCacheStorage kv           = infernix::KvCacheStorage::Fp8E4M3Row256;
     bool quick                          = false;
     bool original_int8_prefill_kernel   = false;
-    infernix::PrefillPv8 prefill_8bit_pv          = infernix::PrefillPv8::Auto;
     bool original_nvfp4_prefill_kernel  = false;
     bool a16_activations                = false;
+    bool fast_paths                     = true;
+    std::vector<infernix::FastPath> fast_path_candidates;
+    std::optional<std::filesystem::path> ngram_volume;
     infernix::product::LogLevel log_level = infernix::product::LogLevel::Info;
 };
 
@@ -74,15 +77,22 @@ std::string usage_text() {
            "       [--rope-yarn-factor F] (startup-fixed, finite [1,4], default 1; ceiling only)\n"
            "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4|vq2|k4v2] (default fp8)\n"
            "       [--use-original-int8-prefill-kernel (int8 only; default fast kernel)]\n"
-           "       [--prefill-8bit-pv | --no-prefill-8bit-pv] (8-bit P*V for INT8 and K4V2;\n"
-           "        FP16 for NVFP4, K8V4 and VQ2, which default to 8-bit; see infernix-serve)\n"
            "       [--use-original-nvfp4-prefill-kernel (nvfp4 only; default fast kernel)]\n"
            "       [--a16-activations] (16-bit activations in every linear: the reference for\n"
-           "        measuring activation quantization; at least 3x slower on NVFP4 artifacts)\n"
+           "        measuring activation quantization, on the exact route; at least 3x slower\n"
+           "        on NVFP4 artifacts)\n"
+           "       [--disable-fast-paths] (score the exact route; by default the qualified fast\n"
+           "        paths run, as in infernix-serve)\n"
+           "       [--fast-path NAME]... (qualification: also run this fast path, qualified or\n"
+           "        not: prompt-pv8, decode-split64)\n"
+           "       [--ngram-volume <file>] (Qwen3.8-Flash-Next n-gram volume; default\n"
+           "        <artifact>.ngram)\n"
            "       [--output <directory>]\n"
-           "       [--save-top-tokens <file>] (record each position's 32 most probable tokens)\n"
+           "       [--save-top-tokens <file>] (record each position's 64 most probable tokens)\n"
            "       [--kl-reference <file>] (KL divergence from a --save-top-tokens run of the\n"
            "        same corpus, context and stride, by context length)\n"
+           "       [--expert-stripe <file>] (Qwen3.8-Flash-Next's expert record tails on a second\n"
+           "        drive, read beside the artifact by the SSD expert tier)\n"
            "       [--log-level trace|debug|info|warning|error|critical|off]\n";
 }
 
@@ -133,14 +143,19 @@ Options parse_options(int argc, char** argv) {
             out.device = parse_integer<int>(value("--device"), "device");
         } else if (option == "--use-original-int8-prefill-kernel") {
             out.original_int8_prefill_kernel = true;
-        } else if (option == "--prefill-8bit-pv") {
-            out.prefill_8bit_pv = infernix::PrefillPv8::On;
-        } else if (option == "--no-prefill-8bit-pv") {
-            out.prefill_8bit_pv = infernix::PrefillPv8::Off;
         } else if (option == "--use-original-nvfp4-prefill-kernel") {
             out.original_nvfp4_prefill_kernel = true;
         } else if (option == "--a16-activations") {
             out.a16_activations = true;
+        } else if (option == "--ngram-volume") {
+            out.ngram_volume = std::filesystem::path(value("--ngram-volume"));
+        } else if (option == "--disable-fast-paths") {
+            out.fast_paths = false;
+        } else if (option == "--fast-path") {
+            const std::string_view name = value("--fast-path");
+            const std::optional<infernix::FastPath> path = infernix::parse_fast_path(name);
+            if (!path) { usage_error("unknown fast path: " + std::string(name)); }
+            out.fast_path_candidates.push_back(*path);
         } else if (option == "--kv-dtype") {
             const std::string_view dtype = value("--kv-dtype");
             if (dtype == "bf16") {
@@ -166,6 +181,8 @@ Options parse_options(int argc, char** argv) {
             out.save_top_tokens = std::filesystem::path(value("--save-top-tokens"));
         } else if (option == "--kl-reference") {
             out.kl_reference = std::filesystem::path(value("--kl-reference"));
+        } else if (option == "--expert-stripe") {
+            out.expert_stripe = std::filesystem::path(value("--expert-stripe"));
         } else if (option == "--log-level") {
             out.log_level = infernix::product::parse_log_level(value("--log-level"));
         } else {
@@ -274,9 +291,13 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     if (options.prefill_chunk) { engine_options.prefill_chunk = *options.prefill_chunk; }
     engine_options.kv_cache         = options.kv;
     engine_options.original_int8_prefill_kernel = options.original_int8_prefill_kernel;
-    engine_options.prefill_8bit_pv              = options.prefill_8bit_pv;
     engine_options.original_nvfp4_prefill_kernel = options.original_nvfp4_prefill_kernel;
     engine_options.a16_activations               = options.a16_activations;
+    // The 16-bit-activation reference runs the exact route.
+    engine_options.fast_paths           = options.fast_paths && !options.a16_activations;
+    engine_options.fast_path_candidates = options.fast_path_candidates;
+    if (options.ngram_volume) { engine_options.ngram_volume_path = *options.ngram_volume; }
+    engine_options.expert_stripe_path   = options.expert_stripe;
     engine_options.startup_observer = startup_log.observer();
     engine_options.diagnostic_observer = infernix::product::engine_diagnostic_observer(logger);
     infernix::Engine engine(std::move(engine_options));
@@ -410,6 +431,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
                                    .top_ids         = scored.top_ids,
                                    .top_logprobs    = scored.top_logprobs});
             }
+            DivergenceAggregate window_divergence;
             if (reference) {
                 const std::size_t k = kl_reference->header().top_k;
                 for (std::size_t position = 0; position < expected; ++position) {
@@ -421,12 +443,13 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
                         scored.top_ids[position * own_top_tokens] == reference->top_ids[position * k];
                     // The predicted token at window input index first_target + position follows
                     // that many tokens of context.
-                    stream_divergence.add(window.first_target + position,
+                    window_divergence.add(window.first_target + position,
                                           infernix::perplexity::position_divergence(
                                               reference_top, evaluated_top, top1_match,
                                               reference->target_logprobs[position],
                                               logprobs[position]));
                 }
+                stream_divergence.add(window_divergence);
             }
             ScoreAggregate window_score;
             window_score.add(logprobs);
@@ -442,6 +465,8 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
             window_report["target_end"]   = window.target_end;
             window_report["first_target"] = window.first_target;
             window_report["seconds"]      = seconds_since(window_started);
+            // Windows are independent samples: tools/quality/fast_path_gate.py pairs them.
+            if (reference) { window_report["kl_divergence"] = window_divergence.summary_json(); }
             window_reports.push_back(std::move(window_report));
 
             if (Clock::now() >= next_progress) {
@@ -533,9 +558,10 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
           {"context_tokens", options.context},
           {"rope_yarn_factor", options.rope_yarn_factor},
           {"original_int8_prefill_kernel", options.original_int8_prefill_kernel},
-          {"prefill_8bit_pv", infernix::prefill_pv8_name(options.prefill_8bit_pv)},
           {"original_nvfp4_prefill_kernel", options.original_nvfp4_prefill_kernel},
           {"a16_activations", options.a16_activations},
+          {"fast_paths", load.fast_paths},
+          {"fast_path_configuration", load.fast_path_configuration},
           {"stride_tokens", options.stride},
           {"prefill_chunk_tokens", engine.options().prefill_chunk},
           {"score_tile_tokens", 1024},

@@ -12,9 +12,11 @@
 #include "core/tensor.h"
 #include "models/qwen4_exp/execution/expert_stream.h"
 #include "models/qwen4_exp/execution/parameters.h"
+#include "models/qwen4_exp/execution/fast_path_flags.h"
 #include "infernix/ops/offloaded_sparse_moe.h"
 #include "infernix/ops/qsa.h"
 #include "infernix/ops/rope.h"
+#include "infernix/ops/sampling.h"
 
 #include <array>
 #include <cstdint>
@@ -58,9 +60,11 @@ public:
 // Where each layer's routed experts live: device frames for resident experts, the pinned host
 // bank otherwise.
 struct ForwardExperts {
-    const std::uint8_t* frame_base = nullptr;
-    std::uint64_t frame_stride     = 0;
-    std::vector<const std::int32_t*> frames; // per layer, device I32 [E]: frame or -1
+    // Per layer: its frame pool's base and pitch (frame f at frame_bases[l] + f * frame_pitches[l];
+    // empty: no frames), and its device I32 [E] table (frame or -1).
+    std::vector<const std::uint8_t*> frame_bases;
+    std::vector<std::uint64_t> frame_pitches;
+    std::vector<const std::int32_t*> frames;
     // Optional route log for the expert cache: layer l's routed ids (I32 [k, T]) are copied to
     // route_log + l * route_stride.
     std::int32_t* route_log  = nullptr;
@@ -82,6 +86,10 @@ struct ForwardExperts {
     // Prefill chunks stage their next pass of misses on this stream while one pass computes.
     cudaStream_t overlap_stream = nullptr;
     std::array<cudaEvent_t, 5> overlap_events{};
+    // Decode and verification calls run the shared expert on this stream (forked at the layer's
+    // input, joined before the combine) while the routed experts compute. Null: in order.
+    cudaStream_t shared_stream = nullptr;
+    std::array<cudaEvent_t, 2> shared_events{};
     // Landing frames of decode and verification calls (design §19.3.5 S4; see
     // ops::MoeExpertSource::landing): layer l uses landing + l * landing_slots and landed + l *
     // landing_slots. Null disables.
@@ -93,6 +101,9 @@ struct ForwardExperts {
     ExpertStream* stream = nullptr;
     // A gated stream's split of each layer's experts between the link and the CPU (§19.3.12).
     const CpuSplitPolicy* split = nullptr;
+    // --expert-tail-skip (approximate, 0: off): the generation rounds' ops::MoeExpertSource::
+    // tail_skip_rank.
+    std::int32_t tail_skip_rank = 0;
 };
 
 // A speculative verification call (design §11): `batch` sequences of `width` >= 2 positions. It
@@ -149,7 +160,11 @@ struct ForwardBatch {
     Tensor rope_positions;   // I32 [T, 3] axis-major: RoPE position of each column
     Tensor block_start_rope; // I32 [batch, 3] axis-major: RoPE position of each sequence's first
                              // pooled-block token (ops::QsaBatch::block_start_rope)
-    Tensor ngram_rows; // U8 [row bytes, heads, T]: each column's FP8 n-gram rows
+    Tensor ngram_rows; // U8 [row bytes, heads, T]: each column's n-gram rows
+    // The rows' format when it is not the artifact's table's (another volume, resolve_ngram_volume),
+    // and an FP8 volume's scale (BF16 [1]) when it is not the artifact's ngram_scale.
+    std::optional<NgramRowFormat> ngram_format;
+    Tensor ngram_scale;
     const NgramRowGate* ngram_gate = nullptr; // when set: ngram_rows are written by the gate
     Tensor slots;      // I32 [batch]: state slot of each sequence, updated in place
     Tensor table_rows; // I32 [batch]: KV block-table row of each sequence
@@ -160,7 +175,14 @@ struct ForwardBatch {
     std::int32_t batch = 0;
     std::int32_t width = 0;
     const ForwardVerify* verify = nullptr; // set for a speculative verification call
+    // A generation round (decode or verification), not a prefill chunk, forced token or scored
+    // position: the only calls ForwardExperts::tail_skip_rank applies to.
+    bool decode_round = false;
     Tensor residual_out;                   // when set: BF16 [S*H, T] copy of the final residual
+    // DFlash2 target features (docs/maintainer/dflash.md): when set, BF16 [taps * H, n] receives,
+    // for the call's last n columns, the stream mean of each tapped layer's completed residual
+    // (tap i at rows [i * H, (i + 1) * H)). n <= T.
+    Tensor draft_features;
     const MtpChunk* mtp_chunk = nullptr;   // when set: the chunk's MTP cells (one sequence)
     // Prefix-cache copies of the call's lane in flight (a restore into it, a copy-out of it): each
     // empty or one event per decoder layer, then one for the MTP block. Layer l waits for entry l
@@ -200,6 +222,16 @@ struct MtpCall {
     // Optional: each draft's log-probability under the draft head (FP32 [1, T]), the confidence
     // a draft-length cut reads.
     Tensor draft_logprobs;
+    // Sampled drafts (the sampled-mtp-drafts fast path): with sample_configs (device, one per
+    // column), each draft is drawn from the draft head's top sample_rows.ne[0] rows under its
+    // column's sampler, keyed by `positions` and the round's draft step (positions clamp at the
+    // lane's last mapped cell, so steps may share one; ops::speculative_sample_sparse_drafts; a
+    // greedy column keeps the argmax). sample_rows / sample_logprobs (I32 / FP32 [n, T]) are the
+    // top-n scratch; draft_candidates / draft_q (I32 / FP32 [16, T]) receive the proposal the sparse
+    // acceptance verifies, and draft_logprobs the top row's log-probability.
+    const ops::SamplingConfig* sample_configs = nullptr;
+    std::uint32_t draft_step                  = 0;
+    Tensor sample_rows, sample_logprobs, draft_candidates, draft_q;
     // Cells whose next token is an image token take its visual embedding (prompt cells only).
     const VisionInput* vision = nullptr;
 };
@@ -222,7 +254,8 @@ struct ForwardTap {
 class Forward {
 public:
     Forward(const Parameters& parameters, DeviceContext& device, WorkspaceArena& work,
-            ForwardState state, ForwardKV kv, ForwardExperts experts, std::int32_t max_context);
+            ForwardState state, ForwardKV kv, ForwardExperts experts, std::int32_t max_context,
+            ForwardFastPaths fast_paths);
     ~Forward();
     Forward(const Forward&)            = delete;
     Forward& operator=(const Forward&) = delete;
@@ -240,13 +273,36 @@ public:
     void begin_call(const ForwardBatch& batch, const Tensor* logits);
     void embed(const ForwardBatch& batch, Tensor& residual);
     void layer(std::uint32_t layer, const ForwardBatch& batch, Tensor& residual, const ForwardTap* tap = nullptr);
+    // layer() in two halves, for a walk whose MoE runs once over several chunks' columns (every
+    // step of both halves acts column by column, so the outputs are layer()'s bit for bit).
+    // layer_mixer runs everything before the MoE and writes its input xm (BF16 [H, T]) and its
+    // inject weights (FP32 [S, T]) into the caller's tensors; layer_moe runs the MoE over xm (any
+    // T, after begin_call of any of its chunks) and injects its output into `residual` (the same
+    // columns), its route log holding the trailing `route_columns` columns (-1: all).
+    void layer_mixer(std::uint32_t layer, const ForwardBatch& batch, Tensor& residual, Tensor& xm, Tensor& inject);
+    void layer_moe(std::uint32_t layer, const ForwardBatch& batch, const Tensor& xm, const Tensor& inject,
+                   Tensor& residual, std::int32_t route_columns);
     void finish(const ForwardBatch& batch, Tensor& residual, Tensor* logits);
+    // DFlash2: when `layer` is one of the drafter's target layers, the stream mean of its completed
+    // residual columns (BF16 [S*H, n]) into that tap's rows of `features` (BF16 [taps * H, n], any
+    // column pitch); layer() applies it to ForwardBatch::draft_features, a layer walk to its spans.
+    void capture_draft_features(std::uint32_t layer, const Tensor& residual, const Tensor& features);
+    // Workspace of one layer_moe call over `columns` columns, with the W4A16 experts' wide route
+    // `wide_a16` (the expert-a4-residual layout is larger: Forward::moe carves it when selected).
+    [[nodiscard]] static std::size_t moe_workspace_bytes(const TextConfig& config, std::int32_t columns,
+                                                         ops::offloaded_moe::WideA16 wide_a16);
 
     // Runs the MTP drafter (requires MTP parameters and state).
     void run_mtp(const MtpCall& call);
 
-    [[nodiscard]] static std::size_t workspace_bytes(const TextConfig& config, std::int32_t columns,
-                                                     std::int32_t max_context, KvCacheStorage storage);
+    // FP32 logits [V, n] of n final residuals (BF16 [S*H, n], ForwardBatch::residual_out): the final
+    // mixer and the LM head, as finish() applies them to a call's logit columns. Teacher-forced
+    // scoring runs it in tiles over a prompt's saved residuals. Uses the workspace (no call open).
+    void head_logits(const Tensor& residuals, Tensor& logits);
+
+    [[nodiscard]] static std::size_t workspace_bytes(
+        const TextConfig& config, std::int32_t columns, std::int32_t max_context, KvCacheStorage storage,
+        ops::offloaded_moe::WideA16 wide_a16 = ops::offloaded_moe::WideA16::kExact);
     // Extra workspace of the MTP drafter: K/V-only calls over up to `kv_columns` columns (chunks
     // run them inside run()) and full steps over `draft_columns` sequences.
     [[nodiscard]] static std::size_t mtp_workspace_bytes(const TextConfig& config, std::int32_t kv_columns,
@@ -255,7 +311,10 @@ public:
 
 private:
     void ple(const PleParameters& p, Tensor& residual, const ForwardBatch& batch);
-    Tensor mix(const HyperConnectionParameters& p, const Tensor& residual, Tensor* inject);
+    // The block's mixed input (into `into` when given, else the workspace).
+    Tensor mix(const HyperConnectionParameters& p, const Tensor& residual, Tensor* inject, Tensor* into = nullptr);
+    // The layer's token mixer (GDN or QSA attention) over its mixed input.
+    Tensor mixer(std::uint32_t layer, const ForwardBatch& batch, const Tensor& xa);
     Tensor gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index, const ForwardBatch& batch);
     // One QSA block's attention through `layer` and `tails`. Index keys go to `key_records` when
     // set (verification and MTP catch-up: tails unchanged) or advance the tails when update_tails;
@@ -274,10 +333,18 @@ private:
         std::int32_t batch = 0, width = 0;
     };
     Tensor attention(const AttentionParameters& p, const Tensor& x, const AttentionCall& call);
+    // `route_columns` >= 0: a layer walk's grouped call, whose route log keeps its last that many
+    // columns. With inject and residual, the output is injected into the residual streams (and not
+    // returned).
     Tensor moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer, Tensor* route_tap,
-               const ForwardBatch* batch = nullptr);
+               const ForwardBatch* batch = nullptr, std::int32_t route_columns = -1, const Tensor* inject = nullptr,
+               Tensor* residual = nullptr);
     void wait_layer(const ForwardBatch& batch, std::size_t entry);
     void mtp_block(const MtpCall& call, Tensor& residual);
+    // The dense projections' route flags for the current call: ggml-bf16-prefill's only in eager
+    // calls (prefill chunks, forced tokens), so decode and verification rounds keep the exact GGUF
+    // route whatever their column count.
+    [[nodiscard]] ops::LinearRoutes dense_routes() const noexcept;
 
     const Parameters& parameters_;
     const TextConfig& config_;
@@ -287,7 +354,10 @@ private:
     ForwardKV kv_;
     ForwardExperts experts_;
     std::int32_t max_context_;
+    // The selected fast paths (program/fast_paths.h); all off on the exact route.
+    ForwardFastPaths fast_;
     ops::PreparedRope rope_; // the text rotation (YaRN-scaled when the factor is above 1)
+    std::vector<std::uint32_t> draft_taps_; // the DFlash2 drafter's target layers (empty without it)
     bool eager_chunk_ = false;
     // A gated call's layer routing on the host: the dispatch offsets (pinned I32 [E + 1]), the
     // event that lands them, and the per-expert columns and CPU marks derived from them.

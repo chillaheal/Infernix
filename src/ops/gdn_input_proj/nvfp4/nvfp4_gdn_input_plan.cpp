@@ -11,13 +11,17 @@ namespace infernix::ops::detail {
 namespace {
 
 enum class Nvfp4GdnInputRoute : std::uint8_t {
+    ColumnInvariantA16,
     A16,
     A4,
 };
 
 Nvfp4GdnInputRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (tokens <= 0) { throw std::invalid_argument("nvfp4 gdn_input_proj: T must be positive"); }
-    if (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8) {
+    if (column_invariant(policy)) { return Nvfp4GdnInputRoute::ColumnInvariantA16; }
+    // The residual profiles are registered for the NVFP4 MLP and FP8 projections only.
+    if (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8 ||
+        allows_residual(policy)) {
         return Nvfp4GdnInputRoute::A16;
     }
     if (allows_a4(policy)) { return Nvfp4GdnInputRoute::A4; }
@@ -40,7 +44,12 @@ std::size_t nvfp4_gdn_input_workspace_capacity_bytes(LinearPolicy policy, std::i
 
 void nvfp4_gdn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                               LinearPolicy policy, WorkspaceArena* workspace, cudaStream_t stream) {
-    if (resolve_route(policy, x.ne[1]) == Nvfp4GdnInputRoute::A16) {
+    const Nvfp4GdnInputRoute route = resolve_route(policy, x.ne[1]);
+    if (route == Nvfp4GdnInputRoute::ColumnInvariantA16) {
+        nvfp4_gdn_input_invariant_launch(x, weight, qkv, z, stream);
+        return;
+    }
+    if (route == Nvfp4GdnInputRoute::A16) {
         nvfp4_gdn_input_a16_launch(x, weight, qkv, z, stream);
         return;
     }

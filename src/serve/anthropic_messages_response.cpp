@@ -1,6 +1,7 @@
 #include "serve/anthropic_messages.h"
 #include "product/constraint_observation.h"
 
+#include "serve/completion_timings.h"
 #include "serve/generation_service.h"
 
 #include <nlohmann/json.hpp>
@@ -142,6 +143,13 @@ AnthropicResponseIdentity make_anthropic_response_identity(std::string request_i
 
 ApiError normalize_anthropic_error(ApiError error) {
     if (error.param == "reasoning_effort") { error.param = "output_config.effort"; }
+    if (const auto& details = error.context_length) {
+        // The Anthropic API's wording, which Claude Code matches to compact the conversation.
+        error.param   = {};
+        error.message = "prompt is too long: " + std::string(details->exact ? "" : "more than ") +
+                        std::to_string(details->prompt_tokens) + " tokens > " + std::to_string(details->max_context) +
+                        " maximum";
+    }
     if (error.code == "server_overloaded" || error.status == 429) {
         error.status = 529;
         error.type   = "overloaded_error";
@@ -277,6 +285,7 @@ std::string make_anthropic_messages_response(const AnthropicResponseIdentity& id
                          {"usage", final_usage(outcome)}};
     if (outcome.constraint)
         response["constraint"] = product::constraint_observation_json(outcome.constraint);
+    response["timings"] = timings_json(outcome_timings(outcome));
     return response.dump();
 }
 
@@ -423,6 +432,7 @@ std::vector<std::string> AnthropicMessagesStream::finish(const GenerationOutcome
                   {"usage", final_usage(outcome)}};
     if (outcome.constraint)
         terminal["constraint"] = product::constraint_observation_json(outcome.constraint);
+    terminal["timings"] = timings_json(outcome_timings(outcome));
     events.push_back(event("message_delta", std::move(terminal)));
     events.push_back(event("message_stop", Json{{"type", "message_stop"}}));
     finished_ = true;

@@ -1,5 +1,7 @@
 #include "ops/offloaded_sparse_moe/cpu/miss_service.h"
 
+#include "core/nvtx.h"
+
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -61,8 +63,15 @@ CpuMissService::CpuMissService(std::vector<Layer> layers, Options options)
     }
     for (const auto& layer : layers_) {
         // Without a bank (the SSD tier) every request is tiered: it carries its records' addresses.
-        if ((layer.records == nullptr && options_.records == nullptr) || layer.scales == nullptr ||
-            layer.record_stride < kRecordBytes) {
+        // A GGUF bank's records are its own size (ggml_expert.h) and carry no per-expert scalars.
+        const std::uint64_t record = layer.ggml.valid()
+                                         ? 2ULL * kIntermediate * layer.ggml.gate_row_bytes +
+                                               static_cast<std::uint64_t>(kHidden) * layer.ggml.down_row_bytes
+                                         : kRecordBytes;
+        if ((layer.records == nullptr && options_.records == nullptr) ||
+            (layer.ggml.valid() ? !ggml_cpu_supported(layer.ggml) || options_.activation != ExpertActivation::kA16
+                                : layer.scales == nullptr) ||
+            layer.record_stride < record) {
             throw std::invalid_argument("CPU miss service layer is incomplete");
         }
     }
@@ -142,6 +151,7 @@ MoeCpuChannel CpuMissService::channel(int layer) const {
     out.max_jobs    = options_.max_jobs;
     out.max_columns  = options_.max_columns;
     out.pcie_divisor = options_.pcie_divisor;
+    out.one_column_divisor = options_.one_column_divisor;
     out.max_job_columns = options_.max_job_columns;
     out.wide_from       = options_.wide_from;
     out.wide_jobs       = options_.wide_jobs;
@@ -151,9 +161,11 @@ MoeCpuChannel CpuMissService::channel(int layer) const {
 void CpuMissService::serve() {
     try {
         pin(options_.cpus.empty() ? -1 : options_.cpus[0]);
+        const bool ggml = std::any_of(layers_.begin(), layers_.end(), [](const Layer& l) { return l.ggml.valid(); });
         CpuExpertTeam team({.workers    = options_.workers,
                             .max_jobs   = jobs_,
                             .activation = options_.activation,
+                            .ggml       = ggml,
                             .cpus       = options_.cpus});
         std::vector<CpuExpertJob> jobs(static_cast<std::size_t>(jobs_));
         std::vector<CpuExpertJob> ready, read;
@@ -164,7 +176,9 @@ void CpuMissService::serve() {
         std::uint32_t beat    = 0;
         auto* volatile_sequence = reinterpret_cast<volatile std::uint32_t*>(&request_->sequence);
         auto* volatile_done     = reinterpret_cast<volatile std::uint32_t*>(done_);
-        std::uint32_t seen      = *volatile_sequence;
+        // The constructor zeroed the request word before starting this thread, so a request
+        // published before the thread first runs is still served.
+        std::uint32_t seen      = 0;
         auto last               = std::chrono::steady_clock::now();
         std::uint32_t polls     = 0;
         while (!stop_.load(std::memory_order_acquire)) {
@@ -189,6 +203,10 @@ void CpuMissService::serve() {
             const MissRequest& r = *request_;
             const Layer& layer   = layers_.at(static_cast<std::size_t>(r.layer));
             const int count      = r.jobs;
+            // One request's experts (payload: layer << 32 | job count).
+            const nvtx::ScopedRange compute_range(
+                nvtx::Name::MoeCpuCompute, nvtx::Category::Moe,
+                (static_cast<std::uint64_t>(static_cast<std::uint32_t>(r.layer)) << 32) | static_cast<std::uint32_t>(count));
             std::uint32_t status = 0;
             ready.clear();
             read_jobs.clear();
@@ -198,8 +216,16 @@ void CpuMissService::serve() {
                 const auto expert = static_cast<std::uint64_t>(r.expert[j]);
                 job.record        = r.tiered != 0 ? reinterpret_cast<const std::uint8_t*>(r.record[j])
                                                       : layer.records + expert * layer.record_stride;
-                job.scales        = layer.scales[expert];
+                job.ggml          = layer.ggml;
+                job.scales        = layer.ggml.valid() ? ExpertScales{} : layer.scales[expert];
                 job.ncols         = r.ncols[j];
+                // The device publishes 1..kMaxCpuColumns columns (cpu_plan_body); any other count
+                // would index past the job's x/y and the kernels' accumulators.
+                if (job.ncols < 1 || job.ncols > kMaxCpuColumns) {
+                    job.ncols = 0;
+                    status    = EINVAL;
+                    continue;
+                }
                 for (int c = 0; c < job.ncols; ++c) {
                     job.x[c] = x_ + static_cast<std::size_t>(r.column[j][c]) * kHidden;
                     job.y[c] = y_ + (static_cast<std::size_t>(j) * kMaxCpuColumns + c) * kHidden;

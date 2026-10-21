@@ -7,6 +7,7 @@
 #include "models/qwen3_5/frontend/processor.h"
 #include "models/qwen3_5/frontend/test_access.h"
 #include "models/qwen3_5/frontend/tokenizer.h"
+#include "runtime/contract/execution.h"
 #include "runtime/prefix_cache/block_hash.h"
 #include "text/unicode.h"
 
@@ -31,6 +32,12 @@
 #include <thread>
 #include <utility>
 #include <vector>
+
+// The Windows SDK's minwindef.h (through runtime/contract/execution.h) defines `near` as an empty
+// legacy compatibility macro; drop it so the local helper below keeps its name.
+#ifdef _WIN32
+#undef near
+#endif
 
 namespace {
 
@@ -441,6 +448,21 @@ bool throws_context_length(Callable&& callable) {
     return false;
 }
 
+// The counts a context overflow reports: {prompt_tokens, max_context, exact}.
+template <class Callable>
+bool throws_context_length(Callable&& callable, std::uint64_t prompt_tokens, std::uint32_t max_context,
+                           bool exact) {
+    try {
+        callable();
+    } catch (const infernix::RequestError& error) {
+        const auto& details = error.context_length();
+        return error.kind() == infernix::RequestErrorKind::ContextLengthExceeded && details &&
+               details->prompt_tokens == prompt_tokens && details->max_context == max_context &&
+               details->exact == exact;
+    }
+    return false;
+}
+
 int test_declared_frontend_semantics() {
     auto source                = resources();
     auto tokenizer             = nlohmann::json::parse(source.tokenizer_json);
@@ -758,16 +780,17 @@ int test_context_capacity_guard() {
     const Frontend short_frontend = make_frontend(resources(), short_options);
     failures += check(short_frontend.count_tokens(input) == exact_count,
                       "exact token counting was incorrectly bounded by max_context");
-    failures += check(throws_context_length([&] { (void)short_frontend.prepare(input); }),
-                      "Frontend accepted a text prompt at max_context + 1");
+    failures += check(throws_context_length([&] { (void)short_frontend.prepare(input); }, exact_count,
+                                            exact_count - 1U, true),
+                      "Frontend accepted a text prompt at max_context + 1, or lost its counts");
 
     std::vector<infernix::TokenId> exact_tokens(exact_count, 0);
     failures += check(exact.prepare_tokens(exact_tokens).summary().prompt_tokens == exact_count,
                       "prepare_tokens rejected an exact-capacity token vector");
     exact_tokens.push_back(0);
-    failures +=
-        check(throws_context_length([&] { (void)exact.prepare_tokens(std::move(exact_tokens)); }),
-              "prepare_tokens accepted a token vector at max_context + 1");
+    failures += check(throws_context_length([&] { (void)exact.prepare_tokens(std::move(exact_tokens)); },
+                                            exact_count + 1U, exact_count, true),
+                      "prepare_tokens accepted a token vector at max_context + 1, or lost its counts");
 
     infernix::models::qwen3_5::FrontendOptions media_options = short_options;
     media_options.vision_enabled                           = true;
@@ -2278,6 +2301,36 @@ int test_constrained_thinking_control(const Frontend& frontend) {
     return failures;
 }
 
+// A token the grammar refuses fails only its request: the Engine releases that row and keeps
+// serving, so the refusal must surface as a request-scoped runtime::RequestOutputError.
+int test_grammar_refusal_is_request_scoped(const Frontend& frontend) {
+    auto prompt           = thinking_prompt(frontend);
+    const auto bare_close = frontend.tokenize_text("</think>");
+    auto session          = frontend.make_output_session(
+        prompt, {}, {}, {.budget = static_cast<std::uint32_t>(bare_close.size())},
+        infernix::OutputConstraint::grammar("root ::= \" yes\""));
+    (void)session.preview_model(bare_close, 512, infernix::FinishReason::OutputLimit);
+    (void)session.commit_preview();
+    (void)session.preview_control(session.pending_control_tokens(), 512);
+    (void)session.commit_preview();
+    int failures = 0;
+    bool request_scoped = false;
+    try {
+        (void)session.preview_model(frontend.tokenize_text(" no"), 512,
+                                    infernix::FinishReason::OutputLimit);
+    } catch (const infernix::runtime::RequestOutputError&) {
+        request_scoped = true;
+    } catch (...) {}
+    failures += check(request_scoped, "a refused grammar token did not fail only its request");
+    session.discard_preview();
+    (void)session.preview_model(frontend.tokenize_text(" yes"), 512,
+                                infernix::FinishReason::OutputLimit);
+    failures +=
+        check(channel_text(session.commit_preview(), infernix::OutputChannel::Content) == " yes",
+              "a refused token left tentative grammar state behind");
+    return failures;
+}
+
 int test_reasoning_close_requires_boundary(const Frontend& frontend) {
     auto prompt  = thinking_prompt(frontend);
     auto session = frontend.make_output_session(prompt, {});
@@ -3053,7 +3106,7 @@ int test_media_cache_singleflight() {
     std::thread first(run, 0);
     producer_started_future.wait();
     std::thread second(run, 1);
-    const auto wait_limit = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    const auto wait_limit = std::chrono::steady_clock::now() + std::chrono::seconds(30);
     while (cache->stats().singleflight_waits == 0 &&
            std::chrono::steady_clock::now() < wait_limit) {
         std::this_thread::yield();
@@ -3083,7 +3136,7 @@ int test_media_cache_runs_independent_misses_in_parallel() {
             const int now = ++active;
             int maximum   = maximum_active.load();
             while (now > maximum && !maximum_active.compare_exchange_weak(maximum, now)) {}
-            const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+            const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(30);
             while (started.load() != static_cast<int>(pending.size()) &&
                    std::chrono::steady_clock::now() < limit) {
                 std::this_thread::yield();
@@ -3232,8 +3285,9 @@ int test_ngram_proposal_only_sources() {
         oversized += std::to_string(i) + ": value = 123456789\n";
     }
     input.messages.back().parts[0].text = std::move(oversized);
-    failures += check(throws_context_length([&] { (void)bounded.prepare(input); }),
-                      "proposal sources bypassed the target context limit");
+    // Far past four times the limit, counting stops: "more than 512 tokens".
+    failures += check(throws_context_length([&] { (void)bounded.prepare(input); }, 512U, 128U, false),
+                      "proposal sources bypassed the target context limit, or its recount was unbounded");
     std::atomic<unsigned> checks{0};
     infernix::PreparationControl control{
         .deadline     = {},
@@ -3302,6 +3356,7 @@ int main() {
     failures += test_thinking_budget_control(frontend);
     failures += test_reasoning_loop_guard(frontend);
     failures += test_constrained_thinking_control(frontend);
+    failures += test_grammar_refusal_is_request_scoped(frontend);
     failures += test_thinking_budget_message();
     failures += test_thinking_budget_ignores_quoted_close(frontend);
     failures += test_utf8_and_hidden_eos(frontend);

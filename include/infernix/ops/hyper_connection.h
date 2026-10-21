@@ -41,7 +41,9 @@ namespace infernix::ops {
 /// registered geometry (S = 4, H = 2560, rank a multiple of 8 up to 512) at T <= 16 run two fused
 /// kernels with every intermediate (Rn, z, m, u) in FP32, so a column's result does not depend on
 /// T within 1..16. Other weights and wider calls run the norm, linear (with `policy`), gates,
-/// linear and collapse steps with BF16 intermediates. `workspace` is caller-owned transient
+/// linear and collapse steps with BF16 intermediates; with a Q8_G32_FP16 RowSplit W_up and 4 streams,
+/// calls of more than 96 columns compute the up linear and the collapse in one kernel that keeps u
+/// on chip, with the same bits as the separate steps. `workspace` is caller-owned transient
 /// storage of hyper_connection_mix_workspace_capacity_bytes; it must not overlap any operand.
 void hyper_connection_mix(const Tensor& residual, const Tensor& norm_weight, const Weight& down,
                           const Weight& up, LinearPolicy policy, std::int32_t streams,
@@ -61,5 +63,12 @@ void hyper_connection_inject(const Tensor& y, const Tensor& inject, Tensor& resi
 /// residual[s*H+d,t] = x[d,t] for every stream: the first block's input from the embedding.
 void hyper_connection_expand(const Tensor& x, std::int32_t streams, Tensor& residual,
                              cudaStream_t stream);
+
+/// out[d,t] = bf16((sum_{s=0}^{S-1} residual[s*H+d,t]) / S), the sum in FP32 in stream order: a
+/// residual's plain stream mean (a DFlash2 drafter's target feature, docs/maintainer/dflash.md).
+/// residual: contiguous BF16 [S*H, T]; out: BF16 [H, T] with contiguous columns of any even
+/// pitch of at least H elements (a row slice of a wider feature matrix).
+void hyper_connection_stream_mean(const Tensor& residual, std::int32_t streams, Tensor& out,
+                                  cudaStream_t stream);
 
 } // namespace infernix::ops

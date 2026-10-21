@@ -39,7 +39,20 @@ PrefixCachePersistence public_result(const prefix::PersistResult& result) {
 void ProgramImpl::create_prefix_cache() {
     if (!options_.prefix_cache) { return; }
     const auto lanes = static_cast<std::uint32_t>(options_.max_concurrency);
-    image_layout_    = prefix::plan_state_image(prefix::state_image_spec(c_, mtp_, options_.kv_cache));
+    // A DFlash2 drafter's context ring: per layer, one lane's K and V (the lane is outermost).
+    prefix::DraftRingGeometry ring;
+    std::vector<std::byte*> ring_k, ring_v;
+    if (dflash2_) {
+        ring.layers = dflash_ring_->layer_count();
+        for (std::uint32_t l = 0; l < ring.layers; ++l) {
+            const CyclicKVCacheLayerView view = dflash_ring_->layer_view(l);
+            ring.k_bytes                      = view.k.bytes() / lanes;
+            ring.v_bytes                      = view.v.bytes() / lanes;
+            ring_k.push_back(static_cast<std::byte*>(view.k.data));
+            ring_v.push_back(static_cast<std::byte*>(view.v.data));
+        }
+    }
+    image_layout_    = prefix::plan_state_image(prefix::state_image_spec(c_, mtp_, options_.kv_cache, ring));
     lane_image_      = std::make_unique<prefix::LaneStateImage>(
         image_layout_,
         prefix::LaneStateBuffers{.gdn       = gdn_.get(),
@@ -48,7 +61,9 @@ void ProgramImpl::create_prefix_cache() {
                                  .tails     = static_cast<std::byte*>(tails_backing_.p),
                                  .mtp_saved = mtp_ ? static_cast<std::byte*>(mtp_saved_.p) : nullptr,
                                  .window    = static_cast<std::byte*>(window_backing_.p),
-                                 .window_geometry = window_geometry_});
+                                 .window_geometry = window_geometry_,
+                                 .ring_k    = std::move(ring_k),
+                                 .ring_v    = std::move(ring_v)});
     prefix::PrefixCacheConfig config;
     config.index.cost = options_.prefix_cost;
     config.taps       = options_.prefix_taps;
@@ -185,7 +200,13 @@ std::optional<PrefixSelection> ProgramImpl::prefix_select(const qwen3_5::Prepare
     };
     std::uint32_t cached_tokens = 0; // the prompt prefix held as cached blocks
     const auto planned = [&](PrefixSelection s) {
-        s.plan          = plan_prefill(prompt, s.frontier, s.existing, base.reuse);
+        // Where the prompt leaves a cached path well past its resume frontier (a client re-sending a
+        // long transcript with new content inserted before its end, Strata PR #2843): a boundary
+        // snapshot there lets the next such prompt resume at the branch instead of re-prefilling
+        // the shared tokens after the frontier again.
+        const std::uint32_t branch =
+            cached_tokens < n && cached_tokens >= s.frontier + kBranchTapMinTokens ? cached_tokens : 0;
+        s.plan          = plan_prefill(prompt, s.frontier, s.existing, base.reuse, branch);
         s.cached_tokens = cached_tokens;
         return s;
     };
@@ -208,8 +229,13 @@ std::optional<PrefixSelection> ProgramImpl::prefix_select(const qwen3_5::Prepare
         cached_tokens = static_cast<std::uint32_t>(match.path.size()) * kBlock;
         // A frontier strictly inside a Vision item would resume half an image (design §19.3.1).
         const std::vector<pc::TapExclusion> spans = prefix_exclusions(prompt);
+        // Without free cache resume a request resumes only from prefill-computed state on the
+        // 16-token grid: a tap, never an endpoint (its state is decode's).
+        const bool grid = !options_.free_cache_resume;
         std::erase_if(match.candidates, [&](const pc::MatchCandidate& c) {
-            return c.filling_blocks != 0 || prefix::inside_exclusion(c.frontier, spans);
+            return c.filling_blocks != 0 || prefix::inside_exclusion(c.frontier, spans) ||
+                   (grid && (c.frontier % kResumeGrid != 0 ||
+                             index.snapshot(c.snapshot).kind == pc::SnapshotKind::Endpoint));
         });
         // A lane-resident snapshot needs no image restore: its state is still in the lane.
         const std::optional<pc::SnapshotRef> resident =
@@ -366,6 +392,8 @@ std::uint64_t ProgramImpl::hybrid_cache_epoch() const noexcept {
 // Qwen3.5 hybrid cache, hybrid-prefix-cache-spec): a /v1/decide fan-out's questions over one state,
 // or concurrent requests over one image, prefill the shared part once.
 bool ProgramImpl::prefix_await_sibling(const qwen3_5::PreparedPromptData& prompt, std::uint32_t reuse) {
+    // Coalescing waits on another request and inserts its tap into this one's prefill.
+    if (!options_.free_cache_resume) { return false; }
     if (options_.prefix_coalesce_wait_seconds <= 0.0) { return false; }
     const auto n = static_cast<std::uint32_t>(prompt.token_ids.size());
     if (n < 2) { return false; }
@@ -591,6 +619,7 @@ void ProgramImpl::prefix_activate(Lane& lane, std::uint32_t index, const PrefixS
         }
         if (mtp_ && lane.mtp_cells != s.frontier) { ++prefix_->counters().mtp_continuation_mismatches; }
         lane.mtp_live = mtp_;
+        lane.dflash_frontier = std::min(meta.draft_frontier, s.frontier);
         // Penalty counts restart with the request; the lane's state came from the snapshot.
         CUDA_CHECK(cudaMemsetAsync(static_cast<std::int32_t*>(token_counts_.p) + index * static_cast<std::size_t>(token_domain_),
                                    0, 4ULL * token_domain_, stream));
@@ -602,12 +631,36 @@ void ProgramImpl::prefix_activate(Lane& lane, std::uint32_t index, const PrefixS
 // The prompt's prefill calls from `frontier` (design §19.3.1, "Prefill integration"): with `taps`, the
 // prefix taps beyond the frontier (no tap inside a Vision item), exact ones admitted by their cost.
 prefix::CallPlan ProgramImpl::plan_prefill(const qwen3_5::PreparedPromptData& prompt, std::uint32_t frontier,
-                                           std::span<const std::uint32_t> existing, bool taps) const {
+                                           std::span<const std::uint32_t> existing, bool taps,
+                                           std::uint32_t branch) const {
     const auto n = static_cast<std::uint32_t>(prompt.token_ids.size());
     std::vector<pc::PlannedTap> planned;
     if (taps && prefix_) {
         const std::vector<pc::TapExclusion> spans = prefix_exclusions(prompt);
         planned = pc::plan_taps(n, frontier, prompt.tap_hints.hints, existing, spans, prefix_->taps());
+        if (branch > frontier && branch < n && !prefix::inside_exclusion(branch, spans)) {
+            const auto at = std::lower_bound(planned.begin(), planned.end(), branch,
+                                             [](const pc::PlannedTap& tap, std::uint32_t p) { return tap.position < p; });
+            if (at != planned.end() && at->position == branch) {
+                at->placement = pc::TapPlacement::Exact;
+                at->boundary  = true;
+            } else {
+                planned.insert(at, pc::PlannedTap{.position = branch, .placement = pc::TapPlacement::Exact,
+                                                  .boundary = true});
+            }
+        }
+        if (!options_.free_cache_resume) {
+            // Each tap moves to the grid position at or before it, so it cuts a call on the grid.
+            for (pc::PlannedTap& tap : planned) { tap.position = tap.position / kResumeGrid * kResumeGrid; }
+            std::erase_if(planned, [&](const pc::PlannedTap& tap) {
+                return tap.position <= frontier || prefix::inside_exclusion(tap.position, spans);
+            });
+            planned.erase(std::unique(planned.begin(), planned.end(),
+                                      [](const pc::PlannedTap& a, const pc::PlannedTap& b) {
+                                          return a.position == b.position;
+                                      }),
+                          planned.end());
+        }
     }
     return prefix::plan_calls(frontier, n, static_cast<std::uint32_t>(chunk_), planned, call_cost());
 }
@@ -706,6 +759,8 @@ std::uint32_t ProgramImpl::prefix_frontier(const Lane& lane, bool finishing) con
 
 void ProgramImpl::prefix_publish(Lane& lane, std::uint32_t frontier) {
     if (!prefix_ || !lane.prefix.reuse) { return; }
+    // Without free cache resume only blocks prefill computed are published: decode's KV differs.
+    if (!options_.free_cache_resume) { frontier = std::min(frontier, lane.prompt_tokens); }
     pc::PrefixCacheIndex& cache = prefix_->index();
     // Blocks past the prompt (generated output) chain their lookup hash from the previous block's
     // and carry the prompt's trailing Vision key, as Qwen3.5's publication does.
@@ -780,6 +835,7 @@ prefix::PrefixCache::Capture ProgramImpl::prefix_capture_at(Lane& lane, std::uin
                         return hint.kind == pc::TapHintKind::GenerationOpener && hint.position == F;
                     });
     c.meta.mtp_accept = lane.mtp_accept;
+    c.meta.draft_frontier = std::min(lane.dflash_frontier, F);
     // The request's first capture supersedes the snapshot it resumed from, which then serves only
     // requests diverging before this one. Its own earlier captures stay retained: its ladder taps and
     // its system-block boundary are where edits and side calls over the history diverge (§19.3.1).
@@ -835,6 +891,12 @@ void ProgramImpl::prefix_finish(Lane& lane, std::uint32_t index) {
     prefix_publish(lane, prefix_frontier(lane, true));
     const std::uint32_t F = lane.state_tokens;
     const bool full_blocks = !lane.mtp_live || lane.mtp_cells >= F / kBlock * kBlock;
+    // An endpoint holds decode-computed state: published only with free cache resume.
+    if (!options_.free_cache_resume) {
+        prefix_->write_blocks(lane.prefix.path, device_.stream);
+        lane.prefix.resident_capture = lane.prefix.deepest == F ? lane.prefix.capture : 0;
+        return;
+    }
     if (F >= lane.prefix.deepest + kBlock && full_blocks && lane.prefix.path.size() >= F / kBlock) {
         prefix_capture(lane, index, pc::SnapshotKind::Endpoint, true);
     } else if (!full_blocks) {
@@ -869,6 +931,10 @@ std::optional<pc::SnapshotRef> ProgramImpl::prefix_resident(const Lane& lane) co
 void ProgramImpl::prefix_release(Lane& lane) noexcept {
     if (!prefix_) { return; }
     try {
+        // A lane released before its first call (cancelled, failed or aborted after binding) may still
+        // have its restore landing in its private page and state slot: whatever reuses them next runs
+        // on the compute stream, so that stream waits for the restore (free once it has landed).
+        if (lane.prefix.restore) { prefix_->order_after_restore(*lane.prefix.restore, device_.stream); }
         if (!lane.prefix.path.empty()) { prefix_->index().release_path(lane.prefix.path); }
         prefix_->poll();
     } catch (...) {}

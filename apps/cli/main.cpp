@@ -1,5 +1,6 @@
 #include "infernix_build_id.h"
 #include "options.h"
+#include "product/config/config_file.h"
 #include "product/logging/logging.h"
 #include "product/logging/pretty_format.h"
 #include "product/logging/engine_diagnostics.h"
@@ -264,6 +265,14 @@ void print_generation_summary(const infernix::GenerationResult& result,
             }
             print_metric(backend + " accepted by pos", positions.str());
         }
+        if (!speculative.rounds_by_draft_length.empty()) {
+            std::ostringstream lengths;
+            for (std::size_t i = 0; i < speculative.rounds_by_draft_length.size(); ++i) {
+                if (i != 0) { lengths << ','; }
+                lengths << speculative.rounds_by_draft_length[i];
+            }
+            print_metric(backend + " rounds by length", lengths.str());
+        }
         if (speculative.tree_rounds != 0) {
             print_metric(backend + " tree rounds", std::to_string(speculative.tree_rounds));
             print_metric(backend + " tree side rounds",
@@ -299,6 +308,9 @@ int main(int argc, char** argv) {
 #ifdef INFERNIX_BUILD_ID
     logger->info("build {}", INFERNIX_BUILD_ID);
 #endif
+    if (cli.config_path) {
+        logger->info("{}", infernix::product::describe_config(*cli.config_path, cli.config_arguments));
+    }
     infernix::product::StartupLogRenderer startup_log(logging);
 
     try {
@@ -338,22 +350,27 @@ int main(int argc, char** argv) {
         engine_options.artifact_path            = cli.artifact_path;
         engine_options.chat_template_path       = cli.chat_template_path;
         engine_options.ngram_volume_path        = cli.ngram_volume_path;
+        engine_options.expert_stripe_path       = cli.expert_stripe_path;
+        engine_options.ngram_residency          = cli.ngram_residency;
         engine_options.expert_state_path        = cli.expert_state ? *cli.expert_state
                                                                    : std::filesystem::path(cli.artifact_path.string() + ".expert-state");
         engine_options.ram_headroom_bytes       = cli.ram_headroom_bytes;
         engine_options.expert_ram_bytes         = cli.expert_ram_bytes;
+        engine_options.expert_pin_bytes         = cli.expert_pin_bytes;
         engine_options.device                   = cli.device;
         engine_options.max_context              = cli.max_context;
         engine_options.rope_yarn_factor         = cli.rope_yarn_factor;
         engine_options.kv_capacity              = cli.kv_capacity;
         engine_options.vram_headroom_bytes      = cli.vram_headroom_bytes;
         engine_options.vram_past_budget         = cli.vram_past_budget;
+        engine_options.expert_tail_skip         = cli.expert_tail_skip;
         engine_options.prefill_chunk            = cli.prefill_chunk;
         engine_options.kv_cache                 = cli.kv_cache;
         engine_options.original_int8_prefill_kernel = cli.original_int8_prefill_kernel;
-        engine_options.prefill_8bit_pv              = cli.prefill_8bit_pv;
         engine_options.prefill_split_workspace_mib  = cli.prefill_split_workspace_mib;
         engine_options.original_nvfp4_prefill_kernel = cli.original_nvfp4_prefill_kernel;
+        engine_options.fast_paths                    = cli.fast_paths;
+        engine_options.fast_path_candidates          = cli.fast_path_candidates;
         engine_options.speculative              = cli.speculative;
         engine_options.enable_vision            = cli.enable_vision;
         engine_options.vision_offload           = cli.vision_offload;

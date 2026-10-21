@@ -52,6 +52,11 @@ struct GdnConfig {
     std::uint32_t value_head_dim = 0;
     std::uint32_t conv_kernel   = 0;
     GateActivation output_gate  = GateActivation::Sigmoid;
+    // A GGUF import (tools/convert/qwen4_exp_gguf.py): the output projection reads its value heads
+    // in ggml's tiled order (slot g holds head (g % key_heads) * per_key + g / key_heads), and the
+    // decay parameter is A = -exp(A_log) itself (gdn/a), not A_log.
+    bool output_ggml_tiled = false;
+    bool a_direct          = false;
 
     [[nodiscard]] std::uint32_t key_width() const noexcept { return key_heads * key_head_dim; }
     [[nodiscard]] std::uint32_t value_width() const noexcept { return value_heads * value_head_dim; }
@@ -86,8 +91,17 @@ struct QsaConfig {
     }
 };
 
-// The FP8 n-gram table volume written beside the artifact (design §12.2).
+// The n-gram table volume written beside the artifact (design §12.2): FP8 E4M3FN rows with one
+// per-tensor scale, a GGUF's IQ4_NL rows (design §12.5), or the unquantized table's BF16 rows (an exact
+// conversion bound to a BF16 volume). Any volume of the model's table, in any of the three formats,
+// may replace the artifact's at run time (resolve_ngram_volume).
+enum class NgramRowFormat : std::uint8_t { Fp8E4m3, Iq4Nl, Bf16 };
+
 struct NgramTableConfig {
+    NgramRowFormat format = NgramRowFormat::Fp8E4m3;
+    // An FP8 volume that is not the artifact's own: its per-tensor scale (BF16 bits), from its header
+    // or its known volume id. Empty for the artifact's own table (its ngram_scale parameter) and other formats.
+    std::optional<std::uint16_t> fp8_scale;
     std::uint64_t rows            = 0;
     std::uint32_t row_bytes       = 0;
     std::uint32_t rows_per_block  = 0;
@@ -136,6 +150,18 @@ struct TextConfig {
     HyperConnectionConfig hc;
     QsaConfig qsa;
     PleConfig ple;
+    // Weights imported from a GGUF (tools/convert/qwen4_exp_gguf.py; the converter writes the gdn_a and
+    // gdn_output_order keys): ggml block formats, an IQ4_XS embedding and ggml expert banks.
+    bool ggml_weights = false;
+    // The routed experts run exact A16 arithmetic over their records' own block scales: a GGUF
+    // import's ggml banks or Qwen's block-FP8 banks (fp8_expert_b128_v1). Set by the loader.
+    bool exact_experts = false;
+    // The largest record stride of exact banks (a GGUF import's strides differ by layer: staging,
+    // stream-ring and RAM slots take it), set by the loader from the stored banks; 0 means the NVFP4
+    // record's. expert_frame_bytes: the mean stride, rounded up (the expert cache's sizing unit: its
+    // pools give every layer the same frame count; ExpertResidency::average_frame_bytes).
+    std::uint64_t expert_frame_stride = 0;
+    std::uint64_t expert_frame_bytes  = 0;
 
     // The positions a context may use: the native ones times the YaRN factor, at most 1,048,576.
     [[nodiscard]] std::uint32_t context_ceiling() const noexcept {
@@ -146,9 +172,39 @@ struct TextConfig {
     [[nodiscard]] std::uint32_t residual_width() const noexcept { return hc.streams * hidden_size; }
 };
 
+// A DFlash2 drafter (docs/maintainer/dflash.md) from a companion artifact (--draft-model): its own
+// block geometry; the hidden width, vocabulary, token embedding and head are the target's. Every
+// layer is a sliding-window layer (the drafter of Qwen3.8-Flash-Next has five).
+struct DFlash2Config {
+    std::uint32_t layers       = 0;
+    AttentionConfig attention;
+    std::uint32_t intermediate = 0;
+    std::uint32_t window       = 0; // the sliding window and context ring capacity
+    float rms_norm_eps         = 0;
+    float rope_theta           = 0; // full-head 1-D RoPE at absolute positions
+    std::vector<std::uint32_t> target_layer_ids; // the completed target layers whose stream means are the features
+    std::uint32_t mask_token_id  = 0;
+    std::uint32_t conv_kernel    = 0; // dynamic convolution taps
+    std::uint32_t conv_group     = 0; // channels sharing one dynamic coefficient
+    std::uint32_t selector_rank  = 0;
+    std::uint32_t selector_top_k = 0;
+    // Set by the loader from the bound head the drafts read (the proposal head with --lm-head-draft,
+    // else the text head): its rows, whether its top-16 runs the fused ops::linear_topk (a Q4
+    // proposal head or a Q8 text head), and whether it is a GGUF import's (ggml blocks).
+    std::uint32_t head_rows = 0;
+    bool fused_head         = false;
+    bool ggml_head          = false;
+
+    // The feature width: the target hidden width per tapped layer.
+    [[nodiscard]] std::uint32_t feature_width(std::uint32_t hidden) const noexcept {
+        return hidden * static_cast<std::uint32_t>(target_layer_ids.size());
+    }
+};
+
 struct Config {
     TextConfig text;
     bool mtp = false;                // the MTP drafter is bound (--spec mtp)
+    std::optional<DFlash2Config> dflash2; // the DFlash2 drafter is bound (--spec dflash2 --draft-model)
     std::uint32_t proposal_rows = 0; // rows of the bound proposal head (--lm-head-draft), else 0
     // The Vision tower (--vision): Qwen3.5's tower except its output width, which the merger's
     // bound fc2 gives (design §19.3.2).
@@ -156,5 +212,10 @@ struct Config {
 };
 
 [[nodiscard]] Config parse_config(const artifact::Directory& directory, const LoadOptions& options);
+
+// The DFlash2 drafter of a companion artifact (a directory without text whose dflash2 component
+// records the target identity it was converted for, tools/convert/qwen4_exp.py), checked against
+// the target's text config.
+[[nodiscard]] DFlash2Config parse_dflash2_config(const artifact::Directory& companion, const TextConfig& target);
 
 } // namespace infernix::models::qwen4_exp

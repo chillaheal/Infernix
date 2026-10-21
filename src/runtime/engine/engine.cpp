@@ -87,6 +87,20 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
             throw std::invalid_argument(
                 "constraint uses more than kMaximumConstraintSets distinct multi-token steps");
         }
+        if (!constraint.observe.empty() && constraint.observe.size() != constraint.steps.size()) {
+            throw std::invalid_argument("constraint observe needs one list per step");
+        }
+        for (const std::vector<TokenId>& observed : constraint.observe) {
+            if (observed.size() > kMaximumObservedTokens) {
+                throw std::invalid_argument(
+                    "constraint step observes more than kMaximumObservedTokens tokens");
+            }
+            std::vector<TokenId> sorted = observed;
+            std::ranges::sort(sorted);
+            if (std::ranges::adjacent_find(sorted) != sorted.end()) {
+                throw std::invalid_argument("constraint observed tokens must be distinct");
+            }
+        }
     }
     runtime::ResolvedRequestOptions resolved;
     resolved.execution.sampling =
@@ -102,11 +116,6 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
     resolved.tool_choice                       = std::move(options.tool_choice);
     resolved.ngram_session                     = std::move(options.ngram_session);
     return resolved;
-}
-
-std::string context_capacity_error(std::size_t prompt_tokens, std::uint32_t max_context) {
-    return "prepared prompt has " + std::to_string(prompt_tokens) +
-           " tokens, exceeding Engine max_context " + std::to_string(max_context);
 }
 
 } // namespace
@@ -209,10 +218,14 @@ class Engine::Impl {
 public:
     using GenerationCore = runtime::EngineCore<runtime::ModelInstance>;
     using ScoringCore    = runtime::CausalScoreCore<runtime::ModelInstance>;
-    // Qwen3.8-Flash-Next: the common core over its own Program.
-    using Qwen4ExpCore = runtime::EngineCore<runtime::Qwen4ExpInstance>;
-    using Core = std::variant<std::monostate, std::unique_ptr<GenerationCore>,
-                              std::unique_ptr<ScoringCore>, std::unique_ptr<Qwen4ExpCore>>;
+    // Qwen3.8-Flash-Next: the common cores over its own Program.
+    using Qwen4ExpCore        = runtime::EngineCore<runtime::Qwen4ExpInstance>;
+    using Qwen4ExpScoringCore = runtime::CausalScoreCore<runtime::Qwen4ExpInstance>;
+    using Core = std::variant<std::monostate, std::unique_ptr<GenerationCore>, std::unique_ptr<ScoringCore>,
+                              std::unique_ptr<Qwen4ExpCore>, std::unique_ptr<Qwen4ExpScoringCore>>;
+    template <class CoreState>
+    static constexpr bool kScoring = std::is_same_v<CoreState, std::unique_ptr<ScoringCore>> ||
+                                     std::is_same_v<CoreState, std::unique_ptr<Qwen4ExpScoringCore>>;
 
     explicit Impl(EngineOptions engine_options)
         : options(normalize(std::move(engine_options))),
@@ -227,7 +240,11 @@ public:
             load.cuda_sync_mode = device.sync_mode();
             sampling_defaults = qwen4->frontend.sampling_defaults();
             StartupPhaseScope finalize_phase(options.startup_observer, StartupPhase::EngineFinalize);
-            core = std::make_unique<Qwen4ExpCore>(*qwen4, device, options);
+            if (options.purpose == EnginePurpose::CausalScoring) {
+                core = std::make_unique<Qwen4ExpScoringCore>(*qwen4, device);
+            } else {
+                core = std::make_unique<Qwen4ExpCore>(*qwen4, device, options);
+            }
             finalize_phase.complete();
             return;
         }
@@ -401,8 +418,8 @@ PreparedPrompt Engine::prepare_tokens(std::vector<TokenId> token_ids,
                                     static_cast<std::uint64_t>(token_ids.size()));
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     if (token_ids.size() > impl_->capacity()) {
-        throw RequestError(RequestErrorKind::ContextLengthExceeded,
-                           context_capacity_error(token_ids.size(), impl_->capacity()));
+        throw RequestError(ContextLengthDetails{.prompt_tokens = token_ids.size(),
+                                                .max_context   = impl_->capacity()});
     }
     auto prepared = impl_->frontend().prepare_tokens(std::move(token_ids), allow_prefix_identity);
     PromptSummary info = prepared.summary();
@@ -449,7 +466,7 @@ ScoreResult Engine::score_tokens(std::vector<TokenId> tokens, std::uint32_t firs
     ScoreResult result                 = std::visit(
         [&](auto& core) -> ScoreResult {
             using CoreState = std::remove_cvref_t<decltype(core)>;
-            if constexpr (std::is_same_v<CoreState, std::unique_ptr<Impl::ScoringCore>>) {
+            if constexpr (Impl::kScoring<CoreState>) {
                 return core->score(std::move(prompt.impl_->value), first_target,
                                    std::move(options));
             } else {
@@ -509,9 +526,8 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
 
     const PromptSummary prompt_summary = prompt.impl_->summary;
     if (prompt_summary.prompt_tokens > impl_->options.max_context) {
-        throw RequestError(
-            RequestErrorKind::ContextLengthExceeded,
-            context_capacity_error(prompt_summary.prompt_tokens, impl_->options.max_context));
+        throw RequestError(ContextLengthDetails{.prompt_tokens = prompt_summary.prompt_tokens,
+                                                .max_context   = impl_->options.max_context});
     }
     const double prepare_seconds = prompt.impl_->prepare.seconds;
     if (resolved_options.execution.requested_output_tokens == 0) {
@@ -545,7 +561,7 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
             using CoreState = std::remove_cvref_t<decltype(core)>;
             if constexpr (std::is_same_v<CoreState, std::monostate>) {
                 throw std::logic_error("Engine core is unavailable");
-            } else if constexpr (std::is_same_v<CoreState, std::unique_ptr<Impl::ScoringCore>>) {
+            } else if constexpr (Impl::kScoring<CoreState>) {
                 throw std::logic_error("Engine generation core is unavailable");
             } else {
                 auto submission =

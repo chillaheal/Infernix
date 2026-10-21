@@ -1,6 +1,9 @@
 #include "infernix/ops/hyper_connection.h"
 
 #include "ops/hyper_connection/hyper_connection_mix_fused.h"
+#include "ops/hyper_connection/hyper_connection_up_collapse.h"
+
+#include "core/pdl.cuh"
 
 #include <cuda_bf16.h>
 
@@ -111,6 +114,8 @@ __global__ void collapse_kernel(const bf16* __restrict__ logits, const bf16* __r
 
 __global__ void inject_kernel(const bf16* __restrict__ y, const float* __restrict__ inject, int hidden,
                               int streams, int columns, bf16* __restrict__ residual) {
+    // A programmatic dependent; its small grid lets the next mixer launch and fetch its weights at once.
+    pdl::enter();
     const int d = blockIdx.x * blockDim.x + threadIdx.x;
     const int t = blockIdx.y;
     if (d >= hidden || t >= columns) { return; }
@@ -132,6 +137,19 @@ __global__ void expand_kernel(const bf16* __restrict__ x, int hidden, int stream
     for (int s = 0; s < streams; ++s) {
         residual[static_cast<std::size_t>(t) * width + static_cast<std::size_t>(s) * hidden + d] = v;
     }
+}
+
+// out column t (row pitch `pitch` elements) = the mean of the streams, summed in stream order.
+__global__ void stream_mean_kernel(const bf16* __restrict__ residual, int hidden, int streams, int columns,
+                                   std::int64_t pitch, bf16* __restrict__ out) {
+    const int d = blockIdx.x * blockDim.x + threadIdx.x;
+    const int t = blockIdx.y;
+    if (d >= hidden || t >= columns) { return; }
+    const std::size_t width = static_cast<std::size_t>(streams) * hidden;
+    const bf16* column      = residual + static_cast<std::size_t>(t) * width + d;
+    float sum               = 0.0F;
+    for (int s = 0; s < streams; ++s) { sum += __bfloat162float(column[static_cast<std::size_t>(s) * hidden]); }
+    out[static_cast<std::size_t>(t) * pitch + d] = __float2bfloat16_rn(sum / static_cast<float>(streams));
 }
 
 // The composed route's steps (private since hyper_connection_mix).
@@ -231,6 +249,11 @@ void hyper_connection_mix(const Tensor& residual, const Tensor& norm_weight, con
     linear(normalized, down, z, policy, workspace, stream);
     Tensor m = workspace.alloc(DType::BF16, {rank, T});
     hyper_connection_gates(z, rank, streams, m, inject, stream);
+    if (detail::hc_up_collapse_supported(up, hidden, streams, T)) {
+        // Q8 W_up beyond the fused decode route: u stays in the MMA tile (bit-identical, §19.3.23).
+        detail::hc_up_collapse(m, up, normalized, streams, x, stream);
+        return;
+    }
     Tensor u = workspace.alloc(DType::BF16, {up.n, T});
     linear(m, up, u, policy, workspace, stream);
     hyper_connection_collapse(u, normalized, streams, x, stream);
@@ -256,10 +279,11 @@ void hyper_connection_inject(const Tensor& y, const Tensor& inject, Tensor& resi
     require(inject.ne[1] == columns && residual.ne[0] == streams * hidden && residual.ne[1] == columns &&
                 columns > 0,
             "inject shapes disagree");
-    inject_kernel<<<dim3((hidden + kThreads - 1) / kThreads, columns), kThreads, 0, stream>>>(
-        static_cast<const bf16*>(y.data), static_cast<const float*>(inject.data), hidden, streams,
-        columns, static_cast<bf16*>(residual.data));
-    check_launch("inject");
+    if (pdl::launch_consumer({dim3((hidden + kThreads - 1) / kThreads, columns), dim3(kThreads), 0, stream},
+                             inject_kernel, static_cast<const bf16*>(y.data), static_cast<const float*>(inject.data),
+                             hidden, streams, columns, static_cast<bf16*>(residual.data)) != cudaSuccess) {
+        check_launch("inject");
+    }
 }
 
 void hyper_connection_expand(const Tensor& x, std::int32_t streams, Tensor& residual,
@@ -272,6 +296,21 @@ void hyper_connection_expand(const Tensor& x, std::int32_t streams, Tensor& resi
     expand_kernel<<<dim3((hidden + kThreads - 1) / kThreads, columns), kThreads, 0, stream>>>(
         static_cast<const bf16*>(x.data), hidden, streams, columns, static_cast<bf16*>(residual.data));
     check_launch("expand");
+}
+
+void hyper_connection_stream_mean(const Tensor& residual, std::int32_t streams, Tensor& out,
+                                  cudaStream_t stream) {
+    require(contiguous_2d(residual, DType::BF16) && streams > 0 && out.data != nullptr &&
+                out.dtype == DType::BF16 && out.ne[2] == 1 && out.ne[3] == 1 && out.nb[0] == 2 &&
+                out.nb[1] % 2 == 0 && out.nb[1] >= 2LL * out.ne[0],
+            "stream mean requires a contiguous BF16 residual and BF16 output columns");
+    const int hidden = out.ne[0], columns = out.ne[1];
+    require(residual.ne[0] == streams * hidden && residual.ne[1] == columns && columns > 0,
+            "stream mean shapes disagree");
+    stream_mean_kernel<<<dim3((hidden + kThreads - 1) / kThreads, columns), kThreads, 0, stream>>>(
+        static_cast<const bf16*>(residual.data), hidden, streams, columns, out.nb[1] / 2,
+        static_cast<bf16*>(out.data));
+    check_launch("stream mean");
 }
 
 } // namespace infernix::ops

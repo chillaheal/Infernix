@@ -10,12 +10,14 @@
 // thread submitting overlapped reads reaches ~220K reads/s on an Optane P5800X, eight threads at
 // depth 16 ~880K (fn/probes/ioring_bench.cpp; the volume must not be mapped, design §19.3.8 F9).
 
+#include "core/host_memory.h"
 #include "core/read_only_file.h"
 #include "models/qwen4_exp/config.h"
 
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <span>
 #include <vector>
 
@@ -23,8 +25,16 @@ namespace infernix::models::qwen4_exp {
 
 class NgramVolume {
 public:
-    // Validates the header against the artifact's table geometry and volume id.
-    NgramVolume(const std::filesystem::path& path, const NgramTableConfig& table);
+    // Validates the header against the artifact's table geometry and volume id. With `resident`,
+    // the whole table is read into pinned host memory here (large unbuffered reads, then one
+    // registration) and every read_rows call is served from RAM; the row cache is not allocated.
+    NgramVolume(const std::filesystem::path& path, const NgramTableConfig& table, bool resident = false);
+
+    // Host bytes a resident table pins: its blocks (the 4 KiB padding included).
+    [[nodiscard]] static std::uint64_t resident_bytes(const NgramTableConfig& table) noexcept {
+        return table.blocks * table.block_bytes;
+    }
+    [[nodiscard]] bool resident() const noexcept { return resident_ != nullptr; }
 
     [[nodiscard]] const NgramTableConfig& table() const noexcept { return table_; }
 
@@ -60,6 +70,7 @@ private:
 
     ReadOnlyFile file_;
     NgramTableConfig table_;
+    std::unique_ptr<RegisteredHostBuffer> resident_; // the whole table's blocks (RAM mode)
     mutable std::vector<std::byte> ring_storage_; // kInFlight blocks, 4 KiB-aligned at ring_
     mutable std::byte* ring_ = nullptr;
     mutable std::vector<std::byte> parallel_storage_; // kReadThreads rings of kParallelInFlight blocks
@@ -76,5 +87,14 @@ private:
 
 // The volume beside the artifact: `<artifact>.ngram`.
 [[nodiscard]] std::filesystem::path default_ngram_volume(const std::filesystem::path& artifact);
+
+// The table a volume holds for this model, from its header: the artifact's own table when the volume
+// is its own (its format and volume id), else the volume's table, in any of the three formats (the
+// format follows from the row size), which any Qwen3.8-Flash-Next artifact of this geometry accepts
+// in place of its own. Such an FP8 volume needs its per-tensor scale (NgramTableConfig::fp8_scale):
+// the BF16 word after the header's fixed fields, which volumes written since record, or for a volume
+// published before, the scale known for its volume id. Throws std::runtime_error for another
+// geometry, an unknown row size or an FP8 volume whose scale is unknown.
+[[nodiscard]] NgramTableConfig resolve_ngram_volume(const std::filesystem::path& path, const PleConfig& ple);
 
 } // namespace infernix::models::qwen4_exp

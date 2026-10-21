@@ -2,6 +2,7 @@
 
 #include "infernix/types.h"
 #include "product/logging/logging.h"
+#include "serve/request.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -15,6 +16,9 @@ namespace infernix::serve {
 // Protocol default when the client omits max_tokens. Engine independently
 // clamps the request to its effective context capacity.
 inline constexpr int kDefaultMaxTokens                    = 8192;
+// ServeOptions::thinking_answer_room's thresholds (as Strata 0.1.45's answer room).
+inline constexpr int kThinkingAnswerRoomMinTokens         = 1024;
+inline constexpr int kThinkingAnswerRoomMinReserve        = 256;
 inline constexpr std::size_t kDefaultMaxRequestBytes      = 384ULL << 20;
 inline constexpr std::size_t kDefaultResponseStoreRecords = 1024;
 inline constexpr std::size_t kDefaultResponseStoreBytes   = 256ULL << 20;
@@ -32,27 +36,36 @@ struct ServeOptions {
     std::string artifact_path;
     std::filesystem::path chat_template_path;
     std::filesystem::path ngram_volume_path;
+    NgramResidency ngram_residency = NgramResidency::Auto;
     // --expert-state FILE|off: absent uses the artifact path + .expert-state, "off" disables.
     std::optional<std::filesystem::path> expert_state;
+    // --expert-stripe FILE: the experts' record tails on a second drive (EngineOptions::expert_stripe_path).
+    std::filesystem::path expert_stripe_path;
     std::string host = "127.0.0.1";
     int port         = 8080;
     std::string api_key;                          // empty => no auth
     std::optional<std::string> model_id_override; // unset => artifact metadata.name
     std::string request_log_jsonl;                // empty => structured request logging disabled
     RequestLogRotation request_log_rotation;
+    // --route-trace FILE: writes the model's internal per-round route trace (route_trace.h).
+    std::filesystem::path route_trace;            // empty => no trace written
     float rope_yarn_factor             = 1.0F;
     std::uint32_t max_context          = 8192;
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(8192);
     std::optional<std::size_t> vram_headroom_bytes; // empty: the model's automatic headroom
     bool vram_past_budget = false;
+    std::uint32_t expert_tail_skip = 0; // EngineOptions::expert_tail_skip
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
-    std::uint32_t prefill_chunk        = 1024;
+    std::uint32_t prefill_chunk        = 0; // 0: the model's default (EngineOptions)
     bool original_int8_prefill_kernel  = false;
-    PrefillPv8 prefill_8bit_pv         = PrefillPv8::Auto;
     std::uint32_t prefill_split_workspace_mib = kDefaultPrefillSplitWorkspaceMiB;
     bool original_nvfp4_prefill_kernel = false;
+    bool fast_paths                    = true; // off with --disable-fast-paths (EngineOptions)
+    // --fast-path NAME (repeatable): also run these, qualified or not (qualification and timing
+    // runs; EngineOptions::fast_path_candidates).
+    std::vector<FastPath> fast_path_candidates;
     std::filesystem::path context_cost_presets;
     std::uint32_t log_stats_interval_ms    = 5000; // 0 disables periodic Engine throughput logs
     std::size_t max_request_bytes          = kDefaultMaxRequestBytes;
@@ -60,6 +73,7 @@ struct ServeOptions {
     std::size_t media_live_bytes           = kDefaultMediaLiveBytes;
     std::uint64_t ram_headroom_bytes       = kDefaultRamHeadroomBytes;
     std::optional<std::uint64_t> expert_ram_bytes; // --expert-ram-mib; empty: the RAM ledger's share
+    std::optional<std::uint64_t> expert_pin_bytes; // --expert-pin-mib; empty: what the OS lets it pin
     std::uint32_t media_preprocess_threads = 0;
     std::size_t response_store_max_records = kDefaultResponseStoreRecords;
     std::size_t response_store_max_bytes   = kDefaultResponseStoreBytes;
@@ -84,7 +98,16 @@ struct ServeOptions {
     std::optional<bool> preserve_thinking;
     // Recover complete Qwen calls with malformed wrapper/suffix output (opt-in; strict by default).
     bool tolerant_tool_calls = false;
+    // --claude-code-prompt as-sent|local: Anthropic Messages from Claude Code keep its System prompt,
+    // or have its Claude-specific parts replaced by a short local-agent preamble.
+    ClaudeCodePrompt claude_code_prompt = ClaudeCodePrompt::AsSent;
     std::optional<std::uint32_t> default_thinking_budget;
+    // A thinking request without a budget (its own or --default-thinking-budget) and at least
+    // kThinkingAnswerRoomMinTokens of max_tokens gets a budget that leaves a quarter of max_tokens
+    // (at least kThinkingAnswerRoomMinReserve, at most half) for the answer: max_tokens counts the
+    // thinking, so a long thought would otherwise end the request with no answer.
+    // --no-thinking-answer-room turns it off.
+    bool thinking_answer_room = true;
     // End-of-thinking message fed to the model when it hits the thinking budget; empty
     // preserves the model's built-in control suffix.
     std::string thinking_budget_message;
@@ -112,13 +135,22 @@ struct ServeOptions {
     // Exact process argv for the server-start record. Secret-bearing option values are redacted
     // while parsing; this is provenance only and never affects execution.
     std::vector<std::string> startup_argv;
+    // --config FILE and the options it gave, secret-bearing values redacted (provenance only).
+    std::optional<std::string> config_path;
+    std::vector<std::string> config_arguments;
 };
 
+// argv[1] is the artifact path and the rest are options. `--config FILE` reads further options, and
+// the artifact path when the command line has none, from a TOML file keyed by their long names
+// without the dashes (product/config/config_file.h); options on the command line override the
+// file, and the file overrides the defaults.
 ServeOptions parse_serve_options(int argc, char** argv);
 // "off", "stop" or "conclude".
 const char* reasoning_loop_name(infernix::ReasoningLoopAction action) noexcept;
 std::string resolve_public_model_id(const ServeOptions& options,
                                     std::string_view artifact_model_name);
 std::string serve_usage_text(const char* argv0);
+// Whether a --host value accepts connections from this machine only (127.0.0.0/8, ::1, localhost).
+bool is_loopback_host(std::string_view host) noexcept;
 
 } // namespace infernix::serve

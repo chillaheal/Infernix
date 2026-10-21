@@ -23,7 +23,7 @@ Int8KvCausalPlan make_int8_kv_causal_plan(int heads, int width, int batch,
                                                                      : Int8KvFamily::Tiled;
     const int tiles =
         family == Int8KvFamily::ParallelGrouped ? (width + grouped_limit - 1) / grouped_limit : 1;
-    const int independent_tiles = batch * (heads == 24 ? 4 : 2) * tiles;
+    const int independent_tiles = (envelope.row_invariant_partition ? 1 : batch) * (heads == 24 ? 4 : 2) * tiles;
     const std::int64_t sms      = multiprocessor_count;
     const auto budget =
         heads == 24 || width <= 4 ||
@@ -31,8 +31,10 @@ Int8KvCausalPlan make_int8_kv_causal_plan(int heads, int width, int batch,
             ? 2 * sms
             : sms;
     CausalKvPartition partition{1, causal_partition_target(budget, independent_tiles)};
-    // Bound partial traffic by keeping enough KV work in each split.
+    // Bound partial traffic by keeping enough KV work in each split. decode-split64 lets 24-head
+    // single-column rows split from 64 keys, so short rows fill the GPU (a different merge order).
     partition.key_shift = (width == 1 ? 7 : 8) - (heads == 16 ? 1 : 0);
+    if (envelope.decode_split64 && heads == 24 && width == 1) partition.key_shift = 6;
     // Multi-column rows of the 24/4 geometry may split down to 64 keys, so short rows fill
     // the GPU; the live count is then balanced to the fewest splits that keep the largest
     // number of 32-key tiles per split. Rows long enough to saturate the target at the

@@ -36,5 +36,6 @@ add_library(infernix_serve STATIC
 infernix_internal_includes(infernix_serve)
 target_link_libraries(infernix_serve
   PUBLIC infernix_engine Threads::Threads infernix::json infernix::httplib
-  PRIVATE infernix_media_acquire infernix_media_decode infernix_product_logging infernix_grammar infernix_cuda_runtime
-          infernix_qwen_image infernix_qwen_image_runtime infernix_media_encode)
+  PRIVATE infernix_product_config infernix_media_acquire infernix_media_decode infernix_product_logging
+          infernix_grammar infernix_cuda_runtime infernix_qwen_image infernix_qwen_image_runtime
+          infernix_media_encode)

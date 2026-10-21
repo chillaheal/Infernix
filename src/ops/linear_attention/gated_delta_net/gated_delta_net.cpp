@@ -102,17 +102,15 @@ Geometry validate_recurrent(const Tensor& q, const Tensor& k, const Tensor& v, c
     return geometry;
 }
 
-Geometry validate_recurrent_batch_update(const Tensor& q, const Tensor& k, const Tensor& v,
-                                         const Tensor& g, const Tensor& beta, float scale,
-                                         const Tensor& ssm_states, const Tensor& source_state_slots,
-                                         const Tensor& destination_state_slots, const Tensor& out) {
+// Every batch-update operand except the gates.
+Geometry validate_batch_update_core(const Tensor& q, const Tensor& k, const Tensor& v, float scale,
+                                    const Tensor& ssm_states, const Tensor& source_state_slots,
+                                    const Tensor& destination_state_slots, const Tensor& out) {
     constexpr std::int32_t kMaximumBatch = 8;
     require_dtype(q, DType::BF16, "q must be BF16");
     require_dtype(k, DType::BF16, "k must be BF16");
     require_dtype(v, DType::BF16, "v must be BF16");
     require_dtype(out, DType::BF16, "out must be BF16");
-    require_dtype(g, DType::FP32, "g must be FP32");
-    require_dtype(beta, DType::FP32, "beta must be FP32");
     require_dtype(ssm_states, DType::FP32, "ssm_states must be FP32");
     require_dtype(source_state_slots, DType::I32, "source_state_slots must be I32");
     require_dtype(destination_state_slots, DType::I32, "destination_state_slots must be I32");
@@ -130,8 +128,6 @@ Geometry validate_recurrent_batch_update(const Tensor& q, const Tensor& k, const
                   batch, "v");
     require_shape(out, detail::gated_delta_net::kStateDim, geometry.value_heads, geometry.tokens,
                   batch, "out");
-    require_shape(g, geometry.value_heads, geometry.tokens, batch, 1, "g");
-    require_shape(beta, geometry.value_heads, geometry.tokens, batch, 1, "beta");
     if (ssm_states.ne[0] != detail::gated_delta_net::kStateDim ||
         ssm_states.ne[1] != detail::gated_delta_net::kStateDim ||
         ssm_states.ne[2] != geometry.value_heads || ssm_states.ne[3] <= 0) {
@@ -143,8 +139,6 @@ Geometry validate_recurrent_batch_update(const Tensor& q, const Tensor& k, const
     require_contiguous_nonnull(q, "q");
     require_contiguous_nonnull(k, "k");
     require_contiguous_nonnull(v, "v");
-    require_contiguous_nonnull(g, "g");
-    require_contiguous_nonnull(beta, "beta");
     require_contiguous_nonnull(ssm_states, "ssm_states");
     require_contiguous_nonnull(source_state_slots, "source_state_slots");
     require_contiguous_nonnull(destination_state_slots, "destination_state_slots");
@@ -152,6 +146,42 @@ Geometry validate_recurrent_batch_update(const Tensor& q, const Tensor& k, const
 
     require_scale(scale);
     return geometry;
+}
+
+Geometry validate_recurrent_batch_update(const Tensor& q, const Tensor& k, const Tensor& v,
+                                         const Tensor& g, const Tensor& beta, float scale,
+                                         const Tensor& ssm_states, const Tensor& source_state_slots,
+                                         const Tensor& destination_state_slots, const Tensor& out) {
+    const Geometry geometry =
+        validate_batch_update_core(q, k, v, scale, ssm_states, source_state_slots, destination_state_slots, out);
+    require_dtype(g, DType::FP32, "g must be FP32");
+    require_dtype(beta, DType::FP32, "beta must be FP32");
+    require_shape(g, geometry.value_heads, geometry.tokens, q.ne[3], 1, "g");
+    require_shape(beta, geometry.value_heads, geometry.tokens, q.ne[3], 1, "beta");
+    require_contiguous_nonnull(g, "g");
+    require_contiguous_nonnull(beta, "beta");
+    return geometry;
+}
+
+// a, b: BF16 [Hv, B] with contiguous columns at any non-overlapping element stride (row slices of
+// one control projection); A_log, dt_bias: contiguous FP32 [Hv].
+void validate_batch_update_gating(const Geometry& geometry, std::int32_t batch, const Tensor& a, const Tensor& b,
+                                  const Tensor& a_log, const Tensor& dt_bias) {
+    const std::int32_t heads = geometry.value_heads;
+    for (const Tensor* t : {&a, &b}) {
+        require_dtype(*t, DType::BF16, "gating inputs a/b must be BF16");
+        require_shape(*t, heads, batch, 1, 1, "gating input");
+        constexpr std::int64_t element = 2;
+        if (t->data == nullptr || t->nb[0] != element ||
+            (t->ne[1] > 1 && (t->nb[1] < heads * element || t->nb[1] % element != 0))) {
+            throw std::invalid_argument("gated_delta_net: gating inputs need contiguous, non-overlapping columns");
+        }
+    }
+    for (const Tensor* t : {&a_log, &dt_bias}) {
+        require_dtype(*t, DType::FP32, "A_log/dt_bias must be FP32");
+        require_shape(*t, heads, 1, 1, 1, "A_log/dt_bias");
+        require_contiguous_nonnull(*t, "A_log/dt_bias");
+    }
 }
 
 void validate_chunked(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
@@ -184,9 +214,10 @@ std::size_t gated_delta_net_workspace_capacity_bytes(std::int32_t qk_heads,
 
 void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
                      const Tensor& beta, float scale, bool normalize_qk, WorkspaceArena& ws,
-                     Tensor& ssm_state, Tensor& out, DeviceExecutionView execution) {
+                     Tensor& ssm_state, Tensor& out, DeviceExecutionView execution,
+                     GdnChunkArithmetic arithmetic) {
     gated_delta_net(q, k, v, g, beta, scale, normalize_qk, ws, ssm_state, ssm_state, out,
-                    execution);
+                    execution, arithmetic);
 }
 
 void gated_delta_net_batch_update(const Tensor& q, const Tensor& k, const Tensor& v,
@@ -203,13 +234,30 @@ void gated_delta_net_batch_update(const Tensor& q, const Tensor& k, const Tensor
                                                            destination_state_slots, out, stream);
 }
 
+void gated_delta_net_batch_update_gating(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& a,
+                                         const Tensor& b, const Tensor& A_log, const Tensor& dt_bias, float scale,
+                                         bool normalize_qk, Tensor& ssm_states, const Tensor& source_state_slots,
+                                         const Tensor& destination_state_slots, Tensor& out, cudaStream_t stream) {
+    const Geometry geometry =
+        validate_batch_update_core(q, k, v, scale, ssm_states, source_state_slots, destination_state_slots, out);
+    validate_batch_update_gating(geometry, q.ne[3], a, b, A_log, dt_bias);
+    const detail::gated_delta_net::BatchUpdateGating gating{a, b, A_log, dt_bias};
+    detail::gated_delta_net::launch_recurrent_batch_update(q, k, v, Tensor{}, Tensor{}, scale, normalize_qk,
+                                                           ssm_states, source_state_slots, destination_state_slots,
+                                                           out, stream, &gating);
+}
+
 void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
                      const Tensor& beta, float scale, bool normalize_qk, WorkspaceArena& ws,
                      const Tensor& ssm_state_in, Tensor& ssm_state_out, Tensor& out,
-                     DeviceExecutionView execution) {
+                     DeviceExecutionView execution, GdnChunkArithmetic arithmetic) {
     validate_chunked(q, k, v, g, beta, scale, ssm_state_in, ssm_state_out, out);
     if (execution.multiprocessor_count <= 0) {
         throw std::invalid_argument("gated_delta_net: invalid SM count");
+    }
+    const bool fp16 = arithmetic == GdnChunkArithmetic::Fp16Accumulate;
+    if (fp16 && !normalize_qk) {
+        throw std::invalid_argument("gated_delta_net: FP16 accumulation requires normalize_qk");
     }
     namespace chunked = detail::gated_delta_net::chunked;
     if (q.ne[2] < chunked::kMinTokens) {
@@ -235,8 +283,8 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
                                   v.ne[1],
                                   q.ne[2],
                                   scale};
-    chunked::launch_prepare(args, qk, control, normalize_qk, execution.stream);
-    chunked::launch_recurrence(args, qk, control, execution);
+    chunked::launch_prepare(args, qk, control, normalize_qk, execution.stream, fp16);
+    chunked::launch_recurrence(args, qk, control, execution, fp16);
 }
 
 } // namespace infernix::ops

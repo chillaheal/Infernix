@@ -12,6 +12,7 @@
 #include "models/qwen3_5/program/vision_control.h"
 #include "models/qwen3_5/program/vision_prefill.h"
 #include "models/qwen3_5/program/prefix/block_keys.h"
+#include "models/qwen3_5/program/planning/idle_prefill.h"
 #include "core/device.h"
 #include "core/startup.h"
 #include "runtime/prefix_cache/block_hash.h"
@@ -439,7 +440,9 @@ void ProgramImpl::hybrid_hold_queue(std::span<const RequestBasePlan* const> queu
     if (!hybrid_) { return; }
     pc::PrefixCacheIndex& index = hybrid_->index();
     std::vector<pc::SnapshotRef> holds;
-    for (const RequestBasePlan* base : queue) {
+    for (const RequestBasePlan* base : context_cache.hybrid.queue_holds
+                                           ? queue
+                                           : std::span<const RequestBasePlan* const>{}) {
         if (holds.size() == pc::kMaxQueueHolds) { break; }
         if (base == nullptr || base->impl_ == nullptr || !base->impl_->prompt ||
             !base->impl_->allow_prefix_reuse || !base->impl_->prompt->identity.reusable) {
@@ -458,7 +461,51 @@ void ProgramImpl::hybrid_hold_queue(std::span<const RequestBasePlan* const> queu
         const pc::AdmissionChoice choice = index.choose(match, n);
         if (choice.candidate) { holds.push_back(match.candidates[*choice.candidate].snapshot); }
     }
+    // Tool-call holds rank after every waiting request: a conversation whose client has not come
+    // back yet gives way before any that has. The earliest deadline (the oldest tool call, the
+    // soonest return) ranks first.
+    const auto now = std::chrono::steady_clock::now();
+    std::erase_if(hybrid_tool_holds_, [&](const HybridToolHold& hold) {
+        return hold.deadline <= now ||
+               std::none_of(hold.sources.begin(), hold.sources.end(),
+                            [&](pc::SnapshotRef source) { return index.valid(source); });
+    });
+    for (const HybridToolHold& hold : hybrid_tool_holds_) {
+        for (const pc::SnapshotRef source : hold.sources) {
+            if (holds.size() < pc::kMaxQueueHolds && index.valid(source)) {
+                holds.push_back(source);
+            }
+        }
+    }
+    hybrid_tool_holds_changed_ = false;
     index.set_queue_holds(holds);
+}
+
+void ProgramImpl::hybrid_hold_continuation(std::chrono::steady_clock::time_point deadline) {
+    if (!hybrid_) { return; }
+    const std::array<pc::SnapshotRef, 2> sources = std::exchange(hybrid_finished_sources_, {});
+    const pc::PrefixCacheIndex& index            = hybrid_->index();
+    if (std::none_of(sources.begin(), sources.end(),
+                     [&](pc::SnapshotRef source) { return index.valid(source); })) {
+        return;
+    }
+    hybrid_tool_holds_.push_back(HybridToolHold{.sources = sources, .deadline = deadline});
+    std::stable_sort(hybrid_tool_holds_.begin(), hybrid_tool_holds_.end(),
+                     [](const HybridToolHold& left, const HybridToolHold& right) {
+                         return left.deadline < right.deadline;
+                     });
+    if (hybrid_tool_holds_.size() > pc::kMaxQueueHolds) {
+        hybrid_tool_holds_.resize(pc::kMaxQueueHolds);
+    }
+    hybrid_tool_holds_changed_ = true;
+    ++hybrid_->counters().tool_call_holds;
+}
+
+bool ProgramImpl::hybrid_holds_stale() const noexcept {
+    if (hybrid_tool_holds_changed_) { return true; }
+    const auto now = std::chrono::steady_clock::now();
+    return std::any_of(hybrid_tool_holds_.begin(), hybrid_tool_holds_.end(),
+                       [&](const HybridToolHold& hold) { return hold.deadline <= now; });
 }
 
 std::uint64_t ProgramImpl::hybrid_cache_epoch() const noexcept {
@@ -466,7 +513,9 @@ std::uint64_t ProgramImpl::hybrid_cache_epoch() const noexcept {
 }
 
 bool ProgramImpl::hybrid_await_sibling(const PreparedPromptData& prompt, std::uint32_t reuse) {
-    if (hybrid_coalesce_wait_seconds_ <= 0.0) { return false; }
+    if (hybrid_coalesce_wait_seconds_ <= 0.0 || execution_schedule.grid_cache) {
+        return false;
+    }
     const auto n = static_cast<std::uint32_t>(prompt.token_ids.size());
 
     struct Wait {
@@ -891,7 +940,9 @@ void ProgramImpl::complete_hybrid_binding(ContextTransaction& tx, ContextProgres
     }
     install_binding(tx);
     // The snapshot image's continuation hidden belongs to the snapshot, not to a committed tail.
-    state.tail_hidden_valid = false;
+    // A resume's Replay bridges MTP from it: every snapshot image holds the target hidden of the
+    // column before its frontier, as the lane that published it did.
+    state.tail_hidden_valid = tx.resume != nullptr && reuse != 0;
     if (!hybrid_) {
         // Without a prefix cache the lane publishes nothing.
         out.sequence  = sequence_handle(lane);
@@ -941,9 +992,12 @@ void ProgramImpl::complete_hybrid_binding(ContextTransaction& tx, ContextProgres
     lane_state.deepest_snapshot = reuse;
     lane_state.resume_snapshot  = reuse != 0 ? quote.snapshot : pc::SnapshotRef{};
     lane_state.resume_frontier  = reuse;
+    lane_state.latest_snapshot  = lane_state.resume_snapshot;
+    lane_state.latest_frontier  = reuse;
     lane_state.last_capture     = reuse;
     lane_state.restore_ticket   = ticket;
     lane_state.restore_layers_pending = ticket != 0;
+    if (execution_schedule.grid_cache) { lane_state.publish_frontier = reuse; }
 
     HybridCacheCounters& counters = hybrid_->counters();
     ++counters.admissions;
@@ -953,6 +1007,13 @@ void ProgramImpl::complete_hybrid_binding(ContextTransaction& tx, ContextProgres
         counters.reused_tokens += reuse;
         index.unpin_snapshot(quote.snapshot);
         hb.snapshot_pinned = false;
+        // The lane resumes its own conversation now: a hold for its next turn has served.
+        if (std::erase_if(hybrid_tool_holds_, [&](const HybridToolHold& hold) {
+                return std::find(hold.sources.begin(), hold.sources.end(), quote.snapshot) !=
+                       hold.sources.end();
+            }) != 0) {
+            hybrid_tool_holds_changed_ = true;
+        }
     }
     out.sequence  = sequence_handle(lane);
     out.replaying = requests[lane].lifecycle == Lifecycle::Replaying;
@@ -971,6 +1032,7 @@ void ProgramImpl::hybrid_publish_blocks(SequenceState& sequence) {
     if (sequence.kv->backend) { frontier = std::min(frontier, backend_kv_valid(sequence)); }
     frontier =
         std::min<std::uint32_t>(frontier, static_cast<std::uint32_t>(sequence.ledger.size()));
+    frontier                 = std::min(frontier, lane.publish_frontier);
     const std::uint32_t full = frontier / kBlock;
     while (lane.path.size() < full) {
         const auto block = static_cast<std::uint32_t>(lane.path.size());
@@ -1027,6 +1089,7 @@ void ProgramImpl::hybrid_publish_pending(SequenceState& sequence, bool finishing
     const auto drop               = [&](const HybridPendingTap& tap) {
         (void)state_store->release(tap.image);
         index.release_device_slot(tap.slot);
+        hybrid_undo_supersession(lane, tap.superseded);
         ++counters.taps_skipped;
     };
     while (!lane.pending.empty()) {
@@ -1081,11 +1144,18 @@ void ProgramImpl::hybrid_publish_pending(SequenceState& sequence, bool finishing
             tap.boundary ? pc::SnapshotKind::Boundary : pc::SnapshotKind::Tap);
         if (!published.created) {
             (void)state_store->release(tap.image);
+            // An identical snapshot serves the lineage; without one (a full snapshot table) the
+            // superseded snapshots stay its resume point.
+            if (!published.snapshot.valid()) { hybrid_undo_supersession(lane, tap.superseded); }
             ++counters.taps_skipped;
             continue;
         }
         hybrid_->attach_image(published.snapshot, tap.image);
         lane.deepest_snapshot = std::max(lane.deepest_snapshot, tap.frontier);
+        if (tap.frontier >= lane.latest_frontier) {
+            lane.latest_snapshot = published.snapshot;
+            lane.latest_frontier = tap.frontier;
+        }
         ++counters.taps_created;
         if (!tap.boundary) {
             // A previous tap still pending when this one was captured is superseded here, before
@@ -1108,17 +1178,23 @@ void ProgramImpl::hybrid_capture_tap(SequenceState& sequence, std::uint32_t fron
         ++counters.taps_skipped;
         return;
     }
-    hybrid_supersede_resume(lane, frontier, sequence.ledger);
-    hybrid_supersede_tap(lane, frontier);
+    // Superseded first so the slot can come from the lineage; undone if the tap is not taken.
+    const HybridSupersession superseded{
+        .resume = hybrid_supersede_resume(lane, frontier, sequence.ledger),
+        .tap    = hybrid_supersede_tap(lane, frontier),
+    };
     const std::optional<std::uint32_t> slot = index.acquire_device_slot(
         index.estimate_priority(lane.last_capture, frontier, frontier % kBlock != 0));
     if (!slot) {
+        hybrid_undo_supersession(lane, superseded);
         ++counters.taps_skipped;
+        ++counters.taps_skipped_no_slot;
         return;
     }
     const std::optional<StateImageHandle> image = state_store->reserve_destination();
     if (!image) {
         index.release_device_slot(*slot);
+        hybrid_undo_supersession(lane, superseded);
         ++counters.taps_skipped;
         return;
     }
@@ -1126,11 +1202,15 @@ void ProgramImpl::hybrid_capture_tap(SequenceState& sequence, std::uint32_t fron
         state_images->copy_slot(state_store->physical_slot(sequence.state.write),
                                 state_store->physical_slot(*image), device.stream);
         state_store->publish_copied_snapshot(*image);
-        lane.pending.push_back(HybridPendingTap{
-            .frontier = frontier, .image = *image, .slot = *slot, .boundary = boundary});
+        lane.pending.push_back(HybridPendingTap{.frontier   = frontier,
+                                                .image      = *image,
+                                                .slot       = *slot,
+                                                .boundary   = boundary,
+                                                .superseded = superseded});
     } catch (...) {
         (void)state_store->release(*image);
         index.release_device_slot(*slot);
+        hybrid_undo_supersession(lane, superseded);
         throw;
     }
     lane.last_capture = frontier;
@@ -1142,6 +1222,15 @@ void ProgramImpl::hybrid_after_prefill_chunk(SequenceState& sequence, std::uint3
     if (!hybrid_ || sequence.lane >= max_concurrency) { return; }
     HybridLaneState& lane = hybrid_lanes_[sequence.lane];
     if (!lane.active || !lane.publish || cursor >= prompt_tokens) { return; }
+    // Without free cache resume prefill splits only on the chunk grid, every tap is realized at a
+    // grid boundary, and blocks publish up to the last one reached.
+    const bool invariant = execution_schedule.grid_cache;
+    const bool on_grid   = cursor % prefill_chunk == 0;
+    if (invariant) {
+        if (!on_grid) { return; }
+        lane.publish_frontier = cursor;
+        hybrid_publish_blocks(sequence);
+    }
     // The next chunk reaches the prompt end, so a flexible tap inside it is realized here.
     const bool final_chunk_next = prompt_tokens - cursor <= prefill_chunk;
     bool exact                  = false;
@@ -1149,7 +1238,7 @@ void ProgramImpl::hybrid_after_prefill_chunk(SequenceState& sequence, std::uint3
     bool boundary               = false;
     while (lane.next_tap < lane.taps.size()) {
         const pc::PlannedTap& tap = lane.taps[lane.next_tap];
-        if (tap.placement == pc::TapPlacement::Exact) {
+        if (tap.placement == pc::TapPlacement::Exact && !invariant) {
             if (tap.position > cursor) { break; }
             exact    = exact || tap.position == cursor;
             boundary = boundary || (tap.position == cursor && tap.boundary);
@@ -1169,30 +1258,72 @@ void ProgramImpl::hybrid_after_prefill_chunk(SequenceState& sequence, std::uint3
     hybrid_capture_tap(sequence, cursor, boundary);
 }
 
-void ProgramImpl::hybrid_supersede_resume(HybridLaneState& lane, std::uint32_t frontier,
-                                          std::span<const TokenId> ledger) {
+std::uint32_t ProgramImpl::hybrid_wide_step_limit(std::uint32_t lane, std::uint32_t cursor,
+                                                  std::uint32_t prompt_tokens,
+                                                  std::uint32_t tokens) const {
+    if (tokens <= prefill_chunk || !hybrid_ || lane >= max_concurrency) { return tokens; }
+    const HybridLaneState& state = hybrid_lanes_[lane];
+    if (!state.active || !state.publish) { return tokens; }
+    for (std::size_t tap = state.next_tap; tap < state.taps.size(); ++tap) {
+        const pc::PlannedTap& planned = state.taps[tap];
+        // An exact tap splits a wide step where it splits a chunk-wide one.
+        if (planned.placement == pc::TapPlacement::Exact) { continue; }
+        // Later flexible taps are realized at this tap's boundary or after it.
+        return flexible_tap_step_limit(cursor, prompt_tokens, prefill_chunk, planned.position,
+                                       tokens);
+    }
+    return tokens;
+}
+
+HybridSuperseded ProgramImpl::hybrid_supersede_resume(HybridLaneState& lane,
+                                                      std::uint32_t frontier,
+                                                      std::span<const TokenId> ledger) {
     pc::PrefixCacheIndex& index = hybrid_->index();
     if (!lane.resume_snapshot.valid() || frontier <= lane.resume_frontier ||
         !index.valid(lane.resume_snapshot)) {
-        return;
+        return {};
     }
+    HybridSuperseded out{.snapshot = lane.resume_snapshot, .frontier = lane.resume_frontier};
     // The lineage's tokens past its source, so the endpoints it went past are superseded too.
     const std::size_t end = std::min<std::size_t>(frontier, ledger.size());
-    index.supersede(lane.resume_snapshot,
-                    end > lane.resume_frontier
-                        ? ledger.subspan(lane.resume_frontier, end - lane.resume_frontier)
-                        : std::span<const TokenId>{});
+    out.index_changed     = index.supersede(
+        lane.resume_snapshot, end > lane.resume_frontier
+                                  ? ledger.subspan(lane.resume_frontier, end - lane.resume_frontier)
+                                  : std::span<const TokenId>{});
     lane.resume_snapshot = {};
+    return out;
 }
 
-void ProgramImpl::hybrid_supersede_tap(HybridLaneState& lane, std::uint32_t frontier) {
+HybridSuperseded ProgramImpl::hybrid_supersede_tap(HybridLaneState& lane, std::uint32_t frontier) {
     pc::PrefixCacheIndex& index = hybrid_->index();
     if (!lane.tap_snapshot.valid() || frontier <= lane.tap_frontier ||
         !index.valid(lane.tap_snapshot)) {
-        return;
+        return {};
     }
-    index.supersede(lane.tap_snapshot);
+    HybridSuperseded out{.snapshot = lane.tap_snapshot, .frontier = lane.tap_frontier};
+    out.index_changed = index.supersede(lane.tap_snapshot);
     lane.tap_snapshot = {};
+    return out;
+}
+
+void ProgramImpl::hybrid_undo_supersession(HybridLaneState& lane,
+                                           const HybridSupersession& superseded) {
+    pc::PrefixCacheIndex& index = hybrid_->index();
+    const auto undo = [&](const HybridSuperseded& entry, pc::SnapshotRef& ref,
+                          std::uint32_t& frontier) {
+        // Gone already (evicted as a superseded snapshot), or the lineage has a deeper snapshot.
+        if (!entry.snapshot.valid() || !index.valid(entry.snapshot) ||
+            lane.deepest_snapshot > entry.frontier) {
+            return;
+        }
+        if (entry.index_changed) { index.unsupersede(entry.snapshot); }
+        if (!ref.valid()) {
+            ref      = entry.snapshot;
+            frontier = entry.frontier;
+        }
+    };
+    undo(superseded.resume, lane.resume_snapshot, lane.resume_frontier);
+    undo(superseded.tap, lane.tap_snapshot, lane.tap_frontier);
 }
 
 std::span<const cudaEvent_t> ProgramImpl::hybrid_take_restore_layers(std::uint32_t lane) {
@@ -1216,6 +1347,7 @@ void ProgramImpl::hybrid_release_lane(std::uint32_t lane) noexcept {
         for (const HybridPendingTap& tap : state.pending) {
             (void)state_store->release(tap.image);
             index.release_device_slot(tap.slot);
+            hybrid_undo_supersession(state, tap.superseded);
         }
         state.pending.clear();
         if (state.active) {
@@ -1232,8 +1364,18 @@ void ProgramImpl::hybrid_release_lane(std::uint32_t lane) noexcept {
 
 void ProgramImpl::hybrid_finish_lane(SequenceState& sequence, bool endpoint) noexcept {
     if (!hybrid_ || sequence.lane >= max_concurrency) { return; }
-    const std::uint32_t lane    = sequence.lane;
-    HybridLaneState& lane_state = hybrid_lanes_[lane];
+    const pc::SnapshotRef published = hybrid_publish_endpoint(sequence, endpoint);
+    const HybridLaneState& lane     = hybrid_lanes_[sequence.lane];
+    hybrid_finished_sources_[0]     = published.valid() ? published : lane.latest_snapshot;
+    hybrid_finished_sources_[1]     = lane.tap_snapshot;
+    hybrid_release_lane(sequence.lane);
+}
+
+pc::SnapshotRef ProgramImpl::hybrid_publish_endpoint(SequenceState& sequence,
+                                                     bool endpoint) noexcept {
+    pc::SnapshotRef out;
+    if (!hybrid_ || sequence.lane >= max_concurrency) { return out; }
+    HybridLaneState& lane_state = hybrid_lanes_[sequence.lane];
     try {
         if (lane_state.active && lane_state.publish && sequence.kv) {
             hybrid_publish_blocks(sequence);
@@ -1245,75 +1387,96 @@ void ProgramImpl::hybrid_finish_lane(SequenceState& sequence, bool endpoint) noe
                 (!is_masked_draft_backend(speculative_backend) ||
                  sequence.dflash_context_frontier == frontier);
             const std::uint32_t anchor_blocks = frontier / kBlock;
-            if (endpoint && backend_caught_up && frontier != 0 &&
+            if (endpoint && !execution_schedule.grid_cache && backend_caught_up &&
+                frontier != 0 &&
                 frontier >= lane_state.deepest_snapshot + pc::kMinimumTapSeparation &&
                 frontier <= sequence.ledger.size() && lane_state.path.size() >= anchor_blocks &&
                 sequence.state.read == sequence.state.write &&
                 state_store->role(sequence.state.write) == StateImageRole::ActiveMutable) {
                 pc::PrefixCacheIndex& index = hybrid_->index();
                 // The lineage moves past its source here, so a slot it needs comes from its own
-                // lineage before another conversation's snapshot.
-                hybrid_supersede_resume(lane_state, frontier, sequence.ledger);
+                // lineage before another conversation's snapshot. Undone if no endpoint results.
+                const HybridSupersession superseded{
+                    .resume = hybrid_supersede_resume(lane_state, frontier, sequence.ledger)};
+                bool endpoint_published = false;
+                const auto skipped      = [&] {
+                    hybrid_undo_supersession(lane_state, superseded);
+                    ++hybrid_->counters().endpoints_skipped;
+                };
                 const std::optional<std::uint32_t> slot =
                     index.acquire_device_slot(index.estimate_priority(
                         lane_state.deepest_snapshot, frontier, frontier % kBlock != 0));
+                if (!slot) { skipped(); }
                 if (slot) {
-                    const std::uint32_t tail = frontier % kBlock;
-                    std::optional<std::uint32_t> tail_id;
                     try {
-                        if (tail != 0) {
-                            // The finishing lane hands its last partial page to the snapshot.
-                            HybridBlockPages pages{.text = text_kv_addresses->logical_page(
-                                                       sequence.kv->text, anchor_blocks)};
-                            std::uint32_t backend_columns = 0;
-                            if (sequence.kv->backend) {
-                                pages.backend = backend_kv_addresses->logical_page(
-                                    *sequence.kv->backend, anchor_blocks);
-                                backend_columns = backend_frontier > anchor_blocks * kBlock
-                                                      ? backend_frontier - anchor_blocks * kBlock
-                                                      : 0U;
+                        const std::uint32_t tail = frontier % kBlock;
+                        std::optional<std::uint32_t> tail_id;
+                        try {
+                            if (tail != 0) {
+                                // The finishing lane hands its last partial page to the snapshot.
+                                HybridBlockPages pages{.text = text_kv_addresses->logical_page(
+                                                           sequence.kv->text, anchor_blocks)};
+                                std::uint32_t backend_columns = 0;
+                                if (sequence.kv->backend) {
+                                    pages.backend = backend_kv_addresses->logical_page(
+                                        *sequence.kv->backend, anchor_blocks);
+                                    backend_columns =
+                                        backend_frontier > anchor_blocks * kBlock
+                                            ? backend_frontier - anchor_blocks * kBlock
+                                            : 0U;
+                                }
+                                tail_id = hybrid_->register_tail(pages, tail, backend_columns);
                             }
-                            tail_id = hybrid_->register_tail(pages, tail, backend_columns);
+                        } catch (...) {
+                            index.release_device_slot(*slot);
+                            throw;
+                        }
+                        const StateImageHandle image = sequence.state.write;
+                        state_store->freeze(image);
+                        const std::span<const TokenId> tail_tokens(
+                            sequence.ledger.data() +
+                                static_cast<std::size_t>(anchor_blocks) * kBlock,
+                            tail);
+                        const pc::NodeRef anchor = anchor_blocks == 0
+                                                       ? pc::NodeRef{}
+                                                       : lane_state.path[anchor_blocks - 1U];
+                        const pc::PublishResult published =
+                            index.publish_snapshot(anchor, frontier, tail_tokens, tail_id, *slot,
+                                                   pc::SnapshotKind::Endpoint);
+                        if (published.snapshot.valid()) {
+                            endpoint_published = true;
+                            lane_state.deepest_snapshot =
+                                std::max(lane_state.deepest_snapshot, frontier);
+                            out = published.snapshot;
+                        } else {
+                            skipped(); // a full snapshot table
+                        }
+                        if (published.created) {
+                            hybrid_->attach_image(published.snapshot, image);
+                            sequence.state = {};
+                            ++hybrid_->counters().endpoints_created;
+                            // Superseded first, so the Host write below can take its slabs.
+                            (void)hybrid_supersede_resume(lane_state, lane_state.deepest_snapshot,
+                                                          sequence.ledger);
+                            (void)hybrid_->start_snapshot_host_write(
+                                published.snapshot, device.stream, device.transfer_stream);
+                        } else {
+                            state_store->thaw(image);
                         }
                     } catch (...) {
-                        index.release_device_slot(*slot);
+                        if (!endpoint_published) { skipped(); }
                         throw;
-                    }
-                    const StateImageHandle image = sequence.state.write;
-                    state_store->freeze(image);
-                    const std::span<const TokenId> tail_tokens(
-                        sequence.ledger.data() + static_cast<std::size_t>(anchor_blocks) * kBlock,
-                        tail);
-                    const pc::NodeRef anchor =
-                        anchor_blocks == 0 ? pc::NodeRef{} : lane_state.path[anchor_blocks - 1U];
-                    const pc::PublishResult published = index.publish_snapshot(
-                        anchor, frontier, tail_tokens, tail_id, *slot, pc::SnapshotKind::Endpoint);
-                    if (published.snapshot.valid()) {
-                        lane_state.deepest_snapshot =
-                            std::max(lane_state.deepest_snapshot, frontier);
-                    }
-                    if (published.created) {
-                        hybrid_->attach_image(published.snapshot, image);
-                        sequence.state = {};
-                        ++hybrid_->counters().endpoints_created;
-                        // Superseded first, so the Host write below can take its slabs.
-                        hybrid_supersede_resume(lane_state, lane_state.deepest_snapshot,
-                                                sequence.ledger);
-                        (void)hybrid_->start_snapshot_host_write(published.snapshot, device.stream,
-                                                                 device.transfer_stream);
-                    } else {
-                        state_store->thaw(image);
                     }
                 }
             }
-            hybrid_supersede_resume(lane_state, lane_state.deepest_snapshot,
-                                    sequence.ledger);
+            (void)hybrid_supersede_resume(lane_state, lane_state.deepest_snapshot,
+                                          sequence.ledger);
         }
     } catch (...) {
-        // Terminal publication is optional; a failure keeps whatever was published and releases
-        // the lane normally.
+        // Terminal publication is optional; a failure keeps whatever was published and the lane
+        // is released normally.
     }
-    hybrid_release_lane(lane);
+    return out;
 }
 
 // ---- Device pressure and statistics ------------------------------------------------------------
@@ -1364,7 +1527,13 @@ HybridPrefixCacheStats ProgramImpl::hybrid_stats() const noexcept {
     out.blocks_duplicate                = counters.blocks_duplicate;
     out.taps_created                    = counters.taps_created;
     out.taps_skipped                    = counters.taps_skipped;
+    out.taps_skipped_no_slot            = counters.taps_skipped_no_slot;
     out.endpoints_created               = counters.endpoints_created;
+    out.endpoints_skipped               = counters.endpoints_skipped;
+    out.host_image_write_refusals       = counters.host_image_write_refusals;
+    out.host_block_write_refusals       = counters.host_block_write_refusals;
+    out.device_slot_evictions           = index.device_slot_evictions;
+    out.device_slot_refusals            = index.device_slot_refusals;
     out.host_image_writes               = counters.host_image_writes;
     out.host_block_writes               = counters.host_block_writes;
     out.host_image_restores             = counters.host_image_restores;
@@ -1373,6 +1542,8 @@ HybridPrefixCacheStats ProgramImpl::hybrid_stats() const noexcept {
     out.host_tail_restores              = counters.host_tail_restores;
     out.host_write_bytes                = counters.host_write_bytes;
     out.host_restore_bytes              = counters.host_restore_bytes;
+    out.host_write_copies               = counters.host_write_copies;
+    out.host_restore_copies             = counters.host_restore_copies;
     out.evicted_blocks                  = counters.evicted_blocks;
     out.host_snapshot_evictions         = index.host_snapshot_evictions;
     out.host_dead_reclaims              = index.host_dead_reclaims;
@@ -1381,6 +1552,7 @@ HybridPrefixCacheStats ProgramImpl::hybrid_stats() const noexcept {
     out.held_device_evictions           = index.held_device_evictions;
     out.held_snapshot_losses            = index.held_snapshot_losses;
     out.held_host_refusals              = index.held_host_refusals;
+    out.tool_call_holds                 = counters.tool_call_holds;
     return out;
 }
 

@@ -5,6 +5,7 @@
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "runtime/prefix_cache/cost.h"
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -60,6 +61,10 @@ public:
     [[nodiscard]] std::size_t host_capacity_bytes() const noexcept;
     // Whether automatic DFlash2 tree widths are active: requested and verifiable by the target.
     [[nodiscard]] bool draft_tree_auto() const noexcept;
+    // The effective prefill chunk, and the width a prefill step takes while no other lane waits
+    // to decode (idle-wide-prefill; the chunk when that fast path is off).
+    [[nodiscard]] std::uint32_t prefill_chunk() const noexcept;
+    [[nodiscard]] std::uint32_t idle_prefill_width() const noexcept;
 
 private:
     explicit SequencePlan(std::unique_ptr<detail::SequencePlanImpl> impl) noexcept;
@@ -89,6 +94,8 @@ private:
 
     friend SequencePlanner make_sequence_planner(const execution::Parameters&, DeviceContext&,
                                                  const EngineOptions&);
+    friend SequencePlanner make_sequence_planner(const execution::Parameters&, DeviceContext&,
+                                                 const EngineOptions&, std::uint32_t);
 };
 
 class RequestBasePlan {
@@ -173,7 +180,13 @@ struct HybridPrefixCacheStats {
     std::uint64_t blocks_duplicate           = 0;
     std::uint64_t taps_created               = 0;
     std::uint64_t taps_skipped               = 0;
+    std::uint64_t taps_skipped_no_slot       = 0;
     std::uint64_t endpoints_created          = 0;
+    std::uint64_t endpoints_skipped          = 0;
+    std::uint64_t host_image_write_refusals  = 0;
+    std::uint64_t host_block_write_refusals  = 0;
+    std::uint64_t device_slot_evictions      = 0;
+    std::uint64_t device_slot_refusals       = 0;
     std::uint64_t host_image_writes          = 0;
     std::uint64_t host_block_writes          = 0;
     std::uint64_t host_image_restores        = 0;
@@ -182,6 +195,8 @@ struct HybridPrefixCacheStats {
     std::uint64_t host_tail_restores         = 0;
     std::uint64_t host_write_bytes           = 0;
     std::uint64_t host_restore_bytes         = 0;
+    std::uint64_t host_write_copies          = 0;
+    std::uint64_t host_restore_copies        = 0;
     std::uint64_t evicted_blocks             = 0;
     std::uint64_t host_snapshot_evictions    = 0;
     std::uint64_t host_dead_reclaims         = 0;
@@ -190,6 +205,7 @@ struct HybridPrefixCacheStats {
     std::uint64_t held_device_evictions      = 0;
     std::uint64_t held_snapshot_losses       = 0;
     std::uint64_t held_host_refusals         = 0;
+    std::uint64_t tool_call_holds            = 0;
 };
 
 class ResumeState {
@@ -269,6 +285,9 @@ struct PrefillProgress {
     runtime::BeginSummary summary;
     std::uint32_t processed_prompt_tokens = 0;
     bool complete                         = false;
+    // Qwen3.5 lends nothing to a prefill, so no capacity comes back between its calls (the Engine
+    // re-runs admission when a Qwen4Exp prompt returns lent frames, GitHub #24).
+    bool capacity_released = false;
     runtime::ExecutionTiming timing;
     std::optional<PendingBatch> pending;
     std::optional<PromptReadout> readout;
@@ -389,6 +408,11 @@ public:
     [[nodiscard]] DiscardResult abort_pending(PendingBatch&& pending) noexcept;
     [[nodiscard]] FinishResult finish(SequenceHandle sequence) noexcept;
     [[nodiscard]] AbortResult abort(SequenceHandle sequence) noexcept;
+    // After a runtime::RecoverableExecutionError, which the Engine raises between units (a resident
+    // that cannot obtain its legal unit, resource-scheduling §3): every lane is released as abort()
+    // releases it and the prefix cache is kept. False when a pending batch or the device makes that
+    // unsafe; the Engine then fails everything.
+    [[nodiscard]] bool recover_after_failure() noexcept;
     void fail_all_cleanup() noexcept;
     // fail_all_cleanup for the Engine's orderly stop. With a hybrid cache file attached, the Host
     // tier is saved once every lane has written its blocks through and before the cleanup drops
@@ -416,6 +440,11 @@ public:
     // Holds the snapshot each queued request would resume from now, in admission order
     // (hybrid-prefix-cache-spec §9.6); an empty queue releases every hold.
     void hybrid_hold_queue(std::span<const RequestBasePlan* const> queue);
+    // Tool-call hold: what the request finished last resumes its next turn from is held after
+    // every queued request's source until `deadline`.
+    void hybrid_hold_continuation(std::chrono::steady_clock::time_point deadline);
+    // Whether hybrid_hold_queue must run again for a tool-call hold added, served or expired.
+    [[nodiscard]] bool hybrid_holds_stale() const noexcept;
     // Changes when a queued request's choice of snapshot may have changed.
     [[nodiscard]] std::uint64_t hybrid_cache_epoch() const noexcept;
     [[nodiscard]] HybridPrefixCacheStats hybrid_stats() const noexcept;
@@ -446,6 +475,21 @@ private:
 
 [[nodiscard]] SequencePlanner make_sequence_planner(const execution::Parameters&, DeviceContext&,
                                                     const EngineOptions&);
+// Plans prefill steps up to `idle_prefill_width` tokens while no other lane waits to decode: one
+// of idle_prefill_widths(parameters, options).
+[[nodiscard]] SequencePlanner make_sequence_planner(const execution::Parameters&, DeviceContext&,
+                                                    const EngineOptions&,
+                                                    std::uint32_t idle_prefill_width);
+// The idle-wide-prefill widths to try, widest first: startup plans the widest whose runtime
+// reservation keeps the KV capacity (runtime/engine/model_instance.cpp). Empty unless the fast
+// path is selected and some width is wider than the effective chunk.
+[[nodiscard]] std::vector<std::uint32_t> idle_prefill_widths(const execution::Parameters&,
+                                                             const EngineOptions&);
 [[nodiscard]] std::unique_ptr<Program> create_program(const execution::Parameters&, SequencePlan&&,
                                                       DeviceContext&, const StartupObserver&);
+// --draft-tokens auto runs the adaptive-mtp policy where it is selected and acts. Elsewhere (it is
+// not qualified for the artifact's configuration, or fast paths are disabled) this makes the options
+// a fixed draft length, auto_fixed_draft_tokens(), and returns it; otherwise it returns 0. Call it
+// before planning. A requested --fast-path adaptive-mtp that cannot act is refused.
+[[nodiscard]] std::uint32_t resolve_auto_draft_length(const execution::Parameters&, EngineOptions&);
 } // namespace infernix::models::qwen3_5

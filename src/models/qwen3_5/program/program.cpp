@@ -45,6 +45,14 @@ bool SequencePlan::draft_tree_auto() const noexcept {
     return impl_ != nullptr && impl_->tree_widths.automatic_mode();
 }
 
+std::uint32_t SequencePlan::prefill_chunk() const noexcept {
+    return impl_ != nullptr ? impl_->prefill_chunk : 0;
+}
+
+std::uint32_t SequencePlan::idle_prefill_width() const noexcept {
+    return impl_ != nullptr ? impl_->idle_prefill_width : 0;
+}
+
 SequencePlanner::SequencePlanner(std::unique_ptr<detail::SequencePlannerImpl> impl) noexcept
     : impl_(std::move(impl)) {}
 
@@ -168,6 +176,8 @@ FinishResult Program::finish(SequenceHandle s) noexcept { return impl_->finish(s
 
 AbortResult Program::abort(SequenceHandle s) noexcept { return impl_->abort(s); }
 
+bool Program::recover_after_failure() noexcept { return impl_->recover_after_failure(); }
+
 void Program::fail_all_cleanup() noexcept { impl_->fail_all_cleanup(); }
 
 void Program::shutdown_cleanup() noexcept { impl_->shutdown_cleanup(); }
@@ -192,6 +202,12 @@ std::uint32_t Program::hybrid_prefetch_room() const noexcept {
 void Program::hybrid_hold_queue(std::span<const RequestBasePlan* const> queue) {
     impl_->hybrid_hold_queue(queue);
 }
+
+void Program::hybrid_hold_continuation(std::chrono::steady_clock::time_point deadline) {
+    impl_->hybrid_hold_continuation(deadline);
+}
+
+bool Program::hybrid_holds_stale() const noexcept { return impl_->hybrid_holds_stale(); }
 
 std::uint64_t Program::hybrid_cache_epoch() const noexcept { return impl_->hybrid_cache_epoch(); }
 
@@ -228,6 +244,25 @@ void Program::reset_memory_peaks() noexcept { impl_->reset_memory_peaks(); }
 SequencePlanner make_sequence_planner(const execution::Parameters& parameters,
                                       DeviceContext& device, const EngineOptions& options) {
     return SequencePlanner(detail::make_sequence_planner_impl(parameters, device, options));
+}
+
+SequencePlanner make_sequence_planner(const execution::Parameters& parameters,
+                                      DeviceContext& device, const EngineOptions& options,
+                                      std::uint32_t idle_prefill_width) {
+    if (idle_prefill_width == 0) {
+        throw std::invalid_argument("an idle prefill width must be positive");
+    }
+    return SequencePlanner(
+        detail::make_sequence_planner_impl(parameters, device, options, idle_prefill_width));
+}
+
+std::vector<std::uint32_t> idle_prefill_widths(const execution::Parameters& parameters,
+                                               const EngineOptions& options) {
+    return detail::idle_prefill_widths_impl(parameters, options);
+}
+
+std::uint32_t resolve_auto_draft_length(const execution::Parameters& parameters, EngineOptions& options) {
+    return detail::resolve_auto_draft_length_impl(parameters, options);
 }
 
 std::unique_ptr<Program> create_program(const execution::Parameters& parameters,

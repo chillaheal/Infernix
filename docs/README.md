@@ -9,7 +9,7 @@ run the CLI or HTTP server.
 |---|---|
 | [CLI](cli.md) | text, chat-history, image/video input, output streams, sampling, MTP, and common runtime options |
 | [HTTP serving](serving.md) | OpenAI Responses/Chat Completions, Anthropic Messages, state, streaming, token counting, authentication, and tool calls |
-| [Qwen3.8-Flash-Next](qwen3_8-flash-next.md) | requirements, conversion (recipes A and B), recommended flags, measured speed and quality of the offloaded-expert model |
+| [Qwen3.8-Flash-Next](qwen3_8-flash-next.md) | requirements, conversion (recipes A and B, the GSQ-RCO IQ3_S GGUF import), recommended flags, the n-gram table in RAM, measured speed and quality of the offloaded-expert model |
 | [Ngram copy proposals](ngram.md) | optional copy acceleration alongside MTP, DFlash or DFlash2 at any concurrency |
 | [Performance](performance.md) | RTX 5090 measurement coverage, per-model serving results, methodology, and publication rules |
 | [Weight conversion](weight-conversion.md) | official recipes, custom formats and sources, conversion methods, optional components and artifact output |
@@ -20,13 +20,9 @@ The executable `--help` output is the exact source for command-line option spell
 
 ## Model artifacts
 
-| Model | Weights | Download | Versioned model card source |
-|---|---|---|---|
-| Qwen3.6-27B | `groupwise-int` | [Hugging Face](https://huggingface.co/neroued/Qwen3.6-27B-NInfer) | [model card](../model-cards/Qwen3.6-27B-NInfer/README.md) |
-| Qwen3.6-27B | `nvfp4` | [Hugging Face](https://huggingface.co/neroued/Qwen3.6-27B-nvfp4-NInfer) | [model card](../model-cards/Qwen3.6-27B-nvfp4-NInfer/README.md) |
-| Qwen3.8-27B | `groupwise-int` | [Hugging Face](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) | [model card](../model-cards/Qwen3.8-27B-NInfer/README.md) |
-| Qwen3.8-27B | `nvfp4` | [Hugging Face](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer) | [model card](../model-cards/Qwen3.8-27B-nvfp4-NInfer/README.md) |
-| Qwen3.6-35B-A3B | `groupwise-int` | [Hugging Face](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer) | [model card](../model-cards/Qwen3.6-35B-A3B-NInfer/README.md) |
+The [project README](../README.md#models) lists every supported model with its Hugging Face
+repository and the Qwen3.8-Flash-Next n-gram volumes. [`model-cards/`](../model-cards/) holds the
+versioned source of each repository's model card.
 
 ## Repository-local guides
 
@@ -61,11 +57,15 @@ other references own narrower contracts:
 | [ReplaySSM GDN](maintainer/replayssm-gdn.md) | raw transition records and faithful commitment of the verified state prefix |
 | [Op development](maintainer/op-development.md) | semantic boundaries, source ownership, numerical qualification and performance evidence |
 | [Model-level numerical quality](maintainer/model-quality.md) | rounding noise at model scale, the 16-bit-activation reference, Infernix-versus-NInfer prefill and decode results, Flash-Next NVFP4 against Unsloth UD-Q4_K_XL |
+| [Basalt port assessment](maintainer/basalt-port-assessment.md) | which mechanisms of Basalt (a Strata fork for Flash-Next) are adopted, candidates, parked or rejected, and why |
+| [NVFP4 quantization-method adoption](maintainer/nvfp4-quantization-methods.md) | evaluated converter-side 4-bit methods, what each demands of the stored representation, and the measured reason none is adopted |
 | [Operational logging](maintainer/logging.md) | log ownership, presentation, severity and data policy |
 | [Linear benchmark](maintainer/linear-benchmark.md) | pure Linear measurement, metrics and suites |
 | [Linear tuning and reports](maintainer/linear-tuning.md) | tuning ranges, priority points, dispatch tradeoffs and final performance report format |
-| [Qwen3.8-Flash-Next design](maintainer/qwen3_8-flash-next-design.md) | temporary design proposal (partly implemented; status in §19.1): bit-exact import of NVIDIA's NVFP4 checkpoint with exact W4A4 expert arithmetic, host-resident experts with CPU miss service and a VRAM expert cache, NVMe n-gram table, QSA over every KV profile (262K `int8` first), performance model and milestones |
+| [Qwen3.8-Flash-Next design](maintainer/qwen3_8-flash-next-design.md) | temporary design proposal (partly implemented; status in §19.1): bit-exact import of NVIDIA's NVFP4 checkpoint with exact W4A4 expert arithmetic, host-resident experts with CPU miss service and a VRAM expert cache, NVMe n-gram table, QSA over every KV profile (262K `int8` first), performance model and milestones; the exact GGUF IQ3_S and official FP8 imports (§16.2.2 arithmetic, §12.5 n-gram rows and RAM residency, §19.3.25 routes, results and rejected alternatives) |
 | [Qwen-Image-2.1 variable inputs](maintainer/qwen-image-2-1-variables.md) | the caller-facing input surface of one image job (prompt, condition images, CFG, size, seed, steps, sigmas, KV-cache mode), the input-dependent scheduler/geometry math, the fixed model constants, and the engine gaps variable-input generation must close |
+| [GLM-5.3-Flash design](maintainer/glm5_3-flash-design.md) | temporary design proposal (not implemented): the EXL3 3.05 bpw GLM-5.3-Flash builds (MikeRoz's uncensored, turboderp's base) on one RTX 5090 with exact E3A16 experts in VRAM, pinned RAM and expert volumes striped over several NVMe drives; sparse MLA, pooled indexer, KDA and mHC Ops; measured storage topology, performance model and milestones |
+| [DeepSeek-V4.1-Flash design](maintainer/deepseek_v4_1-flash-design.md) | temporary design proposal (not implemented): the NVFP4 build of DeepSeek-V4.1-Flash-1017 on one RTX 5090, with its experts stored as the lossless original MXFP4 and computed with DeepSeek's exact 8-bit activations (MX8) from VRAM, RAM and three striped NVMe volumes; CSA2 attention and the two-level indexer, Engram volumes in FP8 or MXFP4 rows, single-pass mHC, the bounded-replay and full-model prompt rules, DSpark; a streaming conversion that fits the free disk; DwarfStar and other engines, performance model and milestones |
 
 Model cards contain official artifact facts and source provenance. The
 [conversion guide](weight-conversion.md) is the entry point for making an artifact. Exact config

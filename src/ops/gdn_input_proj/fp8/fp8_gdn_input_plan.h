@@ -27,14 +27,24 @@ void fp8_gdn_input_matrix_launch(const Tensor& x, const Weight& weight, Tensor& 
 
 void fp8_gdn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                              Fp8A8Workspace workspace, cudaStream_t stream);
+// AllowA8Residual: the workspace's two E4M3 planes into two accumulators (MMA tiles).
+void fp8_gdn_input_a8_residual_launch(const Tensor& x, const Weight& weight, Tensor& qkv,
+                                      Tensor& z, Fp8A8Workspace workspace, cudaStream_t stream);
 
 // Exact contraction mechanisms shared by G1/G2/G3. Semantic Ops own their route frontier and
 // call one of these launchers after resolving their complete-form plan.
+// A16ColumnInvariant: one sliced-K schedule (4 K-warps) for every T, so a column's arithmetic does
+// not depend on the call's other columns.
+void fp8_gdn_input_invariant_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
+                                    cudaStream_t stream);
 void fp8_gdn_input_a16_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                                 cudaStream_t stream);
 
 void fp8_gdn_input_a8_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                                WorkspaceArena& workspace, cudaStream_t stream);
+void fp8_gdn_input_a8_residual_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv,
+                                        Tensor& z, WorkspaceArena& workspace,
+                                        cudaStream_t stream);
 
 void fp8_gdn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                             LinearPolicy policy, WorkspaceArena* workspace, cudaStream_t stream);

@@ -22,11 +22,77 @@ enum class LinearPolicy : std::uint8_t {
     A16Only, ///< Admit only A16 compute profiles.
     AllowA8, ///< Admit either A16 or A8 compute profiles.
     AllowA4, ///< Admit A16, A8 or A4 compute profiles.
+    /// Admit only an A16 profile whose arithmetic for one column does not depend on how many
+    /// columns the call holds or on their values: column t's output bits are a function of column
+    /// t's input and the weight alone, for every T. A projection that does not register such a
+    /// route rejects this policy.
+    A16ColumnInvariant,
+    /// Admit A16 or an A4 residual profile: NVFP4 activations as a sum of NVFP4 terms, each
+    /// encoding what the earlier ones left, so the activation error is roughly A4's raised to the
+    /// term count. Never one-term A4 or A8. A projection that does not register a residual route
+    /// runs A16; one that does needs the A4 activation divisor (as AllowA4 does).
+    AllowA4Residual,
+    /// Admit A16 or an A8 residual profile: FP8 activations as two E4M3 terms per token, the
+    /// second encoding what the first left at a sixteenth of its scale. Never one-term A8 or A4.
+    /// A projection that does not register a residual route runs A16 (the FP8 input projections
+    /// and gate/up register one; the output and down projections do not).
+    AllowA8Residual,
 };
+
+/**
+ * @brief The fast-path routes a projection may select (a set of flags).
+ *
+ * Exact (no flag) keeps each registered problem's output bits fixed from release to release. Each
+ * flag admits one fast path's routes for the problems that register them, whose arithmetic differs;
+ * a Model sets a flag only where its fast path is qualified (docs/maintainer/model-quality.md
+ * section 6.7). A problem with no route for a set flag runs its exact route.
+ */
+enum class LinearRoutes : std::uint8_t {
+    Exact     = 0,
+    Q8SlicedK = 1, ///< q8-sliced-k: NInfer's Q8 GEMV/sliced-K routes (Flash-Next [16384,2560], [2560,6144]).
+    Fp8A8Pair = 2, ///< fp8-a8-pair: FP8 weights with the activation as two E4M3 terms.
+    Q4W4A8    = 4, ///< q4-w4a8: groupwise Q4 weights with int8 activations.
+    /// batched-decode: NVFP4 linear_add [5120,17408] A16 tiles of 8 K-warps at 5-16 columns (the
+    /// exact route keeps the release's 4 K-warp tiles; the K-warp count sets the reduction order).
+    WideDownTile = 8,
+    /// ggml-bf16-prefill: GGUF projections of 32 or more columns on BF16 tensor cores with FP32 sums
+    /// (ops::ggml_linear) instead of the exact A16 integer tiles.
+    GgmlBf16Wide = 16,
+};
+
+[[nodiscard]] constexpr LinearRoutes operator|(LinearRoutes a, LinearRoutes b) noexcept {
+    return static_cast<LinearRoutes>(static_cast<std::uint8_t>(a) | static_cast<std::uint8_t>(b));
+}
+
+[[nodiscard]] constexpr bool has_route(LinearRoutes routes, LinearRoutes flag) noexcept {
+    return (static_cast<std::uint8_t>(routes) & static_cast<std::uint8_t>(flag)) != 0;
+}
+
+[[nodiscard]] constexpr bool valid_linear_routes(LinearRoutes routes) noexcept {
+    return (static_cast<std::uint8_t>(routes) & ~std::uint8_t{31}) == 0;
+}
 
 [[nodiscard]] constexpr bool valid_linear_policy(LinearPolicy policy) noexcept {
     return policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8 ||
-           policy == LinearPolicy::AllowA4;
+           policy == LinearPolicy::AllowA4 || policy == LinearPolicy::A16ColumnInvariant ||
+           policy == LinearPolicy::AllowA4Residual || policy == LinearPolicy::AllowA8Residual;
+}
+
+[[nodiscard]] constexpr bool allows_a4_residual(LinearPolicy policy) noexcept {
+    return policy == LinearPolicy::AllowA4Residual;
+}
+
+[[nodiscard]] constexpr bool allows_a8_residual(LinearPolicy policy) noexcept {
+    return policy == LinearPolicy::AllowA8Residual;
+}
+
+// Either residual profile: a projection without that profile's route runs A16.
+[[nodiscard]] constexpr bool allows_residual(LinearPolicy policy) noexcept {
+    return allows_a4_residual(policy) || allows_a8_residual(policy);
+}
+
+[[nodiscard]] constexpr bool column_invariant(LinearPolicy policy) noexcept {
+    return policy == LinearPolicy::A16ColumnInvariant;
 }
 
 [[nodiscard]] constexpr bool allows_a8(LinearPolicy policy) noexcept {
@@ -103,7 +169,21 @@ enum class LinearPolicy : std::uint8_t {
  * compute under every policy at every positive T. NVFP4 uses A16 for A16Only and
  * AllowA8; AllowA4 permits the private resolver to select either a qualified A16 route or
  * activation quantization to NVFP4 at every positive T. The selected route depends only on the
- * registered problem and T.
+ * registered problem, T and `routes`. A16ColumnInvariant selects one A16 route per registered problem for
+ * every T, so each column's result is independent of the call's other columns. NVFP4 and FP8
+ * register it for their text problems and Q8 for the [248320, 5120] vocabulary head; the other
+ * formats and problems reject it.
+ *
+ * @par Routes
+ * Under LinearRoutes::Q8SlicedK, Q8 `[16384,2560]` and `[2560,6144]` (Qwen3.8-Flash-Next's GDN q/k/v/z
+ * and GDN/QSA output projections) select from NInfer's GEMV, sliced-K and grouped sliced-K routes,
+ * which accumulate in a different order from the exact routes; a column's bits then depend on the
+ * call's T. Under LinearRoutes::Fp8A8Pair, FP8 [16384,2560], [13312,2560], [2560,6144], [1280,2560]
+ * and [2560,640] at T >= 17, unless a single-term A8 route is selected, carry each activation column
+ * as two E4M3 terms with their own scales on the 8-bit Tensor Core path. Every other problem runs its
+ * exact route under a flag it does not register. Under A16ColumnInvariant every flag is ignored:
+ * the column-invariant route is the exact route's. Every route meets the A16 criterion; the
+ * workspace query covers the two-term route's scratch.
  *
  * @par Workspace
  * `workspace` is caller-owned call-scoped transient storage sized by
@@ -123,9 +203,11 @@ enum class LinearPolicy : std::uint8_t {
  * @param[in] policy Permitted private activation-compute profiles.
  * @param[in,out] workspace Caller-owned transient arena.
  * @param[in] stream CUDA stream on which execution is enqueued.
+ * @param[in] routes The fast-path route flags (Exact: none).
  */
 void linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
-            WorkspaceArena& workspace, cudaStream_t stream);
+            WorkspaceArena& workspace, cudaStream_t stream,
+            LinearRoutes routes = LinearRoutes::Exact);
 
 /**
  * @brief Applies the A16-only form of the bias-free matrix projection.

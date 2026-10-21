@@ -14,10 +14,12 @@ namespace infernix::ops::detail {
 namespace {
 
 enum class Nvfp4LinearSwiGluRoute {
+    ColumnInvariantA16,
     DecodeFusedA16,
     SmallTFusedA16,
     FusedA4,
     TmaFusedA4,
+    FusedA4Residual,
 };
 
 Nvfp4LinearSwiGluRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
@@ -25,9 +27,18 @@ Nvfp4LinearSwiGluRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (!valid_linear_policy(policy)) {
         throw std::invalid_argument("nvfp4 linear_swiglu: invalid compute policy");
     }
-    if (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8) {
+    if (column_invariant(policy)) { return Nvfp4LinearSwiGluRoute::ColumnInvariantA16; }
+    if (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8 ||
+        allows_a8_residual(policy)) {
         if (tokens == 1) { return Nvfp4LinearSwiGluRoute::DecodeFusedA16; }
         return Nvfp4LinearSwiGluRoute::SmallTFusedA16;
+    }
+    if (allows_a4_residual(policy)) {
+        // Two terms take 64.1-66.1 us at 6-14 tokens; A16 takes 62.0-64.1 at 6-8, then 76.4-90.7
+        // at 9-14 (RTX 5090, cold weights): the residual's error buys time from 9.
+        if (tokens == 1) { return Nvfp4LinearSwiGluRoute::DecodeFusedA16; }
+        if (tokens <= 8) { return Nvfp4LinearSwiGluRoute::SmallTFusedA16; }
+        return Nvfp4LinearSwiGluRoute::FusedA4Residual;
     }
     if (tokens == 1) { return Nvfp4LinearSwiGluRoute::DecodeFusedA16; }
     if (tokens <= 4) { return Nvfp4LinearSwiGluRoute::SmallTFusedA16; }
@@ -58,8 +69,16 @@ std::size_t nvfp4_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy,
     }
     (void)resolve_route(policy, min_tokens);
     (void)resolve_route(policy, max_tokens);
-    if ((policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8) || max_tokens <= 4) {
+    if (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8 ||
+        allows_a8_residual(policy) ||
+        column_invariant(policy) || max_tokens <= 4) {
         return 0;
+    }
+    if (allows_a4_residual(policy)) {
+        return resolve_route(policy, max_tokens) == Nvfp4LinearSwiGluRoute::FusedA4Residual
+                   ? nvfp4_a4_workspace_capacity_bytes(max_tokens, Nvfp4N34816K5120::kInputRows,
+                                                       kNvfp4A4ResidualTerms)
+                   : 0;
     }
 
     return fused_workspace_bytes(max_tokens);
@@ -69,6 +88,9 @@ void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor&
                                   LinearPolicy policy, WorkspaceArena& workspace,
                                   cudaStream_t stream) {
     switch (resolve_route(policy, x.ne[1])) {
+    case Nvfp4LinearSwiGluRoute::ColumnInvariantA16:
+        nvfp4_linear_swiglu_invariant_launch(x, weight, out, stream);
+        return;
     case Nvfp4LinearSwiGluRoute::DecodeFusedA16:
         nvfp4_linear_swiglu_decode_launch(x, weight, out, stream);
         return;
@@ -77,6 +99,9 @@ void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor&
         return;
     case Nvfp4LinearSwiGluRoute::FusedA4:
         nvfp4_linear_swiglu_a4_launch(x, weight, out, workspace, stream);
+        return;
+    case Nvfp4LinearSwiGluRoute::FusedA4Residual:
+        nvfp4_linear_swiglu_a4_residual_launch(x, weight, out, workspace, stream);
         return;
     case Nvfp4LinearSwiGluRoute::TmaFusedA4: {
         auto scope                     = workspace.scope();

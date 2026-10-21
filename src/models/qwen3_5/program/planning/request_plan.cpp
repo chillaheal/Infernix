@@ -1,6 +1,7 @@
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/execution_context.h"
+#include "core/paged_kv_cache.h"
 #include <algorithm>
 #include <cmath>
 #include <iterator>
@@ -103,6 +104,18 @@ RequestBasePlan ProgramImpl::plan_request(PreparedPromptData&& prompt,
         constraint.step_descriptors.push_back(
             static_cast<std::int32_t>(set - constraint.sets.begin()));
     }
+    for (const std::vector<TokenId>& observed : options.constraint.observe) {
+        if (observed.size() > ops::kTokenObserveTokens) {
+            throw std::invalid_argument("constraint step observes too many tokens");
+        }
+        for (const TokenId id : observed) {
+            if (id < 0 ||
+                id >= execution::dimension(parameters.model.resources().public_token_count)) {
+                throw std::invalid_argument("observed token is outside the public token domain");
+            }
+        }
+    }
+    constraint.observe = options.constraint.observe;
     if (const auto& rewrite = prompt.identity.rewrite_checkpoint;
         rewrite &&
         (rewrite->recovery_frontier == 0 || rewrite->recovery_frontier > rewrite->frontier ||
@@ -202,16 +215,94 @@ std::uint32_t ProgramImpl::initial_mtp_extent(const RequestBasePlanImpl& base) c
                : 0U;
 }
 
+UnitDemand ProgramImpl::held_extent(const RequestBasePlanImpl& base) const {
+    if (!execution_schedule.held_extent) { return {}; }
+    // The prompt, the output budget and one verify window past it bound every unit's frontier
+    // (next_unit), capped at what one lane and the pool can hold, less a page for a binding's
+    // copied tail: a request beyond that grows its last pages per unit, as without the hold.
+    const std::uint64_t pool_pages = text_kv_pages->physical_pool().capacity_pages();
+    const std::uint64_t pool_tokens =
+        (pool_pages > 1 ? pool_pages - 1 : 0) * static_cast<std::uint64_t>(kPagedKVPageSize);
+    const auto limit = static_cast<std::uint32_t>(
+        std::min<std::uint64_t>(capacity, pool_tokens));
+    const std::uint64_t main = static_cast<std::uint64_t>(base.summary.prompt_tokens) +
+                               base.summary.effective_output_tokens + draft_window;
+    UnitDemand extent{.kind = ExecutionUnitKind::Decode};
+    extent.main_frontier = static_cast<std::uint32_t>(std::min<std::uint64_t>(main, limit));
+    if (backend_kv_cache()) {
+        std::uint64_t backend = extent.main_frontier;
+        if (speculative_backend == SpeculativeBackend::Mtp) { backend += draft_window; }
+        std::uint64_t backend_limit = capacity;
+        if (backend_kv_pages) {
+            const std::uint64_t pages = backend_kv_pages->physical_pool().capacity_pages();
+            backend_limit             = std::min<std::uint64_t>(
+                backend_limit,
+                (pages > 1 ? pages - 1 : 0) * static_cast<std::uint64_t>(kPagedKVPageSize));
+        }
+        extent.backend_frontier = static_cast<std::uint32_t>(std::min(backend, backend_limit));
+    }
+    return extent;
+}
+
 UnitDemand ProgramImpl::prefill_unit(std::uint32_t prompt, std::uint32_t cursor,
-                                     std::uint32_t mtp_extent) const {
+                                     std::uint32_t mtp_extent, std::uint32_t step_tokens) const {
     UnitDemand demand{.kind = ExecutionUnitKind::Prefill};
-    demand.main_frontier    = std::min(prompt, cursor + prefill_chunk);
+    demand.main_frontier    = std::min(prompt, cursor + step_tokens);
     demand.backend_frontier = backend_kv_cache() ? demand.main_frontier : 0;
     if (speculative_backend == SpeculativeBackend::Mtp && demand.main_frontier == prompt &&
         mtp_extent != 0) {
         demand.backend_frontier = std::min(capacity, prompt + mtp_extent - 1U);
     }
     return demand;
+}
+
+bool ProgramImpl::other_lane_generating(std::uint32_t lane) const noexcept {
+    for (std::uint32_t other = 0; other < max_concurrency; ++other) {
+        const Lifecycle lifecycle = requests[other].lifecycle;
+        if (other != lane && (lifecycle == Lifecycle::Active || lifecycle == Lifecycle::Pending)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::uint32_t ProgramImpl::prefill_step_tokens(const SequenceState& sequence,
+                                               const RequestControl& request) const {
+    // idle-wide-prefill: a step beside a lane that waits to decode stays one chunk, which bounds
+    // that lane's stall; with none waiting it may take the idle width. A Vision prompt keeps the
+    // chunk (its media is staged per chunk), and so does a recovering request, whose resume
+    // coverage was planned in chunks.
+    if (idle_prefill_width <= prefill_chunk || !request.prefill || request.prefill->vision ||
+        request.recovery || !sequence.kv || other_lane_generating(sequence.lane)) {
+        return prefill_chunk;
+    }
+    const RequestControl::Prefill& staged = *request.prefill;
+    const std::uint32_t tokens =
+        hybrid_wide_step_limit(sequence.lane, staged.cursor, staged.prompt_tokens,
+                               idle_prefill_width);
+    if (tokens <= prefill_chunk || staged.prompt_tokens - staged.cursor <= prefill_chunk) {
+        return prefill_chunk;
+    }
+    // The wider step takes only KV pages that are free or that the prefix cache can give up, so
+    // a request that could advance by a chunk is never paused or failed for the width.
+    const UnitDemand wide =
+        prefill_unit(staged.prompt_tokens, staged.cursor, staged.initial_mtp_extent, tokens);
+    const std::uint64_t evictable = hybrid_ ? hybrid_->index().device_evictable_blocks() : 0U;
+    const auto fits = [evictable](const KVAddressSpaceStore& addresses,
+                                  const LogicalKVPageStore& pages, KVAddressSpaceHandle handle,
+                                  std::uint32_t frontier) {
+        const std::uint32_t needed = addresses.growth_pages_for_tokens(handle, frontier);
+        const std::uint32_t held   = addresses.reserved_growth_pages(handle);
+        return needed <= held ||
+               static_cast<std::uint64_t>(needed - held) <=
+                   pages.physical_pool().available_pages() + evictable;
+    };
+    if (!fits(*text_kv_addresses, *text_kv_pages, sequence.kv->text, wide.main_frontier) ||
+        (sequence.kv->backend && !fits(*backend_kv_addresses, *backend_kv_pages,
+                                       *sequence.kv->backend, wide.backend_frontier))) {
+        return prefill_chunk;
+    }
+    return tokens;
 }
 
 UnitDemand ProgramImpl::next_unit(const SequenceState& sequence, const RequestControl& request,
@@ -224,7 +315,14 @@ UnitDemand ProgramImpl::next_unit(const SequenceState& sequence, const RequestCo
             throw std::logic_error("prefill demand requires a prefill cursor");
         }
         const auto& staged = *request.prefill;
-        return prefill_unit(staged.prompt_tokens, staged.cursor, staged.initial_mtp_extent);
+        // idle-wide-prefill: a held permit keeps the width it was reserved with until its step
+        // runs, since whether another lane waits to decode can change in between.
+        if (idle_prefill_width > prefill_chunk && request.permit &&
+            request.permit->kind == ExecutionUnitKind::Prefill) {
+            return *request.permit;
+        }
+        return prefill_unit(staged.prompt_tokens, staged.cursor, staged.initial_mtp_extent,
+                            prefill_step_tokens(sequence, request));
     }
     case ExecutionUnitKind::Replay:
         if (request.lifecycle != Lifecycle::Replaying) {
@@ -250,8 +348,10 @@ UnitDemand ProgramImpl::next_unit(const SequenceState& sequence, const RequestCo
                                                 : draft_window});
         // A DFlash2 tree row verifies its whole tree whatever output budget it has left: a round
         // widens a row whose neural extent is full to the tree's width (decode.cpp row_extent),
-        // so the unit covers the widest tree that fits before the capacity.
-        if (is_masked_draft_backend(speculative_backend) && available >= neural_draft_window) {
+        // so the unit covers the widest tree that fits before the capacity. Fixed-width rounds
+        // verify no trees (decode.cpp).
+        if (is_masked_draft_backend(speculative_backend) && available >= neural_draft_window &&
+            !execution_schedule.fixed_speculation) {
             std::uint32_t tree_columns = 0;
             for (const std::uint32_t columns : tree_widths.automatic) {
                 tree_columns = std::max(tree_columns, columns);
@@ -304,6 +404,10 @@ runtime::ResourceReservation ProgramImpl::reserve_units(std::span<const Executio
         const auto& state = active_sequence(lane);
         demands[lane]     = next_unit(state, request, unit.kind, unit.tokens);
         coverage[lane]    = request.recovery ? request.recovery->coverage : demands[lane];
+        coverage[lane].main_frontier =
+            std::max(coverage[lane].main_frontier, request.held_extent.main_frontier);
+        coverage[lane].backend_frontier =
+            std::max(coverage[lane].backend_frontier, request.held_extent.backend_frontier);
         if (demands[lane].main_frontier > coverage[lane].main_frontier ||
             demands[lane].backend_frontier > coverage[lane].backend_frontier) {
             throw std::logic_error("execution exceeds the retained recovery capacity");
@@ -401,11 +505,13 @@ void ProgramImpl::settle_unit(std::uint32_t lane) noexcept {
         try {
             text_kv_addresses->settle_growth(
                 state.kv->text, state.text_kv_valid,
-                request.recovery ? request.recovery->coverage.main_frontier : 0);
+                std::max(request.recovery ? request.recovery->coverage.main_frontier : 0U,
+                         request.held_extent.main_frontier));
             if (state.kv->backend) {
                 backend_kv_addresses->settle_growth(
                     *state.kv->backend, backend_kv_valid(state),
-                    request.recovery ? request.recovery->coverage.backend_frontier : 0);
+                    std::max(request.recovery ? request.recovery->coverage.backend_frontier : 0U,
+                             request.held_extent.backend_frontier));
             }
         } catch (...) { std::terminate(); }
     }

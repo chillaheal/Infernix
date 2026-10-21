@@ -171,6 +171,18 @@ int test_cli_contract() {
     failures += expect(parse_for_test({"infernix_bench", "--weights", "model.ninfer"})
                                .speculative.ngram_draft_tokens == 0,
                        "ngram is disabled by default");
+    // --ngram-residency: the Engine's residency, auto unless set.
+    failures += expect(parse_for_test({"infernix_bench", "--weights", "model.ninfer"}).ngram_residency ==
+                           infernix::NgramResidency::Auto,
+                       "n-gram residency defaults to auto");
+    failures += expect(parse_for_test({"infernix_bench", "--weights", "model.ninfer", "--ngram-residency", "ram"})
+                                   .ngram_residency == infernix::NgramResidency::Ram &&
+                           parse_for_test({"infernix_bench", "--weights", "model.ninfer", "--ngram-residency", "volume"})
+                                   .ngram_residency == infernix::NgramResidency::Volume,
+                       "--ngram-residency ram and volume");
+    failures += expect_throws<std::invalid_argument>(
+        [] { (void)parse_for_test({"infernix_bench", "--weights", "model.ninfer", "--ngram-residency", "disk"}); },
+        "--ngram-residency rejects other values");
     for (const std::string backend : {"mtp", "dflash", "dflash2"}) {
         for (unsigned width = 0; width <= 63; ++width) {
             for (const unsigned minimum : {4U, 12U, 64U}) {
@@ -184,6 +196,31 @@ int test_cli_contract() {
                                    "independent neural and ngram benchmark options");
             }
         }
+    }
+    // --spec-min-p: unset keeps the model default; a probability in [0,1] with MTP only.
+    failures += expect(!parse_for_test({"infernix_bench", "--weights", "model.ninfer", "--spec", "mtp",
+                                        "--draft-tokens", "3"})
+                            .speculative.draft_min_p,
+                       "--spec-min-p defaults to the model's value");
+    for (const std::string p : {"0", "0.35", "1"}) {
+        const auto gated = parse_for_test(
+            {"infernix_bench", "--weights", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3", "--spec-min-p", p});
+        failures += expect(gated.speculative.draft_min_p && *gated.speculative.draft_min_p == std::stof(p),
+                           "--spec-min-p keeps its probability");
+    }
+    for (const auto arguments : std::vector<std::vector<std::string>>{
+             {"--spec", "mtp", "--draft-tokens", "3", "--spec-min-p", "-0.1"},
+             {"--spec", "mtp", "--draft-tokens", "3", "--spec-min-p", "1.5"},
+             {"--spec", "mtp", "--draft-tokens", "3", "--spec-min-p", "half"},
+             {"--spec", "dflash", "--draft-tokens", "3", "--spec-min-p", "0.5"},
+             {"--spec-min-p", "0.5"}}) {
+        failures += expect_throws<std::invalid_argument>(
+            [&] {
+                std::vector<std::string> command{"infernix_bench", "--weights", "model.ninfer"};
+                command.insert(command.end(), arguments.begin(), arguments.end());
+                (void)parse_for_test(std::move(command));
+            },
+            "invalid --spec-min-p benchmark options");
     }
     // Copy proposals without a neural drafter parse: which drafter combinations a model verifies is
     // its Program's decision (Qwen3.5 refuses them at startup; Qwen3.8-Flash-Next accepts them).
@@ -227,9 +264,15 @@ int test_cli_contract() {
     failures += expect_throws<std::invalid_argument>(
         [] {
             (void)parse_for_test({"infernix_bench", "--weights", "model.ninfer", "--spec", "mtp",
-                                  "--draft-tokens", "6"});
+                                  "--draft-tokens", "8"});
         },
         "unsupported MTP window");
+    {
+        const auto automatic = parse_for_test(
+            {"infernix_bench", "--weights", "model.ninfer", "--spec", "mtp", "--draft-tokens", "auto"});
+        failures += expect(automatic.speculative.draft_tokens_auto && automatic.speculative.draft_tokens == 0,
+                           "automatic MTP draft length");
+    }
     failures += expect_throws<std::invalid_argument>(
         [] {
             (void)parse_for_test(
@@ -456,13 +499,20 @@ int test_report_contract() {
 
     failures += expect(report.at("config").at("rope_yarn_factor") == 2.5,
                        "report preserves runtime YaRN factor");
-    failures += expect(report.at("schema_version") == 20, "report schema v20");
+    failures += expect(report.at("schema_version") == 23, "report schema v23");
     failures += expect(report.at("config").at("speculative_backend") == "mtp" &&
                            report.at("config").at("draft_tokens") == 5,
                        "report identifies its backend and window");
     failures += expect(report.at("config").at("ngram_draft_tokens") == 31 &&
                            report.at("config").at("ngram_min_match") == 12,
                        "report identifies ngram configuration independently");
+    failures += expect(report.at("config").at("spec_min_p").is_null(), "unset --spec-min-p reports null");
+    auto gated_env                    = env;
+    gated_env.speculative.draft_min_p = 0.25F;
+    failures += expect(Json::parse(qb::format_json(gated_env, "infernix_bench", results))
+                               .at("config")
+                               .at("spec_min_p") == 0.25,
+                       "report records --spec-min-p");
     failures += expect(report.at("artifact_type") == "infernix_bench_report", "report identity");
     failures += expect(report.at("artifact").at("path") == "model.ninfer", "artifact path");
     failures +=
@@ -545,7 +595,7 @@ int test_human_and_csv_reports() {
         expect(table.find("decode eng t/s") != std::string::npos, "table engine throughput");
     failures += expect(table.find("work peak") != std::string::npos, "table workspace peak");
     failures +=
-        expect(table.find("ngram_draft_tokens=31 ngram_min_match=12") != std::string::npos &&
+        expect(table.find("ngram_draft_tokens=31 ngram_min_match=12 spec_min_p=default") != std::string::npos &&
                    table.find("ngram acc/draft/round") != std::string::npos &&
                    table.find("5/5/1") != std::string::npos,
                "table separates ngram configuration and counters");
@@ -561,7 +611,7 @@ int test_human_and_csv_reports() {
                        "CSV identity columns");
     for (const std::string_view field :
          {"model_name", "artifact_path", "proposal_head", "ngram_draft_tokens", "ngram_min_match",
-          "ngram_rounds", "ngram_drafted_tokens", "ngram_accepted_tokens", "kv_payload_bytes",
+          "spec_min_p", "ngram_rounds", "ngram_drafted_tokens", "ngram_accepted_tokens", "kv_payload_bytes",
           "load_host_to_device_bytes", "workspace_general_capacity_bytes",
           "vision_handoff_capacity_bytes", "cuda_graph_allowance_bytes", "workspace_peak_bytes",
           "workspace_allocator_peak_bytes", "spec_acceptance_rate", "decode_output_tok_s_mean",

@@ -1,6 +1,9 @@
 #include "infernix/ops/projection_fp32.h"
 #include "ops/projection_fp32/projection_fp32_route.h"
 #include "ops/projection_fp32/projection_fp32_mma.h"
+#include "ops/common/memory.cuh"
+#include "core/device.h"
+#include "core/pdl.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -89,6 +92,8 @@ __global__ void __launch_bounds__(Threads)
     const int first_row    = blockIdx.x * (Warps * RowsPerWarp) + threadIdx.x / 32;
     uint4 loaded[kMaxLaneChunks];
     if (first_row < rows) { load_row(segments, first_row, k, chunks, lane, loaded); }
+    // Launched as a programmatic dependent: the weights are immutable, so their loads precede the wait.
+    pdl::enter();
     // The CTA's columns of x are contiguous, so chunk i of the staging is chunk i of x from there.
     const auto* xs = reinterpret_cast<const uint4*>(x + static_cast<std::size_t>(first_column) * k);
 #pragma unroll
@@ -279,7 +284,8 @@ __global__ void projection_q8_kernel(const bf16* __restrict__ x, int k, int padd
         const __half* srow = scales + static_cast<std::size_t>(row) * (padded_k / 32);
         float sums[kColumns] = {};
         for (int chunk = lane; chunk < chunks; chunk += 32) {
-            const uint2 packed = w[chunk];
+            // Read once per call (a full-vocabulary head is 636 MB): it leaves L2 first.
+            const uint2 packed = ld_nc_na_evict_first(w + chunk);
             const float scale  = __half2float(srow[chunk / 4]);
             const auto* wv     = reinterpret_cast<const std::int8_t*>(&packed);
             float wf[8];
@@ -583,13 +589,15 @@ void detail::projection_fp32_route(const Tensor& x, std::span<const Tensor* cons
             static_cast<const bf16*>(x.data), k, columns, segments, static_cast<float*>(out.data));
     } else if (columns <= kColumns) {
         constexpr int threads = 128, rows_per_warp = 1, rows_per_cta = threads / 32 * rows_per_warp;
-        projection_kernel<threads, rows_per_warp><<<dim3((rows + rows_per_cta - 1) / rows_per_cta, column_groups.y),
-                                                    threads, staged, stream>>>(
-            static_cast<const bf16*>(x.data), k, columns, segments, static_cast<float*>(out.data));
+        CUDA_CHECK(pdl::launch_consumer({dim3((rows + rows_per_cta - 1) / rows_per_cta, column_groups.y), dim3(threads),
+                                         staged, stream},
+                                        projection_kernel<threads, rows_per_warp>, static_cast<const bf16*>(x.data), k,
+                                        columns, segments, static_cast<float*>(out.data)));
     } else {
-        projection_kernel<kThreads, kRowsPerWarp><<<dim3((rows + kRowsPerCta - 1) / kRowsPerCta, column_groups.y),
-                                                    kThreads, staged, stream>>>(
-            static_cast<const bf16*>(x.data), k, columns, segments, static_cast<float*>(out.data));
+        CUDA_CHECK(pdl::launch_consumer({dim3((rows + kRowsPerCta - 1) / kRowsPerCta, column_groups.y), dim3(kThreads),
+                                         staged, stream},
+                                        projection_kernel<kThreads, kRowsPerWarp>, static_cast<const bf16*>(x.data), k,
+                                        columns, segments, static_cast<float*>(out.data)));
     }
     const cudaError_t error = cudaGetLastError();
     if (error != cudaSuccess) {

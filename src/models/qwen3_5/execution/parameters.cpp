@@ -314,6 +314,134 @@ Parameters::Parameters(const Model& source) : model(source) {
             ProposalParameters{prepare.linear(w.proposal->head), std::nullopt, w.proposal->rows};
         if (w.proposal->token_ids) { proposal->token_ids = prepare.tensor(*w.proposal->token_ids); }
     }
+    if (column_invariant_text_supported(text)) {
+        invariant_text = column_invariant_text(text);
+        constexpr std::pair<bool, bool> kModes[] = {{false, false}, {true, false}, {false, true}};
+        for (const auto [a8, a8_residual] : kModes) {
+            for (const auto [a4, a4_residual] : kModes) {
+                const DecodePrecision precision{a8, a4, a8_residual, a4_residual};
+                precision_text[precision_index(precision)] =
+                    precision_decode_text(text, precision);
+            }
+        }
+    }
+}
+
+namespace {
+
+bool fp8(const LinearParameters& p) { return p.weight.qtype == QType::FP8_E4M3FN_ROW_BF16; }
+bool nvfp4_or_fp8(const LinearParameters& p) { return fp8(p) || p.weight.qtype == QType::NVFP4; }
+
+bool single_nvfp4_or_fp8(const ops::ProjectionWeights& projection) {
+    const auto* single = std::get_if<ops::SingleProjectionWeight>(&projection);
+    return single != nullptr && nvfp4_or_fp8(*single);
+}
+
+// The vocabulary head: FP8, or Q8 at the 27B's [248320, 5120].
+bool invariant_head(const LinearParameters& p) {
+    return fp8(p) || (p.weight.qtype == QType::Q8_G32_FP16 && p.weight.n == 248320 &&
+                      p.weight.k == 5120);
+}
+
+void make_invariant(LinearParameters& p) { p.policy = ops::LinearPolicy::A16ColumnInvariant; }
+
+// Keeps the projection's low-precision permission only where its format's class is permitted; a
+// projection permitted its class's one-term activations may take its residual profile instead
+// (the NVFP4 one, `a4_residual_here`, is registered for the MLP only).
+void limit_precision(LinearParameters& p, DecodePrecision precision, bool a4_residual_here) {
+    const bool fp8   = p.weight.qtype == QType::FP8_E4M3FN_ROW_BF16;
+    const bool nvfp4 = p.weight.qtype == QType::NVFP4;
+    if ((fp8 && precision.a8) || (nvfp4 && precision.a4)) { return; }
+    if (fp8 && precision.a8_residual && ops::allows_a8(p.policy)) {
+        p.policy = ops::LinearPolicy::AllowA8Residual;
+    } else if (nvfp4 && a4_residual_here && precision.a4_residual && ops::allows_a4(p.policy)) {
+        p.policy = ops::LinearPolicy::AllowA4Residual;
+    } else {
+        p.policy = ops::LinearPolicy::A16Only;
+    }
+}
+
+void limit_precision(ops::ProjectionWeights& projection, DecodePrecision precision) {
+    if (auto* single = std::get_if<ops::SingleProjectionWeight>(&projection)) {
+        limit_precision(*single, precision, false);
+    }
+}
+
+void make_invariant(ops::ProjectionWeights& projection) {
+    if (auto* single = std::get_if<ops::SingleProjectionWeight>(&projection)) {
+        make_invariant(*single);
+    }
+}
+
+} // namespace
+
+bool column_invariant_text_supported(const TextParameters& text) {
+    if (!invariant_head(text.output_head)) { return false; }
+    for (const BlockParameters& block : text.layers) {
+        const auto* dense = std::get_if<DenseParameters>(&block.ffn);
+        if (dense == nullptr || !nvfp4_or_fp8(dense->gate_up) || !nvfp4_or_fp8(dense->down)) {
+            return false;
+        }
+        if (const auto* attention = std::get_if<AttentionParameters>(&block.mixer)) {
+            if (!single_nvfp4_or_fp8(attention->projection) || !nvfp4_or_fp8(attention->output)) {
+                return false;
+            }
+        } else {
+            const auto& gdn = std::get<GdnParameters>(block.mixer);
+            if (!single_nvfp4_or_fp8(gdn.projection) || !nvfp4_or_fp8(gdn.output)) {
+                return false;
+            }
+            // The control's column-invariant schedule is the 27B's [96, 5120] BF16 parent.
+            const auto* control = std::get_if<LinearParameters>(&gdn.control);
+            if (control == nullptr || control->weight.qtype != QType::BF16 ||
+                control->weight.n != 96 || control->weight.k != 5120) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+TextParameters column_invariant_text(const TextParameters& text) {
+    TextParameters out = text;
+    make_invariant(out.output_head);
+    for (BlockParameters& block : out.layers) {
+        auto& dense = std::get<DenseParameters>(block.ffn);
+        make_invariant(dense.gate_up);
+        make_invariant(dense.down);
+        if (auto* attention = std::get_if<AttentionParameters>(&block.mixer)) {
+            make_invariant(attention->projection);
+            make_invariant(attention->output);
+        } else {
+            auto& gdn = std::get<GdnParameters>(block.mixer);
+            make_invariant(gdn.projection);
+            make_invariant(gdn.output);
+            if (auto* control = std::get_if<LinearParameters>(&gdn.control)) {
+                make_invariant(*control);
+            }
+        }
+    }
+    return out;
+}
+
+TextParameters precision_decode_text(const TextParameters& text, DecodePrecision precision) {
+    TextParameters out = text;
+    // The vocabulary head keeps 16-bit activations unless its class's one-term profile is on.
+    limit_precision(out.output_head, {precision.a8, precision.a4, false, false}, false);
+    for (BlockParameters& block : out.layers) {
+        auto& dense = std::get<DenseParameters>(block.ffn);
+        limit_precision(dense.gate_up, precision, true);
+        limit_precision(dense.down, precision, true);
+        if (auto* attention = std::get_if<AttentionParameters>(&block.mixer)) {
+            limit_precision(attention->projection, precision);
+            limit_precision(attention->output, precision, false);
+        } else {
+            auto& gdn = std::get<GdnParameters>(block.mixer);
+            limit_precision(gdn.projection, precision);
+            limit_precision(gdn.output, precision, false);
+        }
+    }
+    return out;
 }
 
 } // namespace infernix::models::qwen3_5::execution

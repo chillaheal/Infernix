@@ -18,8 +18,10 @@ using LinearParameters = ops::SingleProjectionWeight;
 
 [[nodiscard]] inline ops::LinearPolicy residual_projection_policy(const LinearParameters& p,
                                                                   bool wide_verification) {
-    // Keep the neural path's residual activation precision in wide copy verification.
-    return wide_verification && p.weight.qtype == QType::FP8_E4M3FN_ROW_BF16
+    // Keep the neural path's residual activation precision in wide copy verification. A
+    // column-invariant projection already runs 16-bit activations at every width.
+    return wide_verification && p.weight.qtype == QType::FP8_E4M3FN_ROW_BF16 &&
+                   !ops::column_invariant(p.policy)
                ? ops::LinearPolicy::A16Only
                : p.policy;
 }
@@ -142,6 +144,32 @@ struct ProposalParameters {
     std::uint32_t rows = 0;
 };
 
+// The exact route's request invariance runs decode and verification under
+// LinearPolicy::A16ColumnInvariant, which needs a column-invariant route for every Text
+// projection: single-parent NVFP4 or FP8 attention and GDN input projections, NVFP4 or FP8 output
+// and dense MLP projections, an FP8 or Q8 vocabulary head, and the 27B's BF16 GDN control parent.
+// Other artifacts run the exact route without request invariance.
+[[nodiscard]] bool column_invariant_text_supported(const TextParameters& text);
+// `text` with every projection's policy LinearPolicy::A16ColumnInvariant, the GDN control
+// included (its fused norm and gating keep one schedule at every width).
+[[nodiscard]] TextParameters column_invariant_text(const TextParameters& text);
+// The activation precision each projection class may take in batched decode and verification.
+// The one-term permission takes precedence over its residual profile.
+struct DecodePrecision {
+    bool a8          = true;
+    bool a4          = true;
+    bool a8_residual = false;
+    bool a4_residual = false;
+};
+
+// `text` with each FP8 projection's policy LinearPolicy::A16Only unless `a8`, and each NVFP4
+// projection's unless `a4`; with `a8_residual` (and not `a8`) an FP8 projection permitted 8-bit
+// activations takes LinearPolicy::AllowA8Residual, and with `a4_residual` (and not `a4`) an NVFP4
+// MLP projection permitted 4-bit activations takes LinearPolicy::AllowA4Residual (others and the
+// GDN control keep their own).
+[[nodiscard]] TextParameters precision_decode_text(const TextParameters& text,
+                                                   DecodePrecision precision);
+
 // Cold native preparation for the fixed model implementation. This owner is stable before
 // startup sizing, execution, or Graph capture; all weight addresses borrow the source Model.
 // Shape-dependent kernel selection and scratch remain with the calling implementation and Op.
@@ -155,6 +183,28 @@ public:
 
     const Model& model;
     TextParameters text;
+    // `text` under LinearPolicy::A16ColumnInvariant, which the exact route's decode and
+    // verification run when the artifact supports it (column_invariant_text_supported).
+    std::optional<TextParameters> invariant_text;
+    // `text` for batched decode and verification under each DecodePrecision, indexed by
+    // precision_index (built with invariant_text; precision_decode_text).
+    std::array<std::optional<TextParameters>, 9> precision_text;
+
+    [[nodiscard]] static constexpr std::size_t precision_index(DecodePrecision precision) noexcept {
+        const std::size_t fp8   = precision.a8 ? 1U : (precision.a8_residual ? 2U : 0U);
+        const std::size_t nvfp4 = precision.a4 ? 1U : (precision.a4_residual ? 2U : 0U);
+        return fp8 + 3U * nvfp4;
+    }
+
+    // The parameters decode and verification run with: the column-invariant copy, else the copy
+    // with the selected low-precision permissions.
+    [[nodiscard]] const TextParameters& decode_text(bool column_invariant,
+                                                    DecodePrecision precision) const noexcept {
+        if (column_invariant && invariant_text) { return *invariant_text; }
+        const std::size_t index = precision_index(precision);
+        if (precision_text[index]) { return *precision_text[index]; }
+        return text;
+    }
     std::optional<MtpParameters> mtp;
     std::optional<VisionParameters> vision;
     std::optional<DraftParameters> draft;

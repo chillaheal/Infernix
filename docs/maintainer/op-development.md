@@ -471,6 +471,18 @@ model-level claim follows [Model-level numerical quality](model-quality.md): sev
 sizes, KL divergence to the 16-bit-activation reference, and the decode-quality judge for decode
 paths.
 
+The oracle leaves private arithmetic free, but the product does not: the exact route's output is
+bit-exact from release to release ([acceptance policy](model-quality.md#6-numerical-acceptance-policy-and-fast-paths)).
+A schedule or route change that alters an exact-route Op's output bits for speed is a fast path
+(`infernix::FastPath`). The Op exposes it through an envelope or policy field named for the path
+(for example `CausalAttentionExecutionEnvelope::decode_split64`) that model planning sets from the
+configuration's fast-path selection (`models/qwen3_5/program/planning/fast_paths.h`), sizes its
+workspace from the same field, and qualifies it in its suite against the same oracle and criterion
+as the exact schedule. Without the field the exact schedule is unchanged. Its model-level approval
+follows the kernels it changes, not a model: every artifact that runs the kernel on the same
+formats shares it, and each configuration needs its own measured speedup
+([kernel-based approval](model-quality.md#61-the-exact-route-and-the-fast-paths)).
+
 ## 7. Performance evidence
 
 An Op microbenchmark measures the public semantic operation at an exact shape, format, layout,
@@ -606,7 +618,10 @@ rewritten:
 7. qualify every affected public entry and reachable production profile directly against the
    independent oracle;
 8. measure the Op when performance changes; measure a product route only for an explicitly scoped
-   end-to-end claim;
+   end-to-end claim; a kernel whose per-thread stack or local memory grows (a register spill or a
+   local array) fails `infernix_cuda_stack_check`, which compares `cuobjdump`'s resource usage of
+   `infernix-serve` with `tools/cuda_stack/cuda_stack_allowlist.json`; fix the spill, or after review
+   record it with `python tools/cuda_stack/check_cuda_stack.py update BINARY`;
 9. integrate models only through semantic contract headers and explicit operands;
 10. give every source and symbol one clear build and link owner.
 

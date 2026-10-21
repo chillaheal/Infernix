@@ -64,6 +64,72 @@ void launch_quantize_exact(const Tensor& x, const Weight& weight, Nvfp4A4Workspa
         workspace.codes, workspace.scales, tokens, written_tokens, weight.input_scale_divisor));
 }
 
+template <class ActivationGeometry, int Terms, Nvfp4ScaleLayout Layout>
+void launch_residual_exact(const Tensor& x, const Weight& weight, Nvfp4A4Workspace workspace,
+                           cudaStream_t stream) {
+    const std::int32_t tokens = x.ne[1];
+    constexpr int kThreads    = 256;
+    const std::int32_t written_tokens =
+        Layout != Nvfp4ScaleLayout::RowMajor ? nvfp4_a4_padded_tokens(tokens, Layout) : tokens;
+    const int blocks =
+        (written_tokens * ActivationGeometry::kGroupsPerRow + kThreads - 1) / kThreads;
+    CUDA_CHECK(pdl::launch_consumer(
+        {dim3(blocks), dim3(kThreads), 0, stream},
+        nvfp4_a4_residual_quantize_kernel<ActivationGeometry, kThreads, Terms, Layout>,
+        static_cast<const __nv_bfloat16*>(x.data), workspace.codes, workspace.scales, tokens,
+        written_tokens, weight.input_scale_divisor,
+        static_cast<std::int64_t>(workspace.code_plane),
+        static_cast<std::int64_t>(workspace.scale_plane)));
+}
+
+template <class ActivationGeometry>
+void launch_residual(const Tensor& x, const Weight& weight, Nvfp4A4Workspace workspace,
+                     Nvfp4ScaleLayout layout, cudaStream_t stream) {
+    constexpr int kTerms = kNvfp4A4ResidualTerms;
+    if (layout == Nvfp4ScaleLayout::Tiled128) {
+        if constexpr (ActivationGeometry::kGroupsPerRow % kNvfp4ScaleTileGroups == 0) {
+            launch_residual_exact<ActivationGeometry, kTerms, Nvfp4ScaleLayout::Tiled128>(
+                x, weight, workspace, stream);
+            return;
+        }
+        throw std::invalid_argument("nvfp4 A4 residual tiled scales need K groups in whole tiles");
+    }
+    launch_residual_exact<ActivationGeometry, kTerms, Nvfp4ScaleLayout::RowMajor>(x, weight,
+                                                                                 workspace, stream);
+}
+
+// Row-major planes feed the MMA routes; 128-token tiled scale planes the TMA route.
+void launch_nvfp4_a4_residual_quantize(const Tensor& x, const Weight& weight,
+                                       Nvfp4A4Workspace workspace, Nvfp4ScaleLayout layout,
+                                       cudaStream_t stream) {
+    if ((layout != Nvfp4ScaleLayout::RowMajor && layout != Nvfp4ScaleLayout::Tiled128) ||
+        workspace.terms != kNvfp4A4ResidualTerms) {
+        throw std::invalid_argument("nvfp4 A4 residual: row-major or 128-token tiled planes");
+    }
+    const std::size_t tokens = static_cast<std::size_t>(x.ne[1]);
+    const std::size_t scale_tokens =
+        layout == Nvfp4ScaleLayout::RowMajor
+            ? tokens
+            : static_cast<std::size_t>(nvfp4_a4_padded_tokens(x.ne[1], layout));
+    if (workspace.code_plane < tokens * (static_cast<std::size_t>(weight.k) / 2) ||
+        workspace.scale_plane < scale_tokens * (static_cast<std::size_t>(weight.k) / 16)) {
+        throw std::invalid_argument("nvfp4 A4 residual: planes smaller than the call");
+    }
+    switch (weight.k) {
+    case Nvfp4Activation5120Geometry::kInputRows:
+        launch_residual<Nvfp4Activation5120Geometry>(x, weight, workspace, layout, stream);
+        return;
+    case Nvfp4Activation6144Geometry::kInputRows:
+        launch_residual<Nvfp4Activation6144Geometry>(x, weight, workspace, layout, stream);
+        return;
+    case Nvfp4Activation17408Geometry::kInputRows:
+        launch_residual<Nvfp4Activation17408Geometry>(x, weight, workspace, layout, stream);
+        return;
+    default:
+        throw std::invalid_argument("nvfp4 A4 residual quantize: unsupported K");
+    }
+}
+
 } // namespace
 
 void launch_nvfp4_a4_quantize(const Tensor& x, const Weight& weight, Nvfp4A4Workspace workspace,
@@ -71,6 +137,10 @@ void launch_nvfp4_a4_quantize(const Tensor& x, const Weight& weight, Nvfp4A4Work
                               bool reciprocal_quotient) {
     if (workspace.codes == nullptr || workspace.scales == nullptr) {
         throw std::invalid_argument("nvfp4 A4 requires caller workspace");
+    }
+    if (workspace.terms > 1) {
+        launch_nvfp4_a4_residual_quantize(x, weight, workspace, layout, stream);
+        return;
     }
     // The tiled layout writes the padding of the last tile, so it needs a plane allocated over the
     // padded token count. Check that here, where the layout is acted on, rather than trust each

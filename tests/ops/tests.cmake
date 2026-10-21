@@ -21,6 +21,7 @@ set(infernix_op_tests
   sampling
   scalar
   cast
+  state_codec
   prepare_ragged_prefix
   rows
   scatter
@@ -28,13 +29,28 @@ set(infernix_op_tests
   target_logprobs
   top_logprobs
   token_constraint
-  position)
+  position
+  ple)
 foreach(op IN LISTS infernix_op_tests)
   infernix_add_op_test(infernix_${op}_test
     SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_${op}.cpp"
     LIBRARIES infernix_ops)
 endforeach()
 
+# GGUF expert banks through the layer route (frames, zero-copy, staged and forked misses) against the
+# exact host expert, bit for bit.
+infernix_add_op_test(infernix_offloaded_moe_ggml_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_ggml.cu"
+  LIBRARIES infernix_ops)
+# Block-FP8 expert banks (Qwen's official FP8 experts) through the layer route and the CPU route
+# against the exact host expert, bit for bit; that reference against a bignum sum.
+infernix_add_op_test(infernix_offloaded_moe_fp8_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_fp8.cu"
+  LIBRARIES infernix_ops)
+# GGUF block projections against an independent exact oracle (every ggml format, K, width).
+infernix_add_op_test(infernix_ggml_linear_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ggml_linear.cpp"
+  LIBRARIES infernix_ops)
 infernix_add_op_test(infernix_linear_topk_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_linear_topk.cu"
   LIBRARIES infernix_ops)
@@ -147,6 +163,11 @@ infernix_add_op_test(infernix_attn_input_proj_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_attn_input_proj.cpp"
   LIBRARIES infernix_ops)
 
+# LinearPolicy::A16ColumnInvariant: a column's bits do not depend on the call's other columns.
+infernix_add_op_test(infernix_column_invariant_projections_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_column_invariant_projections.cpp"
+  LIBRARIES infernix_ops)
+
 infernix_add_op_test(infernix_attn_input_proj_fused_rmsnorm_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_attn_input_proj_fused_rmsnorm.cpp"
   LIBRARIES infernix_ops)
@@ -228,6 +249,12 @@ infernix_add_op_test(infernix_hyper_connection_test
   LIBRARIES infernix_linear_test_support)
 set_tests_properties(infernix_hyper_connection_test PROPERTIES SKIP_RETURN_CODE 77)
 
+# hyper_connection_stream_mean (DFlash2's target features) against the FP64 stream mean.
+infernix_add_op_test(infernix_hyper_connection_stream_mean_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_hyper_connection_stream_mean.cpp"
+  LIBRARIES infernix_ops)
+set_tests_properties(infernix_hyper_connection_stream_mean_test PROPERTIES SKIP_RETURN_CODE 77)
+
 # Canonical W4A4 arithmetic and the CPU expert engine; host-only, needs no GPU.
 infernix_add_op_test(infernix_offloaded_moe_cpu_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_cpu.cpp"
@@ -236,6 +263,11 @@ infernix_add_op_test(infernix_offloaded_moe_cpu_test
 # Canonical W4A16 arithmetic and its CPU route (experts without activation scales); host-only.
 infernix_add_op_test(infernix_offloaded_moe_a16_cpu_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_a16_cpu.cpp"
+  LIBRARIES infernix_offloaded_moe_cpu)
+
+# The CPU route of GGUF (ggml) expert banks against the exact expert, on every ISA; host-only.
+infernix_add_op_test(infernix_offloaded_moe_ggml_cpu_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_ggml_cpu.cpp"
   LIBRARIES infernix_offloaded_moe_cpu)
 
 # The CPU worker team: any worker count gives expert_forward's bits.
@@ -254,10 +286,17 @@ infernix_add_op_test(infernix_speculative_state_ops_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_speculative_state_ops.cu"
   LIBRARIES infernix_ops)
 
-# QSA index queries, pooled keys and tails, selection and attention against FP64 oracles.
-infernix_add_op_test(infernix_qsa_test
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_qsa.cpp"
-  LIBRARIES infernix_ops)
+# QSA index queries, pooled keys and tails, selection and attention against FP64 oracles. One
+# entry per independent part (infernix_qsa_<part>_test), so `ctest -j` runs them concurrently;
+# together they run every case of the unsharded executable.
+add_executable(infernix_qsa_test "${CMAKE_CURRENT_LIST_DIR}/test_qsa.cpp")
+infernix_test_includes(infernix_qsa_test)
+target_link_libraries(infernix_qsa_test PRIVATE infernix_ops)
+infernix_op_oracle_options(infernix_qsa_test)
+foreach(part index bf16 int8 fp8 nvfp4 k8v4 vq2 k4v2)
+  add_test(NAME infernix_qsa_${part}_test COMMAND infernix_qsa_test --part ${part})
+  set_tests_properties(infernix_qsa_${part}_test PROPERTIES SKIP_RETURN_CODE 77)
+endforeach()
 
 # QSA block selection against the kernel it replaced (bit for bit), the exact top-k of its own
 # scores and an FP64 oracle, also under CUDA Graph replay.

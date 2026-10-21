@@ -54,10 +54,8 @@ void require_same_gate_shape(const Tensor& ref, const Tensor& t, const char* lab
     }
 }
 
-} // namespace
-
-void gdn_gating(const Tensor& a, const Tensor& b, const Tensor& A_log, const Tensor& dt_bias,
-                Tensor& g, Tensor& beta, cudaStream_t stream) {
+void gdn_gating_checked(const Tensor& a, const Tensor& b, const Tensor& A_log, const Tensor& dt_bias,
+                        Tensor& g, Tensor& beta, bool a_direct, cudaStream_t stream) {
     if (a.dtype != DType::BF16 || b.dtype != DType::BF16) {
         throw std::invalid_argument("gdn_gating: a/b must be BF16");
     }
@@ -86,16 +84,36 @@ void gdn_gating(const Tensor& a, const Tensor& b, const Tensor& A_log, const Ten
     require_same_gate_shape(a, beta, "beta");
     if (n == 0) { return; }
 
-    if (!a.is_contiguous() || !b.is_contiguous() || !A_log.is_contiguous() ||
+    // a and b: each column's 48 heads contiguous, columns at any element-aligned stride that does
+    // not overlap the next column (a row slice of a wider projection qualifies).
+    const auto columns_contiguous = [](const Tensor& t) {
+        constexpr std::int64_t element = 2;
+        return t.nb[0] == element &&
+               (t.ne[1] == 1 || (t.nb[1] >= 48 * element && t.nb[1] % element == 0));
+    };
+    if (!columns_contiguous(a) || !columns_contiguous(b) || !A_log.is_contiguous() ||
         !dt_bias.is_contiguous() || !g.is_contiguous() || !beta.is_contiguous()) {
-        throw std::invalid_argument("gdn_gating: all tensors must be contiguous");
+        throw std::invalid_argument(
+            "gdn_gating: a/b columns and every other tensor must be contiguous");
     }
     if (a.data == nullptr || b.data == nullptr || A_log.data == nullptr ||
         dt_bias.data == nullptr || g.data == nullptr || beta.data == nullptr) {
         throw std::invalid_argument("gdn_gating: all tensor data pointers must be non-null");
     }
 
-    detail::gdn_gating_launch(a, b, A_log, dt_bias, g, beta, stream);
+    detail::gdn_gating_launch(a, b, A_log, dt_bias, g, beta, a_direct, stream);
+}
+
+} // namespace
+
+void gdn_gating(const Tensor& a, const Tensor& b, const Tensor& A_log, const Tensor& dt_bias,
+                Tensor& g, Tensor& beta, cudaStream_t stream) {
+    gdn_gating_checked(a, b, A_log, dt_bias, g, beta, false, stream);
+}
+
+void gdn_gating_direct(const Tensor& a, const Tensor& b, const Tensor& A, const Tensor& dt_bias,
+                       Tensor& g, Tensor& beta, cudaStream_t stream) {
+    gdn_gating_checked(a, b, A, dt_bias, g, beta, true, stream);
 }
 
 } // namespace infernix::ops

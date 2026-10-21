@@ -86,7 +86,11 @@ public:
           max_outstanding_(static_cast<std::size_t>(options.max_concurrency) +
                            options.max_pending_requests),
           pending_timeout_(std::chrono::milliseconds(options.pending_timeout_ms)),
-          queue_holds_(options.context_cache.enabled && options.context_cache.hybrid.queue_holds) {
+          queue_holds_(options.context_cache.enabled && options.context_cache.hybrid.queue_holds),
+          tool_call_hold_(options.context_cache.enabled
+                              ? options.context_cache.hybrid.tool_call_hold.value_or(
+                                    std::chrono::milliseconds{0})
+                              : std::chrono::milliseconds{0}) {
         if (max_concurrency_ == 0 || max_concurrency_ > kMaximumConcurrency ||
             options.max_pending_requests == 0 || pending_timeout_.count() <= 0) {
             throw std::invalid_argument("Engine core bounds are invalid");
@@ -986,6 +990,13 @@ private:
             request->constrained_draws  = std::move(finished.constrained_draws);
             if constexpr (requires { finished.expert_cache; }) { request->expert_cache = finished.expert_cache; }
             request->terminal_reason.reset();
+            // A reply that hands the client a tool call is followed by the conversation's next
+            // turn once the tool has run: what that turn resumes from is held meanwhile.
+            if (tool_call_hold_.count() > 0 && reason != FinishReason::Cancelled &&
+                request->output.has_tool_calls()) {
+                // Applied by the next admission pass's queue holds.
+                resources_.hold_continuation(*instance_.program, Clock::now() + tool_call_hold_);
+            }
 
             finish_engine_phase(boundary, EngineHostPhase::Boundary);
             complete_success(request, reason);
@@ -1101,6 +1112,8 @@ private:
         std::array<std::size_t, kMaximumConcurrency> generated_sizes{};
         std::array<bool, kMaximumConcurrency> cancelled{};
         std::array<bool, kMaximumConcurrency> failed{};
+        // A row whose output refused its tokens: released like a cancelled row, failed alone.
+        std::array<std::exception_ptr, kMaximumConcurrency> refused{};
         bool generated_staged = false;
         std::array<std::shared_ptr<Request>, kMaximumConcurrency> terminal_requests{};
         std::array<std::uint32_t, kMaximumConcurrency> terminal_lanes{};
@@ -1151,8 +1164,21 @@ private:
                     finish_reasons[row] = FinishReason::Cancelled;
                     continue;
                 }
-                const OutputDecision decision = request->output.preview_model(
-                    row_tokens, request->budget->remaining(), request->budget->limit_reason());
+                OutputDecision decision;
+                try {
+                    decision = request->output.preview_model(
+                        row_tokens, request->budget->remaining(), request->budget->limit_reason());
+                } catch (const RequestOutputError&) {
+                    refused[row]   = std::current_exception();
+                    cancelled[row] = true;
+                    request->output.discard_preview();
+                    decisions[row] = CommitDecision{
+                        .accepted_tokens = 0,
+                        .terminal        = true,
+                        .cancelled       = true,
+                    };
+                    continue;
+                }
                 if (decision.accepted_tokens == 0 || decision.accepted_tokens > count ||
                     (!decision.finished() && decision.accepted_tokens != count) ||
                     (decision.finished() && decision.continuation != ContinuationAction::Decode) ||
@@ -1269,6 +1295,18 @@ private:
                     remove_completed_slot(lane);
                     continue;
                 }
+                if (refused[row]) {
+                    std::string what = "unknown error";
+                    try {
+                        std::rethrow_exception(refused[row]);
+                    } catch (const std::exception& e) { what = e.what(); } catch (...) {}
+                    publish_diagnostic(diagnostics_, DiagnosticLevel::Error,
+                                       "%s: failed 1 request; the Engine keeps serving",
+                                       what.c_str());
+                    complete_error(request, refused[row]);
+                    remove_completed_slot(lane);
+                    continue;
+                }
                 if (!cancelled[row]) { request->budget->commit(accepted); }
                 update_recovery(request, cancelled[row]);
                 auto published = request->output.commit_preview();
@@ -1331,6 +1369,10 @@ private:
             throw std::logic_error("completed prefill did not reach the admitted prompt frontier");
         }
         if (progress.processed_prompt_tokens != 0) { publish_prompt_progress(request); }
+        // Between a long prompt's calls (Qwen4Exp: after each layer-walk span) the frames it borrows
+        // can be returned, so a request waiting for KV growth need not wait for the whole prompt
+        // (GitHub #24: admitted after the first 65,536-token span instead of expiring in the queue).
+        if (progress.capacity_released) { request_admission_check(); }
         if (!progress.complete) { return; }
         if (!request->lane || !progress.pending) {
             throw std::logic_error("completed prefill has no lane or pending token");
@@ -1345,6 +1387,9 @@ private:
         phase.finish();
         commit_pending(std::move(*progress.pending), lanes, false, cancelled_at_unit_start);
         progress.pending.reset();
+        // A completed prompt returns what its prefill held (Qwen4Exp lends expert frames to a long
+        // prompt), which a request waiting for KV growth may need.
+        request_admission_check();
     }
 
     void run_prefill_step(std::uint32_t lane,
@@ -1627,7 +1672,8 @@ private:
     // request furthest back first (hybrid-prefix-cache-spec §9.6). Paused requests restore before
     // fresh ones, so they come first. A request no admission pass has planned yet is skipped.
     void hold_queued_sources() {
-        if (!queue_holds_) { return; }
+        // Tool-call holds share the queue holds' ranks, after every queued request.
+        if (!queue_holds_ && tool_call_hold_.count() == 0) { return; }
         std::vector<std::shared_ptr<Request>> queue(paused_.begin(), paused_.end());
         {
             std::lock_guard lock(queue_mutex_);
@@ -1940,8 +1986,9 @@ private:
                     // failed rows wait or yield their own lane; they cannot block ready rows.
                     // The same shortage has already exhausted the cache.
                     if (pause_reclaim_victim(request->id)) { break; }
-                    // The capacity contract error (resource-scheduling ?3): nothing of the unit
-                    // ran, so only the residents fail and the Engine keeps serving.
+                    // The capacity contract error (resource-scheduling §3): nothing of the unit
+                    // ran, so only the residents and paused requests fail and the Engine keeps
+                    // serving (recover_locked).
                     const char* kind = unit.kind == UnitKind::Control  ? "control"
                                        : unit.kind == UnitKind::Decode ? "decode"
                                        : unit.kind == UnitKind::Replay ? "replay"
@@ -2087,20 +2134,29 @@ private:
         publish_runtime_stats();
     }
 
-    // A unit failed with a RecoverableExecutionError (an expert record that could not be read): the
-    // requests holding lanes fail with it, the Program discards their state, and queued requests
-    // keep waiting. False when this state is not one it handles (a binding, materialization
-    // or paused request in flight) or the Program's cleanup failed; the caller then fails
-    // everything, as for any other worker error.
+    // A RecoverableExecutionError (an expert record that could not be read, or a resident that
+    // cannot obtain its legal unit): the requests holding lanes and the paused requests fail with
+    // it, the Program discards their state, and queued requests keep waiting. False when this state
+    // is not one it handles (a binding or materialization in flight) or the Program's cleanup
+    // failed; the caller then fails everything, as for any other worker error.
     bool recover_locked(const std::exception_ptr& error) noexcept {
         if constexpr (!requires { instance_.program->recover_after_failure(); }) {
             return false;
         } else {
             try {
-                if (materializing_ || context_owner_ || !paused_.empty()) { return false; }
+                if (materializing_ || context_owner_) { return false; }
+                // A paused request releases its suspended state as a cancelled one does, while the
+                // Program still owns it.
+                std::uint32_t failed = 0;
+                for (auto& request : paused_) {
+                    request->suspended.reset();
+                    complete_error(request, error);
+                    scheduler_.capacity_released();
+                    ++failed;
+                }
+                paused_.clear();
                 if (!instance_.program->recover_after_failure()) { return false; }
                 admission_decision_.reset();
-                std::uint32_t failed = 0;
                 for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
                     if (slots_[lane] == nullptr) { continue; }
                     complete_error(slots_[lane], error);
@@ -2452,6 +2508,8 @@ private:
     const std::size_t max_outstanding_;
     const std::chrono::milliseconds pending_timeout_;
     const bool queue_holds_;
+    // How long a tool-call hold lasts (zero: none).
+    const std::chrono::milliseconds tool_call_hold_;
     std::chrono::seconds prefix_save_interval_{0}; // zero: the Host tier is saved only at shutdown
     Clock::time_point next_prefix_save_{};
     ResourceManagement resources_;

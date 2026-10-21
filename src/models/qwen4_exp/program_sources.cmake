@@ -12,15 +12,19 @@ target_sources(infernix_model_loading PRIVATE
 target_sources(infernix_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/execution/parameters.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/forward.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/execution/dflash2.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/expert_stream.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/ngram_volume.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/program.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/program/fast_paths.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/expert_residency.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/rope_positions.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/vision_program.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/prefill_walk.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/program/dflash2_program.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/cpu_rates.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/constraint.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/program/score.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/vision_window.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/route_trace.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/host_expert_tier.cpp"
@@ -34,6 +38,7 @@ target_sources(infernix_model_runtime PRIVATE
 
 # The host expert cache (design §9) is a host-only library its conformance test links directly.
 add_library(infernix_qwen4_exp_expert_cache STATIC
+  "${CMAKE_CURRENT_LIST_DIR}/program/expert_cache/calibrated_order.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/expert_cache/expert_cache.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/expert_cache/expert_state.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/expert_cache/host_tier.cpp")

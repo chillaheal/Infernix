@@ -67,7 +67,14 @@ int q8_a16_conformance() {
         if (shape.n == 9216 && shape.k == 2048) {
             for (int t : {12, 13, 14}) calls.push_back({t});
         }
-        if (shape.n == 248320) calls.push_back({34});
+        if (shape.n == 248320) {
+            calls.push_back({34});
+            // The column-invariant route: one 8-K-warp family at every T, sliced beyond 32.
+            for (int t : {1, 2, 5, 8, 9, 16, 17, 33, 40, 65, 129}) {
+                calls.push_back(
+                    {t, CallForm::Policy, infernix::ops::LinearPolicy::A16ColumnInvariant});
+            }
+        }
         if (shape.n == 2048 && shape.k == 16384) {
             for (int t : {383,  384,  385,  479,  480,  481,  639,  640,  641,  703,
                           704,  705,  959,  960,  961,  1343, 1344, 1345, 1679, 1680,
@@ -81,6 +88,20 @@ int q8_a16_conformance() {
         for (int t : {1, 16, 64, 128}) calls.push_back({t, CallForm::A16Convenience});
         calls.push_back({17, CallForm::Policy, infernix::ops::LinearPolicy::AllowA8});
         calls.push_back({64, CallForm::Policy, infernix::ops::LinearPolicy::AllowA4});
+        // The q8-sliced-k fast routes (LinearRoutes::Q8SlicedK) meet the same criterion on every route and
+        // at each seam of the two fast tables; other shapes run their exact route under Fast.
+        const bool fast_shape = (shape.n == 16384 && shape.k == 2560) || (shape.n == 2560 && shape.k == 6144);
+        for (int t : fast_shape ? std::vector<int>{1,  2,  3,  5,  7,  8,  9,  15, 16, 17, 23,  24,  25,  31,
+                                                   32, 33, 39, 40, 41, 47, 48, 49, 50, 51, 62,  63,  64,  65,
+                                                   95, 96, 97, 127, 128, 129, 256, 511, 512, 513, 4096}
+                                : std::vector<int>{1, 8, 64}) {
+            calls.push_back({t, CallForm::Policy, infernix::ops::LinearPolicy::A16Only, false,
+                             infernix::ops::LinearRoutes::Q8SlicedK});
+        }
+        for (int t : {1, 5, 40}) {
+            calls.push_back({t, CallForm::Policy, infernix::ops::LinearPolicy::A16Only, true,
+                             infernix::ops::LinearRoutes::Q8SlicedK});
+        }
         failures += run_shape("Q8_A16", ActivationCompute::A16, make_q8_g32_fp16_weight,
                               {shape.n, shape.k, shape.seed, Comparison::Sampled, true, calls});
     }

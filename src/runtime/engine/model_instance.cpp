@@ -1,9 +1,12 @@
 #include "runtime/engine/model_instance.h"
 #include "artifact/reader.h"
 #include "artifact/formats.h"
+#include "core/decode_graph.h"
 #include "core/startup.h"
 #include "models/qwen3_5/load.h"
 #include "models/qwen3_5/measurement.h"
+#include "models/qwen3_5/program/planning/fast_paths.h"
+#include "runtime/engine/diagnostics.h"
 
 #include <algorithm>
 #include <system_error>
@@ -11,6 +14,7 @@
 #include <filesystem>
 #include <chrono>
 #include <map>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <utility>
@@ -18,6 +22,11 @@
 namespace infernix::runtime {
 namespace {
 using Clock = std::chrono::steady_clock;
+
+// The extra VRAM headroom of the one startup retry after the CUDA Graphs found no device memory
+// (NInfer 193675826's calibration retry, adapted): their allowance is measured at 2.2-4.1 MiB per
+// executable, and 1 GiB covers the largest graph set (~274 MiB) several times.
+constexpr std::size_t kGraphRetryHeadroomBytes = std::size_t{1} << 30;
 } // namespace
 
 void validate_engine_options(const EngineOptions& options, models::Architecture architecture) {
@@ -85,6 +94,11 @@ void validate_engine_options(const EngineOptions& options, models::Architecture 
         throw std::invalid_argument(
             "the original NVFP4 prefill kernel requires the NVFP4 KV cache (--kv-dtype nvfp4)");
     }
+    // 16-bit activations are the reference the fast paths are measured against.
+    if (options.a16_activations && (options.fast_paths || !options.fast_path_candidates.empty())) {
+        throw std::invalid_argument(
+            "16-bit activations (the quality reference) run the exact route: disable fast paths");
+    }
 }
 
 namespace {
@@ -120,8 +134,8 @@ prefix_cache::CacheCostModel hybrid_cache_cost(const ContextMachineCostModel& mo
 
 } // namespace
 
-// The exact artifact, its execution signature, the KV and speculative formats, RoPE scaling and the
-// product binary's build identity. Any difference makes the saved state meaningless, so the file is
+// The exact artifact, its execution signature, the KV and speculative formats, RoPE scaling, the
+// prefill chunk and the product binary's build identity. Any difference makes the saved state meaningless, so the file is
 // ignored.
 std::string hybrid_cache_fingerprint(const EngineOptions& options, const std::string& signature) {
     std::error_code error;
@@ -134,6 +148,14 @@ std::string hybrid_cache_fingerprint(const EngineOptions& options, const std::st
     out += ";kv=" + std::to_string(static_cast<int>(options.kv_cache));
     out += ";speculative=" + std::to_string(static_cast<int>(options.speculative.backend));
     out += ";yarn=" + std::to_string(options.rope_yarn_factor);
+    // Qwen3.5's exact-route prefill bits follow the chunk grid, so a state prefilled at another
+    // chunk would not be the one this engine computes.
+    out += ";chunk=" + std::to_string(options.prefill_chunk);
+    out += ";host_state=" +
+           std::to_string(static_cast<int>(options.context_cache.hybrid.host_state_precision));
+    // Fast paths change the numbers cached KV and state hold.
+    out += ";fast=" + std::to_string(options.fast_paths ? 1 : 0);
+    for (const FastPath path : options.fast_path_candidates) { out += std::string(",") + fast_path_name(path); }
     out += ";build=" + options.context_cache.hybrid.persistent_identity;
     return out;
 }
@@ -183,13 +205,60 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
     }
     const std::uint32_t concurrency = options.max_concurrency;
     const bool qwen4_exp            = architecture == models::Architecture::Qwen4Exp;
+    // The model's default prefill chunk. Qwen3.8-Flash-Next's exact route split at 1,024, 4,096
+    // and 12,288 tokens gave identical bits (36 perplexity windows of 14,336 tokens; its calls
+    // split on the 16-token GDN grid and its routes are column-invariant), and wide chunks prefill
+    // faster with no decode cost: Dense8, INT8 KV, RTX 5090,
+    // pp32768 9,639 -> 11,211 tok/s from 4,096 to 16,384 (pp65536 9,887 -> 11,268; 26 fewer expert
+    // frames of ~8,560). The Qwen3.5 family keeps 1,024: its prefill bits follow the chunk grid,
+    // and idle-wide-prefill already widens its idle steps (16,384 measured 3.5 % slower at
+    // pp16384 and pp32768 on the 27B).
+    if (options.prefill_chunk == 0) { options.prefill_chunk = qwen4_exp ? 16384U : 1024U; }
+    if (options.expert_tail_skip != 0 && !qwen4_exp) {
+        throw std::invalid_argument("--expert-tail-skip applies to Qwen3.8-Flash-Next (its offloaded experts) only");
+    }
+    // An approximation whose output depends on the cache state: never on the exact route.
+    if (options.expert_tail_skip != 0 && !options.fast_paths) {
+        throw std::invalid_argument("--expert-tail-skip is approximate; the exact route (--disable-fast-paths) refuses it");
+    }
+    // An automatic MTP draft length chooses up to the model's most drafts unless given a ceiling:
+    // Qwen3.8-Flash-Next verifies 8 columns column-invariantly, the Qwen3.5 planner captures 5.
+    // Qwen3.8-Flash-Next's DFlash2 drafter takes the same per-round policy.
+    if (options.speculative.draft_tokens_auto) {
+        if (options.speculative.backend != SpeculativeBackend::Mtp &&
+            !(qwen4_exp && options.speculative.backend == SpeculativeBackend::DFlash2)) {
+            throw std::invalid_argument("--draft-tokens auto requires --spec mtp (Qwen3.8-Flash-Next: also dflash2)");
+        }
+        if (options.speculative.draft_tokens == 0) { options.speculative.draft_tokens = qwen4_exp ? 7U : 5U; }
+    } else if (std::find(options.fast_path_candidates.begin(), options.fast_path_candidates.end(),
+                         FastPath::AdaptiveMtp) != options.fast_path_candidates.end()) {
+        throw std::invalid_argument("--fast-path adaptive-mtp is the policy of --draft-tokens auto; "
+                                    "a fixed --draft-tokens N drafts N");
+    }
+    // The draft-confidence gate exists only on Qwen3.8-Flash-Next's one-row MTP rounds; another
+    // model refuses it rather than ignoring a tuning value.
+    if (const auto& p = options.speculative.draft_min_p) {
+        if (!(*p >= 0.0F && *p <= 1.0F)) {
+            throw std::invalid_argument("speculative draft_min_p (--spec-min-p) must be in [0,1]");
+        }
+        if (!qwen4_exp || (options.speculative.backend != SpeculativeBackend::Mtp &&
+                           options.speculative.backend != SpeculativeBackend::DFlash2)) {
+            throw std::invalid_argument(
+                "--spec-min-p applies to Qwen3.8-Flash-Next with --spec mtp or dflash2 only");
+        }
+    }
     if (cache.enabled) {
         // One pinned Host slab pool serves blocks and snapshots alike; its size is the only
         // capacity a deployment has to choose (docs/maintainer/hybrid-prefix-cache-spec.md §5.4).
-        cache.host_capacity_bytes = cache.host_capacity_bytes.value_or(
-            qwen4_exp ? kDefaultQwen4ExpHybridHostCacheBytes : kDefaultHybridHostCacheBytes);
+        cache.host_capacity_bytes = cache.host_capacity_bytes.value_or(kDefaultHybridHostCacheBytes);
         const bool host_tier             = *cache.host_capacity_bytes != 0;
         HybridPrefixCacheOptions& hybrid = cache.hybrid;
+        // Whether a turn resumes from lossy Host state depends on what eviction left, so the exact
+        // route's output would depend on load (model-quality 6.1).
+        if (!options.fast_paths && hybrid.host_state_precision != HybridHostStatePrecision::Fp32) {
+            throw std::invalid_argument(
+                "--cache-host-state fp24 and bf16 are lossy; --disable-fast-paths requires fp32");
+        }
         if (qwen4_exp) {
             // Qwen3.8-Flash-Next's snapshots are born in the Host tier (design §19.3.1): it needs
             // the tier and has no Device snapshot slots.
@@ -203,7 +272,19 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
                     "Qwen3.8-Flash-Next's prefix cache has no Device snapshot slots");
             }
             hybrid.device_snapshot_slots = 0U;
+            if (hybrid.host_state_precision != HybridHostStatePrecision::Fp32) {
+                throw std::invalid_argument(
+                    "Qwen3.8-Flash-Next's prefix cache keeps snapshot state exact on the Host tier");
+            }
+            // Its endpoints publish asynchronously, after the lane that captured them may be
+            // reused; holding them needs a capture-to-snapshot handover it does not have.
+            if (hybrid.tool_call_hold.value_or(std::chrono::milliseconds{0}).count() != 0) {
+                throw std::invalid_argument(
+                    "Qwen3.8-Flash-Next's prefix cache has no tool-call holds");
+            }
         }
+        hybrid.tool_call_hold =
+            hybrid.tool_call_hold.value_or(qwen4_exp ? std::chrono::milliseconds{0} : kDefaultToolCallHold);
         // One resident snapshot per request lane keeps every live conversation's latest
         // endpoint restorable without PCIe traffic; one more slot stages taps and endpoints while
         // their Host copies are written. Without a Host tier these slots are the only snapshot
@@ -216,13 +297,20 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
         hybrid.max_new_taps = hybrid.max_new_taps.value_or(host_tier ? 8U : 2U);
         // Ladder taps are realized on prefill chunk boundaries, so the ladder never refines below
         // the chunk: coarser ladders only waste snapshots on taps that share one boundary.
-        const std::uint32_t chunk = std::max<std::uint32_t>(options.prefill_chunk, 64U);
+        // Qwen3.8-Flash-Next splits its prefill calls at taps instead (free-cache-resume), so its
+        // ladder keeps the 4,096-token chunk's spacing whatever wider chunk it prefills with.
+        const std::uint32_t chunk = std::max<std::uint32_t>(
+            qwen4_exp ? std::min<std::uint32_t>(options.prefill_chunk, 4096U) : options.prefill_chunk,
+            64U);
         hybrid.tap_ladder_tokens =
             hybrid.tap_ladder_tokens.value_or(std::max<std::uint32_t>(4096U, 2U * chunk));
         hybrid.tap_min_gap_tokens =
             hybrid.tap_min_gap_tokens.value_or(std::max<std::uint32_t>(1024U, chunk));
         if ((!qwen4_exp && *hybrid.device_snapshot_slots == 0) || *hybrid.device_snapshot_slots > 64) {
             throw std::invalid_argument("hybrid device snapshot slots must be in [1,64]");
+        }
+        if (hybrid.tool_call_hold->count() < 0) {
+            throw std::invalid_argument("hybrid tool-call hold must not be negative");
         }
         if (*hybrid.max_new_taps > 64) {
             throw std::invalid_argument("hybrid taps per request must be at most 64");
@@ -239,8 +327,13 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
             throw std::invalid_argument(
                 "prefix cache capacities require the context cache to be enabled");
         }
+        if (cache.hybrid.tool_call_hold.value_or(std::chrono::milliseconds{0}).count() != 0 ||
+            cache.hybrid.host_state_precision != HybridHostStatePrecision::Fp32) {
+            throw std::invalid_argument("prefix cache policies require the context cache to be enabled");
+        }
         cache.host_capacity_bytes          = 0U;
         cache.hybrid.device_snapshot_slots = 0U;
+        cache.hybrid.tool_call_hold        = std::chrono::milliseconds{0};
     }
     return options;
 }
@@ -281,30 +374,85 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
     StartupPhaseScope frontend(options.startup_observer, StartupPhase::FrontendInitialize);
     auto instance = std::make_unique<ModelInstance>(std::move(model), options);
     frontend.complete();
-    StartupPhaseScope planning(options.startup_observer, StartupPhase::TargetFinalize);
+    std::optional<StartupPhaseScope> planning;
+    planning.emplace(options.startup_observer, StartupPhase::TargetFinalize);
+    // --draft-tokens auto where adaptive-mtp does not run: the configuration's fastest fixed length.
+    if (const std::uint32_t fixed = models::qwen3_5::resolve_auto_draft_length(instance->parameters, options)) {
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                           "--draft-tokens auto: adaptive-mtp is not selected for this artifact (or fast paths "
+                           "are disabled), so every round drafts %u, its fastest fixed length",
+                           fixed);
+    }
     const auto signature = models::qwen3_5::prefill_signature(*instance->model);
     auto context_cost    = resolve_context_machine_cost(
         {.hardware_class =
                 context_cost_hardware_class(device.props.name, device.props.major, device.props.minor),
             .prefill_signature = signature},
         options.context_cost.preset_path);
-    auto planner    = models::qwen3_5::make_sequence_planner(instance->parameters, device, options);
-    auto resolution = resolve_kv_capacity(
-        options.kv_capacity, planner.capacity_curve(), current_free_device_bytes(),
-        options.vram_headroom_bytes.value_or(kDefaultKvCapacityHeadroomBytes));
-    auto sequence   = std::move(planner).finalize(resolution.main_page_groups);
-    if (sequence.device_reservation_bytes() != resolution.runtime_reservation_bytes ||
-        sequence.kv_capacity() != resolution.resolved_tokens) {
-        throw std::logic_error("resolved KV capacity does not match the finalized Program plan");
+    const std::size_t base_headroom = options.vram_headroom_bytes.value_or(kDefaultKvCapacityHeadroomBytes);
+    std::size_t retry_headroom      = 0;
+    std::uint32_t planned_prefill_chunk = 0, planned_idle_width = 0;
+    std::optional<StartupPhaseScope> program;
+    for (int attempt = 0;; ++attempt) {
+        if (!planning) { planning.emplace(options.startup_observer, StartupPhase::TargetFinalize); }
+        auto planner    = models::qwen3_5::make_sequence_planner(instance->parameters, device, options);
+        const std::size_t free_bytes = current_free_device_bytes();
+        const std::size_t headroom   = base_headroom + retry_headroom;
+        auto resolution =
+            resolve_kv_capacity(options.kv_capacity, planner.capacity_curve(), free_bytes, headroom);
+        // idle-wide-prefill: plan the widest idle width (4096, 2048, then 1024 tokens, as the chunk is
+        // rounded) whose larger prefill buffers and workspace keep the KV capacity: an explicit one
+        // whole, an automatic one down to every lane's full context. None fitting keeps chunk-wide steps.
+        {
+            const std::uint64_t page_tokens = planner.capacity_curve().main_page_tokens;
+            const std::uint64_t lane_page_groups =
+                static_cast<std::uint64_t>(options.max_concurrency) *
+                ((static_cast<std::uint64_t>(options.max_context) + page_tokens - 1U) / page_tokens);
+            for (const std::uint32_t width :
+                 models::qwen3_5::idle_prefill_widths(instance->parameters, options)) {
+                auto wide = models::qwen3_5::make_sequence_planner(instance->parameters, device,
+                                                                   options, width);
+                if (const auto fitted =
+                        resolve_kv_capacity_beside(options.kv_capacity, wide.capacity_curve(),
+                                                   free_bytes, headroom, resolution, lane_page_groups)) {
+                    planner    = std::move(wide);
+                    resolution = *fitted;
+                    break;
+                }
+            }
+        }
+        auto sequence   = std::move(planner).finalize(resolution.main_page_groups);
+        if (sequence.device_reservation_bytes() != resolution.runtime_reservation_bytes ||
+            sequence.kv_capacity() != resolution.resolved_tokens) {
+            throw std::logic_error("resolved KV capacity does not match the finalized Program plan");
+        }
+        options.context_cache.host_capacity_bytes = sequence.host_capacity_bytes();
+        // Automatic tree widths on a target that cannot verify trees resolve to chain verification.
+        options.speculative.draft_tree_auto = sequence.draft_tree_auto();
+        instance->kv_capacity_resolution    = resolution;
+        planned_prefill_chunk = sequence.prefill_chunk();
+        planned_idle_width    = sequence.idle_prefill_width();
+        planning->complete();
+        planning.reset();
+        program.emplace(options.startup_observer, StartupPhase::ProgramInitialize);
+        try {
+            instance->program = models::qwen3_5::create_program(instance->parameters, std::move(sequence),
+                                                                device, options.startup_observer);
+        } catch (const GraphMemoryExhausted& error) {
+            // The CUDA Graphs needed more device memory than their allowance left (the driver's
+            // per-executable cost varies): an automatic KV capacity retries once with
+            // kGraphRetryHeadroomBytes more headroom, so fewer KV pages; an explicit one cannot shrink.
+            if (attempt > 0 || options.kv_capacity.mode != KvCapacityMode::Automatic) { throw; }
+            retry_headroom = kGraphRetryHeadroomBytes;
+            program.reset();
+            publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Warning,
+                               "%s at startup; retrying with %zu MiB more VRAM headroom (a smaller automatic KV "
+                               "capacity)",
+                               error.what(), kGraphRetryHeadroomBytes >> 20);
+            continue;
+        }
+        break;
     }
-    options.context_cache.host_capacity_bytes = sequence.host_capacity_bytes();
-    // Automatic tree widths on a target that cannot verify trees resolve to chain verification.
-    options.speculative.draft_tree_auto = sequence.draft_tree_auto();
-    instance->kv_capacity_resolution    = resolution;
-    planning.complete();
-    StartupPhaseScope program(options.startup_observer, StartupPhase::ProgramInitialize);
-    instance->program = models::qwen3_5::create_program(instance->parameters, std::move(sequence),
-                                                        device, options.startup_observer);
     LoadSummary::PrefixCacheRestore restore;
     if (options.context_cache.enabled) {
         instance->program->set_hybrid_cost(hybrid_cache_cost(context_cost.model));
@@ -333,7 +481,7 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
         }
     }
     device.synchronize();
-    program.complete();
+    program->complete();
     instance->kv_capacity_resolution.available_after_startup_bytes = current_free_device_bytes();
     const auto& stats = instance->model->storage_stats();
     LoadSummary summary;
@@ -347,6 +495,17 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
         }
     }
     summary.weight_formats.assign(formats.begin(), formats.end());
+    {
+        const models::qwen3_5::FastPathSelection fast = models::qwen3_5::select_fast_paths(
+            *instance->model, options, instance->parameters.invariant_text.has_value());
+        summary.fast_path_configuration = models::qwen3_5::describe(fast.configuration);
+        for (const FastPath path : fast.paths) { summary.fast_paths.emplace_back(fast_path_name(path)); }
+        summary.fast_paths_disabled = !options.fast_paths;
+        summary.request_invariant   = fast.request_invariant();
+        summary.request_invariance_capable = fast.invariant_capable;
+        summary.prefill_chunk       = planned_prefill_chunk;
+        if (fast.selected(FastPath::IdleWidePrefill)) { summary.idle_prefill_width = planned_idle_width; }
+    }
     summary.load_seconds         = std::chrono::duration<double>(Clock::now() - start).count();
     summary.upload_seconds       = stats.upload_seconds;
     summary.artifact_bytes_read  = stats.read_bytes;

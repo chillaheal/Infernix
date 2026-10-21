@@ -165,6 +165,19 @@ void LfruPolicy::step(std::span<const std::uint32_t> group, Step& out, std::size
     }
 }
 
+void LfruPolicy::credit(std::span<const std::uint32_t> keys, std::span<const double> amounts) {
+    if (keys.size() != amounts.size()) { throw std::invalid_argument("LFRU credit: key and amount counts differ"); }
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+        const std::uint32_t k = keys[i];
+        count_[k] += amounts[i];
+        last_[k] = now_;
+        if (resident(k)) {
+            resident_count_[slot_[k]] = count_[k];
+            resident_last_[slot_[k]]  = static_cast<double>(now_);
+        }
+    }
+}
+
 std::optional<std::uint32_t> LfruPolicy::promote(std::uint32_t key, std::span<const std::uint32_t> protect) {
     if (resident(key)) { return std::nullopt; }
     std::optional<std::uint32_t> victim;
@@ -497,6 +510,15 @@ std::optional<std::uint32_t> CacheController::frame_key(std::uint32_t frame) con
     return frame_key_[frame];
 }
 
+std::uint32_t CacheController::longest_unloaned_run() const {
+    std::uint32_t longest = 0, run = 0;
+    for (std::uint32_t f = 0; f < frames_.backed(); ++f) {
+        run     = frames_.is_loaned(f) ? 0 : run + 1;
+        longest = std::max(longest, run);
+    }
+    return longest;
+}
+
 std::optional<std::uint32_t> CacheController::choose_run(std::uint32_t count, std::span<const std::uint8_t> busy) const {
     const std::uint32_t n = frames_.backed();
     if (count == 0 || count > n) { return std::nullopt; }
@@ -542,6 +564,7 @@ std::uint32_t CacheController::lend(std::uint32_t first, std::uint32_t count, st
     for (std::uint32_t v : victims) {
         if (table_[v].state == ResidencyState::kAbsent) { continue; } // still queued: drain drops it
         frames_.release_now(make_absent(v, out));
+        lent_victims_.push_back(v);
         ++evicted;
     }
     // The run's other experts move into free frames outside it, so the loan costs the cache its
@@ -562,11 +585,28 @@ std::uint32_t CacheController::lend(std::uint32_t first, std::uint32_t count, st
     return evicted;
 }
 
-void CacheController::give_back(std::uint32_t first, std::uint32_t count, std::vector<Command>& out) {
+void CacheController::give_back(std::uint32_t first, std::uint32_t count, std::vector<Command>& out, bool refill,
+                                const LfruPolicy::Admissible* admissible) {
     frames_.give_back(first, count);
     std::vector<std::uint32_t> none;
     policy_.set_capacity(policy_.capacity() + count, none);
     drain_queue(out);
+    // The loans' victims, the last evicted (the best of them) first.
+    while (refill && !lent_victims_.empty() && policy_.resident_count() < policy_.capacity()) {
+        const std::uint32_t key = lent_victims_.back();
+        if (table_[key].state != ResidencyState::kAbsent || policy_.resident(key) ||
+            (admissible != nullptr && !(*admissible)(key))) {
+            lent_victims_.pop_back();
+            continue;
+        }
+        const auto frame = frames_.acquire();
+        if (!frame) { break; }
+        lent_victims_.pop_back();
+        const std::uint32_t one[] = {key};
+        policy_.seed(one, {});
+        load(key, *frame, out);
+    }
+    if (frames_.loaned_count() == 0) { lent_victims_.clear(); }
 }
 
 } // namespace infernix::models::qwen4_exp::expert_cache

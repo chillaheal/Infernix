@@ -107,9 +107,9 @@ One request can temporarily hold most of the KV. If, after evicting cached block
 requests, the only request still cannot acquire a legal unit, the Engine reports a capacity contract
 error instead of waiting for a releaser that does not exist. The error names the request, the unit
 kind and the KV pages still short. No part of the unit has run, so it is a
-`RecoverableExecutionError` (engine architecture, failure handling): the residents fail with it and
-the Engine keeps serving, unless a binding, materialization or paused request is in flight or the
-Program cannot recover (Qwen3.5 has no recovery), when everything fails.
+`RecoverableExecutionError` (engine architecture, failure handling): the residents and paused
+requests fail with it and the Engine keeps serving, unless a binding or materialization is in flight
+or the Program cannot recover, when everything fails.
 
 <a id="sources"></a>
 ## 4. Admission sources and binding
@@ -140,7 +140,12 @@ permits row by row, resumes first and original ticket order first, keeps the run
 uses the remaining headroom to try fresh admission.
 It executes the permitted compact Control/Decode set and one Prefill/Replay chunk; rows committed by
 Control reacquire Decode permits in the next cycle. Graphs use the actual member count and execution
-profile.
+profile. With the `idle-wide-prefill` fast path a Prefill permit reserved while no other lane is
+generating covers the startup-planned idle width (a multiple of the chunk) instead of one chunk,
+when its extra KV pages are free or evictable cache; a held permit keeps its width until its step
+runs. A binding's first step takes it only when the free pages alone hold it (and every reused
+block, counted as restored); Replay and recovering requests keep one chunk
+([model quality §6.7](model-quality.md#67-fast-path-registry)).
 
 The fresh queue keeps FIFO tickets, and each blocked request can be successfully bypassed by at most C
 younger requests. Each scan checks the queue head and at most C following candidates; failed checks do

@@ -211,7 +211,7 @@ The numerical example above takes entry_payload_start=65536, so the entry file i
 
 | Field | Type / required | Meaning |
 |---|---|---|
-| components | Object, required and containing text | The model components actually provided and their compact configs |
+| components | Object, required | The model components actually provided and their compact configs; text, except in a companion artifact (section 4.3) |
 | objects | Non-empty Array<ObjectDescriptor>, required | Physical objects ordered by logical payload offset |
 | bindings | Object, required | Mapping from complete logical parameter names to Bindings |
 | uses | Array<Use>, required | Compute permissions and auxiliary inputs expanded per mathematical use site |
@@ -260,6 +260,20 @@ Declaring a component means the artifact provides it. Startup options decide whi
 enabled for this run; text, the selected components and their actually shared data take part in
 loading. The writer is responsible for the data integrity of the declared components, and the binder
 checks the mathematical and data requirements of the features selected at startup.
+
+### 4.3 Companion artifacts
+
+A companion artifact holds optional components of a model without its text: today a
+Qwen3.8-Flash-Next DFlash2 drafter (`components` is `{"dflash2": ...}`), loaded beside any artifact
+of that model with `--draft-model`. Every component of a companion must declare `"target": "text"`,
+which names the text of the main artifact it is loaded beside rather than a component of its own.
+A Use of a companion may name a parameter it does not bind: one of the target's (the drafter's
+reads of `text/output_head` and `proposal/head` at `dflash2/final_hidden`). The generic reader
+accepts these; the loader checks each one it binds against the main artifact, and the component's
+config records the target identity it was converted for (`target_config`: architectures,
+hidden_size, vocab_size, num_hidden_layers), which the loader compares with the main artifact's text.
+A companion is materialized in its own device allocation; its objects never alias the main
+artifact's.
 
 ## 5. Physical objects
 
@@ -361,6 +375,7 @@ the fixed group size, scale type and decoding rules are defined directly by that
 | bf16 | Raw Bfloat16 word |
 | fp32 | Raw IEEE binary32 word |
 | int32 | Signed 32-bit integer |
+| q2_g64_fp16 | Signed 2-bit codes, G64, signed FP16 multiplier |
 | q4_g64_fp16 | Signed 4-bit codes, G64, FP16 multiplier |
 | q5_g64_fp16 | Signed 5-bit codes, G64, FP16 multiplier |
 | q6_g64_fp16 | Signed 6-bit codes, G64, FP16 multiplier |
@@ -383,7 +398,7 @@ the same, and the generation method is recorded in the recipe/provenance.
 | Name | Currently allowed format / shape | Object alignment |
 |---|---|---:|
 | contiguous_le_v1 | bf16/fp32/int32, rank 0..16 | 256 |
-| row_split_k128_v1 | q4_g64_fp16, q5_g64_fp16, q6_g64_fp16, q8_g32_fp16, positive rank-2 `[N,K]` | 256 |
+| row_split_k128_v1 | q2_g64_fp16, q4_g64_fp16, q5_g64_fp16, q6_g64_fp16, q8_g32_fp16, positive rank-2 `[N,K]` | 256 |
 | block_scale_k16_m128x4_v1 | nvfp4, `N%128=0`, `K%64=0` | 256 |
 | row_scale_v1 | fp8_e4m3fn_row_bf16, positive rank-2 `[N,K]` | 256 |
 | raw_bytes_v1 | Resource, non-empty byte string | 1 |
@@ -485,7 +500,7 @@ representation and each provides the permission and auxiliary values at its own 
 
 | Field | Type / required | Meaning |
 |---|---|---|
-| parameter | ID, required | An existing logical parameter name in the root bindings |
+| parameter | ID, required | An existing logical parameter name in the root bindings (in a companion artifact, also a parameter of its target, section 4.3) |
 | input | ID, required | A complete mathematical input position defined by architecture code |
 | activation_policy | Enum, optional | Required for uses that have this permission contract |
 | auxiliaries | Object, optional | Mapping from auxiliary input roles to Bindings; omitted means empty |

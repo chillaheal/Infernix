@@ -12,13 +12,17 @@ namespace infernix::ops::detail {
 namespace {
 
 enum class Nvfp4AttnInputRoute : std::uint8_t {
+    ColumnInvariantA16,
     A16,
     A4,
 };
 
 Nvfp4AttnInputRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (tokens <= 0) { throw std::invalid_argument("nvfp4 attn_input_proj: T must be positive"); }
-    if (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8) {
+    if (column_invariant(policy)) { return Nvfp4AttnInputRoute::ColumnInvariantA16; }
+    // The residual profiles are registered for the NVFP4 MLP and FP8 projections only.
+    if (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8 ||
+        allows_residual(policy)) {
         return Nvfp4AttnInputRoute::A16;
     }
     if (!allows_a4(policy)) {
@@ -44,7 +48,12 @@ std::size_t nvfp4_attn_input_workspace_capacity_bytes(LinearPolicy policy, std::
 void nvfp4_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                                Tensor& k, Tensor& v, LinearPolicy policy, WorkspaceArena* workspace,
                                cudaStream_t stream) {
-    if (resolve_route(policy, x.ne[1]) == Nvfp4AttnInputRoute::A16) {
+    const Nvfp4AttnInputRoute route = resolve_route(policy, x.ne[1]);
+    if (route == Nvfp4AttnInputRoute::ColumnInvariantA16) {
+        nvfp4_attn_input_invariant_launch(x, weight, q, gate, k, v, stream);
+        return;
+    }
+    if (route == Nvfp4AttnInputRoute::A16) {
         nvfp4_attn_input_a16_launch(x, weight, q, gate, k, v, stream);
         return;
     }

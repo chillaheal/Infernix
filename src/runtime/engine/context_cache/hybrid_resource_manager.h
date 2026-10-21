@@ -4,6 +4,7 @@
 #include "runtime/contract/resources.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -73,6 +74,18 @@ public:
         out.hybrid_taps_created            = hybrid.taps_created;
         out.hybrid_taps_skipped            = hybrid.taps_skipped;
         out.hybrid_endpoints_created       = hybrid.endpoints_created;
+        // Publication refusals (Qwen3.5's Device snapshot slots; other caches have none).
+        if constexpr (requires { hybrid.device_slot_refusals; }) {
+            out.hybrid_taps_skipped_no_slot       = hybrid.taps_skipped_no_slot;
+            out.hybrid_endpoints_skipped          = hybrid.endpoints_skipped;
+            out.hybrid_host_image_write_refusals  = hybrid.host_image_write_refusals;
+            out.hybrid_host_block_write_refusals  = hybrid.host_block_write_refusals;
+            out.hybrid_device_slot_evictions      = hybrid.device_slot_evictions;
+            out.hybrid_device_slot_refusals       = hybrid.device_slot_refusals;
+            out.hybrid_free_device_snapshot_slots = hybrid.free_device_snapshot_slots;
+            out.hybrid_host_write_copies          = hybrid.host_write_copies;
+            out.hybrid_host_restore_copies        = hybrid.host_restore_copies;
+        }
         out.hybrid_host_image_writes       = hybrid.host_image_writes;
         out.hybrid_host_block_writes       = hybrid.host_block_writes;
         out.hybrid_host_image_restores     = hybrid.host_image_restores;
@@ -88,6 +101,7 @@ public:
         out.hybrid_held_device_evictions   = hybrid.held_device_evictions;
         out.hybrid_held_snapshot_losses    = hybrid.held_snapshot_losses;
         out.hybrid_held_host_refusals      = hybrid.held_host_refusals;
+        out.hybrid_tool_call_holds         = hybrid.tool_call_holds;
     }
 
     // Holds the sources of the requests waiting for admission, in admission order
@@ -97,7 +111,7 @@ public:
     void hold_queue(Program& program, std::span<const std::uint64_t> ids,
                     std::span<const Base* const> queue) {
         const std::uint64_t epoch = program.hybrid_cache_epoch();
-        if (hold_valid_ && epoch == hold_epoch_ &&
+        if (hold_valid_ && epoch == hold_epoch_ && !program.hybrid_holds_stale() &&
             std::equal(ids.begin(), ids.end(), hold_ids_.begin(), hold_ids_.end())) {
             return;
         }
@@ -105,6 +119,12 @@ public:
         hold_ids_.assign(ids.begin(), ids.end());
         hold_epoch_ = epoch;
         hold_valid_ = true;
+    }
+
+    // A tool-call hold (HybridPrefixCacheOptions::tool_call_hold): the request finished last
+    // ended with a tool call, so its client returns with the next turn within the tool's run time.
+    void hold_continuation(Program& program, std::chrono::steady_clock::time_point deadline) {
+        program.hybrid_hold_continuation(deadline);
     }
 
 private:

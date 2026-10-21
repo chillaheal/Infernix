@@ -3,6 +3,7 @@
 #include "models/qwen3_5/frontend/reasoning_loop.h"
 #include "models/qwen3_5/frontend/tokenizer.h"
 #include "models/qwen3_5/frontend/tool_call_parser.h"
+#include "runtime/contract/execution.h"
 #include "text/unicode.h"
 #include "text/grammar.h"
 #include <algorithm>
@@ -497,13 +498,17 @@ public:
     bool saw_content              = false;
     ConstraintOutputBranch branch = ConstraintOutputBranch::Undecided;
 
+    // A refusal fails this request only (runtime::RequestOutputError), never the Engine.
     void accept_grammar(std::span<const TokenId> tokens) {
         if (!grammar) { return; }
         try {
             grammar->accept(tokens);
+        } catch (const std::exception& error) {
+            grammar->discard();
+            throw runtime::RequestOutputError(std::string("constrained output: ") + error.what());
         } catch (...) {
             grammar->discard();
-            throw;
+            throw runtime::RequestOutputError("constrained output: the grammar refused a token");
         }
     }
 };
@@ -894,6 +899,10 @@ PublishedOutput OutputSession::commit_preview() {
 
 std::vector<GeneratedToolCall> OutputSession::take_tool_calls() noexcept {
     return impl_ != nullptr ? std::move(impl_->tool_calls) : std::vector<GeneratedToolCall>{};
+}
+
+bool OutputSession::has_tool_calls() const noexcept {
+    return impl_ != nullptr && !impl_->tool_calls.empty();
 }
 
 ToolCallParseDiagnostics OutputSession::tool_call_parse_diagnostics() const noexcept {

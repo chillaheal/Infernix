@@ -16,6 +16,7 @@ target_sources(infernix_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/program/decode.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/grammar_masks.cpp"
 
+  "${CMAKE_CURRENT_LIST_DIR}/program/planning/fast_paths.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/planning/startup.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/planning/graph_profiles.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/planning/request_plan.cpp"
@@ -30,6 +31,7 @@ target_sources(infernix_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/program/transactions/replay.cpp"
 
   "${CMAKE_CURRENT_LIST_DIR}/program/speculative/mtp.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/program/speculative/mtp_draft_policy.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/speculative/target_verification.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/speculative/tree_width_controller.cpp"
 

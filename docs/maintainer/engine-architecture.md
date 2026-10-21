@@ -154,7 +154,12 @@ parameters; when a complete FP8/NVFP4 parent stores Q/K/gate/V, a single weight 
 A View keeps the parent's geometry, planes and element ranges; shared objects are resident once and
 every use site keeps its own Use.
 Activation permissions are `A16Only={A16}`, `AllowA8={A16,A8}` and `AllowA4={A16,A8,A4}`; a fused call
-takes the intersection of the relevant permissions.
+takes the intersection of the relevant permissions. Three runtime policies narrow a permission and
+are never stored: `A16ColumnInvariant` (one A16 schedule at every width, the exact route's decode),
+`AllowA4Residual` (A16, or NVFP4 activations as a sum of residual NVFP4 terms, which a projection
+permitted A4 may take under the `batched-a4-residual-decode` fast path) and `AllowA8Residual` (A16,
+or FP8 activations as two E4M3 terms, which an FP8 input projection or gate/up permitted A8 may
+take under `batched-a8-residual-decode`; output and down projections stay A16).
 
 The reader, binder, native parameter preparation, capacity queries, warmup and execution each check
 the contracts they consume. The executable scope is determined by the actual consumers. The
@@ -210,6 +215,15 @@ and Native keeps the actual reservation across chunks.
 At most one request is in this protected resume at a time; real new progress or a terminal state ends
 the permit, after which other resumes are attempted; other requests that hold permits can still
 execute.
+
+Replay recomputes generated tokens as prefill, whose bits differ from their decode, so a request
+that may not depend on the others (request invariance, the exact route's default) is never paused:
+without the `preemption` fast path the Program's binding reserves the request's whole KV extent
+(`RequestControl::held_extent`: prompt + output budget + one verify window, capped at the lane and
+the pool) and every unit settles back to it, so no unit needs new pages and the Engine's reclaim
+never chooses a victim. Admission waits for the extent instead. Without `free-cache-resume` the
+Program likewise splits prefill and publishes and resumes cached state only on the prefill chunk
+grid, and publishes no decode-computed endpoint ([numerical policy](model-quality.md#67-fast-path-registry)).
 
 ### 3.2 Outstanding capacity
 
@@ -352,10 +366,13 @@ raises after a stable boundary when a unit's inputs were unavailable rather than
 (Qwen3.8-Flash-Next: an expert record that could not be read, or a host expert service that missed
 its heartbeat). The Engine raises it itself for the capacity contract error
 ([resource scheduling](resource-scheduling-and-context-cache.md) §3), which fires before the unit
-runs. The Engine fails the requests holding lanes with it, the Program releases those
-lanes without publishing anything and empties a prefix cache the failed round may have published
-into, and queued requests keep waiting; if the Engine is binding, materializing or holding a
-paused request at that moment it fails everything instead. A service or read thread that has itself
+runs. The Engine fails the requests holding lanes and the paused requests with it (a paused
+request's suspended state is released first, as for a cancellation), the Program releases the
+lanes, and queued requests keep waiting. Qwen3.8-Flash-Next releases them without publishing
+anything and empties a prefix cache the failed round may have published into; Qwen3.5, whose only
+recoverable error is the Engine's own between units, releases them as `abort` does and keeps its
+cache, and refuses while a pending batch exists. If the Engine is binding or materializing at that
+moment, or the Program refuses, it fails everything instead. A service or read thread that has itself
 stopped makes every later unit fail, so the Program reports that as an ordinary (fatal) error with
 its cause. CUDA errors are never recoverable: the context state is unknown.
 

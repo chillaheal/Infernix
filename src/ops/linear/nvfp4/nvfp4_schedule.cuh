@@ -88,12 +88,17 @@ struct Nvfp4A16SimtSchedule {
     static constexpr int kPairsPerLane      = ValuesPerLane / 2;
 };
 
+// Terms > 1 is the A4 residual profile: each column's activations are that many NVFP4 planes whose
+// sum approximates them (nvfp4_a4_residual_quantize_kernel), multiplied into one accumulator.
 template <int BlockTokens, int BlockRows, int BlockK, int WarpsTokens, int WarpsRows, int Stages,
-          int MinBlocksPerSm, Cache WeightCache = Cache::cg, Cache ActivationCache = Cache::cg>
+          int MinBlocksPerSm, Cache WeightCache = Cache::cg, Cache ActivationCache = Cache::cg,
+          int Terms = 1>
 struct Nvfp4A4MmaSchedule {
     static constexpr int kStaticK           = 0;
     static constexpr Cache kWeightCache     = WeightCache;
     static constexpr Cache kActivationCache = ActivationCache;
+    static constexpr int kTerms             = Terms;
+    static_assert(Terms >= 1 && Terms <= 3);
     static_assert(BlockTokens > 0 && (BlockTokens % 16) == 0);
     static_assert(BlockRows > 0 && (BlockRows % 8) == 0);
     static_assert(BlockK >= 64 && (BlockK % 64) == 0);
@@ -120,7 +125,7 @@ struct Nvfp4A4MmaSchedule {
     static constexpr int kCodeRowBytes   = BlockK / 2;
     static constexpr int kSegmentsPerRow = kCodeRowBytes / 16;
     static constexpr int kStagingBytes =
-        Stages * (BlockTokens + BlockRows) * (BlockK / 2 + BlockK / 16);
+        Stages * (Terms * BlockTokens + BlockRows) * (BlockK / 2 + BlockK / 16);
     static constexpr int kOutputBytes = BlockTokens * (BlockRows + 8) * 2;
     static constexpr int kSharedBytes = kStagingBytes > kOutputBytes ? kStagingBytes : kOutputBytes;
     static_assert(kThreads <= 1024 && kSharedBytes <= 99 * 1024);
@@ -128,9 +133,14 @@ struct Nvfp4A4MmaSchedule {
 };
 
 template <int BlockTokens, int Stages, int MinBlocksPerSm,
-          CUtensorMapL2promotion WeightCodePromotion = CU_TENSOR_MAP_L2_PROMOTION_NONE>
+          CUtensorMapL2promotion WeightCodePromotion = CU_TENSOR_MAP_L2_PROMOTION_NONE,
+          int Terms = 1>
 struct Nvfp4A4TmaMmaSchedule {
     static constexpr int kStaticK = 0;
+    // Terms > 1 is the A4 residual profile: each stage holds that many activation planes, each
+    // multiplied by the same weight tile into one accumulator.
+    static constexpr int kTerms = Terms;
+    static_assert(Terms == 1 || Terms == 2);
     // Each scale tile serves two consecutive K stages. Before a slot is reused,
     // the producer must have waited for the second consumer of the old pair.
     static constexpr int kScaleSlots = (Stages + 2) / 2;

@@ -71,6 +71,11 @@ public:
               std::size_t admission_budget = static_cast<std::size_t>(-1), const Admissible* admissible = nullptr,
               const Admissible* evictable = nullptr);
 
+    // Prompt seeding (design §19.3.27): adds amounts[i] to keys[i]'s count and marks it used now,
+    // with no clock tick (the prompt's prefill calls ticked already) and no admission: the credit
+    // ranks later admissions and evictions.
+    void credit(std::span<const std::uint32_t> keys, std::span<const double> amounts);
+
     // Promote a non-resident key (for example a staged prefetch whose frame changes role).
     // Returns the victim, or nothing when the pool still has room.
     std::optional<std::uint32_t> promote(std::uint32_t key, std::span<const std::uint32_t> protect);
@@ -207,6 +212,8 @@ public:
     void on_route(std::span<const std::uint32_t> group, std::uint64_t round_started,
                   std::vector<Command>& out, std::size_t admission_budget = static_cast<std::size_t>(-1),
                   const LfruPolicy::Admissible* admissible = nullptr, const LfruPolicy::Admissible* evictable = nullptr);
+    // A prompt's weighted routes at its end (LfruPolicy::credit); issues no command.
+    void credit(std::span<const std::uint32_t> keys, std::span<const double> amounts) { policy_.credit(keys, amounts); }
     // The SSD tier's demotion (design §19.3.7 T4/T7): after on_route evicted an expert and before
     // on_quiescent, its retired frame is held while its record is copied to RAM; release_held frees
     // it once the copy completed and loads queued experts into free frames.
@@ -231,8 +238,12 @@ public:
     // run's remaining experts into free frames outside it, and lends the run. Returns the number
     // of evicted experts.
     std::uint32_t lend(std::uint32_t first, std::uint32_t count, std::vector<Command>& out);
-    // Returns the run: capacity grows back and queued experts load into it.
-    void give_back(std::uint32_t first, std::uint32_t count, std::vector<Command>& out);
+    // Returns the run: capacity grows back and queued experts load into it. With `refill`, the
+    // experts the loans evicted then load into it too, best first, while the policy has room (a
+    // prefill's loans would otherwise leave decode a cache short of them until misses re-admit them);
+    // `admissible` (when given) gates them. Without, the frames stay free for decode's landings.
+    void give_back(std::uint32_t first, std::uint32_t count, std::vector<Command>& out, bool refill = true,
+                   const LfruPolicy::Admissible* admissible = nullptr);
     // Warm start (design §19.3.5 S4b): sets every key's count from `counts` (empty: unchanged), then
     // loads `keys`, best first, into free frames while the policy has capacity. Before the first
     // round only. Returns the number of keys loaded.
@@ -250,6 +261,9 @@ public:
                std::uint64_t round_started, std::vector<Command>& out);
     void release(std::uint32_t frame);
     [[nodiscard]] std::uint32_t loaned_frames() const { return frames_.loaned_count(); }
+    // The longest run of backed frames none of which is lent: the most one more lease can take, since
+    // a lease is one contiguous run (an earlier lease in the middle of the pool splits the rest).
+    [[nodiscard]] std::uint32_t longest_unloaned_run() const;
     // The key held in `frame`, or nothing.
     [[nodiscard]] std::optional<std::uint32_t> frame_key(std::uint32_t frame) const;
 
@@ -281,6 +295,7 @@ private:
     std::vector<std::uint8_t> is_queued_;
     std::vector<std::uint64_t> load_serial_; // per key: the serial of its latest issued copy
     std::vector<std::uint32_t> frame_key_;   // per frame: the key it holds, or kNoKey
+    std::vector<std::uint32_t> lent_victims_; // keys the outstanding loans evicted, lowest score first
     std::uint64_t next_serial_ = 0;
     LfruPolicy::Step step_;
 };

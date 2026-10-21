@@ -1,12 +1,25 @@
+#include "test_temp_path.h"
 #include "options.h"
 
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <iostream>
+#include <set>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
+
+// Replaces the scratch --config file's contents and returns its path.
+std::string write_config(const std::string& text) {
+    const std::filesystem::path path = infernix::test::unique_temp_path("infernix-cli-options-config.toml");
+    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    file << text;
+    return path.string();
+}
 
 infernix::cli::Options parse(std::vector<std::string> arguments) {
     std::vector<char*> argv;
@@ -49,6 +62,25 @@ int run_tests() {
                                        "a", "--json-object"});
                       }),
                       "regex and JSON were accepted together");
+    failures += check(parse({"infernix", "model.ninfer", "--prompt", "hello", "--expert-tail-skip", "8"})
+                              .expert_tail_skip == 8,
+                      "--expert-tail-skip did not parse");
+    const auto gated = parse({"infernix", "model.ninfer", "--prompt", "hello", "--spec", "mtp",
+                              "--draft-tokens", "3", "--spec-min-p", "0.7"});
+    failures += check(gated.speculative.draft_min_p && *gated.speculative.draft_min_p == 0.7F,
+                      "--spec-min-p lost its probability");
+    failures += check(rejects([] {
+                          (void)parse({"infernix", "model.ninfer", "--prompt", "hello", "--spec",
+                                       "dflash", "--draft-tokens", "3", "--spec-min-p", "0.5"});
+                      }),
+                      "--spec-min-p was accepted without MTP");
+    failures += check(rejects([] {
+                          (void)parse({"infernix", "model.ninfer", "--prompt", "hello", "--spec", "mtp",
+                                       "--draft-tokens", "3", "--spec-min-p", "2"});
+                      }),
+                      "--spec-min-p accepted a value above 1");
+    failures += check(infernix::cli::usage_text("infernix").find("--spec-min-p") != std::string::npos,
+                      "CLI help omits --spec-min-p");
     failures += check(
         parse({"infernix", "model.ninfer", "--prompt", "hello", "--grammar-file", "answer.gbnf"})
                 .grammar_path == "answer.gbnf",
@@ -121,9 +153,41 @@ int run_tests() {
                       "CLI narrow ngram/wide MTP pair changed");
     failures += check(rejects([] {
                           (void)parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--spec",
-                                       "mtp", "--draft-tokens", "6", "--ngram-draft-tokens", "15"});
+                                       "mtp", "--draft-tokens", "8", "--ngram-draft-tokens", "15"});
                       }),
                       "CLI admitted unsupported MTP neural width");
+    // auto leaves the count to the Engine (the model's most); a fixed N stays fixed.
+    const auto mtp_auto = parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--spec", "mtp",
+                                 "--draft-tokens", "auto"});
+    failures += check(mtp_auto.speculative.draft_tokens_auto && mtp_auto.speculative.draft_tokens == 0,
+                      "CLI did not select the automatic MTP draft length");
+    const auto mtp_fixed = parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--spec", "mtp",
+                                  "--draft-tokens", "7"});
+    failures += check(!mtp_fixed.speculative.draft_tokens_auto && mtp_fixed.speculative.draft_tokens == 7,
+                      "CLI did not keep a fixed MTP draft length of 7");
+    for (const auto* rejected : {"dflash", "Auto"}) {
+        const std::string backend = std::string(rejected) == "Auto" ? "mtp" : rejected;
+        const std::string tokens  = std::string(rejected) == "Auto" ? "Auto" : "auto";
+        failures += check(rejects([&] {
+                              (void)parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--spec",
+                                           backend, "--draft-tokens", tokens});
+                          }),
+                          ("CLI admitted --draft-tokens " + tokens + " with --spec " + backend).c_str());
+    }
+    // Qwen3.8-Flash-Next's DFlash2 drafter: a companion artifact by path, and the automatic length.
+    const auto companion = parse({"infernix-cli", "model.infernix", "--prompt", "x", "--spec", "dflash2",
+                                  "--draft-tokens", "auto", "--draft-model", "drafter.infernix", "--lm-head-draft"});
+    failures += check(companion.speculative.draft_model == std::filesystem::path("drafter.infernix") &&
+                          companion.speculative.draft_tokens_auto &&
+                          companion.speculative.proposal_head == infernix::ProposalHead::Optimized,
+                      "CLI did not keep --draft-model, --draft-tokens auto and --lm-head-draft with dflash2");
+    failures += check(rejects([] {
+                          (void)parse({"infernix-cli", "model.infernix", "--prompt", "x", "--spec", "mtp",
+                                       "--draft-tokens", "3", "--draft-model", "drafter.infernix"});
+                      }),
+                      "CLI admitted --draft-model without --spec dflash2");
+    failures += check(infernix::cli::usage_text("infernix-cli").find("--draft-model FILE") != std::string::npos,
+                      "CLI help omits --draft-model");
     const infernix::cli::Options configured =
         parse({"infernix-cli", "model.ninfer", "--prompt", "hello", "--thinking-budget", "37"});
     failures += check(configured.thinking_budget == 37,
@@ -239,19 +303,14 @@ int run_tests() {
                       "--use-original-nvfp4-prefill-kernel was not parsed");
     failures += check(help.find("--use-original-nvfp4-prefill-kernel") != std::string::npos,
                       "CLI help omits --use-original-nvfp4-prefill-kernel");
-    failures += check(k8v4.prefill_8bit_pv == infernix::PrefillPv8::Auto,
-                      "the CLI 8-bit prefill P*V must default to auto");
-    failures += check(parse({"infernix-cli", "model.ninfer", "--prompt", "hello", "--kv-dtype",
-                             "k8v4", "--no-prefill-8bit-pv"})
-                          .prefill_8bit_pv == infernix::PrefillPv8::Off,
-                      "--no-prefill-8bit-pv was not parsed");
-    failures += check(parse({"infernix-cli", "model.ninfer", "--prompt", "hello", "--kv-dtype",
-                             "int8", "--prefill-8bit-pv"})
-                          .prefill_8bit_pv == infernix::PrefillPv8::On,
-                      "--prefill-8bit-pv was not parsed");
-    failures += check(help.find("--no-prefill-8bit-pv") != std::string::npos &&
-                          help.find("--prefill-8bit-pv") != std::string::npos,
-                      "CLI help omits the 8-bit prefill P*V flags");
+    failures += check(k8v4.fast_paths, "the CLI fast paths must default on");
+    failures += check(!parse({"infernix-cli", "model.ninfer", "--prompt", "hello", "--disable-fast-paths"})
+                           .fast_paths,
+                      "--disable-fast-paths was not parsed");
+    failures += check(help.find("--disable-fast-paths") != std::string::npos,
+                      "CLI help omits --disable-fast-paths");
+    failures += check(help.find("prefill-8bit-pv") == std::string::npos,
+                      "CLI help still lists the removed 8-bit prefill P*V flags");
     failures +=
         check(k8v4.prefill_split_workspace_mib == infernix::kDefaultPrefillSplitWorkspaceMiB,
               "the CLI prompt split workspace must default to its product default");
@@ -283,6 +342,13 @@ int run_tests() {
                       "--expert-ram-mib must parse a MiB count and auto");
     failures += check(rejects([] { (void)parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--expert-ram-mib", "0"}); }),
                       "--expert-ram-mib must reject zero");
+    failures += check(help.find("--expert-pin-mib") != std::string::npos, "CLI help omits the expert pin control");
+    failures += check(parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--expert-pin-mib", "24576"}).expert_pin_bytes ==
+                              (24576ULL << 20) &&
+                          !parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--expert-pin-mib", "auto"}).expert_pin_bytes,
+                      "--expert-pin-mib must parse a MiB count and auto");
+    failures += check(rejects([] { (void)parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--expert-pin-mib", "0"}); }),
+                      "--expert-pin-mib must reject zero");
     const char* const cli_help_sections[] = {"CONTEXT", "KV CACHE", "SPECULATIVE DECODING",
                                              "SAMPLING", "VISION", "LOGGING"};
     for (const char* section : cli_help_sections) {
@@ -307,6 +373,104 @@ int run_tests() {
     const auto state_file = parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--expert-state", "cache.state"});
     failures += check(state_file.expert_state && *state_file.expert_state == "cache.state",
                       "CLI --expert-state FILE must name the file");
+    failures += check(parse({"infernix-cli", "model.ninfer", "--prompt", "x"}).expert_stripe_path.empty(),
+                      "CLI expert stripe must default to none");
+    failures += check(parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--expert-stripe", "D:/m.stripe"})
+                              .expert_stripe_path == "D:/m.stripe",
+                      "CLI --expert-stripe FILE must name the file");
+    // --fast-path NAME: a qualification candidate, repeatable; unknown names are refused.
+    const auto candidate = parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--fast-path", "sampled-mtp-drafts",
+                                  "--fast-path", "preemption"});
+    failures += check(candidate.fast_path_candidates ==
+                          std::vector<infernix::FastPath>{infernix::FastPath::SampledMtpDrafts,
+                                                          infernix::FastPath::Preemption},
+                      "CLI --fast-path must collect each named candidate");
+    failures += check(rejects([] {
+                          (void)parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--fast-path", "no-such-path"});
+                      }),
+                      "CLI accepted an unknown fast path");
+
+    // --config FILE: the model and options from a TOML file; [cli] overrides the top level, [serve]
+    // is infernix-serve's and is not read here, repeatable options take arrays, and the command
+    // line overrides the file.
+    {
+        const std::string config = write_config("model = \"from-file.infernix\"\n"
+                                                "max-context = 4096\n"
+                                                "kv-dtype = \"int8\"\n"
+                                                "stop = [\"END\", \"STOP\"]\n"
+                                                "choice = [\"yes\", \"no\"]\n"
+                                                "greedy = true\n"
+                                                "[cli]\n"
+                                                "prompt = \"hello there\"\n"
+                                                "max-context = 8192\n"
+                                                "[serve]\n"
+                                                "port = 9000\n");
+        const auto from_file = parse({"infernix", "--config", config});
+        failures += check(from_file.artifact_path == "from-file.infernix" && from_file.prompt == "hello there" &&
+                              from_file.max_context == 8192 &&
+                              from_file.kv_cache == infernix::KvCacheStorage::Int8Group64 &&
+                              from_file.stop_strings.size() == 2 && from_file.stop_strings[1].text == "STOP" &&
+                              from_file.choices == std::vector<std::string>{"yes", "no"} && from_file.greedy &&
+                              from_file.config_path == config,
+                          "CLI --config values did not reach the options");
+        const auto example = parse({"infernix", "--config", std::string(INFERNIX_SOURCE_DIR) + "/infernix.example.toml"});
+        failures += check(example.artifact_path.extension() == ".infernix" && example.max_context == 32768 &&
+                              example.max_new == 1024 && !example.prompt.empty(),
+                          "infernix.example.toml does not configure infernix as written");
+        const auto overridden =
+            parse({"infernix", "cmd.infernix", "--config", config, "--max-context", "1024", "--stop", "HALT"});
+        failures += check(overridden.artifact_path == "cmd.infernix" && overridden.max_context == 1024 &&
+                              overridden.stop_strings.size() == 3,
+                          "the CLI command line did not override --config, or its repeated values replaced the file's");
+        for (const auto& [text, expected] : std::vector<std::pair<std::string, std::string>>{
+                 {"prompt = \"x\"\nport = 9000", "unknown option 'port'"},
+                 {"prompt = \"x\"\nmax-new = [1, 2]", "'max-new' takes one value, not an array"},
+                 {"prompt = \"x\"\n[cli]\nmodel = 1", "'model' takes the artifact path as a string"},
+                 {"prompt = \"x\"", "a model path (.infernix or .ninfer) is required"}}) {
+            std::string error;
+            try {
+                (void)parse({"infernix", "--config", write_config(text)});
+            } catch (const std::exception& exception) { error = exception.what(); }
+            failures += check(error.find(expected) != std::string::npos,
+                              ("CLI --config did not reject \"" + text + "\" with: " + expected).c_str());
+        }
+
+        // Every option the help lists is a --config key with the command line's arity.
+        const std::string help = infernix::cli::usage_text("infernix");
+        std::set<std::string> listed;
+        for (std::size_t at = help.find("--"); at != std::string::npos; at = help.find("--", at + 2)) {
+            std::size_t end = at + 2;
+            while (end < help.size() && ((help[end] >= 'a' && help[end] <= 'z') ||
+                                         (help[end] >= '0' && help[end] <= '9') || help[end] == '-')) {
+                ++end;
+            }
+            listed.insert(help.substr(at, end - at));
+        }
+        listed.erase("--config");
+        failures += check(listed.contains("--prompt") && listed.contains("--greedy") && listed.contains("--stop"),
+                          "the CLI help lists no options to compare with --config");
+        for (const std::string& option : listed) {
+            std::string direct;
+            try {
+                (void)parse({"infernix", "model.ninfer", option});
+            } catch (const std::exception& exception) { direct = exception.what(); }
+            const bool takes_value = direct.ends_with(option + " needs a value");
+            const std::string key  = option.substr(2);
+            std::string error;
+            try {
+                (void)parse({"infernix", "model.ninfer", "--config",
+                             write_config(takes_value ? key + " = \"1\"\n" : key + " = true\n")});
+            } catch (const std::exception& exception) { error = exception.what(); }
+            failures += check(error.find("unknown option") == std::string::npos &&
+                                  error.find("is a flag") == std::string::npos &&
+                                  error.find("takes a string") == std::string::npos &&
+                                  error.find("invalid TOML") == std::string::npos &&
+                                  error.find("has no parser") == std::string::npos,
+                              ("CLI --config does not accept the option " + option).c_str());
+        }
+        std::error_code ignored;
+        std::filesystem::remove(config, ignored);
+    }
     return failures == 0 ? 0 : 1;
 }
 

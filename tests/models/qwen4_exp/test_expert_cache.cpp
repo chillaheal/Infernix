@@ -4,6 +4,8 @@
 // §19.3.7, RT8) evicts the lowest-score experts wherever they sit, moves the survivors below the new
 // top and never names a frame above it.
 
+#include "test_temp_path.h"
+#include "models/qwen4_exp/program/expert_cache/calibrated_order.h"
 #include "models/qwen4_exp/program/expert_cache/expert_cache.h"
 #include "models/qwen4_exp/program/expert_cache/expert_state.h"
 
@@ -475,6 +477,10 @@ void test_lending() {
     for (std::uint32_t k = 0; k < kKeys; ++k) { clear &= frame_of[k] == ~0U || frame_of[k] < first || frame_of[k] >= first + 3; }
     check(clear, "no expert maps to a lent frame");
     check(!cache.choose_run(kFrames, none).has_value(), "lent frames are never chosen");
+    // Frames 5..7 of 8 are lent: one more lease is one run, at most frames 0..4.
+    check(cache.longest_unloaned_run() == 5 && cache.choose_run(5, none).has_value() &&
+              !cache.choose_run(6, none).has_value(),
+          "the longest unlent run bounds the next lease");
 
     // Routes K until it is resident again (queued while the frames are lent, then loaded).
     const auto route_k = [&] {
@@ -488,6 +494,11 @@ void test_lending() {
     cache.give_back(first, 3, cmds);
     apply();
     check(cache.loaned_frames() == 0 && cache.policy().capacity() == capacity, "give_back restores the capacity");
+    bool reloaded = true;
+    for (std::uint32_t k = 0; k < 3; ++k) {
+        reloaded &= cache.entry(k).state == ResidencyState::kReady && frame_of[k] != ~0U && cache.policy().resident(k);
+    }
+    check(reloaded, "give_back reloads the experts the loan evicted");
     route_k();
     check(frame_of[K] != ~0U, "K is resident again after the give-back");
     check(!cache.complete_load(K, K_frame, s1), "K's copy from before the loan (ABA) does not publish");
@@ -528,11 +539,51 @@ void test_seed() {
     check(cache.seed(ranked, {}, cmds) == 0 && cmds.empty(), "a full cache seeds nothing more");
 }
 
+// Prompt seeding (design §19.3.27): credit adds weighted uses, marked used now, with no clock tick
+// and no admission; the credit then ranks the next budgeted admission and its victim.
+void test_prompt_credit() {
+    LfruPolicy policy(64, 4);
+    LfruPolicy::Step step;
+    const std::vector<std::uint32_t> fill{0, 1, 2, 3};
+    policy.step(fill, step); // now 1: every key count 1
+    const std::vector<std::uint32_t> hot{0, 1};
+    for (int i = 0; i < 3; ++i) { policy.step(hot, step); } // now 4: keys 0, 1 count 4; keys 2, 3 age 3
+    const std::uint64_t now = policy.now();
+    const std::vector<std::uint32_t> keys{10, 2};
+    const std::vector<double> amounts{5.0, 2.0};
+    policy.credit(keys, amounts);
+    check(policy.now() == now, "credit does not tick the clock");
+    check(!policy.resident(10) && policy.resident_count() == 4, "credit admits nothing");
+    check(policy.count(10) == 5.0 && policy.score(10) == 5.0, "a credited miss gains its amount, used now");
+    check(policy.count(2) == 3.0 && policy.score(2) == 3.0, "a credited resident gains its amount, used now");
+    // The next call routes keys 10 and 11, both missing, with room for one admission: credited key 10
+    // (6 / 1) outranks 11 (1 / 1), and the victim is key 3 (1 / 5), not key 2, which tied with it
+    // before the credit (lowest key first) and now scores 3 / 2.
+    const std::vector<std::uint32_t> next{10, 11};
+    policy.step(next, step, 1);
+    check(step.admitted == std::vector<std::uint32_t>{10} && step.victims == std::vector<std::uint32_t>{3},
+          "the credit ranks the next admission and its victim");
+    check(policy.resident(2) && !policy.resident(3), "the credited resident outlives its uncredited twin");
+    bool threw = false;
+    try {
+        const std::vector<double> one{1.0};
+        policy.credit(keys, one);
+    } catch (const std::invalid_argument&) { threw = true; }
+    check(threw, "credit rejects mismatched key and amount counts");
+
+    // The controller forwards the credit and issues nothing.
+    CacheController cache(64, 6, 2, 1);
+    const std::vector<std::uint32_t> prompt{40};
+    const std::vector<double> credit{8.0};
+    cache.credit(prompt, credit);
+    check(cache.policy().count(40) == 8.0 && !cache.policy().resident(40) && cache.queued_loads() == 0,
+          "the controller credits without loading");
+}
+
 // The saved state file: a round trip keeps counts and ranking; another identity, key count, version
 // or a truncated file loads nothing (with a reason).
 void test_state_file() {
-    const auto dir  = std::filesystem::temp_directory_path();
-    const auto path = dir / "infernix_expert_state_test.bin";
+    const auto path = infernix::test::unique_temp_path("infernix_expert_state_test.bin");
     SavedState state;
     state.counts = {5, 0, 9, 1};
     state.ranked = {2, 0, 3};
@@ -541,7 +592,7 @@ void test_state_file() {
     check(same.state && same.state->counts == state.counts && same.state->ranked == state.ranked, "a saved state round-trips");
     check(!load_expert_state(path, "artifact B", 4).state, "another artifact's state is ignored");
     check(!load_expert_state(path, "artifact A", 5).state, "a state with another key count is ignored");
-    check(!load_expert_state(dir / "infernix_expert_state_missing.bin", "artifact A", 4).state, "a missing file loads nothing");
+    check(!load_expert_state(infernix::test::unique_temp_path("infernix_expert_state_missing.bin"), "artifact A", 4).state, "a missing file loads nothing");
     {
         const auto size = std::filesystem::file_size(path);
         std::filesystem::resize_file(path, size - 3);
@@ -550,6 +601,37 @@ void test_state_file() {
     check(!cut.state && !cut.message.empty(), "a truncated file is refused with a reason");
     std::filesystem::remove(path);
     check(!std::filesystem::exists(path.string() + ".tmp"), "no temporary file is left behind");
+}
+
+// The calibrated order, the seed of a start without a saved state: every layer ranks each of its
+// experts once, counts reverse the ranks, and the ranked list interleaves the layers by rank (layer
+// 0's first experts as NInfer f8a774f73 lists them: 90, 109, 93).
+void test_calibrated_order() {
+    const SavedState order = calibrated_expert_order();
+    constexpr std::uint32_t kKeys = kCalibratedLayers * kCalibratedExperts;
+    check(order.counts.size() == kKeys && order.ranked.size() == kKeys, "the order covers every key once");
+    bool counts_ok = true;
+    for (std::uint32_t layer = 0; layer < kCalibratedLayers; ++layer) {
+        std::vector<std::uint32_t> counts(order.counts.begin() + layer * kCalibratedExperts,
+                                          order.counts.begin() + (layer + 1) * kCalibratedExperts);
+        std::sort(counts.begin(), counts.end());
+        for (std::uint32_t i = 0; i < kCalibratedExperts; ++i) { counts_ok = counts_ok && counts[i] == i + 1; }
+    }
+    check(counts_ok, "each layer's counts are its ranks reversed, 1 to 512");
+    std::vector<std::uint32_t> ranked = order.ranked;
+    std::sort(ranked.begin(), ranked.end());
+    bool ranked_ok = true;
+    for (std::uint32_t key = 0; key < kKeys && ranked_ok; ++key) { ranked_ok = ranked[key] == key; }
+    check(ranked_ok, "the ranked list is a permutation of the keys");
+    bool interleaved = true;
+    for (std::uint32_t i = 0; i < kKeys; ++i) {
+        const std::uint32_t key = order.ranked[i], layer = key / kCalibratedExperts;
+        interleaved = interleaved && layer == i % kCalibratedLayers &&
+                      order.counts[key] == kCalibratedExperts - i / kCalibratedLayers;
+    }
+    check(interleaved, "the ranked list takes every layer's next-ranked expert in turn");
+    check(order.ranked[0] == 90 && order.ranked[kCalibratedLayers] == 109 && order.ranked[2 * kCalibratedLayers] == 93,
+          "layer 0's first experts are NInfer's");
 }
 
 // Fill-phase landing (design §19.3.5 S4): reserve_free pops free frames only while the policy has
@@ -644,8 +726,10 @@ int main() {
     test_load_serials();
     test_lending();
     test_seed();
+    test_prompt_credit();
     test_landing();
     test_state_file();
+    test_calibrated_order();
     if (g_failures) {
         std::fprintf(stderr, "%d check(s) failed\n", g_failures);
         return 1;

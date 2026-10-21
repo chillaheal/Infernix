@@ -346,6 +346,7 @@ Json speculative_json(const GenerationMetrics& metrics) {
                 {"accepted_tokens", metrics.speculative_accepted_tokens},
                 {"fallback_steps", metrics.speculative_fallback_steps},
                 {"accepted_per_position", metrics.speculative_accepted_per_position},
+                {"rounds_by_draft_length", metrics.speculative_rounds_by_draft_length},
                 {"ngram_rounds", metrics.ngram_rounds},
                 {"ngram_drafted_tokens", metrics.ngram_drafted_tokens},
                 {"ngram_accepted_tokens", metrics.ngram_accepted_tokens},
@@ -518,19 +519,25 @@ std::string format_server_start_json(
              {"media_live_bytes", options.media_live_bytes},
              {"media_preprocess_threads", options.media_preprocess_threads},
              {"request_log_jsonl", options.request_log_jsonl},
+             {"route_trace", options.route_trace.empty() ? Json(nullptr) : Json(options.route_trace.string())},
              {"default_output_tokens", options.default_max_tokens},
              {"default_thinking",
               options.enable_thinking ? Json(*options.enable_thinking) : Json(nullptr)},
              {"default_thinking_budget", std::move(default_thinking_budget)},
+             {"thinking_answer_room", options.thinking_answer_room},
              {"reasoning_loop", reasoning_loop_name(options.reasoning_loop)},
              {"default_preserve_thinking",
-              options.preserve_thinking ? Json(*options.preserve_thinking) : Json(nullptr)}};
+              options.preserve_thinking ? Json(*options.preserve_thinking) : Json(nullptr)},
+             {"claude_code_prompt",
+              options.claude_code_prompt == ClaudeCodePrompt::Local ? "local" : "as-sent"}};
     record["artifact"]                             = Json{{"path", options.artifact_path},
                                                           {"size_bytes", std::move(artifact_size)},
                                                           {"architecture", load.architecture},
                                                           {"name", load.model_name},
                                                           {"formats", load.weight_formats},
                                                           {"prefill_signature", load.prefill_signature},
+                                                          {"fast_path_configuration", load.fast_path_configuration},
+                                                          {"fast_paths", load.fast_paths},
                                                           {"bytes_read", load.artifact_bytes_read},
                                                           {"host_to_device_bytes", load.host_to_device_bytes},
                                                           {"peak_staging_bytes", load.peak_staging_bytes},
@@ -555,9 +562,9 @@ std::string format_server_start_json(
              {"pending_timeout_ms", engine_options.pending_timeout_ms},
              {"prefill_chunk", engine_options.prefill_chunk},
              {"original_int8_prefill_kernel", engine_options.original_int8_prefill_kernel},
-             {"prefill_8bit_pv", prefill_pv8_name(engine_options.prefill_8bit_pv)},
              {"prefill_split_workspace_mib", engine_options.prefill_split_workspace_mib},
              {"original_nvfp4_prefill_kernel", engine_options.original_nvfp4_prefill_kernel},
+             {"fast_paths", engine_options.fast_paths},
              {"log_stats_interval_ms", options.log_stats_interval_ms},
              {"kv_cache", kv_cache_name(engine_options.kv_cache)},
              {"vision", engine_options.enable_vision},
@@ -566,6 +573,11 @@ std::string format_server_start_json(
              {"speculative_backend",
               product::speculative_backend_name(engine_options.speculative.backend)},
              {"speculative_draft_window", engine_options.speculative.draft_tokens},
+             {"speculative_draft_auto", engine_options.speculative.draft_tokens_auto},
+             {"expert_tail_skip", engine_options.expert_tail_skip},
+             {"spec_min_p", engine_options.speculative.draft_min_p
+                                ? Json(static_cast<double>(*engine_options.speculative.draft_min_p))
+                                : Json(nullptr)},
              {"draft_tree_nodes", engine_options.speculative.draft_tree_nodes},
              {"draft_tree_auto", engine_options.speculative.draft_tree_auto},
              {"draft_tree_paths", engine_options.speculative.draft_tree_paths},
@@ -619,6 +631,9 @@ std::string format_server_start_json(
              {"cuda_runtime_version", environment.cuda_runtime_version},
              {"cuda_driver_version", environment.cuda_driver_version}};
     record["argv"] = options.startup_argv;
+    record["config"] =
+        options.config_path ? Json{{"path", *options.config_path}, {"arguments", options.config_arguments}}
+                            : Json(nullptr);
     return record.dump();
 }
 
@@ -826,7 +841,16 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
                  {"blocks_duplicate", delta(&RuntimeStats::hybrid_blocks_duplicate)},
                  {"taps_created", delta(&RuntimeStats::hybrid_taps_created)},
                  {"taps_skipped", delta(&RuntimeStats::hybrid_taps_skipped)},
+                 {"taps_skipped_no_slot", delta(&RuntimeStats::hybrid_taps_skipped_no_slot)},
                  {"endpoints_created", delta(&RuntimeStats::hybrid_endpoints_created)},
+                 {"endpoints_skipped", delta(&RuntimeStats::hybrid_endpoints_skipped)},
+                 {"host_image_write_refusals",
+                  delta(&RuntimeStats::hybrid_host_image_write_refusals)},
+                 {"host_block_write_refusals",
+                  delta(&RuntimeStats::hybrid_host_block_write_refusals)},
+                 {"device_slot_evictions", delta(&RuntimeStats::hybrid_device_slot_evictions)},
+                 {"device_slot_refusals", delta(&RuntimeStats::hybrid_device_slot_refusals)},
+                 {"free_device_snapshot_slots", current.hybrid_free_device_snapshot_slots},
                  {"host_image_writes", delta(&RuntimeStats::hybrid_host_image_writes)},
                  {"host_block_writes", delta(&RuntimeStats::hybrid_host_block_writes)},
                  {"host_image_restores", delta(&RuntimeStats::hybrid_host_image_restores)},
@@ -834,6 +858,8 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
                  {"prefetched_blocks", delta(&RuntimeStats::hybrid_prefetched_blocks)},
                  {"host_write_bytes", delta(&RuntimeStats::hybrid_host_write_bytes)},
                  {"host_restore_bytes", delta(&RuntimeStats::hybrid_host_restore_bytes)},
+                 {"host_write_copies", delta(&RuntimeStats::hybrid_host_write_copies)},
+                 {"host_restore_copies", delta(&RuntimeStats::hybrid_host_restore_copies)},
                  {"evicted_blocks", delta(&RuntimeStats::hybrid_evicted_blocks)},
                  {"host_snapshot_evictions", delta(&RuntimeStats::hybrid_host_snapshot_evictions)},
                  {"host_dead_reclaims", delta(&RuntimeStats::hybrid_host_dead_reclaims)},
@@ -841,7 +867,8 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
                  {"held_snapshots", current.hybrid_held_snapshots},
                  {"held_device_evictions", delta(&RuntimeStats::hybrid_held_device_evictions)},
                  {"held_snapshot_losses", delta(&RuntimeStats::hybrid_held_snapshot_losses)},
-                 {"held_host_refusals", delta(&RuntimeStats::hybrid_held_host_refusals)}};
+                 {"held_host_refusals", delta(&RuntimeStats::hybrid_held_host_refusals)},
+                 {"tool_call_holds", delta(&RuntimeStats::hybrid_tool_call_holds)}};
     }
     return record.dump();
 }

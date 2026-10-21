@@ -29,9 +29,9 @@ infernix_add_test(infernix_perplexity_evaluation_test
 target_include_directories(infernix_perplexity_evaluation_test PRIVATE
   ${PROJECT_SOURCE_DIR}/apps/perplexity)
 
-infernix_add_test(infernix_cli_options_test
+infernix_add_test(infernix_cli_options_test NEEDS_SOURCE_DIR
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_cli_options.cpp" ${PROJECT_SOURCE_DIR}/apps/cli/options.cpp
-  LIBRARIES infernix_runtime_support infernix_product_logging)
+  LIBRARIES infernix_runtime_support infernix_product_config infernix_product_logging)
 
 target_include_directories(infernix_cli_options_test PRIVATE ${PROJECT_SOURCE_DIR}/apps/cli)
 
@@ -74,7 +74,7 @@ infernix_add_test(infernix_anthropic_schema_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_anthropic_schema.cpp"
   LIBRARIES infernix_serve)
 
-infernix_add_test(infernix_serve_options_test
+infernix_add_test(infernix_serve_options_test NEEDS_SOURCE_DIR
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_serve_options.cpp"
   LIBRARIES infernix_serve)
 

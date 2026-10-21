@@ -38,6 +38,7 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
                          {}, state.execution.state_images, state.execution.io,
                          state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
                          &state.text_cache);
+        card.set_execution_schedule(state.execution.execution_schedule);
 
         Tensor tokens             = ordinary.tokens.slice(0, 0, batch_size);
         Tensor cache_positions    = ordinary.cache_positions.slice(0, 0, batch_size);
@@ -99,6 +100,9 @@ void ProgramImpl::install_sampling(SequenceState& sequence, RequestControl& requ
         .enabled               = speculative_backend != SpeculativeBackend::None,
         .draft_window          = draft_window,
         .accepted_per_position = std::vector<std::uint64_t>(draft_window, 0),
+        .rounds_by_draft_length =
+            std::vector<std::uint64_t>(
+                speculative_backend == SpeculativeBackend::Mtp ? neural_draft_window : 0U, 0),
     };
     const bool penalties = request.sampling_host.presence_penalty != 0.0F ||
                            request.sampling_host.frequency_penalty != 0.0F;
@@ -240,7 +244,7 @@ void ProgramImpl::enqueue_dflash_context_append(std::span<const std::uint32_t> l
     execution::DFlashAppendContext state{{device, parameters, work, *state_images,
                                           replay_records ? &*replay_records : nullptr, io,
                                           prefill_hidden, prefill_chunk, proposal_head,
-                                          prompt_attention},
+                                          execution_schedule},
                                          *dflash};
     mark_workspace_usage(workspace_plan.dflash_context);
     execution::dflash_append_context(state, features, positions, device_counts,
@@ -327,7 +331,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_ordinary_batch(
         execution::OrdinaryBatchContext schedule_state{
             {device, parameters, work, *state_images,
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head, prompt_attention},
+             proposal_head, execution_schedule},
             decoder->text_kv,
             *io.ordinary,
             *ordinary_host_ingress,
@@ -503,13 +507,46 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
     }
     // As for DFlash, a round with at least one copy proposal verifies at the narrowest n-gram
     // window that holds its longest copy and an all-neural round at the MTP window, each on the
-    // frame viewed at that width. Every round proposes the next round's drafts at the configured
-    // MTP depth.
+    // frame viewed at that width. Without adaptive speculation the width is the configuration's:
+    // every round verifies at the n-gram window when n-gram drafting is configured, else at the MTP
+    // window, so a row's verification does not depend on the other rows' proposals. With
+    // adaptive-mtp (only where speculation is adaptive) an all-neural round runs the draft length
+    // the policy picks from the rows' learned acceptance (one common length for several rows). A
+    // neural round proposes the next round's drafts at its own length, a copy round at the
+    // configured MTP depth.
+    const bool fixed_width        = execution_schedule.fixed_speculation;
+    std::uint32_t neural_drafts   = neural_draft_window;
+    const bool policy_round = !fixed_width && execution_schedule.adaptive_mtp && mtp_draft_policy && !any_ngram;
+    if (mtp_draft_policy) {
+        // The previous policy round's start-to-start cycle at its length teaches the round cost.
+        const auto batch = static_cast<std::uint32_t>(lanes.size());
+        if (mtp_cost_round.drafts != 0 && mtp_cost_round.batch == batch) {
+            mtp_draft_policy->observe_cycle(mtp_cost_round.drafts, batch,
+                                            std::chrono::duration<double>(started - mtp_cost_round.start).count());
+        }
+        mtp_cost_round = {.start = started, .drafts = 0, .batch = batch};
+    }
+    if (policy_round) {
+        if (lanes.size() == 1) {
+            neural_drafts = mtp_draft_policy->choose(active_sequence(lanes.front()).mtp_draft);
+        } else {
+            std::array<const MtpAcceptanceEstimate*, kMaximumConcurrency> acceptance{};
+            for (std::size_t row = 0; row < lanes.size(); ++row) {
+                acceptance[row] = &active_sequence(lanes[row]).mtp_draft.acceptance;
+            }
+            neural_drafts = mtp_draft_policy->choose_batch(
+                std::span<const MtpAcceptanceEstimate* const>(acceptance.data(), lanes.size()));
+        }
+        mtp_cost_round.drafts = neural_drafts;
+    }
     SpeculativeRoundFamily& family =
-        any_ngram ? round_family(SpeculativeRoundKind::Ngram, longest_copy)
-                  : round_family(SpeculativeRoundKind::Neural, neural_draft_window);
+        fixed_width ? (ngram_draft_window != 0
+                           ? round_family(SpeculativeRoundKind::Ngram, ngram_draft_window)
+                           : round_family(SpeculativeRoundKind::Neural, neural_draft_window))
+        : any_ngram ? round_family(SpeculativeRoundKind::Ngram, longest_copy)
+                    : round_family(SpeculativeRoundKind::Neural, neural_drafts);
     const std::uint32_t verify_drafts = family.shape.verify_drafts;
-    const std::uint32_t mtp_ar_depth  = neural_draft_window;
+    const std::uint32_t mtp_ar_depth  = mtp_proposal_drafts(family.shape, neural_draft_window);
     const std::uint32_t width         = verify_drafts + 1;
     std::uint32_t maximum_frontier    = 0;
     for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -530,7 +567,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
             sequence.ledger_frontier != sequence.execution_frontier + 1 ||
             sequence.ledger.size() != sequence.ledger_frontier ||
             sequence.ledger_splits.size() != sequence.ledger_frontier ||
-            sequence.mtp_draft_count > mtp_ar_depth) {
+            sequence.mtp_draft_count > neural_draft_window) {
             throw std::logic_error("MTP batch row is not decode-ready");
         }
         maximum_frontier = std::max(maximum_frontier, sequence.execution_frontier);
@@ -604,7 +641,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
 
         execution::MtpBatchContext schedule_state{
             {device, parameters, work, *state_images, round_replay_records(verify_drafts),
-             io, prefill_hidden, prefill_chunk, proposal_head, prompt_attention},
+             io, prefill_hidden, prefill_chunk, proposal_head, execution_schedule},
             decoder->text_kv,
             *decoder->mtp_cache(),
             *io.mtp_decode,
@@ -671,6 +708,17 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
                 for (std::int32_t i = 0; i < accepted_i; ++i) {
                     request.speculative_stats.accepted_per_position[static_cast<std::size_t>(i)] +=
                         1;
+                }
+                std::vector<std::uint64_t>& by_length =
+                    request.speculative_stats.rounds_by_draft_length;
+                if (family.shape.kind == SpeculativeRoundKind::Neural &&
+                    verify_drafts <= by_length.size()) {
+                    by_length[verify_drafts - 1U] += 1;
+                }
+                // The row verified MTP drafts (its own, also in a copy round): learn from them.
+                if (mtp_draft_policy && matches[row].tokens.empty()) {
+                    sequence.mtp_draft.acceptance.observe(pcur,
+                                                          static_cast<std::uint32_t>(accepted_i));
                 }
             }
             if (!matches[row].tokens.empty()) {
@@ -779,8 +827,14 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
         constrained |= masks && masks->constrained(row);
     }
     const auto batch_rows    = static_cast<std::uint32_t>(lanes.size());
+    // Without adaptive speculation every round verifies the configuration's chain at a fixed width
+    // (the n-gram window when n-gram drafting is configured, else the drafter's), and the drafter
+    // runs for every row: no tree tables or controller, and nothing taken from the other rows.
+    const bool fixed_width   = execution_schedule.fixed_speculation;
     std::uint32_t tree_nodes = 0;
-    if (!any_ngram && !constrained && tree_controller) {
+    if (fixed_width) {
+        tree_nodes = 0;
+    } else if (!any_ngram && !constrained && tree_controller) {
         const std::uint32_t columns = tree_controller->choose(batch_rows, maximum_frontier);
         tree_nodes                  = columns == neural_draft_window + 1U ? 0U : columns;
     } else if (!any_ngram && !constrained) {
@@ -788,11 +842,14 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
     }
     const bool tree_round = tree_nodes != 0U;
     SpeculativeRoundFamily& family =
-        any_ngram    ? round_family(SpeculativeRoundKind::Ngram, longest_copy)
+        fixed_width  ? (ngram_draft_window != 0
+                            ? round_family(SpeculativeRoundKind::Ngram, ngram_draft_window)
+                            : round_family(SpeculativeRoundKind::Neural, neural_draft_window))
+        : any_ngram  ? round_family(SpeculativeRoundKind::Ngram, longest_copy)
         : tree_round ? round_family(SpeculativeRoundKind::Tree, tree_nodes - 1U)
                      : round_family(SpeculativeRoundKind::Neural, neural_draft_window);
     const std::uint32_t verify_drafts = family.shape.verify_drafts;
-    const bool drafter_runs           = !any_ngram || lanes.size() > 1;
+    const bool drafter_runs           = fixed_width || !any_ngram || lanes.size() > 1;
     const bool dflash2_backend        = speculative_backend == SpeculativeBackend::DFlash2;
     qwen3_5::DFlashDecodeState& frame = *io.dflash_decode;
     for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -905,7 +962,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
         execution::DFlashBatchContext schedule_state{
             {device, parameters, work, *state_images,
              round_replay_records(verify_drafts), io, prefill_hidden, prefill_chunk,
-             proposal_head, prompt_attention},
+             proposal_head, execution_schedule},
             decoder->text_kv,
             *dflash,
             frame,

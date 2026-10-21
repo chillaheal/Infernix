@@ -29,6 +29,13 @@ infernix_add_test(infernix_qwen4_exp_forward_real_test
   LIBRARIES infernix_model_runtime)
 set_tests_properties(infernix_qwen4_exp_forward_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
 
+# Causal scoring through the Engine against the Forward's teacher-forced logits (a --dump-logits
+# reference of the same ids). Skips without INFERNIX_QWEN4_ARTIFACT and its arguments.
+infernix_add_test(infernix_qwen4_exp_score_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_score_real.cpp"
+  LIBRARIES infernix_engine)
+set_tests_properties(infernix_qwen4_exp_score_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
+
 # The SSD tier's in-place records on the real artifact (memory track R6, RT3/RT4): streamed records
 # read through DirectReadQueue equal the pinned load's bytes. Skips without INFERNIX_QWEN4_ARTIFACT.
 infernix_add_test(infernix_qwen4_exp_expert_store_real_test
@@ -165,7 +172,30 @@ infernix_add_test(infernix_qwen4_exp_preemption_real_test
   LIBRARIES infernix_engine)
 set_tests_properties(infernix_qwen4_exp_preemption_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
 
+# Sampled MTP drafts keep the sampler's output distribution and greedy tokens (sampled-mtp-drafts).
+infernix_add_test(infernix_qwen4_exp_sampled_drafts_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_sampled_drafts_real.cpp"
+  LIBRARIES infernix_engine)
+set_tests_properties(infernix_qwen4_exp_sampled_drafts_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
+
+# The DFlash2 draft-length policy (--draft-tokens auto): the calibrated length and its calibration.
+infernix_add_test(infernix_qwen4_exp_draft_length_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_draft_length.cpp"
+  LIBRARIES infernix_engine)
+
+# A DFlash2 companion drafter (--draft-model): greedy tokens, concurrency, the ring through a prefix
+# resume and the sampler's output distribution.
+infernix_add_test(infernix_qwen4_exp_dflash2_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_dflash2_real.cpp"
+  LIBRARIES infernix_engine)
+set_tests_properties(infernix_qwen4_exp_dflash2_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
+
 infernix_add_test(infernix_qwen4_exp_decide_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_decide_real.cpp"
   LIBRARIES infernix_engine)
 set_tests_properties(infernix_qwen4_exp_decide_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
+
+# Fast-path selection rules: where each path applies and which configurations qualify it.
+infernix_add_test(infernix_qwen4_exp_fast_paths_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_fast_paths.cpp"
+  LIBRARIES infernix_model_runtime)

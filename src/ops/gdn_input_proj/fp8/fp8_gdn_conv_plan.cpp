@@ -21,6 +21,11 @@ enum class Fp8GdnConvScheduleId : std::uint8_t {
     FusedA16,
     MaterializedA16,
     MaterializedA8,
+    // A16ColumnInvariant: the column-invariant projection into the BF16 plane at every B and W,
+    // then the per-column convolution, so a row's result does not depend on the other rows.
+    MaterializedInvariantA16,
+    // AllowA8Residual: the two-plane A8 projection, then the generic convolution.
+    MaterializedA8Residual,
 };
 
 struct Fp8GdnConvPlan {
@@ -55,11 +60,18 @@ std::size_t snapshot_capacity(Fp8GdnConvPlan maximum_plan, std::int32_t material
     if (maximum_plan.schedule == Fp8GdnConvScheduleId::MaterializedA8) {
         (void)allocate_fp8_a8_workspace(layout, maximum_columns, Fp8N16384K5120::kInputRows,
                                         fp8_gdn_input_partial_capacity_bytes(maximum_columns));
+    } else if (maximum_plan.schedule == Fp8GdnConvScheduleId::MaterializedA8Residual) {
+        (void)allocate_fp8_a8_workspace(layout, maximum_columns, Fp8N16384K5120::kInputRows, 0,
+                                        true);
     }
     return layout.peak_bytes(1);
 }
 
 std::size_t record_capacity(Fp8GdnConvPlan plan, std::int32_t aggregate_columns) {
+    if (plan.schedule == Fp8GdnConvScheduleId::MaterializedA8Residual) {
+        return fp8_a8_workspace_capacity_bytes(aggregate_columns, Fp8N16384K5120::kInputRows, 0,
+                                               true);
+    }
     if (plan.schedule != Fp8GdnConvScheduleId::MaterializedA8) { return 0; }
     return fp8_a8_workspace_capacity_bytes(aggregate_columns, Fp8N16384K5120::kInputRows,
                                            fp8_gdn_input_partial_capacity_bytes(aggregate_columns));
@@ -72,8 +84,16 @@ void launch_projection(const Tensor& x, const Weight& weight, Tensor& projected,
         fp8_gdn_input_a16_dispatch(x, weight, projected, z, stream);
         return;
     }
+    if (schedule == Fp8GdnConvScheduleId::MaterializedInvariantA16) {
+        fp8_gdn_input_invariant_launch(x, weight, projected, z, stream);
+        return;
+    }
     if (schedule == Fp8GdnConvScheduleId::MaterializedA8) {
         fp8_gdn_input_a8_dispatch(x, weight, projected, z, workspace, stream);
+        return;
+    }
+    if (schedule == Fp8GdnConvScheduleId::MaterializedA8Residual) {
+        fp8_gdn_input_a8_residual_dispatch(x, weight, projected, z, workspace, stream);
         return;
     }
     throw std::logic_error("fp8 GDN materialized projection received a fused plan");
@@ -82,6 +102,10 @@ void launch_projection(const Tensor& x, const Weight& weight, Tensor& projected,
 // Record and snapshot choose the same arithmetic for the same physical block.
 Fp8GdnConvPlan fp8_gdn_conv_resolve_plan(LinearPolicy policy, std::int32_t width,
                                          std::int32_t batch_size) {
+    if (column_invariant(policy)) { return {Fp8GdnConvScheduleId::MaterializedInvariantA16}; }
+    if (allows_a8_residual(policy) && width * batch_size >= 17) {
+        return {Fp8GdnConvScheduleId::MaterializedA8Residual};
+    }
     if (batch_size == 1) {
         if (allows_a8(policy) && width >= 17) { return {Fp8GdnConvScheduleId::MaterializedA8}; }
         return b1_a16_plan(width);
@@ -120,7 +144,8 @@ std::size_t fp8_gdn_snapshot_workspace_capacity_bytes(LinearPolicy policy, std::
     }
     (void)fp8_gdn_snapshot_resolve_plan(policy, min_width, batch_size);
     const Fp8GdnConvPlan maximum = fp8_gdn_snapshot_resolve_plan(policy, max_width, batch_size);
-    const std::int32_t largest_materialized_width = batch_size > 1 || max_width > 3 ? max_width : 0;
+    const std::int32_t largest_materialized_width =
+        column_invariant(policy) || batch_size > 1 || max_width > 3 ? max_width : 0;
     return snapshot_capacity(maximum, batch_size * largest_materialized_width,
                              batch_size * max_width);
 }

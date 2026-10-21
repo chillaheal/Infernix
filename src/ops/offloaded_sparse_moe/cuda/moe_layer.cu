@@ -15,6 +15,11 @@
 #include "core/pdl.cuh"
 
 #include "ops/common/canonical_math.h"
+#include "ops/ggml/ggml_dp4a.cuh"
+#include "ops/ggml/ggml_exact.h"
+#include "ops/ggml/ggml_bf16_tile.cuh"
+#include "ops/ggml/ggml_tile.cuh"
+#include "ops/fp8_block/fp8_exact.h"
 #include "ops/offloaded_sparse_moe/cuda/wide_expert.h"
 
 #include <cuda_bf16.h>
@@ -79,6 +84,21 @@ __device__ __forceinline__ void stage_async(const std::uint8_t* src, std::uint8_
 
 __device__ __forceinline__ void stage_wait() { asm volatile("cp.async.wait_group 0;\n" ::: "memory"); }
 
+// The pitch of frames, staging slots and landings (MoeExpertSource::frame_stride; prefetch slots
+// take prefetch_stride when it is set).
+__host__ __device__ __forceinline__ std::uint64_t frame_pitch(const MoeExpertSource& source) {
+    return source.frame_stride != 0 ? source.frame_stride : source.record_stride;
+}
+
+// Bytes a stage copies: a ggml bank's record, else the NVFP4 record.
+__device__ __forceinline__ int record_copy_bytes(const MoeExpertSource& source) {
+    return source.ggml.record_bytes != 0 ? static_cast<int>(source.ggml.record_bytes) : static_cast<int>(moe::kRecordBytes);
+}
+
+__host__ __device__ __forceinline__ bool ggml_bank(const MoeExpertSource& source) {
+    return source.ggml.gate_up_format != QType::NVFP4_MUL;
+}
+
 // A non-resident expert's host record (MoeExpertSource::host_table, else the pinned bank).
 __device__ __forceinline__ const std::uint8_t* host_record(const MoeExpertSource& source, int expert) {
     return source.host_table != nullptr ? source.host_table[expert]
@@ -103,7 +123,7 @@ __device__ __forceinline__ const std::uint8_t* pass_record(PassPhase phase, cons
     if (phase == PassPhase::All) { return job_records[job]; }
     const bool resident = source.frames[expert] >= 0;
     if (resident != (phase == PassPhase::Resident)) { return nullptr; }
-    return resident ? source.frame_base + static_cast<std::uint64_t>(source.frames[expert]) * source.record_stride
+    return resident ? source.frame_base + static_cast<std::uint64_t>(source.frames[expert]) * frame_pitch(source)
                     : job_records[job];
 }
 
@@ -151,7 +171,7 @@ __device__ __forceinline__ int fetch_index(const FetchCall* call, int job) {
 
 // One poll of the host's answer by the CTA holding the poller token: mirrors `landed` into the
 // device word the other CTAs read in L2 (keeping PCIe reads to one poller), and fails the request
-// on a host status or when the heartbeat has not changed for kHeartbeatTimeoutNs.
+// on a host status or when the heartbeat has not changed for source.heartbeat_timeout_ns.
 __device__ void poll_fetch(const MoeExpertSource& source, FetchCall* call) {
     volatile FetchCall* v = call;
     const auto* response  = reinterpret_cast<const volatile offloaded_moe::FetchResponse*>(source.fetch.response);
@@ -174,8 +194,8 @@ __device__ void poll_fetch(const MoeExpertSource& source, FetchCall* call) {
     if (beat != v->beat) {
         v->beat    = beat;
         v->beat_ns = now;
-    } else if (now - v->beat_ns > offloaded_moe::kHeartbeatTimeoutNs) {
-        report_error(source, offloaded_moe::kErrorHostSilent);
+    } else if (now - v->beat_ns > source.heartbeat_timeout_ns) {
+        report_error(source, offloaded_moe::kErrorFetchSilent);
         v->failed = 1;
     }
 }
@@ -307,6 +327,7 @@ __global__ void __launch_bounds__(kThreads)
     __shared__ int warp_misses[kWarps];
     __shared__ int landed_before[offloaded_moe::kMaxLandingSlots + 1]; // landing frames among slots [0, n)
     __shared__ int misses;
+    pdl::enter(); // a programmatic dependent of the plan on the call's own stream
     const int jobs = min(*dispatch.job_count - job_base, pass_jobs);
     if (jobs <= 0) { return; }
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
@@ -328,9 +349,10 @@ __global__ void __launch_bounds__(kThreads)
             const int frame = source.frames[expert];
             const int slot  = source.prefetched != nullptr ? source.prefetched[expert] : -1;
             if (frame >= 0) {
-                record = source.frame_base + static_cast<std::uint64_t>(frame) * source.record_stride;
+                record = source.frame_base + static_cast<std::uint64_t>(frame) * frame_pitch(source);
             } else if (slot >= 0) { // streamed by the caller (F2)
-                record = source.prefetch_base + static_cast<std::uint64_t>(slot) * source.record_stride;
+                record = source.prefetch_base + static_cast<std::uint64_t>(slot) *
+                                                    (source.prefetch_stride != 0 ? source.prefetch_stride : frame_pitch(source));
             } else if (source.staging_slots > 0) {
                 miss = true;
             } else {
@@ -349,11 +371,11 @@ __global__ void __launch_bounds__(kThreads)
             if (n < landing_slots && source.landing[n] >= 0) {
                 // The frames are the caller's writable pool; frame_base is const for the read routes.
                 destination = const_cast<std::uint8_t*>(source.frame_base) +
-                              static_cast<std::uint64_t>(source.landing[n]) * source.record_stride;
+                              static_cast<std::uint64_t>(source.landing[n]) * frame_pitch(source);
                 if (blockIdx.x == 0) { source.landed[n] = expert; }
             } else {
                 const int slot = n - landed_before[min(n, landing_slots)];
-                destination    = source.staging_base + static_cast<std::uint64_t>(slot) * source.record_stride;
+                destination    = source.staging_base + static_cast<std::uint64_t>(slot) * frame_pitch(source);
             }
             miss_jobs[n] = job_base + j;
             miss_dst[n]  = destination;
@@ -366,7 +388,8 @@ __global__ void __launch_bounds__(kThreads)
         }
         __syncthreads();
     }
-    constexpr int kChunks = (static_cast<int>(moe::kRecordBytes) + kStageChunk - 1) / kStageChunk;
+    const int record_bytes = record_copy_bytes(source);
+    const int kChunks      = (record_bytes + kStageChunk - 1) / kStageChunk;
     constexpr int kVec    = kStageChunk / 16;
     const int total       = misses * kChunks;
     // Tier records live in host slots the host rewrites (RAM slots, the fetch ring): .cv loads
@@ -375,7 +398,7 @@ __global__ void __launch_bounds__(kThreads)
     __shared__ const std::uint8_t* fetched;
     for (int c = blockIdx.x; c < total; c += gridDim.x) {
         const int m = c / kChunks, offset = (c % kChunks) * kStageChunk;
-        const int bytes = min(kStageChunk, static_cast<int>(moe::kRecordBytes) - offset);
+        const int bytes = min(kStageChunk, record_bytes - offset);
         const int expert = dispatch.jobs[miss_jobs[m]];
         const int f      = fetch_index(fetch, miss_jobs[m]);
         const std::uint8_t* record;
@@ -421,18 +444,16 @@ __global__ void __launch_bounds__(kThreads)
 
 // -------------------------------------------------------------------------------------- routing
 
-// One warp per column: exact top-k by repeated arg-max with lower-id ties, then the weights.
-// Every array index is a compile-time constant (unrolled loops guarded by top_k), so the values,
-// the selection and the weights stay in registers; the selection and softmax order are fixed.
-__global__ void route_kernel(const float* __restrict__ logits, int experts, int columns, int top_k,
-                             std::int32_t* __restrict__ ids, float* __restrict__ weights,
-                             float* __restrict__ shared_gate) {
-    const int warp = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
-    const int lane = threadIdx.x % 32;
-    if (warp >= columns) { return; }
-    const float* column = logits + static_cast<std::size_t>(warp) * (experts + 1);
+// One warp routes column t: exact top-k by repeated arg-max with lower-id ties, then the weights.
+// Every array index is a compile-time constant (unrolled loops), so the values stay in registers;
+// the selection and softmax order are fixed. Lane k < top_k returns the k-th selected id.
+__device__ __forceinline__ int route_column(const float* __restrict__ logits, int experts, int top_k, int t,
+                                            std::int32_t* __restrict__ ids, float* __restrict__ weights,
+                                            float* __restrict__ shared_gate) {
+    const int lane      = threadIdx.x % 32;
+    const float* column = logits + static_cast<std::size_t>(t) * (experts + 1);
     // 512 experts: 16 per lane.
-    constexpr int kPerLane = 16, kMaxTopK = 16;
+    constexpr int kPerLane = 16;
     float values[kPerLane];
 #pragma unroll
     for (int i = 0; i < kPerLane; ++i) {
@@ -440,11 +461,10 @@ __global__ void route_kernel(const float* __restrict__ logits, int experts, int 
         values[i]   = e < experts ? column[e] : -INFINITY;
     }
     const float score = lane == 0 ? column[experts] : 0.0F;
-    float selected[kMaxTopK];
-    int chosen[kMaxTopK];
-#pragma unroll
-    for (int k = 0; k < kMaxTopK; ++k) {
-        if (k >= top_k) { break; }
+    // Lane k keeps the k-th selection.
+    float selected = -INFINITY;
+    int chosen     = 0;
+    for (int k = 0; k < top_k; ++k) {
         float best   = -INFINITY;
         int best_id  = 0x7FFFFFFF;
 #pragma unroll
@@ -463,31 +483,34 @@ __global__ void route_kernel(const float* __restrict__ logits, int experts, int 
                 best_id = other_id;
             }
         }
-        selected[k] = best;
-        chosen[k]   = best_id;
+        if (lane == k) {
+            selected = best;
+            chosen   = best_id;
+        }
 #pragma unroll
         for (int i = 0; i < kPerLane; ++i) {
             if (lane + 32 * i == best_id) { values[i] = -INFINITY; }
         }
     }
-    if (lane == 0) {
-        // softmax over all experts then renormalized over the selected ones equals the softmax of
-        // the selected logits.
-        const float top = selected[0];
-        float sum       = 0.0F;
-#pragma unroll
-        for (int k = 0; k < kMaxTopK; ++k) {
-            if (k < top_k) { sum += expf(selected[k] - top); }
-        }
-#pragma unroll
-        for (int k = 0; k < kMaxTopK; ++k) {
-            if (k < top_k) {
-                ids[static_cast<std::size_t>(warp) * top_k + k]     = chosen[k];
-                weights[static_cast<std::size_t>(warp) * top_k + k] = expf(selected[k] - top) / sum;
-            }
-        }
-        shared_gate[warp] = 1.0F / (1.0F + expf(-score));
+    // softmax over all experts then renormalized over the selected ones equals the softmax of the
+    // selected logits. Every lane sums them in selection order.
+    const float top = __shfl_sync(0xFFFFFFFFU, selected, 0);
+    float sum       = 0.0F;
+    for (int k = 0; k < top_k; ++k) { sum += expf(__shfl_sync(0xFFFFFFFFU, selected, k) - top); }
+    if (lane < top_k) {
+        ids[static_cast<std::size_t>(t) * top_k + lane]     = chosen;
+        weights[static_cast<std::size_t>(t) * top_k + lane] = expf(selected - top) / sum;
     }
+    if (lane == 0) { shared_gate[t] = 1.0F / (1.0F + expf(-score)); }
+    return chosen;
+}
+
+__global__ void route_kernel(const float* __restrict__ logits, int experts, int columns, int top_k,
+                             std::int32_t* __restrict__ ids, float* __restrict__ weights,
+                             float* __restrict__ shared_gate) {
+    pdl::enter(); // launched as a programmatic dependent of the router projection
+    const int warp = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    if (warp < columns) { route_column(logits, experts, top_k, warp, ids, weights, shared_gate); }
 }
 
 // ------------------------------------------------------------------------------------- dispatch
@@ -556,16 +579,13 @@ __device__ __forceinline__ void dispatch_scan(int c, int experts, std::int32_t* 
 // shared atomics (so no array needs clearing between calls and no memset node precedes it), the
 // scan, the scatter, and the optional route-log copy of the ids. Same results as the three-kernel
 // route below.
-__global__ void __launch_bounds__(kDispatchThreads)
-    dispatch_small_kernel(const std::int32_t* __restrict__ ids, int entries, int experts, MoeDispatch dispatch,
-                          std::int32_t* __restrict__ route_log) {
-    __shared__ std::int32_t count[kDispatchThreads];
-    __shared__ std::int32_t cursor[kDispatchThreads];
-    __shared__ std::int32_t warp_totals[2][kDispatchThreads / 32];
+// The caller has cleared `count` and synchronized; thread i < entries holds entry i's expert `id`.
+__device__ __forceinline__ void dispatch_small(int id, int entries, int experts, const MoeDispatch& dispatch,
+                                               std::int32_t* __restrict__ route_log,
+                                               std::int32_t (&count)[kDispatchThreads],
+                                               std::int32_t (&cursor)[kDispatchThreads],
+                                               std::int32_t (&warp_totals)[2][kDispatchThreads / 32]) {
     const int i = threadIdx.x;
-    count[i]    = 0;
-    __syncthreads();
-    const int id = i < entries ? ids[i] : 0;
     if (i < entries) {
         atomicAdd(&count[id], 1);
         if (route_log != nullptr) { route_log[i] = id; }
@@ -576,6 +596,45 @@ __global__ void __launch_bounds__(kDispatchThreads)
     dispatch_scan(c, experts, dispatch.offsets, cursor, dispatch.jobs, dispatch.job_count, warp_totals);
     __syncthreads();
     if (i < entries) { dispatch.entries[atomicAdd(&cursor[id], 1)] = i; }
+}
+
+__global__ void __launch_bounds__(kDispatchThreads)
+    dispatch_small_kernel(const std::int32_t* __restrict__ ids, int entries, int experts, MoeDispatch dispatch,
+                          std::int32_t* __restrict__ route_log) {
+    __shared__ std::int32_t count[kDispatchThreads];
+    __shared__ std::int32_t cursor[kDispatchThreads];
+    __shared__ std::int32_t warp_totals[2][kDispatchThreads / 32];
+    pdl::enter(); // launched as a programmatic dependent of the route
+    const int i = threadIdx.x;
+    count[i]    = 0;
+    __syncthreads();
+    dispatch_small(i < entries ? ids[i] : 0, entries, experts, dispatch, route_log, count, cursor, warp_totals);
+}
+
+// Calls of at most this many columns (and kDispatchThreads entries) route and dispatch in one CTA,
+// one warp per column: the dispatch reads the ids from shared memory, with no kernel boundary
+// between the two. Same results as route_kernel followed by dispatch_small_kernel.
+constexpr int kRouteDispatchColumns = kDispatchThreads / 32;
+
+__global__ void __launch_bounds__(kDispatchThreads)
+    route_dispatch_kernel(const float* __restrict__ logits, int experts, int columns, int top_k,
+                          std::int32_t* __restrict__ ids, float* __restrict__ weights,
+                          float* __restrict__ shared_gate, MoeDispatch dispatch,
+                          std::int32_t* __restrict__ route_log) {
+    __shared__ std::int32_t count[kDispatchThreads];
+    __shared__ std::int32_t cursor[kDispatchThreads];
+    __shared__ std::int32_t routed[kDispatchThreads];
+    __shared__ std::int32_t warp_totals[2][kDispatchThreads / 32];
+    pdl::enter(); // launched as a programmatic dependent of the router projection
+    const int i = threadIdx.x, warp = i / 32, lane = i % 32;
+    count[i]    = 0;
+    if (warp < columns) {
+        const int id = route_column(logits, experts, top_k, warp, ids, weights, shared_gate);
+        if (lane < top_k) { routed[warp * top_k + lane] = id; }
+    }
+    __syncthreads();
+    const int entries = columns * top_k;
+    dispatch_small(i < entries ? routed[i] : 0, entries, experts, dispatch, route_log, count, cursor, warp_totals);
 }
 
 __global__ void count_kernel(const std::int32_t* __restrict__ ids, int entries,
@@ -1194,13 +1253,29 @@ void launch_expert_pass_a16(const bf16* x, const MoeDispatch& dispatch, const Mo
                                     phase));
 }
 
+#include "ops/offloaded_sparse_moe/cuda/ggml_expert.cuh"
+#include "ops/offloaded_sparse_moe/cuda/fp8_expert.cuh"
+
 // One pass of the narrow kernels in the source's arithmetic, for a call of `columns` columns. W4A4
 // jobs of any width take the one-column kernels (one pass per column over the staged weights); W4A16
-// jobs take them in calls of at most kA16OneColumnCalls columns, else the multi-column kernels.
+// jobs take them in calls of at most kA16OneColumnCalls columns, else the multi-column kernels. A GGUF
+// import's or block-FP8 bank runs its own exact kernels.
 void launch_pass(int columns, const bf16* x, const MoeDispatch& dispatch, const MoeExpertSource& source, int top_k,
                  const std::uint8_t* const* job_records, const std::int32_t* flags, int base, int jobs,
                  const moe::wide::ExpertsWorkspace& layout, int columns_out, bf16* outputs, cudaStream_t stream,
                  PassPhase phase = PassPhase::All) {
+    // Wide calls (more than kMaxColumns columns) were planned by moe_experts.
+    const bool wide = columns_out / top_k > moe::kMaxColumns;
+    if (source.ggml.gate_up_format == QType::FP8_E4M3FN_B128) {
+        launch_expert_pass_fp8(dispatch, source, top_k, job_records, flags, base, jobs, layout, outputs, stream, phase,
+                               wide ? columns_out : 0);
+        return;
+    }
+    if (ggml_bank(source)) {
+        launch_pass_ggml(x, dispatch, source, top_k, job_records, flags, base, jobs, layout, outputs, stream, phase,
+                         wide ? columns_out : 0);
+        return;
+    }
     if (source.activation == moe::ExpertActivation::kA16) {
         auto* h_plane = reinterpret_cast<std::uint16_t*>(layout.h_rows);
         if (columns <= kA16OneColumnCalls) {
@@ -1222,16 +1297,29 @@ void launch_pass(int columns, const bf16* x, const MoeDispatch& dispatch, const 
 // reads of several jobs are in flight at once.
 constexpr int kWaitCtas = offloaded_moe::kMaxCpuJobs < 8 ? offloaded_moe::kMaxCpuJobs : 8;
 
-// One CTA picks the CPU jobs: of the call's M misses, want = min(cap, M - M / pcie_divisor) of
+// One CTA picks the CPU jobs: of the call's M misses, want = min(cap, M - M / d) of
 // those with at most max_job_columns columns, the fewest-column ones first and, within a width, in
 // job order; cap is max_jobs, or wide_jobs for calls of at least wide_from columns (prefill
-// assist). Each thread ranks its jobs among their width with warp ballots, so no thread walks the
+// assist); d is pcie_divisor, or one_column_divisor (when set) in a one-column call (none for d = 0).
+// Each thread ranks its jobs among their width with warp ballots, so no thread walks the
 // job list. The chosen jobs are marked in cpu_flags and listed in that order in call->job and the
 // request. The x columns they read are published compacted, in column order (the request names
 // them by compact index), then the request's sequence after a system-scope fence.
-__global__ void __launch_bounds__(kThreads)
-    cpu_plan_kernel(MoeDispatch dispatch, MoeExpertSource source, const bf16* __restrict__ x, int columns,
-                    int top_k, int max_jobs, std::int32_t* __restrict__ cpu_flags, CpuCall* __restrict__ call) {
+// The CPU plan of one call by the threads [0, kThreads) of a CTA: the plan kernel's whole CTA, or
+// (Named) the first kThreads threads of the fused route kernel, which synchronize on a named barrier.
+template <bool Named>
+__device__ __forceinline__ void plan_barrier() {
+    if constexpr (Named) {
+        asm volatile("bar.sync 1, %0;" ::"n"(kThreads) : "memory");
+    } else {
+        __syncthreads();
+    }
+}
+
+template <bool Named>
+__device__ __forceinline__ void cpu_plan_body(const MoeDispatch& dispatch, const MoeExpertSource& source,
+                                              const bf16* __restrict__ x, int columns, int top_k, int max_jobs,
+                                              std::int32_t* __restrict__ cpu_flags, CpuCall* __restrict__ call) {
     constexpr int kWidths    = offloaded_moe::kMaxCpuColumns;
     // A miss's category: its width w for an SSD-only expert (no host record, MoeExpertSource::
     // host_table), kWidths + w for one in host memory. SSD-only experts are chosen first (only the
@@ -1252,28 +1340,40 @@ __global__ void __launch_bounds__(kThreads)
     const int max_width = channel.max_job_columns;
     const int cap = channel.wide_from > 0 && columns >= channel.wide_from ? channel.wide_jobs : channel.max_jobs;
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
-    for (int j = threadIdx.x; j < max_jobs; j += blockDim.x) { cpu_flags[j] = 0; }
+    for (int j = threadIdx.x; j < max_jobs; j += kThreads) { cpu_flags[j] = 0; }
     if (threadIdx.x <= kCats) {
         width_misses[threadIdx.x] = 0;
         carry[threadIdx.x]        = 0;
     }
     if (threadIdx.x < kMaskWords) { used[threadIdx.x] = 0; }
     if (threadIdx.x == 0) { misses = 0; }
-    __syncthreads();
+    plan_barrier<Named>();
     // M counts every host-memory miss; only misses of at most max_width columns can be chosen.
     int own = 0;
-    for (int j = threadIdx.x; j < jobs; j += blockDim.x) {
+    for (int j = threadIdx.x; j < jobs; j += kThreads) {
         const int expert = dispatch.jobs[j];
         // A streamed record counts as resident: neither staged nor CPU-served.
         if (source.frames[expert] >= 0 || (source.prefetched != nullptr && source.prefetched[expert] >= 0)) { continue; }
+        const int count = dispatch.offsets[expert + 1] - dispatch.offsets[expert];
+        // Tail skip (MoeExpertSource::tail_skip_rank): a miss every column routes at slot >= R only is
+        // flagged 2, which every route passes over like a CPU job, and is not counted as a miss. Experts
+        // of more than kMaxColumns columns are kept (the wide route does not read the flags).
+        if (source.tail_skip_rank > 0 && count <= moe::kMaxColumns) {
+            const int first = dispatch.offsets[expert];
+            bool tail       = true;
+            for (int c = 0; c < count && tail; ++c) { tail = dispatch.entries[first + c] % top_k >= source.tail_skip_rank; }
+            if (tail) {
+                cpu_flags[j] = 2;
+                continue;
+            }
+        }
         const bool ssd  = source.host_table != nullptr && source.host_table[expert] == nullptr;
         own += ssd ? 0 : 1;
-        const int count = dispatch.offsets[expert + 1] - dispatch.offsets[expert];
         if (count <= max_width) { atomicAdd(&width_misses[(ssd ? 0 : kWidths) + count], 1); }
     }
     own = __reduce_add_sync(0xFFFFFFFFU, own);
     if (lane == 0) { atomicAdd(&misses, own); }
-    __syncthreads();
+    plan_barrier<Named>();
     if (threadIdx.x == 0) {
         int n = 0;
         for (int w = 1; w <= kWidths; ++w) { // SSD-only, up to the cap
@@ -1281,7 +1381,10 @@ __global__ void __launch_bounds__(kThreads)
             take[w]       = min(width_misses[w], cap - n);
             n += take[w];
         }
-        const int want = min(cap - n, channel.pcie_divisor > 0 ? misses - misses / channel.pcie_divisor : misses);
+        const int one     = channel.one_column_divisor_device != nullptr && columns == 1 ? *channel.one_column_divisor_device
+                                                                                         : channel.one_column_divisor;
+        const int divisor = columns == 1 && one > 0 ? one : channel.pcie_divisor;
+        const int want    = min(cap - n, divisor > 0 ? misses - misses / divisor : misses);
         int m = 0;
         for (int w = 1; w <= kWidths; ++w) {
             first_slot[kWidths + w] = n + m;
@@ -1291,19 +1394,20 @@ __global__ void __launch_bounds__(kThreads)
         chosen     = n + m;
         call->jobs = n + m;
     }
-    __syncthreads();
+    plan_barrier<Named>();
     if (chosen == 0) {
         if (threadIdx.x == 0) { call->pending = 0; }
         return;
     }
     // Rank r of a width-w miss: earlier width-w misses in job order (earlier chunks, earlier warps,
     // lower lanes); it is chosen when r < take[w] and goes to slot first_slot[w] + r.
-    for (int base = 0; base < jobs; base += blockDim.x) {
+    for (int base = 0; base < jobs; base += kThreads) {
         const int j = base + threadIdx.x;
         int width = 0, cat = 0, expert = -1, first = 0;
         if (j < jobs) {
             expert = dispatch.jobs[j];
-            if (source.frames[expert] < 0 && (source.prefetched == nullptr || source.prefetched[expert] < 0)) {
+            if (source.frames[expert] < 0 && (source.prefetched == nullptr || source.prefetched[expert] < 0) &&
+                cpu_flags[j] != 2) { // a skipped tail expert is not a miss to serve
                 first           = dispatch.offsets[expert];
                 const int count = dispatch.offsets[expert + 1] - first;
                 width           = count <= max_width ? count : 0;
@@ -1318,7 +1422,7 @@ __global__ void __launch_bounds__(kThreads)
             if (lane == 0) { warp_misses[warp][c] = __popc(ballot); }
             if (cat == c) { rank = __popc(ballot & ((1U << lane) - 1U)); }
         }
-        __syncthreads();
+        plan_barrier<Named>();
         if (cat > 0) {
             rank += carry[cat];
             for (int v = 0; v < warp; ++v) { rank += warp_misses[v][cat]; }
@@ -1337,11 +1441,11 @@ __global__ void __launch_bounds__(kThreads)
                 }
             }
         }
-        __syncthreads();
+        plan_barrier<Named>();
         if (threadIdx.x >= 1 && threadIdx.x <= kCats) {
             for (int v = 0; v < kWarps; ++v) { carry[threadIdx.x] += warp_misses[v][threadIdx.x]; }
         }
-        __syncthreads();
+        plan_barrier<Named>();
     }
     if (threadIdx.x == 0) {
         int k = 0;
@@ -1356,9 +1460,9 @@ __global__ void __launch_bounds__(kThreads)
         channel.request->jobs   = chosen;
         channel.request->tiered = source.host_table != nullptr ? 1 : 0;
     }
-    __syncthreads();
+    plan_barrier<Named>();
     // Each chosen job's columns by compact index.
-    for (int i = threadIdx.x; i < chosen * offloaded_moe::kMaxCpuColumns; i += blockDim.x) {
+    for (int i = threadIdx.x; i < chosen * offloaded_moe::kMaxCpuColumns; i += kThreads) {
         const int slot = i / offloaded_moe::kMaxCpuColumns, c = i % offloaded_moe::kMaxCpuColumns;
         if (c < channel.request->ncols[slot]) {
             channel.request->column[slot][c] = compact[dispatch.entries[slot_first[slot] + c] / top_k];
@@ -1368,12 +1472,12 @@ __global__ void __launch_bounds__(kThreads)
     constexpr int kVectors = moe::kHidden * 2 / 16;
     const auto* src        = reinterpret_cast<const int4*>(x);
     auto* dst              = reinterpret_cast<int4*>(channel.x);
-    for (int i = threadIdx.x; i < publish_count * kVectors; i += blockDim.x) {
+    for (int i = threadIdx.x; i < publish_count * kVectors; i += kThreads) {
         const int k = i / kVectors, v = i % kVectors;
         dst[static_cast<std::size_t>(k) * kVectors + v] = src[static_cast<std::size_t>(published[k]) * kVectors + v];
     }
     __threadfence_system();
-    __syncthreads();
+    plan_barrier<Named>();
     if (threadIdx.x == 0) {
         // 0 means "nothing published" to the wait (CpuCall::pending): skip it when the counter wraps.
         std::uint32_t sequence = atomicAdd(channel.sequence, 1U) + 1U;
@@ -1382,6 +1486,43 @@ __global__ void __launch_bounds__(kThreads)
         __threadfence_system();
         call->pending = static_cast<std::int32_t>(sequence);
     }
+}
+
+__global__ void __launch_bounds__(kThreads)
+    cpu_plan_kernel(MoeDispatch dispatch, MoeExpertSource source, const bf16* __restrict__ x, int columns,
+                    int top_k, int max_jobs, std::int32_t* __restrict__ cpu_flags, CpuCall* __restrict__ call) {
+    pdl::enter(); // launched as a programmatic dependent of the dispatch
+    cpu_plan_body<false>(dispatch, source, x, columns, top_k, max_jobs, cpu_flags, call);
+}
+
+// route_dispatch_kernel followed by the CPU plan in the same CTA: after a barrier of the whole CTA
+// makes the dispatch visible, its first kThreads threads plan as cpu_plan_kernel does (the same
+// results) and the rest exit, so the plan, and the host's start, follow the dispatch with no kernel
+// boundary.
+__global__ void __launch_bounds__(kDispatchThreads)
+    route_dispatch_plan_kernel(const float* __restrict__ logits, int experts, int columns, int top_k,
+                               std::int32_t* __restrict__ ids, float* __restrict__ weights,
+                               float* __restrict__ shared_gate, MoeDispatch dispatch,
+                               std::int32_t* __restrict__ route_log, MoeExpertSource source,
+                               const bf16* __restrict__ x, int max_jobs, std::int32_t* __restrict__ cpu_flags,
+                               CpuCall* __restrict__ call) {
+    __shared__ std::int32_t count[kDispatchThreads];
+    __shared__ std::int32_t cursor[kDispatchThreads];
+    __shared__ std::int32_t routed[kDispatchThreads];
+    __shared__ std::int32_t warp_totals[2][kDispatchThreads / 32];
+    pdl::enter(); // launched as a programmatic dependent of the router projection
+    const int i = threadIdx.x, warp = i / 32, lane = i % 32;
+    count[i]    = 0;
+    if (warp < columns) {
+        const int id = route_column(logits, experts, top_k, warp, ids, weights, shared_gate);
+        if (lane < top_k) { routed[warp * top_k + lane] = id; }
+    }
+    __syncthreads();
+    const int entries = columns * top_k;
+    dispatch_small(i < entries ? routed[i] : 0, entries, experts, dispatch, route_log, count, cursor, warp_totals);
+    __syncthreads();
+    if (i >= kThreads) { return; }
+    cpu_plan_body<true>(dispatch, source, x, columns, top_k, max_jobs, cpu_flags, call);
 }
 
 // CTAs that warm the source's L2 spans after the waiting CTAs (design §19.3.3 Phase 2).
@@ -1416,6 +1557,25 @@ __device__ void warm_l2(const MoeL2Warm& warm, int w) {
     }
 }
 
+// Tail skip (MoeExpertSource::tail_skip_rank): no route writes a skipped expert's outputs, so they are
+// zeroed for the combine. CTA b clears the entries of jobs b, b + gridDim.x, ... flagged 2.
+__global__ void __launch_bounds__(kThreads)
+    tail_zero_kernel(MoeDispatch dispatch, int max_jobs, const std::int32_t* __restrict__ cpu_flags, int hidden,
+                     bf16* __restrict__ outputs) {
+    const int jobs    = min(*dispatch.job_count, max_jobs);
+    const int vectors = hidden * 2 / 16; // 16-byte vectors per column
+    auto* out         = reinterpret_cast<int4*>(outputs);
+    for (int j = static_cast<int>(blockIdx.x); j < jobs; j += static_cast<int>(gridDim.x)) {
+        if (cpu_flags[j] != 2) { continue; }
+        const int expert = dispatch.jobs[j];
+        const int first = dispatch.offsets[expert], count = dispatch.offsets[expert + 1] - first;
+        for (int i = threadIdx.x; i < count * vectors; i += blockDim.x) {
+            out[static_cast<std::size_t>(dispatch.entries[first + i / vectors]) * vectors + i % vectors] =
+                make_int4(0, 0, 0, 0);
+        }
+    }
+}
+
 // kWaitCtas (+ kWarmCtas) CTAs: each waiting CTA with jobs to place waits for the host's answer to
 // this call's request, then places the outputs of jobs blockIdx.x, blockIdx.x + kWaitCtas, ...; the
 // warming CTAs prefetch the source's L2 spans while the host works.
@@ -1441,7 +1601,7 @@ __global__ void __launch_bounds__(kThreads)
         const auto* beat  = reinterpret_cast<const volatile std::uint32_t*>(source.cpu.heartbeat);
         std::uint32_t seen = beat != nullptr ? *beat : 0;
         std::uint64_t since = global_ns();
-        const std::uint64_t limit = beat != nullptr ? offloaded_moe::kHeartbeatTimeoutNs : 2000000000ULL;
+        const std::uint64_t limit = beat != nullptr ? source.heartbeat_timeout_ns : 2000000000ULL;
         silent = false;
         while (*done != sequence) {
             const std::uint64_t now = global_ns();
@@ -1524,6 +1684,31 @@ __global__ void combine_kernel(const bf16* __restrict__ outputs, const float* __
     y[static_cast<std::size_t>(t) * hidden + d] = __float2bfloat16_rn(sum);
 }
 
+// combine_kernel's y, kept in a register, injected into the residual streams as
+// hyper_connection_inject does: residual[s*H+d,t] = bf16(residual + inject[s,t] * y[d,t]).
+__global__ void combine_inject_kernel(const bf16* __restrict__ outputs, const float* __restrict__ weights,
+                                      const float* __restrict__ shared_gate, const bf16* __restrict__ shared,
+                                      const float* __restrict__ inject, int hidden, int top_k, int streams,
+                                      int columns, bf16* __restrict__ residual) {
+    // A programmatic dependent; its small grid lets the next mixer launch and fetch its weights at once.
+    pdl::enter();
+    const int d = blockIdx.x * blockDim.x + threadIdx.x;
+    const int t = blockIdx.y;
+    if (d >= hidden || t >= columns) { return; }
+    float sum = 0.0F;
+    for (int k = 0; k < top_k; ++k) { // fixed rank order: placement-invariant
+        sum += weights[static_cast<std::size_t>(t) * top_k + k] *
+               __bfloat162float(outputs[(static_cast<std::size_t>(t) * top_k + k) * hidden + d]);
+    }
+    sum += shared_gate[t] * __bfloat162float(shared[static_cast<std::size_t>(t) * hidden + d]);
+    const float v           = __bfloat162float(__float2bfloat16_rn(sum));
+    const std::size_t width = static_cast<std::size_t>(streams) * hidden;
+    for (int s = 0; s < streams; ++s) {
+        bf16& r = residual[static_cast<std::size_t>(t) * width + static_cast<std::size_t>(s) * hidden + d];
+        r       = __float2bfloat16_rn(__bfloat162float(r) + inject[static_cast<std::size_t>(t) * streams + s] * v);
+    }
+}
+
 } // namespace
 
 void moe_route(const Tensor& logits, std::int32_t top_k, MoeRouting& routing, cudaStream_t stream) {
@@ -1537,11 +1722,11 @@ void moe_route(const Tensor& logits, std::int32_t top_k, MoeRouting& routing, cu
                 routing.weights.ne[1] == columns && routing.shared_gate.numel() == columns,
             "route output shapes disagree");
     const int warps_per_block = kThreads / 32;
-    route_kernel<<<(columns + warps_per_block - 1) / warps_per_block, kThreads, 0, stream>>>(
-        static_cast<const float*>(logits.data), experts, columns, top_k,
-        static_cast<std::int32_t*>(routing.ids.data), static_cast<float*>(routing.weights.data),
-        static_cast<float*>(routing.shared_gate.data));
-    check_launch("route");
+    CUDA_CHECK(pdl::launch_consumer({dim3((columns + warps_per_block - 1) / warps_per_block), dim3(kThreads), 0, stream},
+                                    route_kernel, static_cast<const float*>(logits.data), experts, columns,
+                                    static_cast<int>(top_k), static_cast<std::int32_t*>(routing.ids.data),
+                                    static_cast<float*>(routing.weights.data),
+                                    static_cast<float*>(routing.shared_gate.data)));
 }
 
 std::size_t moe_dispatch_bytes(std::int32_t experts, std::int32_t entries) {
@@ -1569,8 +1754,8 @@ void moe_dispatch(const MoeRouting& routing, std::int32_t experts, MoeDispatch& 
     const auto* ids   = static_cast<const std::int32_t*>(routing.ids.data);
     if (entries <= kDispatchThreads) {
         // Decode and verification widths (k * T <= 1024): one kernel and no memset node.
-        dispatch_small_kernel<<<1, kDispatchThreads, 0, stream>>>(ids, entries, experts, dispatch, route_log);
-        check_launch("dispatch");
+        CUDA_CHECK(pdl::launch_consumer({dim3(1), dim3(kDispatchThreads), 0, stream}, dispatch_small_kernel, ids,
+                                        entries, experts, dispatch, route_log));
         return;
     }
     require(cudaMemsetAsync(dispatch.counts, 0, sizeof(std::int32_t) * experts, stream) == cudaSuccess,
@@ -1586,9 +1771,32 @@ void moe_dispatch(const MoeRouting& routing, std::int32_t experts, MoeDispatch& 
     check_launch("scatter");
 }
 
+void moe_route_dispatch(const Tensor& logits, std::int32_t top_k, MoeRouting& routing, MoeDispatch& dispatch,
+                        std::int32_t* route_log, cudaStream_t stream) {
+    const int experts = logits.ne[0] - 1, columns = logits.ne[1];
+    if (columns > kRouteDispatchColumns || static_cast<std::int64_t>(columns) * top_k > kDispatchThreads) {
+        moe_route(logits, top_k, routing, stream);
+        moe_dispatch(routing, experts, dispatch, route_log, stream);
+        return;
+    }
+    require(contiguous(logits, DType::FP32) && contiguous(routing.ids, DType::I32) &&
+                contiguous(routing.weights, DType::FP32) && contiguous(routing.shared_gate, DType::FP32),
+            "route requires contiguous FP32 logits and I32/FP32 outputs");
+    require(experts > 0 && experts <= 512 && top_k > 0 && top_k <= 16 && top_k <= experts && columns > 0,
+            "route supports up to 512 experts and top-16");
+    require(routing.ids.ne[0] == top_k && routing.ids.ne[1] == columns && routing.weights.ne[0] == top_k &&
+                routing.weights.ne[1] == columns && routing.shared_gate.numel() == columns,
+            "route output shapes disagree");
+    CUDA_CHECK(pdl::launch_consumer({dim3(1), dim3(kDispatchThreads), 0, stream}, route_dispatch_kernel,
+                                    static_cast<const float*>(logits.data), experts, columns,
+                                    static_cast<int>(top_k), static_cast<std::int32_t*>(routing.ids.data),
+                                    static_cast<float*>(routing.weights.data),
+                                    static_cast<float*>(routing.shared_gate.data), dispatch, route_log));
+}
+
 std::size_t moe_experts_workspace_bytes(std::int32_t max_jobs, std::int32_t entries, std::int32_t columns,
-                                        moe::ExpertActivation activation) {
-    return moe::wide::experts_workspace_bytes(max_jobs, entries, columns, activation);
+                                        moe::ExpertActivation activation, moe::WideA16 wide_a16) {
+    return moe::wide::experts_workspace_bytes(max_jobs, entries, columns, activation, wide_a16);
 }
 
 namespace {
@@ -1600,7 +1808,7 @@ static_assert(kFetchCallOffset + sizeof(FetchCall) <= moe::wide::kCpuCallBytes,
 // The CPU bookkeeping of a call in its workspace.
 CpuCall* cpu_call_of(void* workspace, const Tensor& x, const MoeExpertSource& source, std::int32_t max_jobs,
                      std::int32_t entries, std::int32_t** flags) {
-    const auto layout = moe::wide::carve_experts_workspace(workspace, max_jobs, entries, x.ne[1], source.activation);
+    const auto layout = moe::wide::carve_experts_workspace(workspace, max_jobs, entries, x.ne[1], source.activation, source.wide_a16);
     if (flags != nullptr) { *flags = layout.cpu_flags; }
     return static_cast<CpuCall*>(layout.cpu_call);
 }
@@ -1608,7 +1816,7 @@ CpuCall* cpu_call_of(void* workspace, const Tensor& x, const MoeExpertSource& so
 // The fetch bookkeeping of a call in its workspace, after the CPU's.
 FetchCall* fetch_call_of(void* workspace, const Tensor& x, const MoeExpertSource& source, std::int32_t max_jobs,
                          std::int32_t entries) {
-    const auto layout = moe::wide::carve_experts_workspace(workspace, max_jobs, entries, x.ne[1], source.activation);
+    const auto layout = moe::wide::carve_experts_workspace(workspace, max_jobs, entries, x.ne[1], source.activation, source.wide_a16);
     return reinterpret_cast<FetchCall*>(static_cast<std::byte*>(layout.cpu_call) + kFetchCallOffset);
 }
 
@@ -1616,15 +1824,65 @@ bool cpu_served(const Tensor& x, const MoeExpertSource& source) {
     return source.cpu.max_jobs > 0 && x.ne[1] <= source.cpu.max_columns;
 }
 
+void require_cpu_channel(const Tensor& x, const MoeExpertSource& source) {
+    require(source.cpu.request != nullptr && source.cpu.x != nullptr && source.cpu.y != nullptr &&
+                source.cpu.done != nullptr && source.cpu.sequence != nullptr &&
+                source.cpu.max_jobs <= offloaded_moe::kMaxCpuJobs && source.cpu.wide_jobs >= 0 &&
+                source.cpu.wide_jobs <= offloaded_moe::kMaxCpuJobs &&
+                source.cpu.max_columns <= offloaded_moe::kMaxCpuCallColumns && source.cpu.max_job_columns >= 1 &&
+                source.cpu.max_job_columns <= offloaded_moe::kMaxCpuColumns &&
+                reinterpret_cast<std::uintptr_t>(x.data) % 16 == 0 &&
+                reinterpret_cast<std::uintptr_t>(source.cpu.x) % 16 == 0,
+            "CPU channel is incomplete");
+}
+
 bool fetch_served(const MoeExpertSource& source) { return source.fetch.request != nullptr; }
 
 } // namespace
+
+bool moe_route_dispatch_plan(const Tensor& logits, std::int32_t top_k, MoeRouting& routing, MoeDispatch& dispatch,
+                             std::int32_t* route_log, const Tensor& x, const MoeExpertSource& source,
+                             std::int32_t max_jobs, void* workspace, const Tensor& outputs, cudaStream_t stream) {
+    const int experts = logits.ne[0] - 1, columns = logits.ne[1];
+    if (!cpu_served(x, source) || columns > kRouteDispatchColumns ||
+        static_cast<std::int64_t>(columns) * top_k > kDispatchThreads) {
+        moe_route_dispatch(logits, top_k, routing, dispatch, route_log, stream);
+        return false;
+    }
+    require(contiguous(logits, DType::FP32) && contiguous(routing.ids, DType::I32) &&
+                contiguous(routing.weights, DType::FP32) && contiguous(routing.shared_gate, DType::FP32),
+            "route requires contiguous FP32 logits and I32/FP32 outputs");
+    require(experts > 0 && experts <= 512 && top_k > 0 && top_k <= 16 && top_k <= experts && columns > 0,
+            "route supports up to 512 experts and top-16");
+    require(routing.ids.ne[0] == top_k && routing.ids.ne[1] == columns && routing.weights.ne[0] == top_k &&
+                routing.weights.ne[1] == columns && routing.shared_gate.numel() == columns,
+            "route output shapes disagree");
+    require(contiguous(x, DType::BF16) && x.ne[1] == columns && max_jobs > 0 && max_jobs <= 65535,
+            "route plan needs the experts' BF16 x and a job capacity");
+    require_cpu_channel(x, source);
+    std::int32_t* cpu_flags = nullptr;
+    CpuCall* cpu_call       = cpu_call_of(workspace, x, source, max_jobs, outputs.ne[1], &cpu_flags);
+    CUDA_CHECK(pdl::launch_consumer({dim3(1), dim3(kDispatchThreads), 0, stream}, route_dispatch_plan_kernel,
+                                    static_cast<const float*>(logits.data), experts, columns, static_cast<int>(top_k),
+                                    static_cast<std::int32_t*>(routing.ids.data),
+                                    static_cast<float*>(routing.weights.data),
+                                    static_cast<float*>(routing.shared_gate.data), dispatch, route_log, source,
+                                    static_cast<const bf16*>(x.data), static_cast<int>(max_jobs), cpu_flags,
+                                    cpu_call));
+    return true;
+}
 
 void moe_experts_cpu_wait(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource& source,
                           std::int32_t max_jobs, void* workspace, Tensor& outputs, cudaStream_t stream) {
     if (forked(source, max_jobs, x.ne[1])) { CUDA_CHECK(cudaStreamWaitEvent(stream, source.fork_events[1], 0)); }
     if (!cpu_served(x, source)) { return; }
-    CpuCall* call    = cpu_call_of(workspace, x, source, max_jobs, outputs.ne[1], nullptr);
+    std::int32_t* cpu_flags = nullptr;
+    CpuCall* call    = cpu_call_of(workspace, x, source, max_jobs, outputs.ne[1], &cpu_flags);
+    if (source.tail_skip_rank > 0) {
+        tail_zero_kernel<<<kWaitCtas, kThreads, 0, stream>>>(dispatch, static_cast<int>(max_jobs), cpu_flags,
+                                                             moe::kHidden, static_cast<bf16*>(outputs.data));
+        check_launch("tail zero");
+    }
     bool warm        = false;
     for (int i = 0; i < MoeL2Warm::kSpans; ++i) {
         require(source.l2_warm.bytes[i] == 0 || reinterpret_cast<std::uintptr_t>(source.l2_warm.ptr[i]) % 16 == 0,
@@ -1639,38 +1897,37 @@ void moe_experts_cpu_wait(const Tensor& x, const MoeDispatch& dispatch, const Mo
 
 void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource& source,
                  std::int32_t top_k, std::int32_t max_jobs, void* workspace, Tensor& outputs,
-                 cudaStream_t stream, bool wait_for_cpu) {
+                 cudaStream_t stream, bool wait_for_cpu, bool cpu_planned) {
     require(contiguous(x, DType::BF16) && contiguous(outputs, DType::BF16), "experts need BF16 x and outputs");
     require(x.ne[0] == moe::kHidden && outputs.ne[0] == moe::kHidden && outputs.ne[1] == x.ne[1] * top_k,
             "experts geometry differs from the nvfp4_expert_rg16_v1 record");
-    require(max_jobs > 0 && max_jobs <= 65535 && source.scales != nullptr && source.frames != nullptr &&
+    const bool ggml = ggml_bank(source);
+    const std::uint64_t record_bytes = ggml ? source.ggml.record_bytes : moe::kRecordBytes;
+    require(max_jobs > 0 && max_jobs <= 65535 && (ggml || source.scales != nullptr) && source.frames != nullptr &&
                 (source.host_records != nullptr || source.host_table != nullptr) &&
-                source.record_stride >= moe::kRecordBytes &&
-                source.record_stride % 16 == 0 && source.staging_slots >= 0 &&
+                source.record_stride >= record_bytes && frame_pitch(source) >= record_bytes &&
+                source.record_stride % 16 == 0 && frame_pitch(source) % 16 == 0 && source.staging_slots >= 0 &&
                 (source.staging_slots == 0 || source.staging_base != nullptr),
             "experts source is incomplete");
+    require(!ggml || (source.activation == moe::ExpertActivation::kA16 && source.ggml.record_bytes % 16 == 0 &&
+                      source.ggml.gate_row_bytes > 0 && source.ggml.down_row_bytes > 0),
+            "a ggml bank takes the A16 workspace");
     require(source.landing_slots >= 0 && source.landing_slots <= offloaded_moe::kMaxLandingSlots &&
                 (source.landing_slots == 0 || (source.landing != nullptr && source.landed != nullptr)),
             "experts landing is incomplete");
     require(source.prefetched == nullptr || source.prefetch_base != nullptr, "experts prefetch table without its base");
-    const auto layout  = moe::wide::carve_experts_workspace(workspace, max_jobs, outputs.ne[1], x.ne[1], source.activation);
+    const auto layout  = moe::wide::carve_experts_workspace(workspace, max_jobs, outputs.ne[1], x.ne[1], source.activation, source.wide_a16);
     auto** job_records = layout.job_records;
     std::int32_t* cpu_flags = nullptr;
     CpuCall* cpu_call       = cpu_call_of(workspace, x, source, max_jobs, outputs.ne[1], &cpu_flags);
     const bool cpu          = cpu_served(x, source);
     if (cpu) {
-        require(source.cpu.request != nullptr && source.cpu.x != nullptr && source.cpu.y != nullptr &&
-                    source.cpu.done != nullptr && source.cpu.sequence != nullptr &&
-                    source.cpu.max_jobs <= offloaded_moe::kMaxCpuJobs && source.cpu.wide_jobs >= 0 &&
-                    source.cpu.wide_jobs <= offloaded_moe::kMaxCpuJobs &&
-                    source.cpu.max_columns <= offloaded_moe::kMaxCpuCallColumns && source.cpu.max_job_columns >= 1 &&
-                    source.cpu.max_job_columns <= offloaded_moe::kMaxCpuColumns &&
-                    reinterpret_cast<std::uintptr_t>(x.data) % 16 == 0 &&
-                    reinterpret_cast<std::uintptr_t>(source.cpu.x) % 16 == 0,
-                "CPU channel is incomplete");
-        cpu_plan_kernel<<<1, kThreads, 0, stream>>>(dispatch, source, static_cast<const bf16*>(x.data), x.ne[1], top_k,
-                                                    max_jobs, cpu_flags, cpu_call);
-        check_launch("cpu plan");
+        require_cpu_channel(x, source);
+        if (!cpu_planned) { // else moe_route_dispatch_plan planned the call
+            CUDA_CHECK(pdl::launch_consumer({dim3(1), dim3(kThreads), 0, stream}, cpu_plan_kernel, dispatch, source,
+                                            static_cast<const bf16*>(x.data), static_cast<int>(x.ne[1]), top_k,
+                                            static_cast<int>(max_jobs), cpu_flags, cpu_call));
+        }
     }
     FetchCall* fetch = nullptr;
     if (fetch_served(source)) {
@@ -1684,12 +1941,17 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
         check_launch("fetch plan");
     }
     const std::int32_t* flags = cpu ? cpu_flags : nullptr;
+    // A ggml bank's gate/up kernels read every token's x limbs, encoded once here, before any fork.
+    if (ggml) {
+        launch_encode_x_ggml(x, layout, stream);
+        if (x.ne[1] > moe::kMaxColumns) { launch_plan_ggml(dispatch, max_jobs, layout, stream); }
+    }
     // Passes of at most staging_slots jobs (one pass covering every job without staging).
     const int pass_jobs = source.staging_slots > 0 ? std::min(source.staging_slots, kMaxPassJobs) : max_jobs;
     const int half      = source.staging_slots / 2;
     // In a call of more than eight columns, experts with more than eight take the wide route, pass
     // by pass once each pass's records are resolved; it is planned and x quantized before the passes.
-    const bool use_wide = x.ne[1] > moe::kMaxColumns && !forked(source, max_jobs, x.ne[1]);
+    const bool use_wide = !ggml && x.ne[1] > moe::kMaxColumns && !forked(source, max_jobs, x.ne[1]);
     // The staging overlap is not combined with the wide route: in the Program, overlapped calls with
     // wide experts gave run-to-run differences (prefix-cache exactness failures, varying greedy ids;
     // design §19.3.8, "F1 nondeterminism") that serial passes do not; the cause is not identified.
@@ -1707,7 +1969,7 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
             const int jobs = std::min(half, max_jobs - base);
             const int b    = pass % 2;
             MoeExpertSource buffer = source;
-            buffer.staging_base    = source.staging_base + static_cast<std::uint64_t>(b) * half * source.record_stride;
+            buffer.staging_base    = source.staging_base + static_cast<std::uint64_t>(b) * half * frame_pitch(source);
             buffer.staging_slots   = half;
             buffer.landing         = nullptr; // landing is for forked calls only
             buffer.landing_slots   = 0;
@@ -1752,9 +2014,8 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
     unlanded.landing_slots   = 0;
     for (int base = 0; base < max_jobs; base += pass_jobs) {
         const int jobs = std::min(pass_jobs, max_jobs - base);
-        stage_kernel<<<source.staging_slots > 0 ? kStageCtas : 1, kThreads, 0, stream>>>(dispatch, unlanded, base, jobs,
-                                                                                       flags, job_records, fetch);
-        check_launch("stage");
+        CUDA_CHECK(pdl::launch_consumer({dim3(source.staging_slots > 0 ? kStageCtas : 1), dim3(kThreads), 0, stream},
+                                        stage_kernel, dispatch, unlanded, base, jobs, flags, job_records, fetch));
         launch_pass(x.ne[1], static_cast<const bf16*>(x.data), dispatch, source, top_k, job_records, flags, base, jobs,
                     layout, outputs.ne[1], static_cast<bf16*>(outputs.data), stream);
         if (wide) { moe::wide::run_pass(*wide, base / pass_jobs, stream); }
@@ -1775,6 +2036,25 @@ void moe_combine(const Tensor& outputs, const MoeRouting& routing, const Tensor&
         static_cast<const float*>(routing.shared_gate.data), static_cast<const bf16*>(shared.data),
         hidden, top_k, columns, static_cast<bf16*>(y.data));
     check_launch("combine");
+}
+
+void moe_combine_inject(const Tensor& outputs, const MoeRouting& routing, const Tensor& shared,
+                        const Tensor& inject, Tensor& residual, cudaStream_t stream) {
+    require(contiguous(outputs, DType::BF16) && contiguous(shared, DType::BF16) &&
+                contiguous(residual, DType::BF16) && contiguous(inject, DType::FP32),
+            "combine inject requires contiguous BF16 tensors and FP32 inject");
+    const int hidden = shared.ne[0], columns = shared.ne[1], top_k = routing.weights.ne[0];
+    const int streams = inject.ne[0];
+    require(outputs.ne[0] == hidden && outputs.ne[1] == columns * top_k && routing.weights.ne[1] == columns &&
+                inject.ne[1] == columns && streams > 0 && residual.ne[0] == streams * hidden &&
+                residual.ne[1] == columns,
+            "combine inject shapes disagree");
+    CUDA_CHECK(pdl::launch_consumer({dim3((hidden + kThreads - 1) / kThreads, columns), dim3(kThreads), 0, stream},
+                                    combine_inject_kernel, static_cast<const bf16*>(outputs.data),
+                                    static_cast<const float*>(routing.weights.data),
+                                    static_cast<const float*>(routing.shared_gate.data),
+                                    static_cast<const bf16*>(shared.data), static_cast<const float*>(inject.data),
+                                    hidden, top_k, streams, columns, static_cast<bf16*>(residual.data)));
 }
 
 } // namespace infernix::ops

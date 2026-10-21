@@ -14,9 +14,10 @@ add_library(infernix_core STATIC
   device.cu
   direct_read_queue.cpp
   dtype.cpp
+  host_load.cpp
   host_memory.cpp
   host_worker_pool.cpp
-  link_probe.cpp
+  link_probe.cu
   power_throttling.cpp
   vram_budget.cpp
   gdn_replay_records.cpp
@@ -29,6 +30,7 @@ add_library(infernix_core STATIC
   tensor.cpp
   weight_view.cpp
   decode_graph.cpp
+  decode_graph_gate.cu
 )
 infernix_internal_includes(infernix_core)
 infernix_cuda_archive(infernix_core)

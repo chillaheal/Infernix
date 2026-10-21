@@ -15,7 +15,7 @@
 
 namespace infernix::bench {
 
-inline constexpr int kSchemaVersion                   = 20;
+inline constexpr int kSchemaVersion                   = 23;
 inline constexpr std::string_view kArtifactType       = "infernix_bench_report";
 inline constexpr std::string_view kDefaultCorpusPath  = "bench/fixtures/bench_corpus.ids";
 inline constexpr int kDecodeSeedTokens                = 1;
@@ -23,7 +23,7 @@ inline constexpr int kDefaultNPrompt                  = 512;
 inline constexpr int kDefaultNGen                     = 128;
 inline constexpr int kDefaultRepetitions              = 5;
 inline constexpr int kDefaultWarmup                   = 1;
-inline constexpr std::uint32_t kDefaultPrefillChunk   = 1024;
+inline constexpr std::uint32_t kDefaultPrefillChunk   = 0; // the model's default
 inline constexpr std::uint32_t kPrefillChunkAlignment = 128;
 
 enum class TestKind { Prefill, Decode, PrefillDecode };
@@ -54,10 +54,14 @@ enum class OutputFormat { Table, Json, Csv };
 struct BenchOptions {
     std::string artifact_path;
     std::string ngram_volume_path;
+    infernix::NgramResidency ngram_residency = infernix::NgramResidency::Auto;
+    std::string expert_stripe_path;
     std::uint64_t ram_headroom_bytes = infernix::kDefaultRamHeadroomBytes;
     std::optional<std::uint64_t> expert_ram_bytes; // --expert-ram-mib; empty: the RAM ledger's share
+    std::optional<std::uint64_t> expert_pin_bytes; // --expert-pin-mib; empty: what the OS lets it pin
     std::optional<std::size_t> vram_headroom_bytes; // empty: the model's automatic headroom
     bool vram_past_budget = false;
+    std::uint32_t expert_tail_skip = 0; // EngineOptions::expert_tail_skip
     std::string corpus_path{kDefaultCorpusPath};
     std::string constraint_file;
     std::optional<OutputConstraint> constraint;
@@ -71,9 +75,10 @@ struct BenchOptions {
     float rope_yarn_factor = 1.0F;
     std::optional<std::uint32_t> max_context;
     bool original_int8_prefill_kernel = false;
-    PrefillPv8 prefill_8bit_pv         = PrefillPv8::Auto;
     std::uint32_t prefill_split_workspace_mib = kDefaultPrefillSplitWorkspaceMiB;
     bool original_nvfp4_prefill_kernel = false;
+    bool fast_paths                    = true;
+    std::vector<FastPath> fast_path_candidates;
     std::uint32_t prefill_chunk       = kDefaultPrefillChunk;
     KvCacheStorage kv_cache     = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
@@ -124,9 +129,16 @@ struct BenchEnvironment {
     std::uint32_t max_context   = 0;
     std::uint32_t prefill_chunk       = kDefaultPrefillChunk;
     bool original_int8_prefill_kernel = false;
-    PrefillPv8 prefill_8bit_pv         = PrefillPv8::Auto;
     std::uint32_t prefill_split_workspace_mib = kDefaultPrefillSplitWorkspaceMiB;
     bool original_nvfp4_prefill_kernel = false;
+    bool fast_paths                    = true;
+    std::uint32_t expert_tail_skip     = 0; // approximate: changes the output when set
+    // Qwen3.8-Flash-Next placement (they move its throughput): empty paths and budgets are the defaults.
+    std::string ngram_volume_path;
+    NgramResidency ngram_residency = NgramResidency::Auto;
+    std::string expert_stripe_path;
+    std::optional<std::uint64_t> expert_ram_bytes;
+    std::optional<std::uint64_t> expert_pin_bytes;
     KvCacheStorage kv_cache           = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     bool use_cuda_graph                            = true;

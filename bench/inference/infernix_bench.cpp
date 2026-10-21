@@ -199,13 +199,18 @@ int main(int argc, char** argv) {
         engine_options.kv_cache                          = options.kv_cache;
         engine_options.rope_yarn_factor                  = options.rope_yarn_factor;
         engine_options.original_nvfp4_prefill_kernel     = options.original_nvfp4_prefill_kernel;
-        engine_options.prefill_8bit_pv                   = options.prefill_8bit_pv;
+        engine_options.fast_paths                        = options.fast_paths;
+        engine_options.fast_path_candidates              = options.fast_path_candidates;
         engine_options.prefill_split_workspace_mib       = options.prefill_split_workspace_mib;
         engine_options.ngram_volume_path = options.ngram_volume_path;
+        engine_options.ngram_residency   = options.ngram_residency;
+        engine_options.expert_stripe_path = options.expert_stripe_path;
         engine_options.ram_headroom_bytes = options.ram_headroom_bytes;
         engine_options.expert_ram_bytes   = options.expert_ram_bytes;
+        engine_options.expert_pin_bytes   = options.expert_pin_bytes;
         engine_options.vram_headroom_bytes = options.vram_headroom_bytes;
         engine_options.vram_past_budget    = options.vram_past_budget;
+        engine_options.expert_tail_skip    = options.expert_tail_skip;
         engine_options.context_cache.enabled             = false;
         engine_options.context_cache.host_capacity_bytes = 0;
         engine_options.speculative                       = options.speculative;
@@ -218,9 +223,15 @@ int main(int argc, char** argv) {
         env.rope_yarn_factor         = options.rope_yarn_factor;
         env.prefill_chunk            = options.prefill_chunk;
         env.original_int8_prefill_kernel = options.original_int8_prefill_kernel;
-        env.prefill_8bit_pv              = options.prefill_8bit_pv;
         env.prefill_split_workspace_mib  = options.prefill_split_workspace_mib;
         env.original_nvfp4_prefill_kernel = options.original_nvfp4_prefill_kernel;
+        env.fast_paths                   = options.fast_paths;
+        env.expert_tail_skip             = options.expert_tail_skip;
+        env.ngram_volume_path            = options.ngram_volume_path;
+        env.ngram_residency              = options.ngram_residency;
+        env.expert_stripe_path           = options.expert_stripe_path;
+        env.expert_ram_bytes             = options.expert_ram_bytes;
+        env.expert_pin_bytes             = options.expert_pin_bytes;
         env.kv_cache                 = options.kv_cache;
         env.speculative              = options.speculative;
         env.use_cuda_graph           = options.use_cuda_graph;
@@ -249,6 +260,10 @@ int main(int argc, char** argv) {
                   << " (max_context=" << max_context
                   << ", kv_cache=" << infernix::bench::kv_cache_name(options.kv_cache) << ")\n";
         infernix::Engine engine(std::move(engine_options));
+        env.prefill_chunk = engine.options().prefill_chunk; // the model's default when unset
+        // auto resolves to a ceiling, or on Qwen3.5/3.6 without adaptive-mtp to a fixed length.
+        env.speculative.draft_tokens      = engine.options().speculative.draft_tokens;
+        env.speculative.draft_tokens_auto = engine.options().speculative.draft_tokens_auto;
         fill_cuda_environment(env, options.device);
         env.load   = engine.load_summary();
         env.memory = engine.memory_summary();

@@ -13,6 +13,7 @@
 // moe_dispatch has its own exact oracle (test_dispatch). Layers of W4A16 experts (§16.2.1) run the
 // same configurations against expert_forward_a16, which every W4A16 output equals bit for bit (its
 // wide route is exact as well).
+#include "infernix/ops/hyper_connection.h"
 #include "infernix/ops/offloaded_sparse_moe.h"
 #include "ops/offloaded_moe_fixtures.h"
 #include "ops/offloaded_sparse_moe/cpu/fetch_channel.h"
@@ -28,6 +29,7 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -44,6 +46,12 @@ using infernix::test::cuda_check;
 namespace {
 
 int g_failures = 0;
+
+// Live hosts get production's bound (kHeartbeatTimeoutNs, 10 s): under a loaded machine a 1 s bound
+// mistook OS scheduling stalls for dead hosts. The silent-host cases wait their whole bound, so they
+// use a short one.
+constexpr std::uint64_t kTestHeartbeatTimeoutNs   = moe::kHeartbeatTimeoutNs;
+constexpr std::uint64_t kSilentHeartbeatTimeoutNs = 1000000000ULL;
 
 void check(bool ok, const char* what) {
     if (!ok) {
@@ -284,6 +292,9 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
                                              .pcie_divisor = 0, .cpus = {}, .activation = activation});
     moe::CpuMissService service_narrow(layers, {.workers = 6, .max_jobs = 24, .max_columns = 64, .pcie_divisor = 2,
                                                 .max_job_columns = 2, .cpus = {}, .activation = activation});
+    // A GGUF import's decode split: one-column calls keep every miss on the link (d = 1), wider calls d = 2.
+    moe::CpuMissService service_one(layers, {.workers = 6, .max_jobs = 16, .max_columns = 64, .pcie_divisor = 2,
+                                             .one_column_divisor = 1, .cpus = {}, .activation = activation});
     // Prefill CPU assist (P7): calls of at least 9 columns take up to 256 CPU-served misses.
     moe::CpuMissService service_assist(layers, {.workers = 6, .max_jobs = 8, .max_columns = 255, .pcie_divisor = 4,
                                                 .wide_from = 9, .wide_jobs = moe::kMaxCpuJobs, .cpus = {}, .activation = activation});
@@ -301,7 +312,11 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
     moe::CpuMissService service_ssd8(layers, {.workers = 4, .max_jobs = 8, .max_columns = 64, .cpus = {}, .activation = activation,
                                               .records = &copied});
     // The CPU's share of the misses (design §19.3.5 S3): want = min(cap, M - M / divisor) of the misses
-    // with at most max_job_columns columns, so the number served is min(want, eligible misses).
+    // with at most max_job_columns columns, so the number served is min(want, eligible misses). The
+    // divisor is one_column_divisor (when set) in a one-column call.
+    const auto divisor_of = [&](const auto& channel) {
+        return columns == 1 && channel.one_column_divisor > 0 ? channel.one_column_divisor : channel.pcie_divisor;
+    };
     std::vector<int> expert_columns(experts, 0);
     for (const std::int32_t id : ids) { ++expert_columns[id]; }
     // SSD-only experts have no host record in the table. Narrow set: every third non-resident
@@ -349,7 +364,8 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
         }
         const int cap  = channel.wide_from > 0 && columns >= channel.wide_from ? channel.wide_jobs : channel.max_jobs;
         const int take = std::min(cap, ssd_misses);
-        const int want = std::min(cap - take, channel.pcie_divisor > 0 ? misses - misses / channel.pcie_divisor : misses);
+        const int d    = divisor_of(channel);
+        const int want = std::min(cap - take, d > 0 ? misses - misses / d : misses);
         return take + std::min(want, eligible);
     };
     // Narrow SSD-only experts no CPU job takes (no service, a call wider than its columns, or past
@@ -386,7 +402,8 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
         int misses = 0;
         for (const std::int32_t e : jobs) { misses += miss(e) ? 1 : 0; }
         const int cap  = channel.wide_from > 0 && columns >= channel.wide_from ? channel.wide_jobs : channel.max_jobs;
-        const int want = std::min(cap, channel.pcie_divisor > 0 ? misses - misses / channel.pcie_divisor : misses);
+        const int d    = divisor_of(channel);
+        const int want = std::min(cap, d > 0 ? misses - misses / d : misses);
         int n = 0;
         for (int width = 1; width <= channel.max_job_columns && n < want; ++width) {
             for (const std::int32_t e : jobs) {
@@ -416,7 +433,8 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
                                 Config{3, &service_two}, Config{64, &service_eight}, Config{0, &service_eight},
                                 Config{64, nullptr, true}, Config{64, &service_two, true}, Config{3, nullptr, true},
                                 Config{3, &service_all}, Config{64, &service_all, true}, Config{64, &service_narrow},
-                                Config{64, &service_narrow, true}, Config{64, nullptr, true, true},
+                                Config{64, &service_narrow, true}, Config{64, &service_one}, Config{64, &service_one, true},
+                                Config{64, nullptr, true, true},
                                 Config{64, &service_narrow, true, true}, Config{3, nullptr, false, true},
                                 Config{64, &service_assist}, Config{3, &service_assist}, Config{0, &service_assist},
                                 Config{64, &service_assist, true}, Config{0, nullptr, false, false, true},
@@ -471,7 +489,8 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
                                             .staging_slots = slots,
                                             .cpu = config.service != nullptr ? config.service->channel(0)
                                                                              : infernix::ops::MoeCpuChannel{}};
-        source.activation = activation;
+        source.activation           = activation;
+        source.heartbeat_timeout_ns = config.fetch == Responder::Mode::kSilent ? kSilentHeartbeatTimeoutNs : kTestHeartbeatTimeoutNs;
         if (config.service != nullptr) {
             // The CPU wait warms these into L2 while the host works; no output may change.
             source.l2_warm.ptr[0]   = d_frame_base;
@@ -525,34 +544,52 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
                 cuda_check(cudaDeviceSynchronize(), "moe_experts");
                 return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
             };
-            (void)timed();
-            const double busy = timed();
-            std::array<double, 5> extra{};
-            for (double& e : extra) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(60));
-                if (config.idle == 2) { config.service->wake(); }
-                e = timed() - busy;
+            // Other processes on the machine (a parallel CTest run) can stall one measurement; a slow
+            // idle wait slows every one. The service check passes when any of three measurements meets
+            // the bound.
+            bool within = false;
+            for (int attempt = 0; attempt < 3 && !within; ++attempt) {
+                (void)timed();
+                const double busy = timed();
+                std::array<double, 5> extra{};
+                for (double& e : extra) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+                    if (config.idle == 2) { config.service->wake(); }
+                    e = timed() - busy;
+                }
+                std::sort(extra.begin(), extra.end());
+                std::printf("E=%d T=%d k=%d idle %s: call %.2f ms busy, +%.2f ms idle (median of 5, max +%.2f)\n",
+                            experts, columns, top_k,
+                            config.service == nullptr ? "GPU only"
+                            : config.idle == 2        ? "service after wake()"
+                                                      : "service",
+                            busy, extra[2], extra[4]);
+                if (config.service == nullptr) {
+                    gpu_idle_extra = extra[2];
+                    within         = true;
+                } else {
+                    within = extra[2] - gpu_idle_extra < 10.0 + 0.05 * busy;
+                }
             }
-            std::sort(extra.begin(), extra.end());
-            std::printf("E=%d T=%d k=%d idle %s: call %.2f ms busy, +%.2f ms idle (median of 5, max +%.2f)\n", experts,
-                        columns, top_k,
-                        config.service == nullptr ? "GPU only" : config.idle == 2 ? "service after wake()" : "service",
-                        busy, extra[2], extra[4]);
-            if (config.service == nullptr) {
-                gpu_idle_extra = extra[2];
-            } else {
-                check(extra[2] - gpu_idle_extra < 10.0 + 0.05 * busy,
-                      "an idle CPU miss service adds under 10 ms to a call beyond the GPU's own (median of 5)");
-            }
+            check(within, "an idle CPU miss service adds under 10 ms to a call beyond the GPU's own (median of 5)");
         }
         const std::uint64_t served_before = config.service != nullptr ? config.service->served_experts() : 0;
-        infernix::ops::moe_experts(tx, dispatch, source, top_k, max_jobs, d_workspace, out, nullptr);
+        // A served call routes again through moe_route_dispatch_plan, which plans the CPU-served misses
+        // in its own kernel at decode and verification widths (and otherwise routes as before), so
+        // the checks below cover the fused plan.
+        bool planned = false;
+        if (config.service != nullptr) {
+            planned = infernix::ops::moe_route_dispatch_plan(Tensor(d_logits, DType::FP32, {experts + 1, columns}),
+                                                             top_k, routing, dispatch, nullptr, tx, source, max_jobs,
+                                                             d_workspace, out, nullptr);
+        }
+        infernix::ops::moe_experts(tx, dispatch, source, top_k, max_jobs, d_workspace, out, nullptr, true, planned);
         cuda_check(cudaDeviceSynchronize(), "moe_experts");
         if (config.service != nullptr) {
             // The service counts after answering, so its count may trail the device by a moment.
             const auto* ssd = config.ssd == 1 ? &ssd_narrow : config.ssd == 2 ? &ssd_full : nullptr;
             const auto want = static_cast<std::uint64_t>(expected_cpu_jobs(*config.service, config.streamed, ssd));
-            const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+            const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(30);
             while (config.service->served_experts() - served_before < want && std::chrono::steady_clock::now() < until) {
                 std::this_thread::yield();
             }
@@ -574,7 +611,7 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
             const std::uint32_t count = published ? responder.count() : 0;
             if (config.fetch != Responder::Mode::kAnswer) {
                 // The wait ends without a trap; the word names the layer and the host's errno or the silence.
-                const std::uint32_t want = config.fetch == Responder::Mode::kFail ? EIO : moe::kErrorHostSilent;
+                const std::uint32_t want = config.fetch == Responder::Mode::kFail ? EIO : moe::kErrorFetchSilent;
                 std::printf("E=%d T=%d k=%d staging slots %2d (fetch, %s): %u records requested, error word %#x\n",
                             experts, columns, top_k, slots, config.fetch == Responder::Mode::kFail ? "failing host" : "silent host",
                             count, error);
@@ -588,7 +625,7 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
                 if (error != 0) { continue; }
             } else if (published) {
                 // The device consumed every record it was sent (the last pass stores the total).
-                const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+                const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(30);
                 while (responder.consumed() != count && std::chrono::steady_clock::now() < until) { std::this_thread::yield(); }
                 std::printf("  fetch: %u records requested, %u consumed\n", count, responder.consumed());
                 check(responder.consumed() == count, "the device reports every fetched record consumed");
@@ -654,7 +691,7 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
     }
     if (experts == 12) {
         // A CPU channel whose host never answers and whose heartbeat stands still: the wait gives up
-        // after kHeartbeatTimeoutNs and reports it in the error word instead of trapping, and the
+        // after heartbeat_timeout_ns and reports it in the error word instead of trapping, and the
         // device stays usable.
         const auto mapped = [](std::size_t bytes) {
             void* p = nullptr;
@@ -676,7 +713,8 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
                                             .scales        = d_scales,
                                             .staging_base  = d_staging,
                                             .staging_slots = 3};
-        source.activation = activation;
+        source.activation           = activation;
+        source.heartbeat_timeout_ns = kSilentHeartbeatTimeoutNs;
         source.cpu = {.request = request, .x = cx, .y = cy, .done = words, .status = words + 1, .heartbeat = words + 2,
                       .sequence = sequence, .layer = 7, .max_jobs = 8, .max_columns = 64};
         *reinterpret_cast<volatile std::uint32_t*>(error_host) = 0;
@@ -730,6 +768,155 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
 // entries as a set, and the route-log copy. The dispatch arrays start as garbage, and a captured
 // call is replayed on new ids, so neither route may depend on memory cleared outside the call.
 // Entries <= 1024 take the one-CTA kernel, more the count/scan/scatter kernels.
+// Tail skip (MoeExpertSource::tail_skip_rank, --expert-tail-skip): with the CPU service planning the
+// call, an expert neither resident nor wider than kMaxColumns columns that every column routes at slot
+// >= rank has zero outputs; every other output keeps the CPU engine's bits (the exact narrow route).
+// Both plans (moe_experts' own and moe_route_dispatch_plan's fused one), serial and forked.
+void test_tail_skip(int experts, int columns, int top_k, int rank, std::uint32_t seed) {
+    std::mt19937 rng(seed);
+    const std::size_t stride = moe::kRecordBytes;
+    std::vector<fixtures::Expert> bank;
+    std::vector<moe::ExpertScales> scales;
+    for (int e = 0; e < experts; ++e) {
+        bank.push_back(fixtures::random_expert(rng, e % 3 == 0));
+        scales.push_back(bank.back().scales);
+    }
+    std::uint8_t* host = nullptr;
+    cuda_check(cudaHostAlloc(reinterpret_cast<void**>(&host), stride * experts, cudaHostAllocMapped), "cudaHostAlloc");
+    for (int e = 0; e < experts; ++e) { std::memcpy(host + stride * e, bank[e].record.data(), moe::kRecordBytes); }
+    std::uint8_t* host_device = nullptr;
+    cuda_check(cudaHostGetDevicePointer(reinterpret_cast<void**>(&host_device), host, 0), "cudaHostGetDevicePointer");
+    std::vector<std::int32_t> frames(experts, -1);
+    std::vector<std::uint8_t> frame_bytes;
+    int resident = 0;
+    for (int e = 0; e < experts; e += 3) {
+        frames[e] = resident++;
+        frame_bytes.insert(frame_bytes.end(), bank[e].record.begin(), bank[e].record.end());
+    }
+    auto* d_frame_base = device_copy(frame_bytes);
+    auto* d_frames     = device_copy(frames);
+    auto* d_scales     = device_copy(scales);
+    std::normal_distribution<float> n(0.0F, 1.0F);
+    std::vector<float> logits(static_cast<std::size_t>(experts + 1) * columns);
+    for (auto& v : logits) { v = n(rng); }
+    auto* d_logits = device_copy(logits);
+    std::int32_t* d_ids  = nullptr;
+    float* d_weights     = nullptr;
+    float* d_shared_gate = nullptr;
+    cuda_check(cudaMalloc(&d_ids, sizeof(std::int32_t) * top_k * columns), "cudaMalloc");
+    cuda_check(cudaMalloc(&d_weights, sizeof(float) * top_k * columns), "cudaMalloc");
+    cuda_check(cudaMalloc(&d_shared_gate, sizeof(float) * columns), "cudaMalloc");
+    infernix::ops::MoeRouting routing{Tensor(d_ids, DType::I32, {top_k, columns}),
+                                    Tensor(d_weights, DType::FP32, {top_k, columns}),
+                                    Tensor(d_shared_gate, DType::FP32, {columns})};
+    const Tensor t_logits(d_logits, DType::FP32, {experts + 1, columns});
+    infernix::ops::moe_route(t_logits, top_k, routing, nullptr);
+    void* d_dispatch = nullptr;
+    cuda_check(cudaMalloc(&d_dispatch, infernix::ops::moe_dispatch_bytes(experts, top_k * columns)), "cudaMalloc");
+    auto dispatch = infernix::ops::carve_moe_dispatch(d_dispatch, experts, top_k * columns);
+    const auto x = fixtures::random_activations(rng, columns);
+    auto* d_x    = device_copy(x);
+    std::vector<std::int32_t> ids(static_cast<std::size_t>(top_k) * columns);
+    cuda_check(cudaMemcpy(ids.data(), d_ids, ids.size() * sizeof(std::int32_t), cudaMemcpyDeviceToHost), "cudaMemcpy");
+
+    // The oracle: an expert is skipped when it misses VRAM, has at most kMaxColumns columns and every
+    // column routes it at slot >= rank; its outputs are zero, every other output is the CPU engine's.
+    std::vector<int> expert_columns(experts, 0), best_slot(experts, top_k);
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+        ++expert_columns[ids[i]];
+        best_slot[ids[i]] = std::min(best_slot[ids[i]], static_cast<int>(i % top_k));
+    }
+    const auto skipped = [&](int e) {
+        return frames[e] < 0 && expert_columns[e] <= moe::kMaxColumns && best_slot[e] >= rank;
+    };
+    std::vector<std::uint16_t> expected(static_cast<std::size_t>(moe::kHidden) * top_k * columns, 0);
+    int skipped_entries = 0, computed_misses = 0;
+    for (int t = 0; t < columns; ++t) {
+        for (int s = 0; s < top_k; ++s) {
+            const int e = ids[static_cast<std::size_t>(t) * top_k + s];
+            if (skipped(e)) {
+                ++skipped_entries;
+                continue;
+            }
+            computed_misses += frames[e] < 0 ? 1 : 0;
+            const auto y = cpu_column(bank[e], &x[static_cast<std::size_t>(t) * moe::kHidden], moe::ExpertActivation::kA4);
+            std::memcpy(&expected[(static_cast<std::size_t>(t) * top_k + s) * moe::kHidden], y.data(),
+                        moe::kHidden * sizeof(std::uint16_t));
+        }
+    }
+    check(skipped_entries > 0 && computed_misses > 0, "the tail-skip case skips some misses and computes others");
+
+    const int max_jobs = std::min(experts, top_k * columns);
+    std::uint8_t* d_staging = nullptr;
+    cuda_check(cudaMalloc(&d_staging, stride * 64), "cudaMalloc");
+    void* d_workspace = nullptr;
+    cuda_check(cudaMalloc(&d_workspace, infernix::ops::moe_experts_workspace_bytes(max_jobs, top_k * columns, columns,
+                                                                                   moe::ExpertActivation::kA4)),
+               "cudaMalloc");
+    std::uint16_t* d_out = nullptr;
+    cuda_check(cudaMalloc(&d_out, expected.size() * sizeof(std::uint16_t)), "cudaMalloc");
+    std::vector<moe::CpuMissService::Layer> layers{{.records = host, .record_stride = stride, .scales = scales.data()}};
+    // Used at once: a request published before the service thread first runs must still be served.
+    moe::CpuMissService service(layers, {.workers = 4, .max_jobs = 8, .max_columns = 64, .cpus = {}});
+    cudaStream_t fork_stream = nullptr;
+    cudaEvent_t fork_events[2] = {};
+    cuda_check(cudaStreamCreateWithFlags(&fork_stream, cudaStreamNonBlocking), "cudaStreamCreate");
+    for (auto& event : fork_events) { cuda_check(cudaEventCreateWithFlags(&event, cudaEventDisableTiming), "event"); }
+    Tensor tx(d_x, DType::BF16, {moe::kHidden, columns});
+    Tensor out(d_out, DType::BF16, {moe::kHidden, top_k * columns});
+    for (const bool fork : {false, true}) {
+        for (const bool fused : {false, true}) {
+            infernix::ops::moe_dispatch(routing, experts, dispatch, nullptr, nullptr);
+            cuda_check(cudaMemset(d_out, 0xFF, expected.size() * sizeof(std::uint16_t)), "cudaMemset");
+            infernix::ops::MoeExpertSource source{.frame_base    = d_frame_base,
+                                                .frames        = d_frames,
+                                                .host_records  = host_device,
+                                                .record_stride = stride,
+                                                .scales        = d_scales,
+                                                .staging_base  = d_staging,
+                                                .staging_slots = 64,
+                                                .cpu           = service.channel(0)};
+            source.heartbeat_timeout_ns = kTestHeartbeatTimeoutNs;
+            source.tail_skip_rank       = rank;
+            if (fork) {
+                source.fork_stream    = fork_stream;
+                source.fork_events[0] = fork_events[0];
+                source.fork_events[1] = fork_events[1];
+            }
+            const bool planned = fused && infernix::ops::moe_route_dispatch_plan(t_logits, top_k, routing, dispatch, nullptr,
+                                                                                 tx, source, max_jobs, d_workspace, out, nullptr);
+            infernix::ops::moe_experts(tx, dispatch, source, top_k, max_jobs, d_workspace, out, nullptr, true, planned);
+            cuda_check(cudaDeviceSynchronize(), "moe_experts");
+            std::vector<std::uint16_t> got(expected.size());
+            cuda_check(cudaMemcpy(got.data(), d_out, got.size() * sizeof(std::uint16_t), cudaMemcpyDeviceToHost),
+                       "cudaMemcpy");
+            // Bits are compared where the CPU engine's are the route's (test_layer's `narrow`): every skipped
+            // output, and experts of at most kMaxCpuColumns columns or with separate gate/up scales.
+            long mismatches = 0;
+            for (std::size_t i = 0; i < got.size(); ++i) {
+                const int e = ids[i / moe::kHidden];
+                if (skipped(e) || expert_columns[e] <= moe::kMaxCpuColumns || e % 3 == 0) {
+                    mismatches += got[i] != expected[i] ? 1 : 0;
+                }
+            }
+            std::printf("E=%d T=%d k=%d tail skip %d (%s, %s plan): %d entries skipped, %d misses computed, %ld "
+                        "mismatches\n",
+                        experts, columns, top_k, rank, fork ? "forked" : "serial", planned ? "fused" : "own",
+                        skipped_entries, computed_misses, mismatches);
+            check(mismatches == 0, "tail skip zeroes the skipped experts' outputs and keeps every other output exact");
+        }
+    }
+    cuda_check(cudaStreamDestroy(fork_stream), "cudaStreamDestroy");
+    for (auto& event : fork_events) { cuda_check(cudaEventDestroy(event), "event"); }
+    for (void* p : {static_cast<void*>(d_frame_base), static_cast<void*>(d_frames), static_cast<void*>(d_scales),
+                    static_cast<void*>(d_logits), static_cast<void*>(d_ids), static_cast<void*>(d_weights),
+                    static_cast<void*>(d_shared_gate), d_dispatch, static_cast<void*>(d_x),
+                    static_cast<void*>(d_staging), d_workspace, static_cast<void*>(d_out)}) {
+        cuda_check(cudaFree(p), "cudaFree");
+    }
+    cuda_check(cudaFreeHost(host), "cudaFreeHost");
+}
+
 void test_dispatch(int experts, int entries, std::uint32_t seed) {
     std::mt19937 rng(seed);
     std::uniform_int_distribution<int> pick(0, experts - 1);
@@ -827,6 +1014,264 @@ void test_dispatch(int experts, int entries, std::uint32_t seed) {
     cudaFree(d_ids);
 }
 
+// moe_combine_inject against moe_combine followed by hyper_connection_inject (each qualified against
+// its own oracle): the residual streams bit-equal.
+void test_combine_inject(int columns, int top_k, int streams, std::uint32_t seed) {
+    constexpr int hidden = moe::kHidden;
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> n(0.0F, 1.0F);
+    const auto bf16s = [&](std::size_t count) {
+        std::vector<std::uint16_t> v(count);
+        for (auto& x : v) { x = infernix::test::f32_to_bf16(n(rng)); }
+        return v;
+    };
+    const auto floats = [&](std::size_t count) {
+        std::vector<float> v(count);
+        for (auto& x : v) { x = n(rng); }
+        return v;
+    };
+    const auto outputs = bf16s(static_cast<std::size_t>(hidden) * columns * top_k);
+    const auto shared  = bf16s(static_cast<std::size_t>(hidden) * columns);
+    const auto weights = floats(static_cast<std::size_t>(top_k) * columns);
+    const auto gate = floats(columns), inject = floats(static_cast<std::size_t>(streams) * columns);
+    const auto residual = bf16s(static_cast<std::size_t>(streams) * hidden * columns);
+    auto* d_outputs = device_copy(outputs);
+    auto* d_shared  = device_copy(shared);
+    auto* d_weights = device_copy(weights);
+    auto* d_gate    = device_copy(gate);
+    auto* d_inject  = device_copy(inject);
+    auto* d_split   = device_copy(residual);
+    auto* d_fused   = device_copy(residual);
+    std::uint16_t* d_y = nullptr;
+    cuda_check(cudaMalloc(&d_y, shared.size() * sizeof(std::uint16_t)), "cudaMalloc");
+    const infernix::ops::MoeRouting routing{Tensor{}, Tensor(d_weights, DType::FP32, {top_k, columns}),
+                                            Tensor(d_gate, DType::FP32, {columns})};
+    const Tensor t_outputs(d_outputs, DType::BF16, {hidden, columns * top_k});
+    const Tensor t_shared(d_shared, DType::BF16, {hidden, columns});
+    const Tensor t_inject(d_inject, DType::FP32, {streams, columns});
+    Tensor t_y(d_y, DType::BF16, {hidden, columns});
+    Tensor t_split(d_split, DType::BF16, {streams * hidden, columns});
+    Tensor t_fused(d_fused, DType::BF16, {streams * hidden, columns});
+    infernix::ops::moe_combine(t_outputs, routing, t_shared, t_y, nullptr);
+    infernix::ops::hyper_connection_inject(t_y, t_inject, t_split, nullptr);
+    infernix::ops::moe_combine_inject(t_outputs, routing, t_shared, t_inject, t_fused, nullptr);
+    cuda_check(cudaDeviceSynchronize(), "combine inject");
+    std::vector<std::uint16_t> split(residual.size()), fused(residual.size());
+    cuda_check(cudaMemcpy(split.data(), d_split, split.size() * 2, cudaMemcpyDeviceToHost), "copy");
+    cuda_check(cudaMemcpy(fused.data(), d_fused, fused.size() * 2, cudaMemcpyDeviceToHost), "copy");
+    const bool same = split == fused && split != residual;
+    std::printf("combine_inject T=%d k=%d S=%d: %s\n", columns, top_k, streams,
+                same ? "bit-equal to combine + inject" : "DIFFERENT");
+    check(same, "moe_combine_inject equals moe_combine followed by hyper_connection_inject");
+    for (void* p : {static_cast<void*>(d_outputs), static_cast<void*>(d_shared), static_cast<void*>(d_weights),
+                    static_cast<void*>(d_gate), static_cast<void*>(d_inject), static_cast<void*>(d_split),
+                    static_cast<void*>(d_fused), static_cast<void*>(d_y)}) {
+        cudaFree(p);
+    }
+}
+
+// moe_route_dispatch, captured (so its kernel runs as a programmatic dependent) and replayed on new
+// logits, against the oracles: ids exactly the top-k with lower-id ties (the logits repeat values
+// so ties occur), weights and shared gate against the FP64 formula, the dispatch exact as in
+// test_dispatch, and every output bit equal to moe_route followed by moe_dispatch. Up to 32
+// columns take the one-kernel route, 33 the two calls.
+void test_route_dispatch(int experts, int columns, int top_k, std::uint32_t seed) {
+    std::mt19937 rng(seed);
+    const int entries = columns * top_k;
+    const std::size_t logit_count = static_cast<std::size_t>(experts + 1) * columns;
+    const auto random_logits = [&] {
+        std::uniform_int_distribution<int> level(-64, 64);
+        std::vector<float> logits(logit_count);
+        for (auto& v : logits) { v = static_cast<float>(level(rng)) / 16.0F; } // 129 levels: many ties
+        return logits;
+    };
+    const auto alloc = [](std::size_t bytes) {
+        void* p = nullptr;
+        cuda_check(cudaMalloc(&p, bytes), "cudaMalloc");
+        cuda_check(cudaMemset(p, 0x5A, bytes), "cudaMemset");
+        return p;
+    };
+    const std::size_t dispatch_bytes = infernix::ops::moe_dispatch_bytes(experts, entries);
+    auto* d_logits = static_cast<float*>(alloc(sizeof(float) * logit_count));
+    struct Outputs {
+        infernix::ops::MoeRouting routing;
+        infernix::ops::MoeDispatch dispatch;
+        void* dispatch_base;
+        std::int32_t* log;
+    };
+    const auto make = [&] {
+        Outputs o;
+        o.routing = {Tensor(alloc(sizeof(std::int32_t) * entries), DType::I32, {top_k, columns}),
+                     Tensor(alloc(sizeof(float) * entries), DType::FP32, {top_k, columns}),
+                     Tensor(alloc(sizeof(float) * columns), DType::FP32, {columns})};
+        o.dispatch_base = alloc(dispatch_bytes);
+        o.dispatch      = infernix::ops::carve_moe_dispatch(o.dispatch_base, experts, entries);
+        o.log           = static_cast<std::int32_t*>(alloc(sizeof(std::int32_t) * entries));
+        return o;
+    };
+    Outputs fused = make(), split = make();
+    const Tensor logits(d_logits, DType::FP32, {experts + 1, columns});
+    const auto host = [](const void* p, std::size_t bytes) {
+        std::vector<std::uint8_t> out(bytes);
+        cuda_check(cudaMemcpy(out.data(), p, bytes, cudaMemcpyDeviceToHost), "copy");
+        return out;
+    };
+    const auto verify = [&](const std::vector<float>& values, const char* phase) {
+        infernix::ops::moe_route(logits, top_k, split.routing, nullptr);
+        infernix::ops::moe_dispatch(split.routing, experts, split.dispatch, split.log, nullptr);
+        cuda_check(cudaDeviceSynchronize(), "route and dispatch");
+        std::vector<std::int32_t> ids(entries);
+        std::vector<float> weights(entries), gate(columns);
+        cuda_check(cudaMemcpy(ids.data(), fused.routing.ids.data, sizeof(std::int32_t) * entries, cudaMemcpyDeviceToHost),
+                   "copy");
+        cuda_check(cudaMemcpy(weights.data(), fused.routing.weights.data, sizeof(float) * entries,
+                              cudaMemcpyDeviceToHost), "copy");
+        cuda_check(cudaMemcpy(gate.data(), fused.routing.shared_gate.data, sizeof(float) * columns,
+                              cudaMemcpyDeviceToHost), "copy");
+        bool ids_ok = true, values_ok = true;
+        for (int t = 0; t < columns; ++t) {
+            const float* column = &values[static_cast<std::size_t>(t) * (experts + 1)];
+            std::vector<int> order(experts);
+            for (int e = 0; e < experts; ++e) { order[e] = e; }
+            std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return column[a] > column[b]; });
+            double sum = 0.0;
+            for (int k = 0; k < top_k; ++k) { sum += std::exp(static_cast<double>(column[order[k]]) - column[order[0]]); }
+            for (int k = 0; k < top_k; ++k) {
+                const std::size_t i = static_cast<std::size_t>(t) * top_k + k;
+                ids_ok = ids_ok && ids[i] == order[k];
+                const double want = std::exp(static_cast<double>(column[order[k]]) - column[order[0]]) / sum;
+                values_ok = values_ok && std::abs(weights[i] - want) <= 2e-6 * want;
+            }
+            const double want_gate = 1.0 / (1.0 + std::exp(-static_cast<double>(column[experts])));
+            values_ok = values_ok && std::abs(gate[t] - want_gate) <= 2e-6 * want_gate;
+        }
+        // The dispatch: counts, offsets, jobs and job count exact, each expert's entries as a set.
+        const auto words = [&](const std::int32_t* p, int n) {
+            std::vector<std::int32_t> out(n);
+            cuda_check(cudaMemcpy(out.data(), p, sizeof(std::int32_t) * n, cudaMemcpyDeviceToHost), "copy");
+            return out;
+        };
+        const auto counts = words(fused.dispatch.counts, experts), offsets = words(fused.dispatch.offsets, experts + 1);
+        const auto jobs = words(fused.dispatch.jobs, experts), got = words(fused.dispatch.entries, entries);
+        const auto log = words(fused.log, entries);
+        const int job_count = words(fused.dispatch.job_count, 1)[0];
+        bool dispatch_ok = log == ids && offsets[experts] == entries;
+        int used = 0;
+        for (int e = 0, start = 0; e < experts; ++e) {
+            std::vector<std::int32_t> want;
+            for (int i = 0; i < entries; ++i) {
+                if (ids[i] == e) { want.push_back(i); }
+            }
+            const int c = static_cast<int>(want.size());
+            std::vector<std::int32_t> mine(got.begin() + start, got.begin() + start + c);
+            std::sort(mine.begin(), mine.end());
+            dispatch_ok = dispatch_ok && counts[e] == c && offsets[e] == start && mine == want &&
+                          (c == 0 || jobs[used++] == e);
+            start += c;
+        }
+        dispatch_ok = dispatch_ok && job_count == used;
+        // Bit-equal to the two calls (entry order within an expert is unspecified, so as sets above).
+        const bool same =
+            host(fused.routing.ids.data, sizeof(std::int32_t) * entries) ==
+                host(split.routing.ids.data, sizeof(std::int32_t) * entries) &&
+            host(fused.routing.weights.data, sizeof(float) * entries) ==
+                host(split.routing.weights.data, sizeof(float) * entries) &&
+            host(fused.routing.shared_gate.data, sizeof(float) * columns) ==
+                host(split.routing.shared_gate.data, sizeof(float) * columns);
+        std::printf("route_dispatch E=%d T=%d k=%d (%s): ids %s, weights/gate %s, dispatch %s, %s the two calls\n",
+                    experts, columns, top_k, phase, ids_ok ? "exact" : "MISMATCH", values_ok ? "ok" : "MISMATCH",
+                    dispatch_ok ? "exact" : "MISMATCH", same ? "equal to" : "DIFFERENT from");
+        check(ids_ok && values_ok && dispatch_ok && same, "moe_route_dispatch equals its oracles and the two calls");
+    };
+
+    auto values = random_logits();
+    cuda_check(cudaMemcpy(d_logits, values.data(), sizeof(float) * logit_count, cudaMemcpyHostToDevice), "copy");
+    infernix::ops::moe_route_dispatch(logits, top_k, fused.routing, fused.dispatch, fused.log, nullptr);
+    verify(values, "eager");
+
+    cudaStream_t stream  = nullptr;
+    cudaGraph_t graph    = nullptr;
+    cudaGraphExec_t exec = nullptr;
+    cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "cudaStreamCreate");
+    cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "capture");
+    infernix::ops::moe_route_dispatch(logits, top_k, fused.routing, fused.dispatch, fused.log, stream);
+    cuda_check(cudaStreamEndCapture(stream, &graph), "capture");
+    cuda_check(cudaGraphInstantiate(&exec, graph, 0), "instantiate");
+    values = random_logits();
+    cuda_check(cudaMemcpyAsync(d_logits, values.data(), sizeof(float) * logit_count, cudaMemcpyHostToDevice, stream),
+               "copy");
+    cuda_check(cudaGraphLaunch(exec, stream), "launch");
+    cuda_check(cudaStreamSynchronize(stream), "replay");
+    verify(values, "graph replay");
+    cudaGraphExecDestroy(exec);
+    cudaGraphDestroy(graph);
+    cudaStreamDestroy(stream);
+    for (auto* o : {&fused, &split}) {
+        cudaFree(o->routing.ids.data);
+        cudaFree(o->routing.weights.data);
+        cudaFree(o->routing.shared_gate.data);
+        cudaFree(o->dispatch_base);
+        cudaFree(o->log);
+    }
+    cudaFree(d_logits);
+}
+
+// The CPU miss service refuses a job whose column count lies outside 1..kMaxCpuColumns (it would
+// index past the job's x/y): the request is answered with EINVAL and no output, and the service
+// keeps serving. Requests are published from the host the way the device writes them.
+void test_service_column_bound() {
+    std::mt19937 rng(503);
+    const fixtures::Expert expert = fixtures::random_expert(rng, false);
+    std::uint8_t* host            = nullptr;
+    cuda_check(cudaHostAlloc(reinterpret_cast<void**>(&host), moe::kRecordBytes, cudaHostAllocMapped), "cudaHostAlloc");
+    std::memcpy(host, expert.record.data(), moe::kRecordBytes);
+    const std::vector<moe::ExpertScales> scales{expert.scales};
+    std::vector<moe::CpuMissService::Layer> layers{{.records = host, .record_stride = moe::kRecordBytes,
+                                                    .scales = scales.data()}};
+    {
+        moe::CpuMissService service(layers, {.workers = 2, .max_jobs = 2, .max_columns = 64, .cpus = {}});
+        const infernix::ops::MoeCpuChannel channel = service.channel(0);
+        const auto x = fixtures::random_activations(rng, 1);
+        std::memcpy(channel.x, x.data(), sizeof(std::uint16_t) * moe::kHidden);
+        auto* y = const_cast<std::uint16_t*>(channel.y);
+        const std::size_t y_elements = static_cast<std::size_t>(moe::kHidden) * moe::kMaxCpuColumns;
+        std::fill(y, y + y_elements, std::uint16_t{0xABCD});
+        const auto publish = [&](std::uint32_t sequence, std::int32_t columns) -> std::uint32_t {
+            moe::MissRequest& request = *channel.request;
+            request.layer             = 0;
+            request.jobs              = 1;
+            request.tiered            = 0;
+            request.expert[0]         = 0;
+            request.ncols[0]          = columns;
+            for (int c = 0; c < moe::kMaxCpuColumns; ++c) { request.column[0][c] = 0; }
+            std::atomic_thread_fence(std::memory_order_release);
+            *reinterpret_cast<volatile std::uint32_t*>(&request.sequence) = sequence;
+            const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+            while (*reinterpret_cast<const volatile std::uint32_t*>(channel.done) != sequence &&
+                   std::chrono::steady_clock::now() < until) {
+                std::this_thread::yield();
+            }
+            std::atomic_thread_fence(std::memory_order_acquire);
+            check(*reinterpret_cast<const volatile std::uint32_t*>(channel.done) == sequence,
+                  "the CPU miss service answers every request");
+            return *reinterpret_cast<const volatile std::uint32_t*>(channel.status);
+        };
+        const auto untouched = [&] {
+            return std::all_of(y, y + y_elements, [](std::uint16_t v) { return v == 0xABCD; });
+        };
+        check(publish(1, 0) == EINVAL && untouched(), "a job of no columns is refused (EINVAL) without output");
+        check(publish(2, moe::kMaxCpuColumns + 1) == EINVAL && untouched(),
+              "a job past kMaxCpuColumns columns is refused (EINVAL) without output");
+        check(publish(3, -1) == EINVAL && untouched(), "a negative column count is refused (EINVAL)");
+        check(publish(4, 1) == 0, "the service serves a valid job after refusing bad ones");
+        const auto want = cpu_column(expert, x.data(), moe::ExpertActivation::kA4);
+        check(std::equal(want.begin(), want.end(), y), "the valid job's output equals the CPU engine's");
+        check(service.failure().empty(), "refused jobs do not fail the service");
+    }
+    cudaFreeHost(host);
+    std::printf("CPU miss service: column counts outside 1..%d refused\n", moe::kMaxCpuColumns);
+}
+
 } // namespace
 
 int main() {
@@ -838,6 +1283,11 @@ int main() {
         for (const int entries : {1, 10, 1024, 1025, 40960}) { test_dispatch(512, entries, 100U + entries); }
         test_dispatch(1024, 1024, 31); // every expert slot of the one-CTA kernel
         test_dispatch(3, 1000, 37);    // few experts, long runs per expert
+        for (const int columns : {1, 5, 32, 33}) { test_route_dispatch(512, columns, 10, 200U + columns); }
+        test_route_dispatch(512, 64, 16, 233); // 1024 entries past the one-kernel column count
+        test_route_dispatch(9, 3, 3, 239);     // few experts: lanes past E in every selection
+        for (const int columns : {1, 5}) { test_combine_inject(columns, 10, 4, 300U + columns); }
+        test_service_column_bound();
         test_layer(12, 1, 10, 7);  // decode: one column, ten experts
         test_layer(24, 8, 10, 11); // the widest forked call: more jobs than one 3-slot pass
         test_layer(9, 5, 3, 13);   // several columns per expert: several passes per job
@@ -847,6 +1297,9 @@ int main() {
         test_layer(400, 64, 10, 23); // more than 256 jobs: the plan ranks in several chunks
         test_layer(512, 512, 10, 29);  // a short prompt's call: ~10 columns per expert, hundreds of narrow jobs
         test_layer(512, 2048, 10, 31); // a wider call: x published from thousands of columns
+        test_tail_skip(48, 1, 10, 7, 401);  // decode: one column, Strata's default rank
+        test_tail_skip(48, 6, 10, 5, 403);  // MTP verification width: an expert skips only if every column ranks it low
+        test_tail_skip(96, 16, 10, 8, 409); // two verify rows: past the fork route, wide experts never skipped
         // W4A16 experts (§16.2.1): decode, verification, several columns per expert, many misses, and
         // a short prompt's call (experts of more than eight columns on the narrow kernels). Calls of
         // four columns take the one-column kernels and of five or more the multi-column ones.

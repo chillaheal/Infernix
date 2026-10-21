@@ -8,6 +8,7 @@
 #include <nlohmann/json.hpp>
 
 #include <cstdint>
+#include <functional>
 #include <initializer_list>
 #include <string>
 #include <string_view>
@@ -29,14 +30,31 @@ struct OpenAIPromptCachePolicy {
 [[nodiscard]] OpenAIPromptCachePolicy parse_openai_prompt_cache_policy(const RequestJson& body);
 void apply_openai_prompt_cache_policy(GenerationRequest& request, OpenAIPromptCachePolicy policy);
 
+// The loaded chat template's capabilities, reported as `chat_template_caps` on each /v1/models
+// object (the object llama.cpp reports for its own template).
+struct ChatTemplateCaps {
+    bool supports_tools = false; // a declared tool reaches the rendered prompt
+};
+
+// Probes the chat template through the serving prompt path: `count_prompt_tokens` counts a short
+// conversation declaring one probe tool, once under a short name and once under a longer one. The
+// template renders tool declarations when the longer name lengthens the prompt; a template that
+// ignores tools, or renders a fixed tool preamble without the declaration, counts both alike. A
+// template that refuses a declared tool (HTTP 400) does not support tools, and a tool-bearing
+// prompt that overflows the context while the tool-free one fits shows that the declaration
+// rendered. Other errors propagate.
+[[nodiscard]] ChatTemplateCaps
+probe_chat_template_caps(const std::function<int(const GenerationRequest&)>& count_prompt_tokens);
+
 // The /v1/models list. `image_model_id` is the image resource's public id, empty when no image
 // pipeline is attached. It is listed as a bare model object because the fields that describe a
 // language model (max_model_len, n_ctx, ftype) say nothing true about a diffusion pipeline.
 std::string make_models_list(const std::string& model_id, std::int64_t created,
                              std::uint32_t max_model_len, const ModelMetadata& metadata,
-                             std::string_view image_model_id = {});
+                             const ChatTemplateCaps& caps, std::string_view image_model_id = {});
 std::string make_model_object(const std::string& model_id, std::int64_t created,
-                              std::uint32_t max_model_len, const ModelMetadata& metadata);
+                              std::uint32_t max_model_len, const ModelMetadata& metadata,
+                              const ChatTemplateCaps& caps);
 std::string make_image_model_object(std::string_view image_model_id, std::int64_t created);
 std::string make_error_body(const ApiError& error);
 std::int64_t unix_time_now();

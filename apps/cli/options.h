@@ -17,10 +17,14 @@ struct Options {
     std::filesystem::path artifact_path;
     std::filesystem::path chat_template_path;
     std::filesystem::path ngram_volume_path;
+    NgramResidency ngram_residency = NgramResidency::Auto;
     // --expert-state FILE|off: absent uses the artifact path + .expert-state, "off" disables.
     std::optional<std::filesystem::path> expert_state;
+    // --expert-stripe FILE: the experts' record tails on a second drive (EngineOptions::expert_stripe_path).
+    std::filesystem::path expert_stripe_path;
     std::uint64_t ram_headroom_bytes = kDefaultRamHeadroomBytes;
     std::optional<std::uint64_t> expert_ram_bytes; // --expert-ram-mib; empty: the RAM ledger's share
+    std::optional<std::uint64_t> expert_pin_bytes; // --expert-pin-mib; empty: what the OS lets it pin
     std::filesystem::path grammar_path;
     std::filesystem::path json_schema_path;
     std::optional<std::string> regex;
@@ -35,15 +39,20 @@ struct Options {
     KvCapacityPolicy kv_capacity = KvCapacityPolicy::explicit_capacity(2048);
     std::optional<std::size_t> vram_headroom_bytes; // empty: the model's automatic headroom
     bool vram_past_budget = false;
-    std::uint32_t prefill_chunk  = 1024;
+    std::uint32_t expert_tail_skip = 0; // EngineOptions::expert_tail_skip
+    std::uint32_t prefill_chunk  = 0; // 0: the model's default (EngineOptions)
     int device                   = 0;
 
     KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
     // INT8 KV prefills with the fast prompt kernel unless the original kernel is selected.
     bool original_int8_prefill_kernel = false;
-    PrefillPv8 prefill_8bit_pv         = PrefillPv8::Auto;
     std::uint32_t prefill_split_workspace_mib = kDefaultPrefillSplitWorkspaceMiB;
     bool original_nvfp4_prefill_kernel = false;
+    // Off with --disable-fast-paths (EngineOptions::fast_paths).
+    bool fast_paths = true;
+    // --fast-path NAME (repeatable): also run these, qualified or not (qualification runs;
+    // EngineOptions::fast_path_candidates).
+    std::vector<FastPath> fast_path_candidates;
     SpeculativeOptions speculative;
     bool enable_vision                     = false;
     VisionOffload vision_offload                    = VisionOffload::Auto;
@@ -65,8 +74,15 @@ struct Options {
     SamplingOverrides sampling;
     bool greedy                 = false;
     product::LogLevel log_level = product::LogLevel::Info;
+
+    // --config FILE and the options it gave (provenance for the startup log).
+    std::optional<std::string> config_path;
+    std::vector<std::string> config_arguments;
 };
 
+// argv[1] is the model path and the rest are options. `--config FILE` reads further options, and the
+// model path when the command line has none, from a TOML file (product/config/config_file.h);
+// options on the command line override the file.
 [[nodiscard]] Options parse_options(int argc, char** argv);
 [[nodiscard]] std::string usage_text(const char* argv0);
 

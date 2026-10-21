@@ -19,11 +19,18 @@ bool aligned_to(const void* pointer, std::uintptr_t alignment) {
     return pointer != nullptr && (reinterpret_cast<std::uintptr_t>(pointer) & (alignment - 1)) == 0;
 }
 
-void validate_policy(LinearPolicy policy) {
+void validate_policy(LinearPolicy policy, QType qtype) {
+    if (column_invariant(policy) && qtype != QType::NVFP4 &&
+        qtype != QType::FP8_E4M3FN_ROW_BF16) {
+        throw std::invalid_argument("linear_swiglu: the weight format registers no column-invariant route");
+    }
     switch (policy) {
     case LinearPolicy::A16Only:
     case LinearPolicy::AllowA8:
     case LinearPolicy::AllowA4:
+    case LinearPolicy::A16ColumnInvariant:
+    case LinearPolicy::AllowA4Residual:
+    case LinearPolicy::AllowA8Residual:
         return;
     }
     throw std::invalid_argument("linear_swiglu: invalid compute policy");
@@ -34,8 +41,11 @@ void validate_policy(LinearPolicy policy) {
 std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gate_up_rows,
                                                    std::int32_t input_rows, LinearPolicy policy,
                                                    std::int32_t min_tokens,
-                                                   std::int32_t max_tokens) {
-    validate_policy(policy);
+                                                   std::int32_t max_tokens, LinearRoutes routes) {
+    validate_policy(policy, qtype);
+    if (!valid_linear_routes(routes)) {
+        throw std::invalid_argument("linear_swiglu workspace: invalid route flags");
+    }
     if (min_tokens <= 0 || max_tokens < min_tokens || (gate_up_rows % 2) != 0) {
         throw std::invalid_argument("linear_swiglu workspace: invalid profile or token interval");
     }
@@ -55,7 +65,7 @@ std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gat
     }
     if (qtype == QType::Q4_G64_FP16) {
         return detail::q4_linear_swiglu_capacity_workspace_bytes(
-            gate_up_rows, gate_up_rows / 2, input_rows, input_rows, min_tokens, max_tokens);
+            gate_up_rows, gate_up_rows / 2, input_rows, input_rows, min_tokens, max_tokens, routes);
     }
     if (qtype == QType::NVFP4 && gate_up_rows == 34816 && input_rows == 5120) {
         return detail::nvfp4_linear_swiglu_workspace_capacity_bytes(policy, min_tokens, max_tokens);
@@ -74,8 +84,11 @@ std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gat
 }
 
 void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, LinearPolicy policy,
-                   WorkspaceArena& ws, cudaStream_t stream) {
-    validate_policy(policy);
+                   WorkspaceArena& ws, cudaStream_t stream, LinearRoutes routes) {
+    validate_policy(policy, gate_up_weight.qtype);
+    if (!valid_linear_routes(routes)) {
+        throw std::invalid_argument("linear_swiglu: invalid route flags");
+    }
     if (x.dtype != DType::BF16 || out.dtype != DType::BF16) {
         throw std::invalid_argument("linear_swiglu: x/out must be BF16");
     }
@@ -88,6 +101,10 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
                            gate_up_weight.padded_shape[1] == 2048) ||
                           (x.ne[0] == 2560 && out.ne[0] == 640 && gate_up_weight.n == 1280 &&
                            gate_up_weight.k == 2560 && gate_up_weight.padded_shape[0] == 1280 &&
+                           gate_up_weight.padded_shape[1] == 2560) ||
+                          // Qwen3.8-Flash-Next's DFlash2 MLP.
+                          (x.ne[0] == 2560 && out.ne[0] == 7680 && gate_up_weight.n == 15360 &&
+                           gate_up_weight.k == 2560 && gate_up_weight.padded_shape[0] == 15360 &&
                            gate_up_weight.padded_shape[1] == 2560);
     if (t <= 0 || x.ne[2] != 1 || x.ne[3] != 1 || out.ne[1] != t || out.ne[2] != 1 ||
         out.ne[3] != 1 || (!large_shape && !q8_shape)) {
@@ -146,7 +163,7 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
     if (q8_weight) {
         detail::q8_linear_swiglu_dispatch(x, gate_up_weight, out, stream);
     } else {
-        detail::q4_linear_swiglu_dispatch(x, gate_up_weight, out, ws, stream);
+        detail::q4_linear_swiglu_dispatch(x, gate_up_weight, out, ws, stream, routes);
     }
 }
 

@@ -49,7 +49,14 @@ struct HybridCacheCounters {
     std::uint64_t blocks_duplicate    = 0;
     std::uint64_t taps_created        = 0;
     std::uint64_t taps_skipped        = 0;
+    std::uint64_t taps_skipped_no_slot = 0; // of taps_skipped: no Device snapshot slot
     std::uint64_t endpoints_created   = 0;
+    // Endpoints that passed their gates but were not published (no Device snapshot slot, a full
+    // snapshot table, or a failure while publishing).
+    std::uint64_t endpoints_skipped   = 0;
+    // Snapshot images and blocks refused Host slabs (they stay Device-only).
+    std::uint64_t host_image_write_refusals = 0;
+    std::uint64_t host_block_write_refusals = 0;
     std::uint64_t host_image_writes   = 0;
     std::uint64_t host_block_writes   = 0;
     std::uint64_t host_image_restores = 0;
@@ -58,7 +65,11 @@ struct HybridCacheCounters {
     std::uint64_t host_tail_restores  = 0;
     std::uint64_t host_write_bytes    = 0;
     std::uint64_t host_restore_bytes  = 0;
+    // The copy calls behind those bytes (many small copies queue on the copy engine).
+    std::uint64_t host_write_copies   = 0;
+    std::uint64_t host_restore_copies = 0;
     std::uint64_t evicted_blocks      = 0;
+    std::uint64_t tool_call_holds     = 0; // tool-call holds placed
 };
 
 // One layer of the model's forward pass, in execution order, as a restore sees it: whether it
@@ -284,8 +295,9 @@ private:
     void adopt_destination(const HybridBlockPages& pages, std::uint32_t columns);
     [[nodiscard]] std::byte* slab(std::uint32_t id) const noexcept;
     void add_copies(PageCopies& copies, const HybridBlockPages& pages, std::uint32_t slab_id);
-    void enqueue_to_host(const PageCopies& copies, cudaStream_t stream) const;
-    void enqueue_from_host(const PageCopies& copies, cudaStream_t stream) const;
+    // Each returns the copy calls it issued.
+    std::uint32_t enqueue_to_host(const PageCopies& copies, cudaStream_t stream) const;
+    std::uint32_t enqueue_from_host(const PageCopies& copies, cudaStream_t stream) const;
     [[nodiscard]] cudaEvent_t take_event();
     void order_after(cudaStream_t producer, cudaStream_t consumer);
     void publish_write(PendingWrite& write);

@@ -28,10 +28,13 @@ constexpr ReductionCriterion kA16Tolerance{
     2.0 * kBf16UnitRoundoff,
 };
 constexpr ReductionCriterion kA4Tolerance{0.16, kBf16UnitRoundoff, 0.16};
+// The A4 residual profile: tight enough that one term (A4's error) fails it.
+constexpr ReductionCriterion kA4ResidualTolerance{2.5e-2, kBf16UnitRoundoff, 5.0e-2};
 
 struct Invocation {
     std::int32_t tokens;
     ops::LinearPolicy policy;
+    ops::LinearRoutes routes = ops::LinearRoutes::Exact;
 };
 
 std::vector<std::int32_t> sampled_indices(std::int32_t extent) {
@@ -95,6 +98,7 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
         Invocation{4, ops::LinearPolicy::A16Only},
         Invocation{5, ops::LinearPolicy::A16Only},
         Invocation{8, ops::LinearPolicy::A16Only},
+        Invocation{12, ops::LinearPolicy::A16Only},
         Invocation{16, ops::LinearPolicy::A16Only},
         Invocation{17, ops::LinearPolicy::A16Only},
         Invocation{24, ops::LinearPolicy::A16Only},
@@ -108,6 +112,16 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
         Invocation{128, ops::LinearPolicy::A16Only},
         Invocation{129, ops::LinearPolicy::A16Only},
         Invocation{1024, ops::LinearPolicy::A16Only},
+        // The column-invariant route: one schedule at every T, sliced beyond its widest tile.
+        Invocation{1, ops::LinearPolicy::A16ColumnInvariant},
+        Invocation{2, ops::LinearPolicy::A16ColumnInvariant},
+        Invocation{5, ops::LinearPolicy::A16ColumnInvariant},
+        Invocation{9, ops::LinearPolicy::A16ColumnInvariant},
+        Invocation{17, ops::LinearPolicy::A16ColumnInvariant},
+        Invocation{33, ops::LinearPolicy::A16ColumnInvariant},
+        Invocation{40, ops::LinearPolicy::A16ColumnInvariant},
+        Invocation{65, ops::LinearPolicy::A16ColumnInvariant},
+        Invocation{129, ops::LinearPolicy::A16ColumnInvariant},
         Invocation{first_a4, ops::LinearPolicy::AllowA4},
         Invocation{17, ops::LinearPolicy::AllowA4},
         Invocation{8, ops::LinearPolicy::AllowA4},
@@ -123,6 +137,26 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
         Invocation{1023, ops::LinearPolicy::AllowA4},
         Invocation{1024, ops::LinearPolicy::AllowA4},
         Invocation{1025, ops::LinearPolicy::AllowA4},
+        // The A4 residual profile: A16 below 9 columns, then each residual tile and a ragged
+        // last tile; 128 also replays under a CUDA Graph.
+        Invocation{7, ops::LinearPolicy::AllowA4Residual},
+        Invocation{8, ops::LinearPolicy::AllowA4Residual},
+        Invocation{9, ops::LinearPolicy::AllowA4Residual},
+        Invocation{13, ops::LinearPolicy::AllowA4Residual},
+        Invocation{16, ops::LinearPolicy::AllowA4Residual},
+        Invocation{17, ops::LinearPolicy::AllowA4Residual},
+        Invocation{32, ops::LinearPolicy::AllowA4Residual},
+        Invocation{33, ops::LinearPolicy::AllowA4Residual},
+        Invocation{64, ops::LinearPolicy::AllowA4Residual},
+        Invocation{65, ops::LinearPolicy::AllowA4Residual},
+        Invocation{128, ops::LinearPolicy::AllowA4Residual},
+        Invocation{129, ops::LinearPolicy::AllowA4Residual},
+        // batched-decode's down tiles (8 K-warps at K=17408, 5-16 columns): the A16 criterion.
+        Invocation{5, ops::LinearPolicy::A16Only, ops::LinearRoutes::WideDownTile},
+        Invocation{8, ops::LinearPolicy::A16Only, ops::LinearRoutes::WideDownTile},
+        Invocation{12, ops::LinearPolicy::A16Only, ops::LinearRoutes::WideDownTile},
+        Invocation{16, ops::LinearPolicy::A16Only, ops::LinearRoutes::WideDownTile},
+        Invocation{9, ops::LinearPolicy::AllowA4, ops::LinearRoutes::WideDownTile},
     };
     // The invocation list is what drives the host buffers, so take the bound from it rather than
     // from a literal that silently caps it.
@@ -158,7 +192,7 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
         const std::size_t capacity = ops::linear_add_workspace_capacity_bytes(
             QType::NVFP4, n, k, invocation.policy, invocation.tokens, invocation.tokens);
         WorkspaceArena workspace(std::max<std::size_t>(capacity, 256));
-        ops::linear_add(x, weight, residual, invocation.policy, workspace, nullptr);
+        ops::linear_add(x, weight, residual, invocation.policy, workspace, nullptr, invocation.routes);
         cuda_check(cudaDeviceSynchronize(), "synchronize NVFP4 linear_add");
 
         if (invocation.tokens == 128) {
@@ -167,7 +201,7 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
             cudaGraphExec_t executable;
             CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
             CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
-            ops::linear_add(x, weight, residual, invocation.policy, workspace, stream);
+            ops::linear_add(x, weight, residual, invocation.policy, workspace, stream, invocation.routes);
             CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
             CUDA_CHECK(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
             for (int replay = 0; replay < 2; ++replay) {
@@ -182,9 +216,12 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
         }
 
         const bool a4           = invocation.policy == ops::LinearPolicy::AllowA4;
+        const bool a4_residual  = invocation.policy == ops::LinearPolicy::AllowA4Residual;
         const std::string label = "NVFP4 linear_add [" + std::to_string(n) + "," +
-                                  std::to_string(k) + "] " + (a4 ? "A4" : "A16") +
-                                  " T=" + std::to_string(invocation.tokens);
+                                  std::to_string(k) + "] " +
+                                  (a4 ? "A4" : (a4_residual ? "A4 residual" : "A16")) +
+                                  " T=" + std::to_string(invocation.tokens) +
+                                  (invocation.routes == ops::LinearRoutes::WideDownTile ? " wide-down-tile" : "");
         if (workspace.peak_used() != capacity) {
             std::cerr << label << ": workspace query/execution high-water mismatch\n";
             ++failures;
@@ -215,7 +252,10 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
                 expected.push_back(sum + static_cast<double>(bf16_to_f32(initial_residual[index])));
             }
         }
-        failures += verify_reduction(label, actual, expected, a4 ? kA4Tolerance : kA16Tolerance);
+        failures += verify_reduction(label, actual, expected,
+                                     a4 ? kA4Tolerance
+                                        : (a4_residual && invocation.tokens >= 9 ? kA4ResidualTolerance
+                                                                                 : kA16Tolerance));
     }
 
     failures += device_activation.verify_guards("NVFP4 linear_add activation");

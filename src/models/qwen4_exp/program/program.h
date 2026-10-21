@@ -16,6 +16,7 @@
 #include "models/qwen3_5/ngram.h"
 #include "models/qwen4_exp/config.h"
 #include "models/qwen4_exp/memory_plan.h"
+#include "models/qwen4_exp/execution/fast_path_flags.h"
 #include "infernix/types.h"
 #include "runtime/contract/execution.h"
 #include "runtime/contract/request.h"
@@ -25,9 +26,11 @@
 #include "runtime/prefix_cache/tap_planner.h"
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <stdexcept>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -97,6 +100,7 @@ struct HybridPrefixCacheStats {
     std::uint64_t held_device_evictions   = 0;
     std::uint64_t held_snapshot_losses    = 0;
     std::uint64_t held_host_refusals      = 0;
+    std::uint64_t tool_call_holds         = 0;
 };
 
 class SequenceHandle {
@@ -218,6 +222,10 @@ struct PrefillProgress {
     runtime::BeginSummary summary;
     std::uint32_t processed_prompt_tokens = 0;
     bool complete                         = false;
+    // The expert frames lent to this prompt's calls are returnable now (between calls, and after
+    // each layer-walk span), so a request waiting for KV growth may be admitted: the Engine re-runs
+    // admission (GitHub #24).
+    bool capacity_released = false;
     runtime::ExecutionTiming timing;
     std::optional<PendingBatch> pending;
     std::optional<PromptReadout> readout;
@@ -295,7 +303,8 @@ struct ProgramDevicePlan {
     std::uint64_t state     = 0; // GDN, PLE and QSA tail state, verification records, MTP columns
     std::uint64_t io        = 0; // per-call inputs, logits, sampling and round arrays
     std::uint64_t residency = 0; // the expert frame tables and route log
-    std::uint64_t expert_record_stride = 0; // one expert frame
+    std::uint64_t expert_record_stride = 0; // the largest expert record (staging and stream-ring slots)
+    std::uint64_t expert_frame_bytes   = 0; // one average expert frame (the cache's sizing unit)
     std::uint32_t max_frames           = 0; // the most frames the expert cache uses
     std::uint32_t graph_bound          = 0; // CUDA graph executables the Program may instantiate
 
@@ -321,25 +330,45 @@ struct PrefixCachePersistence {
 struct ProgramOptions {
     std::uint32_t max_context     = 0;
     std::uint32_t max_concurrency = 1;
+    // Teacher-forced scoring (EnginePurpose::CausalScoring, causal_score): the device plan adds the
+    // final-mixer output of a max_context window and one tile of FP32 logits.
+    bool causal_scoring = false;
     std::uint32_t prefill_chunk   = 1024;
     // Main KV capacity in tokens, shared by every lane.
     std::uint32_t kv_capacity_tokens = 0;
     KvCacheStorage kv_cache          = KvCacheStorage::Int8Group64;
+    // The fast paths the Forward runs (fast_paths.h); all off on the exact route.
+    execution::ForwardFastPaths fast_paths;
     std::filesystem::path ngram_volume;
+    // The table that volume holds (resolve_ngram_volume): another volume, in any format, replaces the
+    // artifact's table. Empty: the artifact's table.
+    std::optional<NgramTableConfig> ngram_table;
+    // The whole n-gram table read into pinned RAM at startup (EngineOptions::ngram_residency,
+    // resolved by the RAM ledger); rows are then never read from the volume.
+    bool ngram_in_ram = false;
     // The expert cache's saved state (design §19.3.5 S4b): read at startup to fill the frames, written
     // at stop and every 10 minutes between requests. Empty: no warm start. The identity names the
     // artifact the state belongs to.
     std::filesystem::path expert_state;
     std::string expert_state_identity;
+    // The SSD tier reads each record's tail from this expert stripe (EngineOptions::expert_stripe_path).
+    std::filesystem::path expert_stripe;
     // Device memory left free for the display and other programs once the fixed allocations and
     // the expert frames are made (design §19.3.7); empty selects it from the display state.
     std::optional<std::uint64_t> vram_headroom;
     bool vram_past_budget = false; // EngineOptions::vram_past_budget
+    // EngineOptions::expert_tail_skip (approximate, 0: off): execution::ForwardExperts::tail_skip_rank.
+    std::uint32_t expert_tail_skip = 0;
     bool expert_cache = true;
     // SSD expert tier (design §19.3.7): pinned RAM for expert slots when the model's banks are
-    // streamed from the artifact (LoadOptions::stream_experts; the RAM ledger's expert share).
-    // Ignored in full mode.
-    std::uint64_t expert_ram_bytes = 0;
+    // streamed from the artifact (LoadOptions::stream_experts; the RAM ledger's pinned expert
+    // share), and resident pageable RAM for unpinned records past the page-locking limit (its
+    // pageable share). Ignored in full mode.
+    std::uint64_t expert_ram_bytes      = 0;
+    std::uint64_t expert_unpinned_bytes = 0;
+    // Pinned allocations the Program makes after the tier (the prefix cache's Host tier and an
+    // allowance): when the OS refuses a slot chunk, the tier leaves this much below the limit.
+    std::uint64_t later_pinned_bytes = 0;
     // Speculative decoding with n-gram copy proposals (design section 11.3): at most this many
     // draft tokens per round (0 disables, at most 15), proposed only from a match of at least
     // ngram_min_match tokens (4..64) earlier in the request.
@@ -348,12 +377,50 @@ struct ProgramOptions {
     // MTP drafts per round when the drafter is loaded (design section 11, at most 7). A longer
     // n-gram proposal, when enabled, replaces a round's MTP drafts.
     std::uint32_t mtp_draft_tokens = 0;
+    // DFlash2 (--spec dflash2 --draft-model, docs/maintainer/dflash.md): the drafter proposes this
+    // many tokens per round (1..7) in one block of dflash2_draft_tokens + 1 columns; a round verifies
+    // them all, or with auto_draft_length the prefix its draft-length policy chooses. A longer n-gram
+    // proposal, when enabled, replaces a round's drafts as it replaces MTP's.
+    std::uint32_t dflash2_draft_tokens = 0;
+    // The automatic draft length (--draft-tokens auto, design 11.3): each one-row round drafts the
+    // length in 0..mtp_draft_tokens that maximizes its expected tokens per round time, and a pair
+    // round one length in 0..min(mtp_draft_tokens, 2) from both rows' acceptance. False: one-row
+    // rounds draft mtp_draft_tokens and pair rounds min(mtp_draft_tokens, 2).
+    bool auto_draft_length = false;
+    // A one-row round verifies its neural drafts up to the first whose drafter probability is below
+    // this value (design §19.3.5; --spec-min-p): MTP's draft-head probability, DFlash2's
+    // candidate-selector probability (temperature 1); 0 verifies every draft. 0.5 is the measured MTP
+    // value the Engine passes with the automatic draft length, 0 with a fixed one.
+    double draft_min_p = 0.5;
+    // The request-coupling fast paths (FastPath; docs/maintainer/model-quality.md section 6.7). Each
+    // is off unless selected, and with all three off a request's output does not depend on the other
+    // requests (concurrency, cache contents, KV pressure):
+    // - pair_speculation (adaptive-speculation): two-row rounds draft one length chosen from both
+    //   rows' acceptance; without it they decode plain, as rounds of three or more rows do;
+    // - free_cache_resume (free-cache-resume): prefill calls, taps and resumes at any position, sibling
+    //   coalescing, and endpoints and blocks holding decode-computed state; without it every call
+    //   boundary, tap and resume is a multiple of 16 tokens (the GDN prefill's sub-chunk) and only
+    //   prompt blocks and taps are published;
+    // - preemption (preemption): KV pages grow per unit and a short pool pauses residents (replay
+    //   recomputes generated tokens as prefill); without it a request holds its whole extent from
+    //   admission.
+    bool pair_speculation  = false;
+    bool free_cache_resume = false;
+    bool preemption        = false;
+    // sampled-mtp-drafts (FastPath::SampledMtpDrafts): a sampled row's MTP drafts are drawn from the
+    // draft head's top tokens under its sampler and verified by sparse rejection sampling, and its
+    // one-row rounds verify every draft (no draft_min_p cut). Greedy rows are unchanged.
+    bool sampled_mtp_drafts = false;
     // CPU-served misses (design section 10): host expert-engine workers (0 disables), the most
     // experts one layer call hands to them, and the share kept on the PCIe stage (misses / divisor;
     // 0 derives it from the measured link and CPU rates, design §19.3.12).
     // Defaults measured fastest on the i9-13900K (design sections 19.2 and 19.3.16): 16 jobs pay in
     // calls with many misses (C = 4 fill +7 %, cold MTP +3 %) and are neutral elsewhere; 32 is no faster.
     std::uint32_t cpu_expert_workers = 6;
+    // The workers for a GGUF import's banks (the ggml CPU route, compute-bound where the NVFP4
+    // route is DRAM-bound): on the i9-13900K, tg512 decoded 100.5 tok/s without CPU service, 98.4
+    // with 6 workers, 103.7 with 16 and 103.6 with 20 (2026-10-11; 16 workers with divisor 3: 101.1).
+    std::uint32_t cpu_ggml_expert_workers = 16;
     std::uint32_t cpu_expert_jobs    = 16;
     std::int32_t cpu_pcie_divisor    = 0;
     // Prefill CPU assist (design §19.3.1 P7): prefill calls wider than a decode round and narrower
@@ -474,6 +541,13 @@ public:
     // Holds the snapshot each queued request would resume from now, in admission order
     // (hybrid-prefix-cache-spec §9.6); an empty queue releases every hold.
     void hybrid_hold_queue(std::span<const RequestBasePlan* const> queue);
+    // No tool-call holds (HybridPrefixCacheOptions::tool_call_hold is zero for this architecture
+    // and normalize_engine_options refuses another value), so the queue holds go stale only with
+    // the queue or the snapshots.
+    void hybrid_hold_continuation(std::chrono::steady_clock::time_point) {
+        throw std::logic_error("Qwen4Exp: the prefix cache has no tool-call holds");
+    }
+    [[nodiscard]] bool hybrid_holds_stale() const noexcept { return false; }
     // Changes when a queued request's choice of snapshot may have changed.
     [[nodiscard]] std::uint64_t hybrid_cache_epoch() const noexcept;
     [[nodiscard]] HybridPrefixCacheStats hybrid_stats() const noexcept;
@@ -531,6 +605,12 @@ public:
     // when it has been written since the last save or load (Engine periodic save,
     // HybridPrefixCacheOptions::persistent_save_interval). Absent without a file or a change.
     [[nodiscard]] std::optional<PrefixCachePersistence> save_prefix_cache_now(const CancellationView& abandoned);
+
+    // Teacher-forced scoring of a text prompt (ProgramOptions::causal_scoring; an idle Program): the
+    // log-probability of each token from first_target on given the tokens before it, with the
+    // top_k distribution and the candidates' log-probabilities (ScoreOptions).
+    [[nodiscard]] ScoreResult causal_score(PreparedPrompt&& prompt, std::uint32_t first_target,
+                                           const ScoreOptions& options);
 
     [[nodiscard]] PhysicalUsageSnapshot physical_usage() const noexcept;
     [[nodiscard]] MemorySummary memory_summary() const noexcept;

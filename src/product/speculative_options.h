@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -29,6 +31,38 @@ namespace infernix::product {
         return "dflash2";
     }
     return "unknown";
+}
+
+// Parses --spec-min-p: a draft-head probability in [0, 1].
+[[nodiscard]] inline float parse_draft_min_p(std::string_view value) {
+    const std::string text(value);
+    char* end                = nullptr;
+    const double probability = std::strtod(text.c_str(), &end);
+    if (text.empty() || end != text.c_str() + text.size() || !(probability >= 0.0) ||
+        !(probability <= 1.0)) {
+        throw std::invalid_argument("--spec-min-p takes a probability in [0,1]: " + text);
+    }
+    return static_cast<float>(probability);
+}
+
+// "0.5"-style text of --spec-min-p, or "default" when unset.
+[[nodiscard]] inline std::string draft_min_p_text(const SpeculativeOptions& options) {
+    if (!options.draft_min_p) { return "default"; }
+    char text[32];
+    std::snprintf(text, sizeof(text), "%g", static_cast<double>(*options.draft_min_p));
+    return text;
+}
+
+// Applies a --draft-tokens value: "auto" selects the automatic MTP draft length up to the model's
+// most (draft_tokens 0 until the Engine resolves it), anything else a fixed count.
+inline void apply_draft_tokens(SpeculativeOptions& options, std::string_view value) {
+    options.draft_tokens_auto = value == "auto";
+    options.draft_tokens      = 0;
+    if (options.draft_tokens_auto) { return; }
+    if (value.empty() || value.size() > 3 || value.find_first_not_of("0123456789") != std::string_view::npos) {
+        throw std::invalid_argument("--draft-tokens takes a count or auto: " + std::string(value));
+    }
+    options.draft_tokens = static_cast<std::uint32_t>(std::stoul(std::string(value)));
 }
 
 // Parses --draft-tree-nodes: one to eight comma-separated column counts, entry c-1 applying to
@@ -125,6 +159,18 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
             }
         }
     }
+    if (options.draft_min_p && options.backend != SpeculativeBackend::Mtp &&
+        options.backend != SpeculativeBackend::DFlash2) {
+        throw std::invalid_argument("--spec-min-p requires --spec mtp or dflash2");
+    }
+    // auto with dflash2: Qwen3.8-Flash-Next's per-round policy (the Engine refuses it elsewhere).
+    if (options.draft_tokens_auto && options.backend != SpeculativeBackend::Mtp &&
+        options.backend != SpeculativeBackend::DFlash2) {
+        throw std::invalid_argument("--draft-tokens auto requires --spec mtp or dflash2");
+    }
+    if (!options.draft_model.empty() && options.backend != SpeculativeBackend::DFlash2) {
+        throw std::invalid_argument("--draft-model is a DFlash2 drafter: it requires --spec dflash2");
+    }
     if (options.draft_tree_paths < 2 || options.draft_tree_paths > 8) {
         throw std::invalid_argument("--draft-tree-paths must be in [2,8]");
     }
@@ -136,8 +182,11 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
         }
         return;
     case SpeculativeBackend::Mtp:
-        if (options.draft_tokens == 0 || options.draft_tokens > 5) {
-            throw std::invalid_argument("--spec mtp requires --draft-tokens in [1,5]");
+        // Qwen3.8-Flash-Next verifies up to 8 columns with column-invariant kernels (1..7); the
+        // Qwen3.5/3.6 MTP planner accepts 1..5 itself. auto leaves the count to the Engine.
+        if (options.draft_tokens_auto) { return; }
+        if (options.draft_tokens == 0 || options.draft_tokens > 7) {
+            throw std::invalid_argument("--spec mtp requires --draft-tokens in [1,7] or auto");
         }
         return;
     case SpeculativeBackend::DFlash:
@@ -146,8 +195,9 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
         }
         return;
     case SpeculativeBackend::DFlash2:
+        if (options.draft_tokens_auto) { return; }
         if (options.draft_tokens == 0 || options.draft_tokens > 15) {
-            throw std::invalid_argument("--spec dflash2 requires --draft-tokens in [1,15]");
+            throw std::invalid_argument("--spec dflash2 requires --draft-tokens in [1,15] (auto: Qwen3.8-Flash-Next)");
         }
         return;
     }

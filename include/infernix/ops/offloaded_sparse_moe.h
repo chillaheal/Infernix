@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/tensor.h"
+#include "core/weight.h"
 #include "ops/offloaded_sparse_moe/cpu/fetch_request.h"
 #include "ops/offloaded_sparse_moe/cpu/miss_request.h"
 #include "ops/offloaded_sparse_moe/cpu/w4a4_expert.h"
@@ -68,6 +69,10 @@ struct MoeDispatch {
 /// no clearing between calls, so a captured call replays correctly.
 void moe_dispatch(const MoeRouting& routing, std::int32_t experts, MoeDispatch& dispatch,
                   std::int32_t* route_log, cudaStream_t stream);
+/// moe_route then moe_dispatch (experts = E of the logits), in one kernel for decode and
+/// verification widths.
+void moe_route_dispatch(const Tensor& logits, std::int32_t top_k, MoeRouting& routing, MoeDispatch& dispatch,
+                        std::int32_t* route_log, cudaStream_t stream);
 
 /// The layer's routed expert records: expert e's record is at frame_base + frames[e] *
 /// record_stride when frames[e] >= 0, else at host_records + e * record_stride (pinned host
@@ -88,7 +93,7 @@ void moe_dispatch(const MoeRouting& routing, std::int32_t experts, MoeDispatch& 
 /// Calls of at least wide_from columns (prefill; 0: none) take wide_jobs as their cap instead.
 /// moe_experts returns after placing the host's outputs. The arithmetic is the same exact W4A4,
 /// so where an expert is computed never changes a bit. The wait lasts as long as the host's
-/// heartbeat word keeps changing; when it stops for kHeartbeatTimeoutNs the call writes
+/// heartbeat word keeps changing; when it stops for MoeExpertSource::heartbeat_timeout_ns the call writes
 /// kErrorHostSilent to the source's error word and leaves its CPU outputs unwritten (without an
 /// error word, or without a heartbeat after 2 s, it traps).
 struct MoeCpuChannel {
@@ -107,6 +112,12 @@ struct MoeCpuChannel {
     // misses / pcie_divisor of a call's misses stay on the GPU stage (0: the CPU takes up to
     // max_jobs of them), so the CPU and the PCIe stage share the call's misses.
     std::int32_t pcie_divisor           = 3;
+    // One-column calls (plain decode) use this divisor instead (0: pcie_divisor). When
+    // one_column_divisor_device is set, they read it there at execution instead (a device I32 the
+    // caller rewrites between rounds, so captured graphs follow it: Qwen4Exp's plain decode by
+    // context; 0 or less: pcie_divisor).
+    std::int32_t one_column_divisor     = 0;
+    const std::int32_t* one_column_divisor_device = nullptr;
     std::int32_t max_job_columns        = offloaded_moe::kMaxCpuColumns; // 1..kMaxCpuColumns
     // Prefill CPU assist (design §19.3.1 P7): calls of at least wide_from columns (0: none) take up
     // to wide_jobs <= kMaxCpuJobs CPU-served misses.
@@ -118,7 +129,7 @@ struct MoeCpuChannel {
 /// Phase 2): typically the next layer's first weights. Spans start 16-byte aligned; a span's bytes
 /// are rounded down to 16. Warming changes no result.
 struct MoeL2Warm {
-    static constexpr int kSpans = 4;
+    static constexpr int kSpans = 12;
     const void* ptr[kSpans]   = {};
     std::size_t bytes[kSpans] = {};
 };
@@ -139,6 +150,21 @@ struct MoeFetchChannel {
     std::int32_t layer                          = 0;
 };
 
+/// The record geometry of an exact-arithmetic expert bank: a GGUF (ggml) bank
+/// (docs/maintainer/qwen3_8-flash-next-design.md §19.3.25, storage layouts §8: gate rows, up rows in gate_up_format, then
+/// down rows in down_format, every row verbatim ggml blocks) or a block-FP8 bank (fp8_expert_b128_v1,
+/// both formats FP8_E4M3FN_B128: the rows, one byte per weight, then their BF16 tile scales;
+/// storage layouts §9). gate_up_format == NVFP4_MUL selects the NVFP4 record and its
+/// routes. Both banks run exact A16 arithmetic on every column count, so their outputs depend on
+/// neither placement nor batch.
+struct MoeGgmlBank {
+    QType gate_up_format       = QType::NVFP4_MUL;
+    QType down_format          = QType::NVFP4_MUL;
+    std::uint32_t gate_row_bytes = 0;
+    std::uint32_t down_row_bytes = 0;
+    std::uint64_t record_bytes = 0; // bytes a stage copies: the record rounded up to 16 (within its stride)
+};
+
 struct MoeExpertSource {
     const std::uint8_t* frame_base   = nullptr;
     const std::int32_t* frames       = nullptr; // device [E]
@@ -155,12 +181,18 @@ struct MoeExpertSource {
     // writes layer << 16 | code there (offloaded_moe::kError* or an errno); that call's outputs are
     // undefined and the caller must fail the round. The word is the caller's to clear.
     std::uint32_t* error = nullptr;
+    // How long the CPU wait and the fetch poller wait on a heartbeat that stands still (GPU time)
+    // before they write kErrorHostSilent / kErrorFetchSilent.
+    std::uint64_t heartbeat_timeout_ns = offloaded_moe::kHeartbeatTimeoutNs;
     std::uint64_t record_stride      = 0;
     const offloaded_moe::ExpertScales* scales = nullptr;
     // The layer's expert arithmetic: W4A4 with stored input scales (§16.2), or W4A16 for experts
     // stored without activation scales (§16.2.1; scales then hold the multipliers in alpha_*). The
     // CPU channel's service must compute with the same arithmetic.
     offloaded_moe::ExpertActivation activation = offloaded_moe::ExpertActivation::kA4;
+    // W4A16 experts' wide route: exact (default) or the two-term A4 fast path (design §19.3.23); the
+    // workspace must be sized for the same choice. Narrow routes and W4A4 experts ignore it.
+    offloaded_moe::WideA16 wide_a16 = offloaded_moe::WideA16::kExact;
     std::uint8_t* staging_base  = nullptr;
     std::int32_t staging_slots  = 0;
     MoeCpuChannel cpu;
@@ -193,16 +225,29 @@ struct MoeExpertSource {
     MoeL2Warm l2_warm;
     // Optional streamed records (design §19.3.8 F2): prefetched (device [E]) gives, for a
     // non-resident expert, the slot whose record the caller has already copied to prefetch_base +
-    // slot * record_stride (ordered before this call), or -1. Such an expert is read there like a
+    // slot * prefetch_stride (ordered before this call), or -1. Such an expert is read there like a
     // resident one: never staged and never CPU-served (the CPU takes misses the stream left out).
     const std::int32_t* prefetched     = nullptr;
     const std::uint8_t* prefetch_base  = nullptr;
+    std::uint64_t prefetch_stride      = 0; // 0 means frame_stride's
+    // The pitch of device frames, staging slots and landings; 0 means record_stride. The caller's
+    // frames of a layer's bank have that bank's record stride (a frame pool per record size).
+    std::uint64_t frame_stride = 0;
+    MoeGgmlBank ggml;
+    // Approximate tail skip (0: off; 1..top_k-1): in a CPU-served call (moe_experts' CPU plan runs), an
+    // expert neither resident nor prefetched, of at most kMaxColumns columns, that every column of the
+    // call routes at top-k slot >= tail_skip_rank (the smallest router weights) is neither staged,
+    // fetched nor computed: its outputs are zero and the other experts keep their weights (no
+    // renormalisation). It changes the output; the routing and route log are unchanged, so the
+    // expert is still credited as routed.
+    std::int32_t tail_skip_rank = 0;
 };
 
 /// Workspace of one moe_experts call of `columns` (T) columns and `entries` (k*T) routed entries
 /// with the layer's expert arithmetic.
 [[nodiscard]] std::size_t moe_experts_workspace_bytes(std::int32_t max_jobs, std::int32_t entries, std::int32_t columns,
-                                                      offloaded_moe::ExpertActivation activation);
+                                                      offloaded_moe::ExpertActivation activation,
+                                                      offloaded_moe::WideA16 wide_a16 = offloaded_moe::WideA16::kExact);
 
 /// x: BF16 [H, T]. outputs: BF16 [H, k*T], column t*k + slot receives expert ids[slot, t]'s
 /// output for column t. max_jobs bounds the job count the grid covers (min(E, k*T)).
@@ -212,7 +257,15 @@ struct MoeExpertSource {
 /// arguments before reading `outputs`. The workspace stays reserved until then.
 void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource& source,
                  std::int32_t top_k, std::int32_t max_jobs, void* workspace, Tensor& outputs,
-                 cudaStream_t stream, bool wait_for_cpu = true);
+                 cudaStream_t stream, bool wait_for_cpu = true, bool cpu_planned = false);
+
+/// moe_route_dispatch and, for a CPU-served call of decode or verification width, the CPU plan of
+/// the moe_experts call with these x, source, max_jobs, workspace and outputs, in one kernel.
+/// Returns true when it planned; that moe_experts call then passes cpu_planned = true.
+[[nodiscard]] bool moe_route_dispatch_plan(const Tensor& logits, std::int32_t top_k, MoeRouting& routing,
+                                           MoeDispatch& dispatch, std::int32_t* route_log, const Tensor& x,
+                                           const MoeExpertSource& source, std::int32_t max_jobs, void* workspace,
+                                           const Tensor& outputs, cudaStream_t stream);
 
 /// Waits for the host's answer to a moe_experts call made with wait_for_cpu == false and places
 /// its outputs; a no-op when that call published no request.
@@ -222,5 +275,10 @@ void moe_experts_cpu_wait(const Tensor& x, const MoeDispatch& dispatch, const Mo
 /// y = bf16(sum_slot w * outputs + shared_gate * shared), BF16 [H, T].
 void moe_combine(const Tensor& outputs, const MoeRouting& routing, const Tensor& shared, Tensor& y,
                  cudaStream_t stream);
+/// moe_combine followed by hyper_connection_inject(y, inject, residual) without materializing y:
+/// residual[s*H+d, t] = bf16(residual[s*H+d, t] + inject[s, t] * y[d, t]), y the BF16 combine of
+/// column t, with the same bits as the two calls. inject: FP32 [S, T]; residual: BF16 [S*H, T].
+void moe_combine_inject(const Tensor& outputs, const MoeRouting& routing, const Tensor& shared,
+                        const Tensor& inject, Tensor& residual, cudaStream_t stream);
 
 } // namespace infernix::ops

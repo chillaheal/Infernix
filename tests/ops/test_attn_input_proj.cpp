@@ -32,6 +32,8 @@ constexpr ReductionCriterion kAttnInputProjA16Tolerance{2.9e-3, 4.0e-3, 4.5e-3};
 // attention-input implementations' reduction profile.
 constexpr ReductionCriterion kFp8AttnInputProjA16Tolerance{1.0 / 256.0, 1.0 / 256.0, 2.0 / 256.0};
 constexpr ReductionCriterion kAttnInputProjA8Tolerance{0.04, 1.0 / 256.0, 0.06};
+// Two E4M3 terms put the A8 residual profile near A16; one term (A8's error) fails it.
+constexpr ReductionCriterion kAttnInputProjA8ResidualTolerance{1.0e-2, 1.0 / 256.0, 2.0e-2};
 
 int verify_output(std::string_view label, const GuardedBf16Tensor& output,
                   const quantized_weight::PackedWeight& weight, std::int32_t weight_row_offset,
@@ -84,8 +86,17 @@ int run_target_projection_case(DevicePackedWeight& parent, DevicePackedWeight* g
     const auto q_weight = rows(first, 0, qrows), k_weight = rows(first, qrows, kvrows);
     const auto g_weight = rows(dual ? second : first, dual ? 0 : 7168, qrows);
     const auto v_weight = rows(dual ? second : first, dual ? 6144 : 13312, kvrows);
-    const auto prepared = ops::prepare_attn_input_proj_weights(
-        {q_weight, policy}, {k_weight, policy}, {g_weight, policy}, {v_weight, policy});
+    // A column-invariant or A8 residual Use is an A16 or A8 preparation whose execution policy
+    // the Model sets.
+    const ops::LinearPolicy use = ops::column_invariant(policy)       ? ops::LinearPolicy::A16Only
+                                  : ops::allows_a8_residual(policy) ? ops::LinearPolicy::AllowA8
+                                                                    : policy;
+    auto prepared = ops::prepare_attn_input_proj_weights({q_weight, use}, {k_weight, use},
+                                                         {g_weight, use}, {v_weight, use});
+    if (auto* single = std::get_if<ops::SingleProjectionWeight>(&prepared);
+        single != nullptr && use != policy) {
+        single->policy = policy;
+    }
     const auto launch = [&] {
         if (const auto* pair = std::get_if<ops::PairedProjectionWeights>(&prepared)) {
             ops::attn_input_proj(x, pair->first, pair->second, q, g, k, v, device.stream);
@@ -121,12 +132,15 @@ int run_target_projection_case(DevicePackedWeight& parent, DevicePackedWeight* g
         cuda_synchronize(device.stream);
         const bool a8 =
             policy == ops::LinearPolicy::AllowA8 || policy == ops::LinearPolicy::AllowA4;
-        const auto criterion     = dual ? kAttnInputProjA16Tolerance
-                                   : a8 ? kAttnInputProjA8Tolerance
-                                        : kFp8AttnInputProjA16Tolerance;
-        const int sample_count   = (a8 || replay) ? 31 : 7;
+        const bool a8_residual = ops::allows_a8_residual(policy) && tokens >= 17;
+        const auto criterion     = dual          ? kAttnInputProjA16Tolerance
+                                   : a8          ? kAttnInputProjA8Tolerance
+                                   : a8_residual ? kAttnInputProjA8ResidualTolerance
+                                                 : kFp8AttnInputProjA16Tolerance;
+        const int sample_count   = (a8 || a8_residual || replay) ? 31 : 7;
         const std::string suffix = std::string(dual ? " Q4/Q5" : " FP8") +
-                                   (a8 ? " allow-a8" : " a16") + " T=" + std::to_string(tokens) +
+                                   (a8 ? " allow-a8" : (a8_residual ? " a8-residual" : " a16")) +
+                                   " T=" + std::to_string(tokens) +
                                    " phase=" + std::to_string(phase);
         failures += verify_output("attn q" + suffix, query, parent.host, 0, qrows, activation,
                                   hidden, tokens, criterion, sample_count);
@@ -376,10 +390,13 @@ int run_nvfp4_target_case(DevicePackedWeight& parent, std::int32_t tokens,
     const auto auxiliary    = [&](int index) -> std::optional<float> {
         return omit_divisors ? std::nullopt : std::optional(divisor + index * unused_step);
     };
-    const auto prepared =
-        std::get<ops::SingleProjectionWeight>(ops::prepare_attn_input_proj_weights(
-            {qw, policy, auxiliary(0)}, {kw, policy, auxiliary(1)}, {gw, policy, auxiliary(2)},
-            {vw, policy, auxiliary(3)}));
+    // A column-invariant Use is an A16 preparation whose execution policy the Model sets.
+    const ops::LinearPolicy use =
+        ops::column_invariant(policy) ? ops::LinearPolicy::A16Only : policy;
+    auto prepared = std::get<ops::SingleProjectionWeight>(ops::prepare_attn_input_proj_weights(
+        {qw, use, auxiliary(0)}, {kw, use, auxiliary(1)}, {gw, use, auxiliary(2)},
+        {vw, use, auxiliary(3)}));
+    if (ops::column_invariant(policy)) { prepared.policy = policy; }
     if (policy == ops::LinearPolicy::AllowA8) {
         const auto mixed =
             std::get<ops::SingleProjectionWeight>(ops::prepare_attn_input_proj_weights(
@@ -429,6 +446,11 @@ int run_nvfp4_target() {
     for (const std::int32_t tokens : {1, 2, 4, 8, 16, 20, 32, 33}) {
         failures += run_nvfp4_target_case(parent, tokens, ops::LinearPolicy::A16Only, tokens == 1);
     }
+    // The column-invariant route: one schedule at every T, sliced beyond its widest tile.
+    for (const std::int32_t tokens : {1, 2, 5, 8, 9, 16, 17, 33, 40, 65, 129}) {
+        failures +=
+            run_nvfp4_target_case(parent, tokens, ops::LinearPolicy::A16ColumnInvariant);
+    }
     failures += run_nvfp4_target_case(parent, 4, ops::LinearPolicy::AllowA8);
     failures += run_nvfp4_target_case(parent, 4, ops::LinearPolicy::AllowA8, true);
     failures += run_nvfp4_target_case(parent, 4, ops::LinearPolicy::AllowA4);
@@ -468,6 +490,33 @@ int run_fp8_target() {
         for (int t : {1,   4,   8,   16,  17,  32,  33,  64,  65,  96,  97,
                       128, 129, 192, 193, 288, 289, 385, 512, 513, 1025})
             failures += run_target_projection_case(parent, nullptr, t, policy, true);
+    }
+    // The A8 residual route: A16 below 17 columns, then its 32- and 64-token tiles and their edges.
+    {
+        constexpr auto kResidual = ops::LinearPolicy::AllowA8Residual;
+        std::size_t peak         = 0;
+        for (int t : {16, 17, 32, 33, 48, 64, 65, 96, 97, 128, 129, 192, 256, 257}) {
+            peak = std::max(peak, ops::attn_input_proj_workspace_capacity_bytes(
+                                      QType::FP8_E4M3FN_ROW_BF16, kRows, kHidden, kResidual, t, t));
+            failures += run_target_projection_case(parent, nullptr, t, kResidual);
+        }
+        if (ops::attn_input_proj_workspace_capacity_bytes(QType::FP8_E4M3FN_ROW_BF16, kRows,
+                                                          kHidden, kResidual, 1, 257) != peak) {
+            std::cerr << "FP8 A8 residual attention projection workspace interval mismatch\n";
+            ++failures;
+        }
+        for (int t : {17, 65, 97})
+            failures += run_target_projection_case(parent, nullptr, t, kResidual, true);
+    }
+    // The column-invariant route: one schedule at every T, sliced beyond its widest tile.
+    for (int t : {1, 2, 5, 8, 9, 16, 17, 33, 40, 65, 129})
+        failures += run_target_projection_case(parent, nullptr, t,
+                                               ops::LinearPolicy::A16ColumnInvariant);
+    if (ops::attn_input_proj_workspace_capacity_bytes(QType::FP8_E4M3FN_ROW_BF16, kRows, kHidden,
+                                                      ops::LinearPolicy::A16ColumnInvariant, 1,
+                                                      128) != 0) {
+        std::cerr << "FP8 column-invariant attention projection needs no workspace\n";
+        ++failures;
     }
     return failures;
 }
@@ -591,17 +640,20 @@ int run_q8_companion() {
     return failures;
 }
 
+// Qwen3.8-27B's drafter (H 5120) and Qwen3.8-Flash-Next's (H 2560).
 int run_q8_dflash2() {
-    constexpr int kHidden = 5120;
-    DevicePackedWeight parent(
-        quantized_weight::make_patterned_weight(QType::Q8_G32_FP16, 6144, kHidden, 313U));
     int failures = 0;
-    for (int tokens = 1; tokens <= 128; ++tokens)
-        failures += run_q8_qkv_case(parent, kHidden, "DFlash2", tokens);
-    for (int tokens : {129, 192, 193, 1024})
-        failures += run_q8_qkv_case(parent, kHidden, "DFlash2", tokens);
-    for (int tokens : {1, 8, 16, 48, 49, 53, 54, 63, 64, 65, 96, 97, 112, 127, 128, 129})
-        failures += run_q8_qkv_case(parent, kHidden, "DFlash2", tokens, true, 31);
+    for (const int hidden : {5120, 2560}) {
+        DevicePackedWeight parent(
+            quantized_weight::make_patterned_weight(QType::Q8_G32_FP16, 6144, hidden, 313U));
+        const std::string label = "DFlash2 H=" + std::to_string(hidden);
+        for (int tokens = 1; tokens <= 128; ++tokens)
+            failures += run_q8_qkv_case(parent, hidden, label.c_str(), tokens);
+        for (int tokens : {129, 192, 193, 1024})
+            failures += run_q8_qkv_case(parent, hidden, label.c_str(), tokens);
+        for (int tokens : {1, 8, 16, 48, 49, 53, 54, 63, 64, 65, 96, 97, 112, 127, 128, 129})
+            failures += run_q8_qkv_case(parent, hidden, label.c_str(), tokens, true, 31);
+    }
     return failures;
 }
 
@@ -646,15 +698,21 @@ int main(int argc, char** argv) {
 
     int failures = 0;
     if (inputs_only) { return run_weight_inputs() == 0 ? 0 : 1; }
-    if (!dflash2_only) {
-        failures += run_q4_q5();
-        failures += run_bf16_target();
-        failures += run_nvfp4_target();
-        failures += run_fp8_target();
-        failures += run_q8_target();
-        failures += run_q8_companion();
+    try {
+        if (!dflash2_only) {
+            failures += run_q4_q5();
+            failures += run_bf16_target();
+            failures += run_nvfp4_target();
+            failures += run_fp8_target();
+            failures += run_q8_target();
+            failures += run_q8_companion();
+        }
+        failures += run_q8_dflash2();
+    } catch (const std::exception& error) {
+        std::cout << std::flush;
+        std::cerr << "FAIL attn_input_proj: " << error.what() << '\n';
+        return 1;
     }
-    failures += run_q8_dflash2();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " attn_input_proj\n";
     return failures == 0 ? 0 : 1;
 }

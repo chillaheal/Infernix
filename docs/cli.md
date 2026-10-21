@@ -137,8 +137,8 @@ output capacity for the inserted suffix and the answer:
 GPU residency is frozen when the Engine starts:
 
 - no `--spec` omits MTP/DFlash/DFlash2 weights and state and the optimized proposal head;
-- `--spec mtp`, `--spec dflash` (35B-A3B), and `--spec dflash2` (Qwen3.8-27B) load only
-  the selected speculative backend;
+- `--spec mtp`, `--spec dflash` (35B-A3B), and `--spec dflash2` (Qwen3.8-27B; Qwen3.8-Flash-Next
+  with its companion artifact, `--draft-model`) load only the selected speculative backend;
 - a speculative backend with the full proposal head omits the optimized proposal head;
 - Vision is disabled by default, omitting its weights and Vision-specific unified-workspace extent;
 - `--vision` loads the weights, expands the one Program workspace for Vision encode/handoff, and
@@ -241,6 +241,10 @@ For DFlash:
 For Qwen3.8-27B artifacts containing the DFlash2 companion weights, select
 `--spec dflash2 --draft-tokens 7`, optionally with `--lm-head-draft` and `--vision`.
 DFlash2 accepts every draft count from 1 through 15; seven is the checkpoint recommendation.
+Qwen3.8-Flash-Next artifacts take their DFlash2 drafter from a separate companion artifact
+(`--spec dflash2 --draft-model Qwen3.8-Flash-Next-DFlash2-Infernix.infernix --draft-tokens 7`,
+optionally `--lm-head-draft`), with 1 to 7 drafts (`auto`: each round's length from its acceptance,
+up to 7); see the [Flash-Next guide](qwen3_8-flash-next.md).
 Both `groupwise-int` and `nvfp4` artifacts use the same Engine route, including CUDA Graph,
 concurrent requests, sampling penalties, and prefix reuse. An artifact without the companion
 weights reports a missing DFlash2 component when selected. Vision, MTP and DFlash follow the same
@@ -257,25 +261,31 @@ The table lists executable defaults. The examples above select FP8 KV and MTP3.
 
 | Option | Meaning | Default |
 |---|---|---:|
+| `--config FILE` | read options, and the model path, from a TOML file ([Configuration file](#configuration-file)); command-line options override it | unset |
 | `--rope-yarn-factor F` | startup-fixed runtime YaRN factor, finite `[1,4]`; extends allowed ceiling only | `1` |
 | `--max-context N` | per-sequence logical context ceiling | `2048` |
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` | `2048` |
 | `--vram-headroom-mib N\|auto` | VRAM in MiB that startup sizing leaves free. Qwen3.5: after `--kv-capacity auto` sizes the KV pool (requires `auto`; `auto` = 1024). Qwen3.8-Flash-Next: after the expert cache takes the rest, for the display and other programs (`auto` = 1024 with a display on the GPU, 256 without; [details](qwen3_8-flash-next.md#vram)) | `auto` |
 | `--vram-past-budget` | Qwen3.8-Flash-Next on Windows: also size the expert cache into the VRAM the Windows per-process budget withholds (~0.6 GiB, ~240 more expert frames on an RTX 5090), measured at startup; that memory may be moved to system memory if another program needs VRAM ([details](qwen3_8-flash-next.md#vram)) | off |
-| `--prefill-chunk N` | positive text-prefill chunk, in multiples of 128; rounded down to whole prompt-attention waves (896 tokens for the 24-head model on RTX 5090) with INT8, NVFP4, FP8, K8V4, VQ2 or K4V2 KV unless an original prompt kernel is selected | `1024` |
+| `--expert-tail-skip R` | Qwen3.8-Flash-Next, approximate: trades quality for decode speed. In decode and verification rounds, a routed expert missing from VRAM that every token of the round routes at top-10 rank `R` or lower (`1..9`, 0-based; 9 skips least) is neither copied nor computed: it adds zero and the other experts keep their router weights. The output changes, is slightly worse, and depends on which experts the cache holds; prefill is unchanged; the exact route (`--disable-fast-paths`) refuses it. Strata does the same by default at rank 7 (`STRATA_ROUTE_TAIL_SKIP=7`) ([details](qwen3_8-flash-next.md#expert-tail-skip)) | off |
+| `--prefill-chunk N` | positive text-prefill chunk, in multiples of 128; rounded down to whole prompt-attention waves (896 tokens for the 24-head model on RTX 5090) with INT8, NVFP4, FP8, K8V4, VQ2 or K4V2 KV unless an original prompt kernel is selected | `16384` for Qwen3.8-Flash-Next, `1024` otherwise |
 | `--max-new N` | requested output-token limit | `128` |
 | `--device N` | CUDA device index | `0` |
 | `--ram-headroom-mib N` | physical Host RAM in MiB that pinned weights and caches leave free for the system; startup refuses a lock that would take it (Qwen3.8-Flash-Next plans every allocation against it in its RAM ledger) | `2048` |
 | `--expert-ram-mib N\|auto` | Qwen3.8-Flash-Next: Host RAM in MiB for the routed experts; less than all of them need (~64.5 GiB) keeps that many in RAM and reads the rest from the artifact ([SSD expert tier](qwen3_8-flash-next.md#ssd-expert-tier)); more than is free is an error | `auto` (what the ledger leaves) |
+| `--ngram-residency auto\|ram\|volume` | Qwen3.8-Flash-Next: where the PLE n-gram table lives. `ram` reads the whole table into pinned Host RAM at startup (27.1 GiB for a GGUF import's IQ4_NL table, 48.8 GiB for the FP8 table) and never reads the volume again; `volume` reads rows on demand through a 2^20-row cache; `auto` takes RAM only when the RAM ledger still keeps every expert in RAM beside it ([details](qwen3_8-flash-next.md#n-gram-table-in-ram)) | `auto` |
+| `--expert-pin-mib N\|auto` | Qwen3.8-Flash-Next: at most N MiB of the experts' RAM page-locked for the GPU; the rest stays in RAM unpinned and the CPU serves it ([Page-locking limit](qwen3_8-flash-next.md#page-locking-limit)) | `auto` (what Windows lets the GPU page-lock) |
 | `--kv-dtype bf16\|int8\|fp8\|nvfp4\|k8v4\|vq2\|k4v2` | KV-cache storage | `bf16` |
 | `--use-original-int8-prefill-kernel` | prefill INT8 KV with the original prompt-attention kernel; requires `--kv-dtype int8` | fast kernel |
-| `--prefill-8bit-pv` | force prompt attention's P×V onto 8-bit Tensor Cores where its kernel has both forms (the fast INT8 and NVFP4 prompt kernels, K8V4's tiled kernel and the VQ2 and K4V2 prompt kernel); INT8 and K4V2 only override their default, FP16 P×V, which is 5-7 % slower on long prompts but has half (INT8) or 1.09x (K4V2) the KL divergence from a BF16 KV reference | INT8, K4V2 |
-| `--no-prefill-8bit-pv` | force FP16 P×V for NVFP4, K8V4 and VQ2 KV too, without their default 8-bit forms (5-7 % more end-to-end long-prompt prefill time; those forms stay within 1.1x FP16's KL divergence from BF16 KV) | NVFP4, K8V4, VQ2 |
 | `--use-original-nvfp4-prefill-kernel` | prefill NVFP4 KV with the tiled prompt-attention kernel; requires `--kv-dtype nvfp4` | fast kernel over more than 768 visible keys |
 | `--prefill-split-workspace-mib N` | workspace in MiB, `0..16384`, for splitting one prompt-attention launch's keys across SMs (INT8, NVFP4, FP8, K8V4, VQ2 and K4V2 KV); less frees KV cache but slows 1-2K-token chunks over long context (`64`: 17-25 % slower attention over 32K-128K keys; `128`: 2-5 %; `192` and up: under 1 %); `0` turns splitting off. See [serving](serving.md) | `256` |
+| `--disable-fast-paths` | run the exact route. By default every fast path qualified for the loaded artifact's configuration (the kernels it runs and its KV format; artifacts with the same kernels share one) and measured faster there runs: faster kernels (such as 8-bit P×V in prompt attention) whose output is not bit-exact with the exact route but whose measured quality cost stays within Infernix's [numerical acceptance policy](maintainer/model-quality.md#6-numerical-acceptance-policy-and-fast-paths). Startup logs the paths selected (`fast paths \| ...`) and whether a request's output is independent of the other requests (`request-invariant`). The exact route is bit-exact from release to release and, on artifacts whose formats support it (NVFP4 and FP8 dense text decoders), request-invariant: concurrency, other requests, the prefix cache's contents and KV pressure do not change a request's output. It then runs decode at 16-bit activations at every batch size, verifies one fixed-width chain per speculative round (no DFlash2 trees), resumes from the prefix cache only on the prefill chunk grid, and admits a request only when its whole KV extent (prompt + `max_tokens`) fits, so it is never preempted; the [fast-path registry](maintainer/model-quality.md#67-fast-path-registry) lists each path, the configurations it is qualified for, and its measured cost and speedup | fast paths on |
+| `--fast-path NAME` | also run this fast path (a name from the [registry](maintainer/model-quality.md#67-fast-path-registry)), qualified for the configuration or not; repeatable. For qualification runs: a path that cannot apply to the loaded model fails startup | none |
 | `--spec mtp\|dflash\|dflash2` | speculative backend | off |
-| `--draft-tokens N` | MTP `1..5`; DFlash/DFlash2 `1..15` | unset |
+| `--draft-tokens N\|auto` | MTP `1..7` (Qwen3.5/3.6 `1..5`); DFlash/DFlash2 `1..15` (Qwen3.8-Flash-Next DFlash2 `1..7`). `N` drafts and verifies N tokens every round (fewer only near the output limit). `auto` on Qwen3.8-Flash-Next DFlash2: each round drafts 7 and verifies the number its drafts' calibrated probabilities make fastest ([guide](qwen3_8-flash-next.md#run)). `auto` (MTP): each round drafts the length the learned acceptance makes fastest, `0..7` on Qwen3.8-Flash-Next (with the `--spec-min-p` cut, [design §11.3](maintainer/qwen3_8-flash-next-design.md#113-draft-length)); on Qwen3.5/3.6 it is the `adaptive-mtp` fast path (`1..5`) where that is qualified (the NVFP4 Qwen3.8-27B and Qwen3.6-35B-A3B); elsewhere, and with `--disable-fast-paths`, every round drafts the artifact's fastest fixed length (5 on the NVFP4 27B, 3 otherwise), which startup reports | unset |
 | `--lm-head-draft` | optimized proposal head | off |
+| `--draft-model FILE` | Qwen3.8-Flash-Next with `--spec dflash2`: the DFlash2 drafter's companion artifact (`tools.convert --components dflash2`); Qwen3.5/3.6 artifacts bundle their drafters and refuse it | unset |
+| `--spec-min-p P` | Qwen3.8-Flash-Next with `--spec mtp` or `--spec dflash2` only: a one-request round verifies its drafts up to the first whose drafter probability (MTP's draft head, DFlash2's candidate selector) is below `P`, `0..1`; `0` verifies every draft. Greedy output still equals plain decoding; a seeded sampled run may realize differently with the same distribution. See [serving](serving.md) for the measured default | `0.5` with `--draft-tokens auto`, else `0` |
 | `--draft-tree-nodes auto\|N` | DFlash2 tree verification: each round verifies a small tree of alternative drafts, built on the device from the drafter's candidate lattice, instead of a single draft, so more drafted tokens are accepted with the same output distribution; any `--kv-dtype`. `auto` (recommended) chooses the single draft or a tree of `draft tokens + 5` or `+ 9` tokens every round from measured speed and acceptance at the current context length, and keeps single drafts (with a warning) on an artifact without tree support; `N` fixes a tree of `draft tokens + 2..32` tokens and keeps seeded runs reproducible, which `auto` does not; see [tree verification](maintainer/tree-verification.md) | off |
 | `--draft-tree-paths N` | most branches (root-to-leaf paths) per tree, `2..8` | `8` |
 | `--ngram-draft-tokens N` | verified n-gram copy proposals per round beside the `--spec` drafter (Qwen3.8-Flash-Next: also alone, `1..15`), `1..63`; `0` disables; see [ngram copy proposals](ngram.md) | `0` |
@@ -284,7 +294,8 @@ The table lists executable defaults. The examples above select FP8 KV and MTP3.
 | `--vision-offload auto\|on\|off` | keep the vision tower in pinned system RAM and borrow Device memory only while encoding; takes effect only with `--vision`. `auto` is on for Qwen3.8-Flash-Next (the expert cache lends the encode memory) and off for Qwen3.5 | `auto` |
 | `--vision-max-merged N` | merged vision tokens per image or video, `64..32768`; larger media is downscaled during preprocessing | `32768` |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
-| `--expert-state FILE\|off` | Qwen3.8-Flash-Next: the expert cache's saved state. At startup the engine fills the VRAM expert cache with the experts the file ranks highest (about 1 s for a full cache) and starts their use counts from it; it writes the file when it stops and every 10 minutes between requests (through `FILE.tmp` and a rename). A file from another artifact or of another size is ignored and replaced. `off` starts with an empty cache and saves nothing; cold benchmarks need it | `<artifact>.expert-state` |
+| `--expert-state FILE\|off` | Qwen3.8-Flash-Next: the expert cache's saved state. At startup the engine fills the VRAM expert cache with the experts the file ranks highest (about 1 s for a full cache) and starts their use counts from it; it writes the file when it stops and every 10 minutes between requests (through `FILE.tmp` and a rename). A file from another artifact or of another size is ignored and replaced. Without a usable file the engine seeds the cache from a built-in calibrated expert order instead. `off` starts with an empty cache, no seed, and saves nothing; cold benchmarks need it | `<artifact>.expert-state` |
+| `--expert-stripe FILE` | Qwen3.8-Flash-Next with the SSD expert tier: an expert stripe (`tools/flash_next/expert_stripe.py`) holding the tail of every expert record on a second drive; each record not in RAM is then read in two parts, its head from the artifact and its tail from the stripe, at the same time. The stripe must belong to the artifact. Unused when every expert fits in RAM ([guide](qwen3_8-flash-next.md#ssd-expert-tier)) | none |
 | `--chat-template FILE` | use a local Jinja template | artifact template |
 | `--no-thinking` | disable thinking | template default |
 | `--thinking-budget N` | positive model-origin thinking-token cap; omitted means unlimited | unset |
@@ -311,6 +322,8 @@ and rendered prompt mode. The current official models use:
 | Qwen3.8-27B | non-thinking | `0.7` | `0.80` | `20` | `0` | `1.5` |
 | Qwen3.6-35B-A3B | thinking | `1.0` | `0.95` | `20` | `0` | `1.5` |
 | Qwen3.6-35B-A3B | non-thinking | `0.7` | `0.80` | `20` | `0` | `1.5` |
+| Qwen3.8-Flash-Next | thinking | `1.0` | `0.95` | `20` | `0` | `0` |
+| Qwen3.8-Flash-Next | non-thinking | `0.7` | `0.80` | `20` | `0` | `1.5` |
 
 Frequency penalty is `0` in every registered preset. Task-specific profiles such as Qwen's
 precise-coding profile use explicit sampling overrides.
@@ -320,6 +333,34 @@ Repeat `--stop-token-id`, `--stop`, or `--reasoning-stop` to add stop conditions
 generated token IDs in diagnostics.
 
 Run `./build/apps/infernix --help` for the exact option contract.
+
+## Configuration file
+
+`--config FILE` reads options from a TOML file keyed by the long option names without the dashes,
+in the format `infernix-serve` reads ([serving](serving.md#configuration-file) has the full rules).
+Top-level keys and those of a `[cli]` table apply to `infernix`, the `[cli]` table's overriding
+the top level's; a `[serve]` table is `infernix-serve`'s and is skipped. `model` names the model
+when the command line does not, and repeatable options take arrays:
+
+```toml
+model = "models/qwen3_8_27b_nvfp4.ninfer"
+kv-dtype = "int8"
+spec = "dflash2"
+draft-tokens = 7
+
+[cli]
+max-context = 32768
+max-new = 1024
+prompt = "Summarize sparse attention."
+stop = ["END", "STOP"]
+```
+
+```bash
+./build/apps/infernix --config infernix.toml --temperature 0.6
+```
+
+Options on the command line override the file; the values of a repeatable option such as `--stop`
+add to the file's. The startup log lists the options the file gave.
 
 ## CUDA synchronization
 

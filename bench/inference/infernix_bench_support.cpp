@@ -217,6 +217,12 @@ SpeculativeStats aggregate_speculative(const TestResult& result) {
         for (std::size_t i = 0; i < in.accepted_per_position.size(); ++i) {
             out.accepted_per_position[i] += in.accepted_per_position[i];
         }
+        if (out.rounds_by_draft_length.size() < in.rounds_by_draft_length.size()) {
+            out.rounds_by_draft_length.resize(in.rounds_by_draft_length.size());
+        }
+        for (std::size_t i = 0; i < in.rounds_by_draft_length.size(); ++i) {
+            out.rounds_by_draft_length[i] += in.rounds_by_draft_length[i];
+        }
     }
     return out;
 }
@@ -296,6 +302,11 @@ void append_speculative_json(std::ostringstream& out, const SpeculativeStats& st
         if (i != 0) { out << ", "; }
         out << stats.accepted_per_position[i];
     }
+    out << "],\n" << indent << "  \"rounds_by_draft_length\": [";
+    for (std::size_t i = 0; i < stats.rounds_by_draft_length.size(); ++i) {
+        if (i != 0) { out << ", "; }
+        out << stats.rounds_by_draft_length[i];
+    }
     out << "]\n" << indent << '}';
 }
 
@@ -306,6 +317,29 @@ void append_timings_json(std::ostringstream& out, const GenerationTimings& timin
         << "\"prefill_seconds\": " << number(timings.prefill_seconds) << ", "
         << "\"decode_seconds\": " << number(timings.decode_seconds) << ", "
         << "\"total_seconds\": " << number(timings.total_seconds) << '}';
+}
+
+// The fast paths the Engine runs, comma-separated; "off" on the exact route, "none" when none is
+// qualified for the configuration.
+std::string fast_path_list(const BenchEnvironment& env) {
+    std::string out;
+    for (const std::string& path : env.load.fast_paths) { out += (out.empty() ? "" : ",") + path; }
+    if (out.empty()) { out = env.load.fast_paths_disabled ? "off" : "none"; }
+    return out;
+}
+
+const char* ngram_residency_name(NgramResidency residency) {
+    switch (residency) {
+    case NgramResidency::Ram: return "ram";
+    case NgramResidency::Volume: return "volume";
+    case NgramResidency::Auto: break;
+    }
+    return "auto";
+}
+
+// A MiB budget as the options spell it; "auto" when unset.
+std::string mib_or_auto(const std::optional<std::uint64_t>& bytes) {
+    return bytes ? std::to_string(*bytes >> 20) : std::string("auto");
 }
 
 } // namespace
@@ -333,14 +367,24 @@ std::string usage_text(std::string_view program) {
         << "Options:\n"
         << "  --weights <path>            required .ninfer artifact\n"
         << "  --corpus <path>             token-id corpus (default: " << kDefaultCorpusPath << ")\n"
-        << "  --ngram-volume <path>       Qwen3.8-Flash-Next n-gram volume (default: <weights>.ngram)\n"
+        << "  --ngram-volume <path>       Qwen3.8-Flash-Next n-gram volume: the artifact's, or any FP8,\n"
+        << "                              IQ4_NL or BF16 volume of the table (default: <weights>.ngram)\n"
+        << "  --ngram-residency <mode>    Qwen3.8-Flash-Next n-gram table: auto, ram (all of it in pinned\n"
+        << "                              RAM) or volume (rows read on demand) (default: auto)\n"
+        << "  --expert-stripe <path>      Qwen3.8-Flash-Next expert stripe: the SSD tier reads each record's\n"
+        << "                              tail from it (a second drive) beside its head in the artifact\n"
         << "  --ram-headroom-mib <N>      physical Host RAM pinned weights and caches leave free (default "
         << (infernix::kDefaultRamHeadroomBytes >> 20) << ")\n"
         << "  --expert-ram-mib <N|auto>   Qwen3.8-Flash-Next: Host RAM for the routed experts (default auto);\n"
         << "                              less than all of them need reads the rest from the artifact\n"
+        << "  --expert-pin-mib <N|auto>   Qwen3.8-Flash-Next: at most this much of the experts' RAM page-locked;\n"
+        << "                              the rest stays in RAM for the CPU (default auto: what Windows allows)\n"
         << "  --vram-headroom-mib <N|auto> Qwen3.8-Flash-Next: VRAM the expert cache leaves free for the\n"
         << "                              display and other programs (default auto: 1024 with a display, else 256)\n"
         << "  --vram-past-budget          Qwen3.8-Flash-Next on Windows: also use the VRAM the OS budget withholds\n"
+        << "  --expert-tail-skip <1..9>   Qwen3.8-Flash-Next: skip a VRAM-missing expert every token of a decode\n"
+        << "                              round routes at top-10 rank R or lower (faster, lower quality; changes\n"
+        << "                              the output; default off, Strata's default 7)\n"
         << "  --concurrency <1..8>       simultaneous requests per repetition (default: 1)\n"
         << "  --grammar-file <path>      constrain output with GBNF\n"
         << "  --json-object              constrain output to a JSON object\n"
@@ -361,23 +405,29 @@ std::string usage_text(std::string_view program) {
            "only\n"
         << "  --max-ctx <tokens>          override auto-sized context capacity\n"
         << "  --prefill-chunk <tokens>    multiple of " << kPrefillChunkAlignment
-        << " (default: " << kDefaultPrefillChunk << ")\n"
+        << " (default: 16384 for Qwen3.8-Flash-Next, 1024 otherwise)\n"
         << "  --kv-dtype <bf16|int8|fp8|nvfp4|k8v4|vq2|k4v2>  KV cache storage (default: bf16)\n"
         << "  --use-original-int8-prefill-kernel  original INT8-KV prompt kernel at the\n"
         << "                              requested chunk (default: fast kernel, wave-aligned\n"
         << "                              chunks); requires --kv-dtype int8\n"
-        << "  --prefill-8bit-pv           INT8 and K4V2 KV: 8-bit P*V in the prompt kernel\n"
-        << "                              (default FP16; faster but a measurable KL divergence\n"
-        << "                              from a BF16 KV reference)\n"
-        << "  --no-prefill-8bit-pv        NVFP4, K8V4 and VQ2 KV: FP16 P*V (default 8-bit,\n"
-        << "                              5-7 % faster at long context)\n"
         << "  --use-original-nvfp4-prefill-kernel  tiled NVFP4-KV prompt kernel (default:\n"
         << "                              fast kernel); requires --kv-dtype nvfp4\n"
+        << "  --disable-fast-paths        the exact route (default: every fast path qualified\n"
+        << "                              for the configuration, the artifact's kernels and KV)\n"
+        << "  --fast-path <name>          qualification: also run this fast path, qualified\n"
+        << "                              or not (a registry name; repeatable)\n"
         << "  --prefill-split-workspace-mib <n>  prompt-attention split workspace (default: "
         << kDefaultPrefillSplitWorkspaceMiB << ";\n"
         << "                              128-384 recommended, 0 = no splitting)\n"
         << "  --spec <mtp|dflash|dflash2> speculative backend (default: none)\n"
-        << "  --draft-tokens <n>         MTP 1..5; DFlash/DFlash2 1..15\n"
+        << "  --draft-tokens <n>|auto    MTP 1..7 (Qwen3.5/3.6 1..5); DFlash/DFlash2 1..15\n"
+        << "                             (Qwen3.8-Flash-Next DFlash2 1..7); n drafts n every round,\n"
+        << "                             auto lets MTP (and Qwen3.8-Flash-Next DFlash2) pick each\n"
+        << "                             round's length (0..7; Qwen3.5/3.6 1..5 by adaptive-mtp where\n"
+        << "                             qualified, else the model's fastest fixed length)\n"
+        << "  --draft-model <path>       Qwen3.8-Flash-Next DFlash2: the drafter's companion artifact\n"
+        << "  --spec-min-p <p>           Qwen3.8-Flash-Next MTP draft-confidence gate 0..1\n"
+        << "                             (default 0.5 with --draft-tokens auto, else 0 (every draft))\n"
         << "  --ngram-draft-tokens <n>   copy proposals 1..63; 0 disables (default: 0)\n"
         << "  --ngram-min-match <n>      copy admission 4..64 (default: 12)\n"
         << "  --draft-tree-nodes <auto|list>  DFlash2 tree verification (default: off): auto\n"
@@ -421,6 +471,10 @@ BenchOptions parse_args(int argc, char** argv) {
             options.corpus_path = value("--corpus");
         } else if (arg == "--ngram-volume") {
             options.ngram_volume_path = value("--ngram-volume");
+        } else if (arg == "--ngram-residency") {
+            options.ngram_residency = infernix::parse_ngram_residency(value("--ngram-residency"));
+        } else if (arg == "--expert-stripe") {
+            options.expert_stripe_path = value("--expert-stripe");
         } else if (arg == "--ram-headroom-mib") {
             const std::string text = value("--ram-headroom-mib");
             std::size_t used       = 0;
@@ -435,6 +489,8 @@ BenchOptions parse_args(int argc, char** argv) {
             options.ram_headroom_bytes = static_cast<std::uint64_t>(mib) << 20;
         } else if (arg == "--vram-past-budget") {
             options.vram_past_budget = true;
+        } else if (arg == "--expert-tail-skip") {
+            options.expert_tail_skip = parse_u32(value("--expert-tail-skip"), "expert-tail-skip");
         } else if (arg == "--expert-ram-mib") {
             const std::string text = value("--expert-ram-mib");
             if (text == "auto") {
@@ -450,6 +506,22 @@ BenchOptions parse_args(int argc, char** argv) {
                     throw std::invalid_argument("--expert-ram-mib must be a MiB count or auto");
                 }
                 options.expert_ram_bytes = static_cast<std::uint64_t>(mib) << 20;
+            }
+        } else if (arg == "--expert-pin-mib") {
+            const std::string text = value("--expert-pin-mib");
+            if (text == "auto") {
+                options.expert_pin_bytes.reset();
+            } else {
+                std::size_t used       = 0;
+                unsigned long long mib = 0;
+                try {
+                    mib = std::stoull(text, &used);
+                } catch (const std::exception&) { used = 0; }
+                if (used != text.size() || text.empty() || text.front() == '-' || mib == 0 ||
+                    mib > (std::numeric_limits<std::uint64_t>::max() >> 20)) {
+                    throw std::invalid_argument("--expert-pin-mib must be a MiB count or auto");
+                }
+                options.expert_pin_bytes = static_cast<std::uint64_t>(mib) << 20;
             }
         } else if (arg == "--vram-headroom-mib") {
             const std::string text = value("--vram-headroom-mib");
@@ -507,23 +579,33 @@ BenchOptions parse_args(int argc, char** argv) {
             options.max_context = parse_u32(value("--max-ctx"), "max-ctx");
         } else if (arg == "--prefill-chunk") {
             options.prefill_chunk = parse_u32(value("--prefill-chunk"), "prefill-chunk");
+            if (options.prefill_chunk == 0) {
+                throw std::invalid_argument("--prefill-chunk must be a positive multiple of 128");
+            }
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_cache(value("--kv-dtype"));
         } else if (arg == "--use-original-int8-prefill-kernel") {
             options.original_int8_prefill_kernel = true;
-        } else if (arg == "--prefill-8bit-pv") {
-            options.prefill_8bit_pv = PrefillPv8::On;
-        } else if (arg == "--no-prefill-8bit-pv") {
-            options.prefill_8bit_pv = PrefillPv8::Off;
         } else if (arg == "--prefill-split-workspace-mib") {
             options.prefill_split_workspace_mib =
                 parse_u32(value("--prefill-split-workspace-mib"), "prefill-split-workspace-mib", true);
         } else if (arg == "--use-original-nvfp4-prefill-kernel") {
             options.original_nvfp4_prefill_kernel = true;
+        } else if (arg == "--disable-fast-paths") {
+            options.fast_paths = false;
+        } else if (arg == "--fast-path") {
+            const std::string name(value("--fast-path"));
+            const std::optional<FastPath> path = parse_fast_path(name);
+            if (!path) { throw std::invalid_argument("unknown fast path: " + name); }
+            options.fast_path_candidates.push_back(*path);
         } else if (arg == "--spec") {
             options.speculative.backend = product::parse_speculative_backend(value("--spec"));
         } else if (arg == "--draft-tokens") {
-            options.speculative.draft_tokens = parse_u32(value("--draft-tokens"), "draft-tokens");
+            product::apply_draft_tokens(options.speculative, value("--draft-tokens"));
+        } else if (arg == "--draft-model") {
+            options.speculative.draft_model = std::filesystem::path(std::string(value("--draft-model")));
+        } else if (arg == "--spec-min-p") {
+            options.speculative.draft_min_p = product::parse_draft_min_p(value("--spec-min-p"));
         } else if (arg == "--ngram-draft-tokens") {
             options.speculative.ngram_draft_tokens =
                 parse_u32(value("--ngram-draft-tokens"), "ngram-draft-tokens", true);
@@ -797,17 +879,25 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
         << " concurrency=" << env.concurrency << " constraint=" << constraint_name(env.constraint)
         << (env.mixed_constraints ? " (mixed)" : "")
         << " original_int8_prefill_kernel=" << (env.original_int8_prefill_kernel ? "on" : "off")
-        << " prefill_8bit_pv=" << prefill_pv8_name(env.prefill_8bit_pv)
         << " prefill_split_workspace_mib=" << env.prefill_split_workspace_mib
         << " original_nvfp4_prefill_kernel=" << (env.original_nvfp4_prefill_kernel ? "on" : "off")
+        << " fast_paths=" << fast_path_list(env)
+        << " expert_tail_skip=" << env.expert_tail_skip
+        << " ngram_volume=" << (env.ngram_volume_path.empty() ? "default" : env.ngram_volume_path)
+        << " ngram_residency=" << ngram_residency_name(env.ngram_residency)
+        << " expert_stripe=" << (env.expert_stripe_path.empty() ? "none" : env.expert_stripe_path)
+        << " expert_ram_mib=" << mib_or_auto(env.expert_ram_bytes)
+        << " expert_pin_mib=" << mib_or_auto(env.expert_pin_bytes)
         << " rope_yarn_factor=" << env.rope_yarn_factor
         << " kv_cache=" << kv_cache_name(env.kv_cache)
         << " spec=" << product::speculative_backend_name(env.speculative.backend)
         << " draft_tokens=" << env.speculative.draft_tokens
+        << " draft_auto=" << (env.speculative.draft_tokens_auto ? "on" : "off")
         << " draft_tree=" << product::draft_tree_nodes_text(env.speculative) << '/'
         << env.speculative.draft_tree_paths
         << " ngram_draft_tokens=" << env.speculative.ngram_draft_tokens
         << " ngram_min_match=" << env.speculative.ngram_min_match
+        << " spec_min_p=" << product::draft_min_p_text(env.speculative)
         << " proposal_head=" << proposal_head_name(env.speculative.proposal_head)
         << " decode_path=" << decode_path_name(env.use_cuda_graph, env.speculative)
         << " graph_prime="
@@ -937,17 +1027,28 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "    \"prefill_chunk\": " << env.prefill_chunk << ",\n"
         << "    \"original_int8_prefill_kernel\": "
         << (env.original_int8_prefill_kernel ? "true" : "false") << ",\n"
-        << "    \"prefill_8bit_pv\": \"" << prefill_pv8_name(env.prefill_8bit_pv) << "\""
-        << ",\n"
         << "    \"prefill_split_workspace_mib\": " << env.prefill_split_workspace_mib << ",\n"
         << "    \"original_nvfp4_prefill_kernel\": "
         << (env.original_nvfp4_prefill_kernel ? "true" : "false") << ",\n"
+        << "    \"fast_paths\": \"" << fast_path_list(env) << "\",\n"
+        << "    \"expert_tail_skip\": " << env.expert_tail_skip << ",\n"
+        << "    \"ngram_volume\": \"" << json_escape(env.ngram_volume_path) << "\",\n"
+        << "    \"ngram_residency\": \"" << ngram_residency_name(env.ngram_residency) << "\",\n"
+        << "    \"expert_stripe\": \"" << json_escape(env.expert_stripe_path) << "\",\n"
+        << "    \"expert_ram_mib\": "
+        << (env.expert_ram_bytes ? std::to_string(*env.expert_ram_bytes >> 20) : "null") << ",\n"
+        << "    \"expert_pin_mib\": "
+        << (env.expert_pin_bytes ? std::to_string(*env.expert_pin_bytes >> 20) : "null") << ",\n"
         << "    \"kv_cache\": \"" << kv_cache_name(env.kv_cache) << "\",\n"
         << "    \"speculative_backend\": \""
         << product::speculative_backend_name(env.speculative.backend) << "\",\n"
         << "    \"draft_tokens\": " << env.speculative.draft_tokens << ",\n"
+        << "    \"draft_tokens_auto\": " << (env.speculative.draft_tokens_auto ? "true" : "false") << ",\n"
         << "    \"ngram_draft_tokens\": " << env.speculative.ngram_draft_tokens << ",\n"
         << "    \"ngram_min_match\": " << env.speculative.ngram_min_match << ",\n"
+        << "    \"spec_min_p\": "
+        << (env.speculative.draft_min_p ? product::draft_min_p_text(env.speculative) : "null")
+        << ",\n"
         << "    \"proposal_head\": \"" << proposal_head_name(env.speculative.proposal_head)
         << "\",\n"
         << "    \"use_cuda_graph\": " << (env.use_cuda_graph ? "true" : "false") << ",\n"
@@ -1046,7 +1147,7 @@ std::string format_csv(const BenchEnvironment& env, const std::vector<TestResult
            "context,prefill_chunk,concurrency,constraint_type,constraint_file,constraint_source,"
            "constraint_choices,mixed_constraints,rope_yarn_factor,"
            "speculative_"
-           "backend,draft_tokens,ngram_draft_tokens,ngram_min_match,"
+           "backend,draft_tokens,ngram_draft_tokens,ngram_min_match,spec_min_p,"
            "proposal_head,decode_path,kv_cache,kv_payload_bytes,load_host_to_device_bytes,"
            "weights_capacity_bytes,sequence_capacity_bytes,workspace_capacity_bytes,"
            "workspace_general_capacity_bytes,vision_handoff_capacity_bytes,"
@@ -1082,6 +1183,7 @@ std::string format_csv(const BenchEnvironment& env, const std::vector<TestResult
             << product::speculative_backend_name(env.speculative.backend) << ','
             << env.speculative.draft_tokens << ',' << env.speculative.ngram_draft_tokens << ','
             << env.speculative.ngram_min_match << ','
+            << (env.speculative.draft_min_p ? product::draft_min_p_text(env.speculative) : "") << ','
             << proposal_head_name(env.speculative.proposal_head) << ','
             << decode_path_name(env.use_cuda_graph, env.speculative) << ','
             << kv_cache_name(env.kv_cache) << ',' << env.memory.kv_payload_bytes << ','

@@ -1,12 +1,16 @@
 #include "options.h"
+#include "product/config/config_file.h"
 #include "product/speculative_options.h"
 
+#include <algorithm>
+#include <array>
 #include <cerrno>
 #include <cmath>
 #include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <string_view>
+#include <utility>
 
 namespace infernix::cli {
 namespace {
@@ -68,6 +72,89 @@ KvCapacityPolicy parse_kv_capacity(const char* text) {
     return KvCapacityPolicy::explicit_capacity(parse_u32(text, "kv-capacity"));
 }
 
+// Every option parse_options accepts after the model path, whether it takes a value and whether it
+// repeats. --config maps a file's keys through this table, so a config file accepts exactly the
+// command line's options with the same arity.
+using CliOption = product::ConfigOption;
+
+constexpr std::array kCliOptions{
+    CliOption{"--prompt"},
+    CliOption{"--messages"},
+    CliOption{"--chat-template"},
+    CliOption{"--ngram-volume"},
+    CliOption{"--ngram-residency"},
+    CliOption{"--expert-state"},
+    CliOption{"--expert-stripe"},
+    CliOption{"--grammar-file"},
+    CliOption{"--json-object", false},
+    CliOption{"--json-schema-file"},
+    CliOption{"--regex"},
+    CliOption{"--choice", true, true},
+    CliOption{"--max-new"},
+    CliOption{"--rope-yarn-factor"},
+    CliOption{"--max-context"},
+    CliOption{"--kv-capacity"},
+    CliOption{"--vram-past-budget", false},
+    CliOption{"--expert-tail-skip"},
+    CliOption{"--vram-headroom-mib"},
+    CliOption{"--prefill-chunk"},
+    CliOption{"--device"},
+    CliOption{"--ram-headroom-mib"},
+    CliOption{"--expert-ram-mib"},
+    CliOption{"--expert-pin-mib"},
+    CliOption{"--kv-dtype"},
+    CliOption{"--spec"},
+    CliOption{"--draft-tokens"},
+    CliOption{"--draft-model"},
+    CliOption{"--spec-min-p"},
+    CliOption{"--ngram-draft-tokens"},
+    CliOption{"--ngram-min-match"},
+    CliOption{"--draft-tree-nodes"},
+    CliOption{"--draft-tree-paths"},
+    CliOption{"--lm-head-draft", false},
+    CliOption{"--raw-output", false},
+    CliOption{"--print-token-ids", false},
+    CliOption{"--log-colours"},
+    CliOption{"--no-thinking", false},
+    CliOption{"--thinking-budget"},
+    CliOption{"--reasoning-loop"},
+    CliOption{"--reasoning-effort"},
+    CliOption{"--vision", false},
+    CliOption{"--vision-offload"},
+    CliOption{"--vision-max-merged"},
+    CliOption{"--no-cuda-graph", false},
+    CliOption{"--use-original-int8-prefill-kernel", false},
+    CliOption{"--prefill-split-workspace-mib"},
+    CliOption{"--use-original-nvfp4-prefill-kernel", false},
+    CliOption{"--disable-fast-paths", false},
+    CliOption{"--fast-path", true, true},
+    CliOption{"--stop-token-id", true, true},
+    CliOption{"--stop", true, true},
+    CliOption{"--reasoning-stop", true, true},
+    CliOption{"--temperature"},
+    CliOption{"--top-p"},
+    CliOption{"--top-k"},
+    CliOption{"--min-p"},
+    CliOption{"--presence-penalty"},
+    CliOption{"--frequency-penalty"},
+    CliOption{"--seed"},
+    CliOption{"--greedy", false},
+    CliOption{"--log-level"},
+};
+
+const CliOption* find_option(std::string_view name) noexcept {
+    const auto found = std::find_if(kCliOptions.begin(), kCliOptions.end(),
+                                    [&](const CliOption& option) { return option.name == name; });
+    return found == kCliOptions.end() ? nullptr : &*found;
+}
+
+// infernix's --config: top-level keys and the [cli] table; [serve] is infernix-serve's.
+const product::ConfigProgram& cli_config_program() {
+    static const product::ConfigProgram program{
+        .table = "cli", .other_table = "serve", .find_option = [](std::string_view name) { return find_option(name); }};
+    return program;
+}
+
 ReasoningEffort parse_reasoning_effort(std::string_view text) {
     if (text == "none") { return ReasoningEffort::None; }
     if (text == "minimal") { return ReasoningEffort::Minimal; }
@@ -87,14 +174,16 @@ std::string usage_text(const char* argv0) {
            "       [--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new N]\n"
            "       [--device N]\n"
            "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4|vq2|k4v2] [--spec mtp|dflash|dflash2 --draft-tokens "
-           "N]\n"
-           "       [--lm-head-draft] [--draft-tree-nodes auto|N] [--draft-tree-paths N]\n"
+           "N|auto]\n"
+           "       [--draft-model FILE]\n"
+           "       [--lm-head-draft] [--spec-min-p P] [--draft-tree-nodes auto|N] [--draft-tree-paths N]\n"
            "       [--ngram-draft-tokens 1..63] [--ngram-min-match 4..64]\n"
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
-           "       [--chat-template FILE] [--ngram-volume FILE] [--expert-state FILE|off]\n"
-           "       [--ram-headroom-mib N] [--expert-ram-mib N|auto]\n"
+           "       [--chat-template FILE] [--ngram-volume FILE] [--ngram-residency auto|ram|volume]\n"
+           "       [--expert-state FILE|off] [--expert-stripe FILE]\n"
+           "       [--ram-headroom-mib N] [--expert-ram-mib N|auto] [--expert-pin-mib N|auto]\n"
            "       [--grammar-file FILE | --json-object | --json-schema-file FILE |\n"
            "        --regex PATTERN | --choice TEXT ...]\n"
            "       [--raw-output] [--print-token-ids] [--no-thinking] [--thinking-budget N]\n"
@@ -103,16 +192,26 @@ std::string usage_text(const char* argv0) {
            "       [--vision] [--vision-offload auto|on|off] [--vision-max-merged N]\n"
            "       [--no-cuda-graph]\n"
            "       [--log-level trace|debug|info|warning|error|critical|off]\n"
+           "       " + argv0 + " --config FILE [options]   (FILE gives the model)\n"
            "\n"
            "Runs one generation: answer content streams to stdout, reasoning and\n"
            "diagnostics to stderr. Sampling defaults come from the loaded model and\n"
            "thinking mode; flags override individual fields.\n"
+           "\n"
+           "  --config FILE            read options from a TOML file keyed by the long option\n"
+           "                           names without the dashes, e.g. max-context = 32768,\n"
+           "                           kv-dtype = \"int8\", greedy = true (a flag takes true or\n"
+           "                           false; a repeatable option an array); model = \"PATH\"\n"
+           "                           names the model; keys in a [cli] table apply only here,\n"
+           "                           [serve] only to infernix-serve. Options on the command\n"
+           "                           line override the file\n"
            "\n"
            "CONTEXT\n"
            "  --max-context N          max context tokens (default 2048)\n"
            "  --rope-yarn-factor F     startup-fixed YaRN, finite [1,4] (default 1);\n"
            "                           extends allowed ceiling only, not --max-context\n"
            "  --prefill-chunk N        prefill chunk size in tokens, multiple of 128\n"
+           "                           (default 16384 for Qwen3.8-Flash-Next, 1024 otherwise)\n"
            "  --max-new N              cap on generated tokens\n"
            "  --device N               CUDA device ordinal (default 0)\n"
            "  --ram-headroom-mib N     physical Host RAM in MiB that pinned weights and\n"
@@ -123,6 +222,10 @@ std::string usage_text(const char* argv0) {
            "                           experts (auto: what --ram-headroom-mib and the other\n"
            "                           pins leave); less than all of them need reads the\n"
            "                           rest from the artifact (the SSD tier)\n"
+           "  --expert-pin-mib N|auto  Qwen3.8-Flash-Next: at most this much of the experts'\n"
+           "                           RAM page-locked for the GPU; the rest stays in RAM\n"
+           "                           and the CPU serves it (auto: what Windows allows,\n"
+           "                           the GPU's shared memory)\n"
            "\n"
            "KV CACHE\n"
            "  --kv-capacity N|auto     KV-cache capacity in tokens\n"
@@ -133,6 +236,12 @@ std::string usage_text(const char* argv0) {
            "                           OS budget withholds (~0.6 GiB more expert cache on\n"
            "                           an RTX 5090; may move to system memory if another\n"
            "                           program needs VRAM)\n"
+           "  --expert-tail-skip R     Qwen3.8-Flash-Next: trade quality for decode speed by\n"
+           "                           skipping a routed expert missing from VRAM that every\n"
+           "                           token of a decode round routes at top-10 rank R or\n"
+           "                           lower (1-9; 9 skips least). Changes the output; not\n"
+           "                           with --disable-fast-paths. Default off; Strata's\n"
+           "                           default is 7\n"
            "  --vram-headroom-mib N|auto\n"
            "                           VRAM in MiB startup sizing leaves free: Qwen3.5,\n"
            "                           after --kv-capacity auto (auto " +
@@ -145,14 +254,6 @@ std::string usage_text(const char* argv0) {
            "  --use-original-int8-prefill-kernel\n"
            "                           prefill INT8 KV with the original prompt kernel\n"
            "                           (default: the fast kernel)\n"
-           "  --prefill-8bit-pv        INT8 and K4V2 KV: run prompt attention's P*V on 8-bit\n"
-           "                           Tensor Cores (up to 5-7 % faster long-prompt prefill,\n"
-           "                           but a measurable KL divergence from a BF16 KV\n"
-           "                           reference, so FP16 P*V is the default)\n"
-           "  --no-prefill-8bit-pv     NVFP4, K8V4 and VQ2 KV: run prompt attention's P*V in\n"
-           "                           FP16 instead of 8 bits (5-7 % slower long-prompt\n"
-           "                           prefill; the default 8-bit form stays within 1.1x\n"
-           "                           FP16's KL divergence from BF16 KV)\n"
            "  --use-original-nvfp4-prefill-kernel\n"
            "                           prefill NVFP4 KV with the original prompt kernel\n"
            "                           (default: the fast kernel)\n"
@@ -163,11 +264,30 @@ std::string usage_text(const char* argv0) {
            "; 128-384 recommended). Less frees KV cache but\n"
            "                           slows 1-2K-token chunks over long context (64: up\n"
            "                           to 27% slower attention; 0: no splitting)\n"
+           "  --disable-fast-paths     run the exact route: bit-exact across releases and,\n"
+           "                           for NVFP4/FP8 dense models, independent of other\n"
+           "                           requests. Without it, every path qualified and\n"
+           "                           measured faster for this artifact's kernels and KV\n"
+           "                           type runs (within Infernix's numerical quality\n"
+           "                           policy; startup lists them; docs/cli.md)\n"
+           "  --fast-path NAME         also run this fast path, qualified or not\n"
+           "                           (qualification runs; repeatable)\n"
            "\n"
            "SPECULATIVE DECODING (off by default)\n"
            "  --spec mtp|dflash|dflash2 speculative backend\n"
-           "  --draft-tokens N         draft tokens per round (mtp 1-5; dflash 1-15)\n"
+           "  --draft-tokens N|auto    drafts per round: mtp 1-7 (Qwen3.5/3.6 1-5),\n"
+           "                           dflash/dflash2 1-15 (Qwen3.8-Flash-Next dflash2 1-7)\n"
+           "                             N     every round drafts and verifies N\n"
+           "                             auto  mtp: each round picks 0-7 from recent\n"
+           "                                   acceptance (Qwen3.5/3.6: 1-5 where qualified,\n"
+           "                                   else the model's fastest fixed length);\n"
+           "                                   Qwen3.8-Flash-Next dflash2 likewise\n"
+           "  --draft-model FILE       Qwen3.8-Flash-Next dflash2: the DFlash2 drafter's\n"
+           "                           companion artifact (Qwen3.5/3.6 artifacts bundle theirs)\n"
            "  --lm-head-draft          use the optimized proposal head\n"
+           "  --spec-min-p P           Qwen3.8-Flash-Next mtp: verify drafts only up to the\n"
+           "                           first below probability P, 0-1 (default 0.5 with\n"
+           "                           --draft-tokens auto, else 0 = all)\n"
            "  --draft-tree-nodes auto|N\n"
            "                           dflash2: verify a small tree of alternative drafts each\n"
            "                           round instead of a single draft, so more drafted tokens\n"
@@ -225,16 +345,24 @@ Options parse_options(int argc, char** argv) {
         options.help_requested = true;
         return options;
     }
-    if (argc < 2) { throw std::invalid_argument("a model path (.infernix or .ninfer) is required"); }
-    options.artifact_path     = argv[1];
+    product::ProgramArguments program = product::read_program_arguments(argc, argv, cli_config_program());
+    if (program.model.empty()) {
+        throw std::invalid_argument("a model path (.infernix or .ninfer) is required: give it first on "
+                                    "the command line or as `model` in the --config file");
+    }
+    options.artifact_path     = program.model;
+    options.config_path       = std::move(program.config_path);
+    options.config_arguments  = program.config_arguments;
     bool kv_capacity_explicit = false;
 
-    for (int i = 2; i < argc; ++i) {
-        const std::string_view arg(argv[i]);
+    const std::vector<std::string>& arguments = program.arguments;
+    for (std::size_t i = 0; i < arguments.size(); ++i) {
+        const std::string_view arg(arguments[i]);
         const auto value = [&](std::string_view flag) -> const char* {
-            if (++i >= argc) { throw std::invalid_argument(std::string(flag) + " needs a value"); }
-            return argv[i];
+            if (++i >= arguments.size()) { throw std::invalid_argument(std::string(flag) + " needs a value"); }
+            return arguments[i].c_str();
         };
+        if (find_option(arg) == nullptr) { throw std::invalid_argument("unknown argument: " + std::string(arg)); }
 
         if (arg == "--prompt") {
             options.prompt = value(arg);
@@ -242,9 +370,13 @@ Options parse_options(int argc, char** argv) {
             options.chat_template_path = value(arg);
         } else if (arg == "--ngram-volume") {
             options.ngram_volume_path = value(arg);
+        } else if (arg == "--ngram-residency") {
+            options.ngram_residency = parse_ngram_residency(value(arg));
         } else if (arg == "--expert-state") {
             const std::string path = value(arg);
             options.expert_state   = path == "off" ? std::filesystem::path{} : std::filesystem::path(path);
+        } else if (arg == "--expert-stripe") {
+            options.expert_stripe_path = value(arg);
         } else if (arg == "--grammar-file") {
             options.grammar_path = value(arg);
         } else if (arg == "--json-object") {
@@ -268,6 +400,8 @@ Options parse_options(int argc, char** argv) {
             kv_capacity_explicit = true;
         } else if (arg == "--vram-past-budget") {
             options.vram_past_budget = true;
+        } else if (arg == "--expert-tail-skip") {
+            options.expert_tail_skip = parse_u32(value(arg), "expert-tail-skip", true);
         } else if (arg == "--vram-headroom-mib") {
             const char* text = value(arg);
             if (std::string_view(text) == "auto") {
@@ -281,6 +415,9 @@ Options parse_options(int argc, char** argv) {
             }
         } else if (arg == "--prefill-chunk") {
             options.prefill_chunk = parse_u32(value(arg), "prefill-chunk");
+            if (options.prefill_chunk == 0) {
+                throw std::invalid_argument("--prefill-chunk must be a positive multiple of 128");
+            }
         } else if (arg == "--device") {
             options.device = parse_device(value(arg));
         } else if (arg == "--ram-headroom-mib") {
@@ -300,12 +437,27 @@ Options parse_options(int argc, char** argv) {
                 }
                 options.expert_ram_bytes = mib << 20;
             }
+        } else if (arg == "--expert-pin-mib") {
+            const std::string text = value(arg);
+            if (text == "auto") {
+                options.expert_pin_bytes.reset();
+            } else {
+                const std::uint64_t mib = parse_u64(text.c_str(), "expert-pin-mib");
+                if (mib == 0 || mib > (std::numeric_limits<std::uint64_t>::max() >> 20)) {
+                    throw std::invalid_argument("--expert-pin-mib is out of range");
+                }
+                options.expert_pin_bytes = mib << 20;
+            }
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_cache(value(arg));
         } else if (arg == "--spec") {
             options.speculative.backend = product::parse_speculative_backend(value(arg));
         } else if (arg == "--draft-tokens") {
-            options.speculative.draft_tokens = parse_u32(value(arg), "draft-tokens");
+            product::apply_draft_tokens(options.speculative, value(arg));
+        } else if (arg == "--draft-model") {
+            options.speculative.draft_model = std::filesystem::path(std::string(value(arg)));
+        } else if (arg == "--spec-min-p") {
+            options.speculative.draft_min_p = product::parse_draft_min_p(value(arg));
         } else if (arg == "--ngram-draft-tokens") {
             options.speculative.ngram_draft_tokens =
                 parse_u32(value(arg), "ngram-draft-tokens", true);
@@ -370,15 +522,18 @@ Options parse_options(int argc, char** argv) {
             options.use_cuda_graph = false;
         } else if (arg == "--use-original-int8-prefill-kernel") {
             options.original_int8_prefill_kernel = true;
-        } else if (arg == "--prefill-8bit-pv") {
-            options.prefill_8bit_pv = PrefillPv8::On;
-        } else if (arg == "--no-prefill-8bit-pv") {
-            options.prefill_8bit_pv = PrefillPv8::Off;
         } else if (arg == "--prefill-split-workspace-mib") {
             options.prefill_split_workspace_mib =
                 parse_u32(value(arg), "prefill-split-workspace-mib", true);
         } else if (arg == "--use-original-nvfp4-prefill-kernel") {
             options.original_nvfp4_prefill_kernel = true;
+        } else if (arg == "--disable-fast-paths") {
+            options.fast_paths = false;
+        } else if (arg == "--fast-path") {
+            const std::string name(value(arg));
+            const std::optional<FastPath> path = parse_fast_path(name);
+            if (!path) { throw std::invalid_argument("unknown fast path: " + name); }
+            options.fast_path_candidates.push_back(*path);
         } else if (arg == "--stop-token-id") {
             const std::uint32_t token = parse_u32(value(arg), "stop-token-id", true);
             if (token > static_cast<std::uint32_t>(std::numeric_limits<TokenId>::max())) {
@@ -417,7 +572,7 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--log-level") {
             options.log_level = product::parse_log_level(value(arg));
         } else {
-            throw std::invalid_argument("unknown argument: " + std::string(arg));
+            throw std::logic_error("CLI option " + std::string(arg) + " has no parser");
         }
     }
 
