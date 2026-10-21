@@ -62,8 +62,11 @@ struct ChatImageToolRound {
 // or an error result for a call the model argued badly or pushed past the limit).
 //
 // A bad argument set is the model's mistake and becomes an error tool result, so it can retry. A
-// pipeline failure (429/500/503) is not, and propagates as the ApiException the images route would
-// have returned. `already_generated` is how many pictures this request produced earlier.
+// pipeline failure (429 no room for this size, 429 another draw in flight, 500 a failed job) is not
+// the model's mistake, but it is still this tool's answer: it comes back as an error result with the
+// code and reason the images route would have returned, so the model can retry smaller, wait, or
+// answer in words. The user's request was for an answer, not for the HTTP status of a draw.
+// `already_generated` is how many pictures this request produced earlier.
 // [[nodiscard]] so a caller cannot run the pictures and forget to feed the results back.
 [[nodiscard]] ChatImageToolRound run_chat_image_tool_round(
     GenerationRequest& request, const GenerationOutcome& outcome, std::string_view image_model_id,

@@ -1,7 +1,8 @@
 // Server-executed chat image tool host contract: the hidden tool is injected only where the client
 // left tool choice free, a round is fed back as the same assistant+tool turns a client round-trip
 // would send, the per-request picture cap and bad arguments become tool errors instead of pictures,
-// a failing pipeline still propagates, and the round loop ends in one answer that carries every URL.
+// and so does a failing pipeline -- the model's request was for an answer, not for the HTTP status
+// of a draw. The round loop ends in one answer that carries every URL.
 // CHAT_IMAGE_TOOL_TEST: PASS
 #include "serve/chat_image_tool.h"
 
@@ -55,6 +56,7 @@ struct FakeGenerator {
     std::vector<OpenAIImagesRequest> requests;
     std::vector<std::string> urls;
     int fail_status   = 0;
+    const char* fail_code = "image_pipeline_unavailable";
     int calls         = 0;
 
     RequestJson operator()(const OpenAIImagesRequest& request) {
@@ -65,7 +67,7 @@ struct FakeGenerator {
             error.status  = fail_status;
             error.type    = "server_error";
             error.message = "the image pipeline is busy";
-            error.code    = "image_pipeline_unavailable";
+            error.code    = fail_code;
             throw ApiException(std::move(error));
         }
         const std::string id = "img-" + std::to_string(requests.size());
@@ -186,25 +188,34 @@ void test_cap_and_bad_arguments() {
           "and comes back as an error result the model can correct");
 }
 
-void test_pipeline_failure_propagates() {
-    GenerationRequest request;
-    FakeGenerator generator;
-    generator.fail_status = 503;
-    bool propagated       = false;
-    bool settled          = true;
-    try {
+void test_pipeline_failure_becomes_a_tool_result() {
+    // The three ways a draw can fail after the model asked for it: this size does not fit now,
+    // another picture is already on the device, the job fell over. None is the model's mistake and
+    // none may take the user's answer with it.
+    for (const char* code : {"image_vram_insufficient", "image_interlude_in_flight",
+                             "image_generation_failed"}) {
+        GenerationRequest request;
+        FakeGenerator generator;
+        generator.fail_status = 503;
+        generator.fail_code   = code;
         const ChatImageToolRound round = run_chat_image_tool_round(
             request, image_call_outcome({R"({"prompt":"a"})"}), kImageModel, kUrlBase, 0, 0,
             observer_of(generator));
-        (void)round;
-    } catch (const ApiException& exception) {
-        settled    = false;
-        propagated = exception.error().status == 503;
+        const std::string what{code};
+
+        check(round.executed == 0 && round.urls.empty() && round.ids.empty(),
+              what + " leaves no URL the answer could promise");
+        check(request.messages.size() == 2 && request.messages[0].tool_calls.size() == 1,
+              what + " settles as one assistant call and one tool result, as a client round-trip "
+                    "would");
+        const std::string result = tool_result_text(request, 1);
+        check(result.find(code) != std::string::npos &&
+                  result.find("the image pipeline is busy") != std::string::npos,
+              what + " reaches the model through the tool result with the pipeline's own reason "
+                    "(the size that would fit travels in it), not as a failed request");
+        check(request.messages[1].tool_result_is_error,
+              what + " is marked as an error, so the model may retry smaller or answer in words");
     }
-    check(!settled && propagated,
-          "a pipeline failure surfaces as the error the images route would return");
-    check(request.messages.empty(),
-          "and the failed round is not fed back as a tool result the model must answer");
 }
 
 void test_url_suffix() {
@@ -292,7 +303,7 @@ int main() {
     test_round_detection();
     test_single_round();
     test_cap_and_bad_arguments();
-    test_pipeline_failure_propagates();
+    test_pipeline_failure_becomes_a_tool_result();
     test_url_suffix();
     test_round_loop();
     test_round_bound_and_cancellation();

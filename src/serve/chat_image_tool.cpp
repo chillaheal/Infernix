@@ -122,8 +122,11 @@ ChatImageToolRound run_chat_image_tool_round(GenerationRequest& request,
                 ++round.executed;
                 result = RequestJson{{"id", id}, {"url", url}}.dump();
             } catch (const ApiException& exception) {
-                // Bad arguments are the model's to fix; a failing pipeline is not its to swallow.
-                if (exception.error().status != 400) { throw; }
+                // EVERY image failure comes back to the model as the tool's error result, including the
+                // ones that used to be rethrown (no VRAM for this size, another draw in flight, a failed
+                // job): the user's request is about an answer, and a picture that could not be drawn is
+                // the model's to work around -- the code and the reason tell it to retry smaller, wait,
+                // or answer in words. The rounds stay invisible to the client either way.
                 is_error = true;
                 result   = json_error_result(exception.error().code.empty() ? "image_arguments_invalid"
                                                                             : exception.error().code,
