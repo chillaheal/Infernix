@@ -16,6 +16,8 @@
 
 #include "infernix/engine.h"
 
+#include <nlohmann/json.hpp>
+
 #include "serve/image_job_store.h"
 #include "serve/openai_images.h"
 #include "serve/reference_image.h"
@@ -110,6 +112,13 @@ public:
     // hidden tool round runs before the response, so the request that triggered the job is the
     // one ticker this can ever name).
     [[nodiscard]] std::shared_ptr<ImageJobProgress> last_job_progress() const;
+
+    // The GET /v1/images/<id> status object for a stored job: {"id", "status",
+    // "progress_percent"}. Non-terminal jobs report "running"; terminals carry their stored
+    // state name ("succeeded", "failed", ...). Null when the id names no job at all (the route
+    // keeps its documented 404 for that). The picture itself still answers from the file for
+    // succeeded jobs; this object is what an unfinished or failed job exposes.
+    [[nodiscard]] nlohmann::json job_status_json(std::string_view id) const;
 
 private:
     std::unique_ptr<ImageInterludeRunner> runner_;

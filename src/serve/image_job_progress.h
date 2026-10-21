@@ -10,7 +10,16 @@
 #include <atomic>
 #include <chrono>
 
+#include <cmath>
+
 namespace infernix::serve {
+
+// steady_clock::now() as nanoseconds since the epoch, the unit `last_progress` carries.
+[[nodiscard]] inline long long progress_clock_now() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
 
 struct ImageJobProgress {
     // -1 until the pipeline reports its first step; then a monotone 0-100.
@@ -23,14 +32,11 @@ struct ImageJobProgress {
     std::atomic<bool> stalled{false};
 
     // Records one step. Returns false once the watchdog has flagged the job: the pipeline hook
-    // throws at that point rather than continuing a wedged generation.
-    bool advance(int pct) {
+    // throws at that point rather than continuing a wedged generation. `at_ns` lets a test move
+    // the stamp without moving the real clock.
+    bool advance(int pct, long long at_ns = progress_clock_now()) {
         percent.store(pct, std::memory_order_relaxed);
-        last_progress.store(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now().time_since_epoch())
-                .count(),
-            std::memory_order_relaxed);
+        last_progress.store(at_ns, std::memory_order_relaxed);
         return !stalled.load(std::memory_order_relaxed);
     }
 };

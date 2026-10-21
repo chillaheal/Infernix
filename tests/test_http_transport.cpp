@@ -25,6 +25,7 @@ namespace {
 
 using infernix::serve::ClientDisconnected;
 using infernix::serve::HeartbeatTicker;
+using infernix::serve::ImageJobProgress;
 using infernix::serve::SseTransport;
 
 int check(bool condition, const char* message) {
@@ -458,6 +459,51 @@ int test_heartbeat_ticker() {
         failures += check(enough && custom_writes.front() == ": image 42%\n\n" &&
                               !custom_cancelled,
                           "the ticker ignored a nonempty next_comment");
+    }
+
+    // The stall watchdog: a progress state whose clock is frozen past the bound is flagged by the
+    // ticker, and a moving last_progress is not.
+    {
+        httplib::DataSink quiet_sink;
+        quiet_sink.write       = [](const char*, std::size_t) { return true; };
+        quiet_sink.is_writable = [] { return true; };
+        std::atomic<bool> quiet_cancelled{false};
+        SseTransport quiet(quiet_sink, quiet_cancelled, 5ms);
+        auto frozen = std::make_shared<ImageJobProgress>();
+        frozen->last_progress.store(0LL);
+        std::atomic<long long> now_ms{0};
+        {
+            HeartbeatTicker ticker(
+                quiet, [&] { return std::string(); }, [&] { return frozen; },
+                std::chrono::milliseconds(50), [&now_ms] {
+                    return std::chrono::time_point<std::chrono::steady_clock>(
+                        std::chrono::milliseconds(now_ms.load()));
+                });
+            for (int i = 0; i < 20 && !frozen->stalled.load(); ++i) {
+                now_ms.store((i + 1) * 10);  // the world's clock moves; the job's does not
+                std::this_thread::sleep_for(10ms);
+            }
+            failures += check(frozen->stalled.load(),
+                              "the ticker watchdog did not flag a progress state frozen past its bound");
+        }
+        auto moving = std::make_shared<ImageJobProgress>();
+        std::atomic<long long> moving_now{0};
+        {
+            HeartbeatTicker ticker(
+                quiet, [&] { return std::string(); }, [&] { return moving; },
+                std::chrono::milliseconds(50), [&moving_now] {
+                    return std::chrono::time_point<std::chrono::steady_clock>(
+                        std::chrono::milliseconds(moving_now.load()));
+                });
+            for (int i = 0; i < 8; ++i) {
+                const long long stamp_ns = (i + 1) * 20LL * 1000000LL;  // matches now_ms's clock
+                moving->advance(i * 10, stamp_ns);
+                moving_now.store((i + 1) * 20);
+                std::this_thread::sleep_for(10ms);
+            }
+            failures += check(!moving->stalled.load(),
+                              "the watchdog flagged a job that kept stamping progress");
+        }
     }
     return failures;
 }

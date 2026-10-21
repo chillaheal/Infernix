@@ -615,6 +615,15 @@ void HttpServer::handle_image_artifact(const httplib::Request& req, httplib::Res
             return;
         }
     }
+    // No picture file yet (or never): a stored job still answers with its status object, so a
+    // client polling an id can watch an in-flight generation instead of seeing 404.
+    if (images_ != nullptr) {
+        if (const auto status = images_->job_status_json(id); !status.is_null()) {
+            res.set_header("Cache-Control", "no-store");
+            res.set_content(status.dump(), "application/json");
+            return;
+        }
+    }
     write_openai_error(res, ApiError{.status  = 404,
                                      .type    = "invalid_request_error",
                                      .message = "image '" + id + "' not found",

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "serve/generation_service.h"
+#include "serve/image_job_progress.h"
 #include "serve/request_json.h"
 
 #include <httplib.h>
@@ -85,9 +86,18 @@ private:
 // round: every interval it writes next_comment()'s text when nonempty (an ": image 42%" progress
 // comment), else the transport's standard quiet-interval beat. Destruction stops and joins the
 // thread. A write failure marks the transport's request cancelled, exactly as poll() does.
+// When `watch` names a job's progress, the ticker is also its stall watchdog: a state whose
+// last_progress stands still past `stall_bound` gets `stalled` set, and the pipeline's next step
+// boundary throws instead of letting a wedged job hold the interlude's VRAM forever.
 class HeartbeatTicker final {
 public:
-    HeartbeatTicker(SseTransport& transport, std::function<std::string()> next_comment);
+    static constexpr std::chrono::seconds kDefaultStallBound{60};
+
+    HeartbeatTicker(SseTransport& transport, std::function<std::string()> next_comment,
+                    std::function<std::shared_ptr<ImageJobProgress>()> watch = {},
+                    std::chrono::milliseconds stall_bound =
+                        std::chrono::duration_cast<std::chrono::milliseconds>(kDefaultStallBound),
+                    std::function<SseTransport::Clock::time_point()> now = SseTransport::Clock::now);
     ~HeartbeatTicker();
 
     HeartbeatTicker(const HeartbeatTicker&)            = delete;
@@ -98,6 +108,9 @@ private:
 
     SseTransport& transport_;
     std::function<std::string()> next_comment_;
+    std::function<std::shared_ptr<ImageJobProgress>()> watch_;
+    std::chrono::nanoseconds stall_bound_;
+    std::function<SseTransport::Clock::time_point()> now_;
     std::mutex mutex_;
     std::condition_variable condition_;
     bool stopping_ = false;

@@ -307,6 +307,16 @@ std::shared_ptr<ImageJobProgress> ImageGenerationService::last_job_progress() co
     return last_progress_;
 }
 
+nlohmann::json ImageGenerationService::job_status_json(std::string_view id) const {
+    const auto record = store_.get(std::string(id));
+    if (record == nullptr) { return nullptr; }
+    const bool running = !is_terminal(record->state);
+    return nlohmann::json{{"id", record->id},
+                          {"status", running ? "running" : state_to_string(record->state)},
+                          {"progress_percent",
+                           record->progress ? record->progress->percent.load() : -1}};
+}
+
 RequestJson ImageGenerationService::generate(const OpenAIImagesRequest& request, std::int64_t now,
                                              std::string_view artifact_url_base) {
     if (!is_configured()) {

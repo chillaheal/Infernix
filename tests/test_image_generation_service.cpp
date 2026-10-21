@@ -455,6 +455,24 @@ int main() {
         check(threw && failed != nullptr && failed->state == ImageJobState::Failed &&
                   failed->error["message"].get<std::string>().find("stalled") != std::string::npos,
               "a watchdog-flagged job does not fail terminally with its stall message");
+
+        // The status object the GET route serves for stored jobs (the route's own wiring is the
+        // same call; this is its single authority).
+        const auto succeeded_status = service.job_status_json("img-4000-1");
+        check(succeeded_status != nullptr &&
+                  succeeded_status["status"].get<std::string>() == "succeeded" &&
+                  succeeded_status["progress_percent"].get<int>() == 100,
+              "a succeeded job's status object is not its stored terminal state at 100");
+        const auto failed_status = stalled_service.job_status_json("img-5000-1");
+        check(failed_status != nullptr && failed_status["status"].get<std::string>() == "failed",
+              "a failed job's status object lost its state");
+        check(service.job_status_json("img-9999-9").is_null(),
+              "an unknown id named a status object (the route must still 404)");
+        const auto stall_percent = failed->progress->percent.load();
+        check(stall_percent == 50, "the failed job's stored percent is not its last step");
+        const auto failed_status_percent = failed_status["progress_percent"].get<int>();
+        check(failed_status_percent == stall_percent,
+              "the status object's percent does not read the job's live state");
     }
 
     // Every check that reached a job wrote its picture into the working directory; leave nothing behind.

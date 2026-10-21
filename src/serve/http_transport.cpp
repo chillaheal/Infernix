@@ -221,9 +221,12 @@ void SseTransport::beat(Clock::time_point now) {
     last_write_ = now;
 }
 
-HeartbeatTicker::HeartbeatTicker(SseTransport& transport, std::function<std::string()> next_comment)
-    : transport_(transport), next_comment_(std::move(next_comment)),
-      thread_([this] { run(); }) {}
+HeartbeatTicker::HeartbeatTicker(SseTransport& transport, std::function<std::string()> next_comment,
+                                 std::function<std::shared_ptr<ImageJobProgress>()> watch,
+                                 std::chrono::milliseconds stall_bound,
+                                 std::function<SseTransport::Clock::time_point()> now)
+    : transport_(transport), next_comment_(std::move(next_comment)), watch_(std::move(watch)),
+      stall_bound_(stall_bound), now_(std::move(now)), thread_([this] { run(); }) {}
 
 HeartbeatTicker::~HeartbeatTicker() {
     {
@@ -247,6 +250,19 @@ void HeartbeatTicker::run() {
         // probe cancels on a transient !is_writable, which must not abort an image round.
         // Dead peers surface through the write below.
         if (transport_.is_cancelled()) { return; }
+        if (watch_) {
+            // The stall watchdog: the ticker is the only observer of a job whose pipeline has
+            // wedged; setting `stalled` makes the job throw at its next step boundary.
+            if (const auto progress = watch_()) {
+                const auto elapsed_ns =
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(now_().time_since_epoch())
+                        .count() -
+                    progress->last_progress.load(std::memory_order_relaxed);
+                if (elapsed_ns > stall_bound_.count()) {
+                    progress->stalled.store(true, std::memory_order_relaxed);
+                }
+            }
+        }
         const std::string comment = next_comment_ ? next_comment_() : std::string();
         try {
             // One comment per interval: the progress comment replaces the standard beat, it
