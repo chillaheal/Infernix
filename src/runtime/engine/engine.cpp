@@ -397,6 +397,14 @@ std::uint64_t Engine::run_image_interlude(std::uint64_t target_bytes, std::uint6
     return impl_->qwen4->program->run_image_interlude(target_bytes, margin_bytes, job, drain_deadline_ms);
 }
 
+ImageYieldProbe Engine::probe_image_yield(std::uint64_t target_bytes, std::uint64_t margin_bytes) const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    if (impl_->qwen4 == nullptr || impl_->qwen4->program == nullptr) {
+        throw std::logic_error("Engine: this model's Program supports no image interlude");
+    }
+    return impl_->qwen4->program->probe_image_yield(target_bytes, margin_bytes);
+}
+
 PreparedPrompt Engine::prepare(PromptInput input, const PreparationControl& control) const {
     nvtx::ScopedRange prepare_range(nvtx::Name::FrontendPrepare, nvtx::Category::Runtime);
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }

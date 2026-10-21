@@ -129,6 +129,15 @@ public:
                                       const std::function<bool(const ImageInterludeContext&)>& job,
                                       std::uint64_t drain_deadline_ms = 60000);
 
+    // Whether an image job wanting `target_bytes` (plus `margin_bytes` kept below the headroom) would
+    // fit right now. Runs the same pure plan the interlude applies against the live pools, WITHOUT
+    // quiescing, draining, unmapping or resizing anything: a caller that gets `fits == false` refuses
+    // the request before the submit door closes, so a job that cannot run never stalls the LLM. Legal
+    // while the Engine is serving. Throws std::logic_error when the Engine is moved from or its model
+    // supports no interlude.
+    [[nodiscard]] ImageYieldProbe probe_image_yield(std::uint64_t target_bytes,
+                                                   std::uint64_t margin_bytes) const;
+
     void reset_memory_peaks() noexcept;
 
     // Begins the orderly stop without waiting for it: new work is refused, and queued and active

@@ -152,6 +152,10 @@ PrefixCachePersistence Program::attach_prefix_cache_file(const std::filesystem::
 
 std::optional<PrefixCachePersistence> Program::prefix_shutdown_save() const { return impl_->prefix_shutdown_save(); }
 
+ImageYieldProbe Program::probe_image_yield(std::uint64_t target_bytes, std::uint64_t margin_bytes) const {
+    return impl_->probe_image_yield(target_bytes, margin_bytes);
+}
+
 std::uint64_t Program::run_image_interlude(std::uint64_t target_bytes, std::uint64_t margin_bytes,
                                            const std::function<bool(const ImageInterludeContext&)>& job,
                                            std::uint64_t drain_deadline_ms) {

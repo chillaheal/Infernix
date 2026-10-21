@@ -640,6 +640,12 @@ public:
                                       const std::function<bool(const ImageInterludeContext&)>& job,
                                       std::uint64_t drain_deadline_ms = 60000);
 
+    // Whether a job wanting `target_bytes` (plus `margin_bytes`) would fit: the pure yield plan over
+    // the live pools plus the device's own free bytes, with nothing quiesced, drained or unmapped.
+    // Legal while serving, and from outside an interlude (which holds the VRAM lock it reads).
+    [[nodiscard]] ImageYieldProbe probe_image_yield(std::uint64_t target_bytes,
+                                                   std::uint64_t margin_bytes) const;
+
 private:
     std::unique_ptr<detail::ProgramImpl> impl_;
 };

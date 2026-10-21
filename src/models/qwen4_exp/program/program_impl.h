@@ -5057,6 +5057,41 @@ public:
     // expert-frame pool and the elastic KV pool toward their floors to free `target_bytes` plus a
     // `margin_bytes` kept below the headroom, and returns the bytes actually released; the lease
     // carries what to restore. The caller allocates the image's scratch in the freed region and calls
+    // Whether an image job of `target_bytes` (+ `margin_bytes` below the headroom) would fit, answered
+    // from the live pools WITHOUT quiescing, draining, synchronizing or moving anything: the same pure
+    // plan yield_for_image applies, plus the device's own free bytes -- the image allocates through the
+    // driver, not only out of what these pools give up. Legal while the Engine serves; it takes
+    // vram_mutex_, so it is not callable from inside an interlude, which already holds it.
+    ImageYieldProbe probe_image_yield(std::uint64_t target_bytes, std::uint64_t margin_bytes) {
+        ImageYieldProbe out;
+        out.target_bytes = target_bytes;
+        out.margin_bytes = margin_bytes;
+        const std::lock_guard<std::mutex> lock(vram_mutex_);
+        const VramSnapshot snapshot = vram_ ? vram_->query() : VramSnapshot{};
+        out.device_free_bytes = snapshot.device_free;
+        out.headroom_bytes    = display_headroom(snapshot.display, true, options_.vram_headroom);
+
+        // The same request yield_for_image builds, so the two can never disagree about the pools.
+        ImageYieldRequest req;
+        req.pool_bytes   = residency_->pool_bytes();
+        req.frames       = residency_->frames();
+        req.frame_stride = residency_->frame_bytes();
+        req.frame_chunk  = ExpertResidency::kChunkBytes;
+        req.frames_floor = 0; // the image may take every frame (the LLM is paused during the job)
+        req.kv_mapped    = kv_vmm_ ? kv_vmm_->mapped_bytes() : 0;
+        req.kv_floor     = kv_vmm_ ? kv_mapped_bytes(plan_, plan_.kv_base_pages) : 0;
+        req.kv_chunk     = kKvChunkBytes;
+        req.lease_held   = residency_->lendable_bytes() == 0 && residency_->frames() != 0;
+        req.target_bytes = target_bytes;
+        req.margin_bytes = margin_bytes;
+        const auto plan  = plan_image_yield(req);
+
+        out.freed_bytes_expected = plan.total_freed;
+        out.fits                 = out.freed_bytes_expected + out.device_free_bytes >=
+                                   target_bytes + margin_bytes + out.headroom_bytes;
+        return out;
+    }
+
     // release_from_yield when done (success, cancel or CUDA failure alike). It works on the pools
     // directly, so it does not re-enter shrink_kv/grow_kv (which take the same lock).
     ImageYieldLease yield_for_image(std::uint64_t target_bytes, std::uint64_t margin_bytes) {

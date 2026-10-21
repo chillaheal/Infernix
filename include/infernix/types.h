@@ -1567,6 +1567,20 @@ struct ImageInterludeContext {
     void* image_stream        = nullptr;
 };
 
+// The answer to "would an image job wanting this much VRAM fit?", computed before anything is
+// quiesced or unmapped: the same pure yield plan the interlude applies, over the pools as they stand,
+// plus what the device already has free. `fits` holds when freed_bytes_expected + device_free_bytes
+// covers target_bytes + margin_bytes + headroom_bytes. A caller that gets false refuses the request
+// without ever closing the LLM's submit door.
+struct ImageYieldProbe {
+    bool fits = false;
+    std::uint64_t target_bytes         = 0;
+    std::uint64_t margin_bytes         = 0;
+    std::uint64_t freed_bytes_expected = 0; // plan_image_yield's total_freed, on the pools' own grids
+    std::uint64_t device_free_bytes    = 0; // free before anything is unmapped
+    std::uint64_t headroom_bytes       = 0; // the display headroom the sizing path reserves
+};
+
 struct MemorySummary {
     int device                                = 0;
     std::uint32_t max_context                 = 0;
