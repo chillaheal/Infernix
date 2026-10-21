@@ -5076,7 +5076,7 @@ public:
         lease.kv_pages_before = pool_ ? pool_->backed_pages() : 0;
         const std::uint64_t before = residency_->pool_bytes() + (kv_vmm_ ? kv_vmm_->mapped_bytes() : 0);
         diagnostic("yield: device synchronized; pool+kv " + std::to_string(before >> 20) + " MiB, frames " +
-                       std::to_string(residency_->frames()) + ", lendable " + std::to_string(residency_->lendable()) +
+                       std::to_string(residency_->frames()) + ", lendable " + std::to_string(residency_->lendable_bytes()) +
                        ", target " + std::to_string(target_bytes >> 20) + " MiB, margin " +
                        std::to_string(margin_bytes >> 20) + " MiB",
                    DiagnosticLevel::Info);
@@ -5084,13 +5084,13 @@ public:
         ImageYieldRequest req;
         req.pool_bytes    = residency_->pool_bytes();
         req.frames        = lease.frames_before;
-        req.frame_stride  = residency_->frame_stride();
+        req.frame_stride  = residency_->frame_bytes();
         req.frame_chunk   = ExpertResidency::kChunkBytes;
         req.frames_floor  = 0; // the image may take every frame (the LLM is paused during the job)
         req.kv_mapped     = kv_vmm_ ? kv_vmm_->mapped_bytes() : 0;
         req.kv_floor      = kv_vmm_ ? kv_mapped_bytes(plan_, plan_.kv_base_pages) : 0;
         req.kv_chunk      = kKvChunkBytes;
-        req.lease_held    = residency_->lendable() == 0 && residency_->frames() != 0; // a loan freezes the pool
+        req.lease_held    = residency_->lendable_bytes() == 0 && residency_->frames() != 0; // a loan freezes the pool
         req.target_bytes  = target_bytes;
         req.margin_bytes  = margin_bytes;
         const auto plan = plan_image_yield(req);

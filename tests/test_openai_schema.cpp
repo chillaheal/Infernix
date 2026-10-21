@@ -1192,10 +1192,11 @@ int test_common_objects() {
 
     // The image resource is advertised only when the image route is configured, and then as its own
     // entry: a plain OpenAI model object, with no chat context or llama.cpp meta to mislead about it.
-    failures += check(Json::parse(make_models_list("qwen", 7, 240000, metadata))["data"].size() == 1U,
-                      "no image artifact means one advertised model");
-    const Json with_image =
-        Json::parse(make_models_list("qwen", 7, 240000, metadata, "Qwen-Image-2.1-FP8-v3"));
+    failures +=
+        check(Json::parse(make_models_list("qwen", 7, 240000, metadata, ChatTemplateCaps{}))["data"].size() == 1U,
+              "no image artifact means one advertised model");
+    const Json with_image = Json::parse(
+        make_models_list("qwen", 7, 240000, metadata, ChatTemplateCaps{}, "Qwen-Image-2.1-FP8-v3"));
     failures += check(with_image["data"].size() == 2U &&
                           with_image["data"][1]["id"] == "Qwen-Image-2.1-FP8-v3" &&
                           with_image["data"][1]["object"] == "model" &&
