@@ -250,6 +250,18 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                 try {
                     outcome = run_stream_round(stream->prepared, true);
                     if (images_configured && outcome_is_chat_image_tool_round(outcome)) {
+                        // The picture draws with the Engine loop stopped: this ticker is the
+                        // stream's only traffic while it runs, and it carries the job's real
+                        // percent as an SSE comment.
+                        HeartbeatTicker ticker(
+                            transport, [this] -> std::string {
+                                const auto progress =
+                                    images_ != nullptr ? images_->last_job_progress() : nullptr;
+                                if (progress == nullptr) { return {}; }
+                                const int percent = progress->percent.load(std::memory_order_relaxed);
+                                if (percent < 0) { return {}; }
+                                return ": image " + std::to_string(percent) + "%\n\n";
+                            });
                         ChatImageRounds rounds = run_chat_image_rounds(
                             *generation, std::move(outcome), image_model, image_url_base,
                             unix_time_now(), make_picture,

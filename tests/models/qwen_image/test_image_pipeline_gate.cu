@@ -89,7 +89,8 @@ int main() {
 
         // The entry links (image_pipeline.cu compiled into the runtime library) and is callable.
         auto (*entry)(artifact::Reader&, const DiTWeights&, const VaeWeights&, const ImageJobInputs&,
-                      cudaStream_t) = &run_image_job;
+                      cudaStream_t, ImageJobProgressView*,
+                      std::function<void(const std::string&)>) = &run_image_job;
         require(entry != nullptr, "run_image_job entry resolved to null");
 
         // The #17 ledger is exported and readable with no job run: live and peak start at zero and
