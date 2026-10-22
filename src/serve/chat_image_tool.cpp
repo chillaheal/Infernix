@@ -1,9 +1,15 @@
 #include "serve/chat_image_tool.h"
 
+#include "product/media_acquire/source.h"
+#include "serve/image_generation_service.h"
+
+#include <charconv>
+#include <cstdint>
 #include <exception>
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace infernix::serve {
 namespace {
@@ -18,13 +24,141 @@ constexpr std::string_view kChatImageToolSchema = R"JSON({
     "steps": {"type": "integer", "description": "Denoise steps, 2 to 100. Default 40."},
     "negative_prompt": {"type": "string", "description": "What must not appear. Only used when true_cfg_scale is above 1."},
     "true_cfg_scale": {"type": "number", "description": "Guidance 1 to 20; 1 (default) runs one forward per step."},
-    "seed": {"type": "integer", "description": "Repeatable draw."}
+    "seed": {"type": "integer", "description": "Repeatable draw."},
+    "image": {"type": "string", "description": "Draw from an existing picture instead of from nothing. Three forms only: a job id this server drew (\"img-...\"), the URL of a picture this server drew (\".../v1/images/img-...\"), or \"attachment:N\" for the Nth picture attached to this chat request, counted from zero. Not base64, and not a picture from another machine."}
   },
   "required": ["prompt"]
 })JSON";
 
 [[nodiscard]] std::string json_error_result(std::string_view code, std::string_view message) {
     return RequestJson{{"error", code}, {"message", message}}.dump();
+}
+
+// The base64 length above which the decoded payload cannot fit `kMaximumImageInputBytes`. The same
+// expression the images route itself uses, so the chat tool and the route refuse the same payloads.
+[[nodiscard]] constexpr std::size_t kMaximumChatImageReferenceBase64 =
+    (kMaximumImageInputBytes / 3) * 4 + 4;
+
+// Everything a refused `image` argument has to say: the reason the model gave, and the forms it may
+// give instead. The forms are in the text because the model is the one that has to retry -- an error
+// that only says "invalid" tells it nothing it can act on.
+[[nodiscard]] std::invalid_argument rejected_image_argument(std::string_view argument,
+                                                            std::string_view reason) {
+    return std::invalid_argument(
+        std::string("the image argument \"") + std::string(argument) + "\" is not usable: " +
+        std::string(reason) +
+        ". Pass one of: the job id of a picture this server drew (\"img-...\"), the URL of a picture "
+        "this server drew (\".../v1/images/img-...\"), or \"attachment:N\" for the Nth picture "
+        "attached to this chat request, counted from zero. Base64 and pictures from another machine "
+        "are not accepted here.");
+}
+
+// The base64 payload of one attached picture, in the shape the images route takes. The protocols put
+// the media in the request as `source`; a data URI is already the route's own accepted shape and is
+// passed through rather than decoded and re-encoded, which would only add a copy of a 16 MiB buffer.
+[[nodiscard]] std::string attached_image_payload(
+    const infernix::product::media_acquire::Source& source) {
+    using SourceKind = infernix::product::media_acquire::SourceKind;
+    switch (source.kind) {
+    case SourceKind::Data:
+        if (source.value.size() > kMaximumChatImageReferenceBase64) {
+            throw rejected_image_argument("attachment",
+                                          "the attached picture is larger than the " +
+                                              std::to_string(kMaximumImageInputBytes / (1024 * 1024)) +
+                                              " MiB a reference may be");
+        }
+        return source.value;
+    case SourceKind::Bytes:
+        if (source.bytes.size() > kMaximumImageInputBytes) {
+            throw rejected_image_argument("attachment",
+                                          "the attached picture is larger than the " +
+                                              std::to_string(kMaximumImageInputBytes / (1024 * 1024)) +
+                                              " MiB a reference may be");
+        }
+        return base64_encode_bytes(source.bytes);
+    case SourceKind::Url:
+        // An attachment that is a URL to another machine is refused like any other foreign picture:
+        // nothing in the chat tool fetches media, which is why the protocols' own acquisition is the
+        // only way media gets here at all.
+        throw rejected_image_argument("attachment",
+                                      "that attachment names a URL on another machine rather than "
+                                      "picture bytes this request carries");
+    case SourceKind::Path:
+        break;
+    }
+    throw rejected_image_argument("attachment",
+                                  "that attachment names a file on this server's disk, which the "
+                                  "chat tool does not read");
+}
+
+// Resolves the model's `image` argument into the images route's own reference payload. This is the
+// chat layer's job and not the route's: only here are the chat request's attachments and this
+// process's URL prefix both in reach, and the route's contract stays the one base64 shape it has
+// always had. Accepted forms, in the order the design names them:
+//   1. a job id this server handed out (`img-<created>-<sequence>`), read back from its file;
+//   2. a URL of this server's own artifact route -- absolute as this server gives it, or in its
+//      path form -- which is the same picture, named the way a client saw it;
+//   3. `attachment:N`, the Nth picture the user attached to this request.
+// Everything else is refused here with the forms named, including base64: a model cannot type a
+// picture, so base64 in this argument is always a hallucination, and sending it to the route would
+// trade a clear rejection for an undecodable-image error.
+[[nodiscard]] std::string resolve_chat_image_reference(const std::string& argument,
+                                                      const GenerationRequest& request,
+                                                      std::string_view artifact_url_base) {
+    if (argument.empty()) {
+        throw rejected_image_argument(argument, "it is empty");
+    }
+
+    if (argument.starts_with("attachment:")) {
+        constexpr std::string_view kPrefix = "attachment:";
+        const std::string_view digits = std::string_view(argument).substr(kPrefix.size());
+        std::size_t index = 0;
+        const std::from_chars_result parsed =
+            std::from_chars(digits.data(), digits.data() + digits.size(), index);
+        if (digits.empty() || parsed.ec != std::errc{} ||
+            parsed.ptr != digits.data() + digits.size()) {
+            throw rejected_image_argument(argument,
+                                          "the part after \"attachment:\" must be a plain number");
+        }
+        std::size_t seen = 0;
+        for (const ChatTurn& turn : request.messages) {
+            for (const ContentPart& part : turn.content) {
+                if (part.kind != ContentKind::Image) { continue; }
+                if (seen++ != index) { continue; }
+                return attached_image_payload(part.source);
+            }
+        }
+        throw rejected_image_argument(argument,
+                                      "this request carries only " + std::to_string(seen) +
+                                          " attached picture(s), so there is no number " +
+                                          std::to_string(index));
+    }
+
+    // The picture this server drew, named either by its id or by the URL it came back with.
+    std::string_view id = argument;
+    if (argument.starts_with("http://") || argument.starts_with("https://")) {
+        if (artifact_url_base.empty() || argument.rfind(artifact_url_base, 0) != 0) {
+            throw rejected_image_argument(argument,
+                                          "it is a URL on a machine other than this server, and "
+                                          "nothing here fetches media");
+        }
+        id = std::string_view(argument).substr(artifact_url_base.size());
+    } else if (const std::size_t route = argument.rfind(kImageArtifactRoutePrefix);
+               route != std::string::npos) {
+        id = std::string_view(argument).substr(route + kImageArtifactRoutePrefix.size());
+    }
+    if (!is_image_artifact_id(id)) {
+        throw rejected_image_argument(argument,
+                                      "it is neither a job id this server handed out nor one of the "
+                                      "other accepted forms");
+    }
+    std::vector<std::uint8_t> png = load_generated_image(id);
+    if (png.empty()) {
+        throw rejected_image_argument(argument,
+                                      "no picture with that id is on this server's disk: it was "
+                                      "never drawn here, or its retention has run out");
+    }
+    return base64_encode_bytes(png);
 }
 
 } // namespace
@@ -34,8 +168,10 @@ ToolDefinition make_chat_image_tool_definition() {
         .name        = std::string(kChatImageToolName),
         .description = "Generate a new picture from a text prompt using this server's image model. "
                        "Call it when the user asks for an image, illustration, photo, poster or "
-                       "diagram, and call it again for a second, different picture. The result is "
-                       "the URL of the finished PNG; put that URL in your reply.",
+                       "diagram, and call it again for a second, different picture. Set `image` to "
+                       "redraw an existing picture -- one this server drew earlier, or one the user "
+                       "attached to this request -- with the prompt as the change to make. The result "
+                       "is the URL of the finished PNG; put that URL in your reply.",
         .input_schema_json = std::string(kChatImageToolSchema),
         // An internal definition has no client request path to name in an error.
         .schema_param = "infernix.image_tool.input_schema",
@@ -110,6 +246,16 @@ ChatImageToolRound run_chat_image_tool_round(GenerationRequest& request,
                 body["model"]             = image_model_id;
                 body["n"]                 = 1;
                 body["response_format"]   = "url";
+                // `image` is the one argument the model cannot give the route directly: it names a
+                // picture, the route wants its bytes. Resolved here, before the route's parser, so a
+                // name that means nothing comes back naming the forms that do. An empty string is
+                // the route's own "no reference" and is left to it.
+                if (auto field = body.find("image");
+                    field != body.end() && field->is_string() &&
+                    !field->get_ref<const std::string&>().empty()) {
+                    (*field) = resolve_chat_image_reference(field->get<std::string>(), request,
+                                                            artifact_url_base);
+                }
                 const OpenAIImagesRequest image_request = parse_openai_images_request(body);
                 const RequestJson response = generate(image_request);
                 const std::string url      = response.at("data").at(0).at("url").get<std::string>();

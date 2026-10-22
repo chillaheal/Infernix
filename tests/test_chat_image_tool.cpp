@@ -5,14 +5,19 @@
 // of a draw. The round loop ends in one answer that carries every URL.
 // CHAT_IMAGE_TOOL_TEST: PASS
 #include "serve/chat_image_tool.h"
+#include "product/media_acquire/source.h"
+#include "serve/image_generation_service.h"
 
 #include <infernix/types.h>
 
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -296,10 +301,168 @@ void test_round_bound_and_cancellation() {
           "a cancelled generation draws nothing and is reported as it is");
 }
 
+// The chat `image` argument: three forms are resolved into the route's own base64 reference, and
+// every other shape -- including the base64 a model cannot type -- is refused with the accepted forms
+// in the text, because the model is the one that has to retry.
+void test_image_argument_forms() {
+    using MediaSource = infernix::product::media_acquire::Source;
+    using MediaKind   = infernix::product::media_acquire::SourceKind;
+
+    const ToolDefinition definition = make_chat_image_tool_definition();
+    const RequestJson schema        = RequestJson::parse(definition.input_schema_json);
+    const std::string described     = schema.at("properties").at("image").dump();
+    check(schema.at("properties").at("image").at("type") == "string",
+          "the hidden tool advertises an optional string image argument");
+    check(described.find("img-") != std::string::npos &&
+              described.find("attachment:N") != std::string::npos &&
+              described.find("base64") != std::string::npos &&
+              described.find("another machine") != std::string::npos,
+          "its description names exactly the forms that resolve, and the two that do not");
+
+    // A request carrying one inline attachment, as the protocols parse one.
+    const std::string data_uri = "data:image/png;base64,iVBORw0KGgo=";
+    auto with_attachment       = [&](std::size_t pictures) {
+        GenerationRequest request;
+        ChatTurn user;
+        user.role = infernix::ChatRole::User;
+        user.content.push_back(ContentPart{.kind = ContentKind::Text, .text = "look at this"});
+        for (std::size_t index = 0; index < pictures; ++index) {
+            user.content.push_back(ContentPart{
+                .kind   = ContentKind::Image,
+                .source = MediaSource{.kind = MediaKind::Data, .value = data_uri},
+            });
+        }
+        request.messages.push_back(std::move(user));
+        return request;
+    };
+
+    {
+        // The file a picture this server drew leaves on disk, named by the id it came back with.
+        std::error_code ignored;
+        std::filesystem::create_directories("images", ignored);
+        const std::vector<std::uint8_t> png{0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a};
+        {
+            std::ofstream file("images/img-100-1.png", std::ios::binary | std::ios::trunc);
+            file.write(reinterpret_cast<const char*>(png.data()),
+                       static_cast<std::streamsize>(png.size()));
+        }
+        const std::string expected = base64_encode_bytes(png);
+
+        for (const std::string name : {std::string("img-100-1"), std::string(kUrlBase) + "img-100-1",
+                                       std::string("/v1/images/img-100-1")}) {
+            GenerationRequest request;
+            FakeGenerator generator;
+            const ChatImageToolRound round = run_chat_image_tool_round(
+                request, image_call_outcome({R"({"prompt":"again","image":")" + name + R"("})"}),
+                kImageModel, kUrlBase, 0, 0, observer_of(generator));
+            check(round.executed == 1 && generator.requests.size() == 1 &&
+                      generator.requests[0].image == expected,
+                  "the picture named \"" + (name.size() > 40 ? name.substr(0, 40) : name) +
+                      "\" is read back off disk as the route's reference");
+        }
+
+        // Every refusal: no draw, an error result, and the accepted forms in its text.
+        struct Refusal {
+            std::string argument;
+            std::string why;
+        };
+        const std::vector<Refusal> refusals{
+            {"img-7-7", "a drawn picture that is not on disk"},
+            {"http://elsewhere.example/v1/images/img-100-1", "a picture on another machine"},
+            {"iVBORw0KGgoAAAANSUhEUg", "raw base64 the model cannot have typed"},
+            {"data:image/png;base64,iVBORw0KGgo=", "a data URI in the argument"},
+            {"attachment:1", "an attachment index past what the request carries"},
+            {"attachment:x", "a non-numeric attachment index"},
+        };
+        for (const Refusal& refusal : refusals) {
+            GenerationRequest request = with_attachment(1);
+            FakeGenerator generator;
+            const ChatImageToolRound round = run_chat_image_tool_round(
+                request, image_call_outcome({R"({"prompt":"again","image":")" + refusal.argument +
+                                                       R"("})"}),
+                kImageModel, kUrlBase, 0, 0, observer_of(generator));
+            const std::string result = tool_result_text(request, request.messages.size() - 1);
+            check(round.executed == 0 && generator.calls == 0,
+                  "the refused form (" + refusal.why + ") never reaches the pipeline");
+            check(result.find("image_arguments_invalid") != std::string::npos &&
+                      result.find("attachment:N") != std::string::npos &&
+                      result.find(refusal.argument) != std::string::npos,
+                  "and comes back naming the argument, the reason and the forms that would work");
+            check(request.messages.back().tool_result_is_error,
+                  "the refusal is marked as an error result for the model to act on");
+        }
+
+        // attachment:N is the user's own picture, in the shape the route already takes.
+        for (const std::string argument : {"attachment:0", "attachment:1"}) {
+            GenerationRequest request = with_attachment(1);
+            FakeGenerator generator;
+            const ChatImageToolRound round = run_chat_image_tool_round(
+                request, image_call_outcome({R"({"prompt":"again","image":")" + argument + R"("})"}),
+                kImageModel, kUrlBase, 0, 0, observer_of(generator));
+            const bool accepted = argument == "attachment:0";
+            check(generator.calls == (accepted ? 1 : 0) && round.executed == (accepted ? 1 : 0) &&
+                      round.rejected == 0,
+                  std::string(accepted ? "attachment:0 resolves to " : "the index in ") + argument +
+                      (accepted ? " the request's own attachment" : " that this request lacks"));
+            if (accepted) {
+                // The route's own parser keeps the base64 of a data: URI and drops the prefix, so
+                // "unchanged" here means the same payload bytes, not the same string.
+                check(generator.requests[0].image == data_uri.substr(data_uri.find(',') + 1),
+                      "an inline attachment travels to the route as its own payload, not decoded "
+                      "and re-typed");
+            }
+        }
+
+        // Bytes, the shape a server-internal caller can carry.
+        {
+            GenerationRequest request;
+            ChatTurn user;
+            user.role = infernix::ChatRole::User;
+            const std::vector<std::uint8_t> bytes{1, 2, 3, 4, 5};
+            user.content.push_back(ContentPart{
+                .kind = ContentKind::Image,
+                .source = MediaSource{.kind = MediaKind::Bytes, .bytes = bytes},
+            });
+            request.messages.push_back(std::move(user));
+            FakeGenerator generator;
+            const ChatImageToolRound round = run_chat_image_tool_round(
+                request, image_call_outcome({R"({"prompt":"again","image":"attachment:0"})"}),
+                kImageModel, kUrlBase, 0, 0, observer_of(generator));
+            check(generator.calls == 1 && round.executed == 1 &&
+                      generator.requests[0].image == base64_encode_bytes(bytes),
+                  "an attachment carried as bytes is encoded into the route's reference");
+        }
+
+        // Over the reference limit: refused here rather than decoded and failed deeper down.
+        {
+            GenerationRequest request;
+            ChatTurn user;
+            user.role = infernix::ChatRole::User;
+            std::vector<std::uint8_t> huge(kMaximumImageInputBytes + 1, 0x20);
+            user.content.push_back(ContentPart{
+                .kind   = ContentKind::Image,
+                .source = MediaSource{.kind = MediaKind::Bytes, .bytes = std::move(huge)},
+            });
+            request.messages.push_back(std::move(user));
+            FakeGenerator generator;
+            const ChatImageToolRound round = run_chat_image_tool_round(
+                request, image_call_outcome({R"({"prompt":"again","image":"attachment:0"})"}),
+                kImageModel, kUrlBase, 0, 0, observer_of(generator));
+            check(generator.calls == 0 && round.executed == 0 &&
+                      request.messages.back().tool_result_is_error,
+                  "an attachment larger than a reference may be is refused before any work");
+        }
+
+        std::filesystem::remove("images/img-100-1.png", ignored);
+        std::filesystem::remove("images", ignored);
+    }
+}
+
 } // namespace
 
 int main() {
     test_injection();
+    test_image_argument_forms();
     test_round_detection();
     test_single_round();
     test_cap_and_bad_arguments();

@@ -319,6 +319,22 @@ std::filesystem::path generated_image_path(std::string_view id) {
     return std::filesystem::current_path() / "images" / (std::string(id) + ".png");
 }
 
+std::vector<std::uint8_t> load_generated_image(std::string_view id) {
+    const std::filesystem::path file = generated_image_path(id);
+    if (file.empty()) { return {}; }
+
+    std::error_code error;
+    const std::uintmax_t size = std::filesystem::file_size(file, error);
+    if (error || size == 0 || size > kMaximumImageInputBytes) { return {}; }
+
+    std::ifstream input(file, std::ios::binary);
+    if (!input) { return {}; }
+    std::vector<std::uint8_t> bytes(static_cast<std::size_t>(size));
+    input.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(size));
+    if (!input) { return {}; }
+    return bytes;
+}
+
 std::filesystem::path save_generated_image(const std::string& id, std::span<const std::uint8_t> png) {
     std::error_code error;
     const std::filesystem::path file      = generated_image_path(id);
