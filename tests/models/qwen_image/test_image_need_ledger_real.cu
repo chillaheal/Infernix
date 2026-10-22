@@ -132,6 +132,18 @@ int main() {
                           << (measured - predicted) / mib << " MiB\n";
                 ++failures;
             }
+            // Reservation floor. The serving layer keeps 512 MiB between the predicted need and the
+            // device it yields (kInterludeMarginBytes), so a row that clears the real peak by less than
+            // that means kImageWeightResidentBytes was cut below the footprint plus its reservation. This
+            // is the pair to "predicted >= measured": it catches the next change that lowers the constant
+            // too far, exactly the mistake the 3072 MiB tightening must not be re-lowered into.
+            const std::uint64_t kFloor = 512ULL * mib;
+            if (predicted >= measured && predicted < measured + kFloor) {
+                std::cout << "FAIL: " << c.what << " clears the measured peak by only "
+                          << (predicted - measured) / mib << " MiB, under the " << kFloor / mib
+                          << " MiB reservation floor\n";
+                ++failures;
+            }
             if (image_device_bytes_live() != 0) {
                 std::cout << "FAIL: the ledger holds " << image_device_bytes_live()
                           << " bytes after the job\n";

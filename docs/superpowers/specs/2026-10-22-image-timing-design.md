@@ -272,6 +272,15 @@ golv är FIXEN, inte en multiplier-fudge. Ledger-talet bekräftat täcka streame
 = 448 MiB pre-loop live, 864 under DiT-loopen), tower (text_tower allocerar ENbart via `Buf`), VAE-planen
 (peak 1 845 nås vid VAE-decode) och latenten. Därför står `8dc9c63`: det är ingen OOM-generator.
 
+**Känt, ej åtgärdat: 1024-radens negativa residual.** Där överstiger inventariets strukturella termer
+(`dit_activations + latent_and_velocity + vae_peak + rope_and_tables` ≈ 4 318 MiB) redan radens mätta
+peak (4 010 MiB) -- residualen mot allowance är negativ. Det är det tydligaste beviset för felkälla (b):
+inventariet summerar buffertar som inte är samtidiga i stället för maximum samtidiga, och just där sitter
+de sista ~2x konservatismen kvar. Det är ofarligt åt rätt håll (predicted förbliver en övre gräns) och att
+rätta det vore en omritning av inventariet, inte en konstant -- det ligger utanför denna bundle.
+Ledger-certen vaktar nu riktningen: varje rad måste klara både `predicted >= measured` OCH ett 512 MiB
+reservationsgolv, så nästa sänkning av konstanten för långt är ett certfel.
+
 **`need` bundet till `blocks_resident` (2026-10-23).** En enda symbol `kImageResidentBlocks = 2`
 ([image_device_need.h](../../../src/models/qwen_image/image_device_need.h)) binder now resident-block-
 talet: serve-admittenten och ledger-certen sätter `blocks_resident = kImageResidentBlocks`, och
