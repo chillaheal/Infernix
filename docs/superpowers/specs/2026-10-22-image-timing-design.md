@@ -89,6 +89,10 @@ LLM:n återupptas medan PNG-kodning, base64 och diskskriv körs klart på host.
 
 ## 5. Fas 3 -- resident blockbudget
 
+**Avböjd 2026-10-23, motiverad under Korsvisningen.** Designen nedan står kvar som underlag för den dag
+fas 3 återöppnas; den byggs inte i den här bundle:en, för fas 2:s överlapp åt upp den tidvinst som residens
+skulle ha kunnat ge, medan dess kostnad betalas i den VRAM som avgör om en storlek överhuvudtaget admitteras.
+
 - Budgeten kommer ur det faktiskt yieldade beloppet: `N = (tillgängliga bytes efter aktiveringar och
   arbetsytor) / image_block_bytes(dims)` ([image_device_need.h:39-42](../../../src/models/qwen_image/image_device_need.h)),
   valda block efter sparad kopieringstid per upptagen byte; resten streamas med prefetch ur fas 2.
@@ -261,9 +265,49 @@ bort all överlappning, och att asynkron H2D kräver pinned värdminne. Recensio
 green context/MPS här: LLM-arbetet är redan pausat, så ingen av mekanismerna ger mer VRAM eller snabbare
 PCIe.
 
+### Andra korsvisningen, 2026-10-23 (efter fas 2:s mätresultat)
+
+En ny recension (ChatGPT, tråd `chatgpt.com/c/6ada884d-b468-83ed-b70d-47f60e9f130d`) fick fas 2:s siffror och
+de tre kvarvarande spåren, och rekommenderade: **rätta admittentens prediktion först, håll full residens
+utanför kritiska vägen, undersök fas 3b mot en timeline.** Det är den ordning vi följer. Motiveringarna vi köper:
+
+- Fas 2 flyttade butelneckan från överföring till räkning, så residens köper inte längre vägen. Att 260 GB
+  per bild slutar överföras är inget mål i sig; vinsten måste mätas som wall time, svans eller
+  kernel-duration, inte som byte-räknaren.
+- Kostnaden är just den resurs som avgör om en bild betjänas alls: +211 MiB för att gå från 1 till 2
+  residenta block, extrapolerat mot 31 × 211 MiB ≈ 6,4 GiB för full residens, mot KV-poolens utrymme.
+  Recensionens princip: behandla residens som ett köp av latens med VRAM-huvudutrymme.
+- Återöppningsvillkoret är en timeline som visar kvarstående kopieringsberoenden, kopieringsrelaterad
+  kernel-slowdown eller mätbar svansvinst. Copy-engine-utilisering ensam är inget bevis — motorn kan vara
+  upptagen hela loopen medan arbetet ändå är fullständigt dolt bakom beräkningen.
+- Fas 3b är värt att pröva av en annan anledning än vikter: det tar bort *synkronisering* per steg, och
+  synkroniseringar kan exponera gap som annars är dolda, även när kärnorna är räknetidsbundna. Villkoret
+  är att en timeline först visar att de två synkarna per steg faktiskt lägger igen, och att numeriken hålls
+  bit-identisk (eller inom avtalad tolerance) inklusive CFG- och referens-rad.
+
+För `image_device_need` gav recensionen ett krav som väger tyngre än själva kalibreringen, och det gäller
+innan konstanten rörs (**garanti 0**): predicted och measured måste mäta *samma* storhet. De fyra
+räkenskapsfelen att utesluta är (1) persistenta vikter som redan finns i serverns baseline, (2) summation av
+aktiveringar/workspace/latent som är samtidiga i stället för maximalt samtidiga, (3) *allocated* blandat med
+allocator-*reserved*, (4) worst-case-summa av temp-buffertar där bara en delmängd är live. Ett fel på
+faktor fyra har oftast en räkenskapsförklaring, och den ska fixas — inte kalibreras bort med en multiplier.
+Ledger-talet måste vara bekräftat att täcka streamed-block-uppladdning, tower/VAE/text-encoder och latent;
+gör det inte är "1845 mot 7470" äpplen och pomer, och att sänka `need` mot 1845 vore en OOM-generator.
+
+Slutligen: admittenten ska vara en **reservation**, inte en gissning —
+`H_admit = total − committed − future KV reserve − safety margin`, där KV-tillväxt under interluden inte får
+äta reserven (KV-explicit-kapaciteten och `kv_hold_pages` är halva den mekanismen redan). Validering nära
+full KV-pool, inte bara med LLM i vila; `need` bundet till den `blocks_resident`-konfiguration som
+validerats så att talet inte kan glida tyst; utrullning i skuggläge (loggat förslag mot mätt peak per rad)
+först, konservativ bana kvar för konfigurationer som inte validerats. Recensionen gav också den ärliga
+gränsen: en modell kalibrerad mot max observerad peak plus marginal utesluter inte matematiskt en
+runtime-OOM så länge KV-tillväxten kan vara obegränsad — garantin kommer från reserven, inte från talet.
+
 ## Explicitly not in scope
 
 - Mer än ett jobb åt gången, och att två bildjobb delar på minnet.
 - Green context eller MPS (motiverat ovan).
-- Att göra blockvikterna boende bortom certifierat minne, eller att sänka 503-tröskeln för att få plats.
+- Full residens av blockvikterna, och att göra blockvikterna boende bortom certifierat minne (fas 3 avböjd
+  ovan). Inte heller att *rycka i marginalen* för att få plats: åtkomligheten den här bundle:en vinner kommer
+  ur att `image_device_need` slutar mäta fel, inte ur att 503-tröskeln sänks.
 - Chatt-argumentet `image`, GC av genererade filer och variabel-dokumentationen: bundle C.
