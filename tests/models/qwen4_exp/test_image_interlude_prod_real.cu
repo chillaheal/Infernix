@@ -266,6 +266,32 @@ int main() {
                     qi::run_image_job(reader, dit, vae, inputs, static_cast<cudaStream_t>(ctx.image_stream));
 
                 ledger("inside the yield (after run_image_job)");
+                // WHY THE GATE LOOKS AFTER A SYNC: the job's last frees are stream-ordered on the image
+                // stream, so the host sees the driver short by the whole job peak the instant
+                // run_image_job returns (measured 2026-10-22: 10063 MiB at the return, 11247 MiB after a
+                // device-wide sync, with the default stream-ordered pool reserving 0 MiB before and
+                // after -- nothing is held, the releases simply had not been processed yet). The route
+                // that needs the bytes back, release_from_yield, takes device_.synchronize() before it
+                // remaps anything, so production never allocates against that lag; the gate therefore
+                // tests the contract where it can be observed, after the device has reached the frees.
+                {
+                    const std::uint64_t free_now = device_free_bytes();
+                    (void)cudaDeviceSynchronize();
+                    const std::uint64_t free_synced = device_free_bytes();
+                    std::size_t reserved = 0, trimmed = 0;
+                    cudaMemPool_t pool = nullptr;
+                    if (cudaDeviceGetDefaultMemPool(&pool, 0) == cudaSuccess && pool != nullptr) {
+                        (void)cudaMemPoolGetAttribute(pool, cudaMemPoolAttrReservedMemCurrent, &reserved);
+                        (void)cudaMemPoolTrimTo(pool, 0);
+                        (void)cudaMemPoolGetAttribute(pool, cudaMemPoolAttrReservedMemCurrent, &trimmed);
+                    }
+                    std::printf("RELEASE PROBE: driver free %llu MiB at the job's return, %llu MiB after a "
+                                "device-wide sync; default pool reserved %llu MiB, %llu MiB after trim\n",
+                                static_cast<unsigned long long>(free_now >> 20),
+                                static_cast<unsigned long long>(free_synced >> 20),
+                                static_cast<unsigned long long>(reserved >> 20),
+                                static_cast<unsigned long long>(trimmed >> 20));
+                }
                 check(device_free_bytes() + kGiB / 10 >= free_yield,
                       "run_image_job returned with its device allocations freed");
                 std::printf("IMAGE LEDGER: live %llu MiB, peak %llu MiB\n",

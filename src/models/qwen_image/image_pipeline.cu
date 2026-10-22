@@ -282,11 +282,24 @@ GeneratedImage run_image_job(artifact::Reader& reader, const DiTWeights& dit, co
                              std::function<void(const std::string&)> log_line) {
     // The stage telemetry goes through the caller's sink (the serving route's logger, serialized
     // against the console's stats panel); with no sink the certified route prints nothing.
+    // The ledger is the module's own account of what it holds; the driver free and the stream-ordered
+    // pool's reserved bytes are what the NEXT allocator (the LLM's restore, plain cudaMalloc) can
+    // actually get. Reporting all three per stage is what separates a leak from a release that is still
+    // queued on the image stream: live 0 with a large pool reserved means the latter.
     const auto log_mem = [&](const char* stage) {
         if (!log_line) { return; }
+        std::size_t driver_free = 0, driver_total = 0;
+        (void)cudaMemGetInfo(&driver_free, &driver_total);
+        std::size_t pool_reserved = 0;
+        cudaMemPool_t pool = nullptr;
+        if (cudaDeviceGetDefaultMemPool(&pool, 0) == cudaSuccess && pool != nullptr) {
+            (void)cudaMemPoolGetAttribute(pool, cudaMemPoolAttrReservedMemCurrent, &pool_reserved);
+        }
         log_line("image job: " + std::string(stage) + " | ledger live " +
                  std::to_string(g_image_device_live.load() / (1024 * 1024)) + " MiB peak " +
-                 std::to_string(g_image_device_peak.load() / (1024 * 1024)) + " MiB");
+                 std::to_string(g_image_device_peak.load() / (1024 * 1024)) +
+                 " MiB | driver free " + std::to_string(driver_free / (1024 * 1024)) +
+                 " MiB pool reserved " + std::to_string(pool_reserved / (1024 * 1024)) + " MiB");
     };
     const std::size_t progress_units = inputs.timesteps.size() + 1;  // + the VAE decode unit
     const auto step    = [&](std::size_t units_done) {
