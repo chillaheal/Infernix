@@ -26,12 +26,19 @@ inline constexpr std::uint64_t kImageMiB          = 1024ULL * 1024ULL;
 
 // The operands and op scratch the inventory above does not enumerate: the DiT's top-level
 // projections, the VAE's weights, and whatever workspace the linear/conv/attention ops take per
-// call. The starting value is the one measured peak this project has -- 6183 MiB for the certified
+// call. The starting value was the measured peak this project has -- 6183 MiB for the certified
 // 512x512 route (image-spike/blackout_step8d.outer.log:30) -- deliberately conservative: an
 // over-estimated need refuses a job that might have run, while an under-estimated one OOMs it. The
 // ledger qualification (tests/models/qwen_image/test_image_need_ledger_real.cu) measures the split
 // and lowers this to what the route actually holds.
-inline constexpr std::uint64_t kImageWeightResidentBytes = 6183ULL * kImageMiB;
+//
+// Bundle B fas 2: with the copy-stream prefetch, TWO DiT block slots are resident at once and are
+// counted explicitly by `blocks_resident * image_block_bytes` below. The old 6183 MiB allowance was
+// set when only one block was resident, so it already carried one block's worth inside this slack
+// term. Lowering it by one image_block_bytes (~211 MiB for the shipped dims) keeps the predicted
+// total -- and therefore the sizes the serving layer admits -- exactly as §8 measured them, while
+// modelling the second resident block honestly instead of double-counting it.
+inline constexpr std::uint64_t kImageWeightResidentBytes = 5972ULL * kImageMiB;
 
 // One DiT block resident on device: the seven FP8 RowScale roles (four [hidden,hidden] and three
 // [intermediate,hidden], one byte per code) plus the two BF16 head norms. Derived from the bound

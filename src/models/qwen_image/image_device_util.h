@@ -14,7 +14,9 @@
 
 #include <cuda_runtime.h>
 
+#include <array>
 #include <atomic>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
@@ -157,9 +159,105 @@ inline void h2d(void* dst, const void* src, std::size_t bytes) {
     cuda_ok(cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice), "H2D (image weight)");
 }
 
+// The representation of one image weight object, flattened from the artifact geometry so the ONE
+// place that fills the device Weight ABI (fill_uploaded_weight) and the one that sizes a device
+// region (object_device_bytes) never drift apart. The synchronous upload and the bundle-B fas 2
+// copy-stream upload both build from here, so the bytes on the device -- and therefore every kernel
+// that reads them -- are identical across the two routes.
+struct ObjectGeom {
+    QType      format;
+    QuantLayout layout;
+    std::uint64_t bytes = 0;        // the stored object size
+    std::uint64_t n     = 0;        // rows
+    std::uint64_t k     = 0;        // cols
+    std::uint64_t high_bytes  = 0;
+    std::uint64_t code_bytes  = 0;
+    std::uint64_t scale_bytes = 0;
+    std::uint64_t scale_offset = 0;
+};
+
+inline ObjectGeom object_geom(const WeightGeometry& g) {
+    ObjectGeom o;
+    o.format        = g.format;
+    o.layout        = g.layout;
+    o.bytes         = g.bytes;
+    o.high_bytes    = g.high_bytes;
+    o.code_bytes    = g.code_bytes;
+    o.scale_bytes   = g.scale_bytes;
+    o.scale_offset  = g.scale_offset;
+    o.n             = g.shape.empty() ? 0 : g.shape[0];
+    o.k             = (o.n == 0 || g.elements % o.n != 0) ? 0 : g.elements / o.n;
+    return o;
+}
+
+// Device bytes this object occupies after upload: a BF16 object is stored as-is; a RowScale FP8
+// object is repacked to a compact [codes][scales] plane (the artifact may carry a gap the device
+// drops). The async copy lays the nine block roles out with this stride.
+inline std::size_t object_device_bytes(const ObjectGeom& g) {
+    if (g.format == QType::BF16 && g.layout == QuantLayout::Contiguous) return g.bytes;
+    if (g.format == QType::FP8_E4M3FN_ROW_BF16 && g.layout == QuantLayout::RowScale)
+        return static_cast<std::size_t>(g.code_bytes + g.scale_bytes);
+    throw std::runtime_error("image weight: unsupported object representation");
+}
+
+// Fill the Weight the qualified linear routes read: a contiguous BF16 object as a Contiguous
+// Weight, a RowScale FP8 object as the single [codes][scales] plane. `dptr` addresses the object's
+// device payload (already uploaded). Both upload routes call this, so the ABI has one definition.
+inline void fill_uploaded_weight(Weight& w, const ObjectGeom& g, void* dptr) {
+    if (g.n == 0 || g.k == 0) {
+        throw std::runtime_error("image weight: geometry does not frame as [rows, cols]");
+    }
+    const std::uint64_t n = g.n, k = g.k;
+    if (g.format == QType::BF16 && g.layout == QuantLayout::Contiguous) {
+        w                = Weight{};
+        w.payload        = dptr;
+        w.payload_bytes  = g.bytes;
+        w.qtype          = QType::BF16;
+        w.shape[0]       = n;   w.shape[1]       = k;
+        w.shape[2]       = 1;   w.shape[3]       = 1;
+        w.padded_shape[0] = n;  w.padded_shape[1] = k;
+        w.padded_shape[2] = 1;  w.padded_shape[3] = 1;
+        w.ndim           = 2;
+        w.qdata          = dptr;
+        w.n              = n;   w.k              = k;
+        w.layout         = QuantLayout::Contiguous;
+        return;
+    }
+    if (g.format == QType::FP8_E4M3FN_ROW_BF16 && g.layout == QuantLayout::RowScale) {
+        if (g.high_bytes != 0 || g.code_bytes != n * k || g.scale_bytes != n * 2 ||
+            g.scale_offset < g.code_bytes) {
+            throw std::runtime_error("image weight: FP8 object is not a plain [codes][scales] plane");
+        }
+        w                = Weight{};
+        w.payload        = dptr;
+        w.payload_bytes  = g.code_bytes + g.scale_bytes;
+        w.qtype          = QType::FP8_E4M3FN_ROW_BF16;
+        w.shape[0]       = n;   w.shape[1]       = k;
+        w.shape[2]       = 1;   w.shape[3]       = 1;
+        w.padded_shape[0] = n;  w.padded_shape[1] = k;
+        w.padded_shape[2] = 1;  w.padded_shape[3] = 1;
+        w.ndim           = 2;
+        w.qdata          = dptr;
+        w.qhigh          = nullptr;
+        w.high_plane_bytes = 0;
+        w.scales         = static_cast<std::uint8_t*>(dptr) + g.code_bytes;
+        w.n              = n;   w.k              = k;
+        w.group          = k;   w.group_size     = static_cast<std::uint32_t>(k);
+        w.layout         = QuantLayout::RowScale;
+        w.scale_dtype    = DType::BF16;
+        w.scale_ne[0]    = n;   w.scale_ne[1]    = 1;
+        w.scale_ne[2]    = 1;   w.scale_ne[3]    = 1;
+        const std::int64_t ss = static_cast<std::int64_t>(n) * 2;
+        w.scale_nb[0]    = 2;   w.scale_nb[1]    = ss;
+        w.scale_nb[2]    = ss;  w.scale_nb[3]    = ss;
+        return;
+    }
+    throw std::runtime_error("image weight: unsupported image weight representation");
+}
+
 // One streamed parameter uploaded to the device, wrapped the way the qualified linear routes read
-// it: a contiguous BF16 object as a Contiguous Weight, a RowScale FP8 object as the single
-// [codes][scales] plane with the FP8 RowScale Weight ABI the device route verified.
+// it. The bundle-B fas 2 streamed block weights do NOT use this (they land on the copy stream into a
+// shared slot); it is the path for the resident top-level/VAE weights and any artifact-direct upload.
 struct Uploaded {
     Buf buf;
     Weight w{};
@@ -179,7 +277,7 @@ inline Uploaded upload_streamed(const artifact::Reader& reader, const artifact::
     if (ref.binding.parts.size() != 1) {
         throw std::runtime_error(ref.name + ": an image weight must bind exactly one whole object");
     }
-    const WeightGeometry& g = reader.geometry(ref.binding.parts.front().object);
+    const ObjectGeom g = object_geom(reader.geometry(ref.binding.parts.front().object));
     std::vector<std::byte> owned;
     const std::vector<std::byte>* obj = object_bytes;
     if (obj == nullptr) {
@@ -189,62 +287,20 @@ inline Uploaded upload_streamed(const artifact::Reader& reader, const artifact::
     if (obj->size() != g.bytes) {
         throw std::runtime_error(ref.name + ": object size differs from its geometry");
     }
-    const std::uint64_t n = g.shape.empty() ? 0 : g.shape[0];
-    if (n == 0 || g.elements % n != 0) {
-        throw std::runtime_error(ref.name + ": geometry does not frame as [rows, cols]");
-    }
-    const std::uint64_t k = g.elements / n;
 
     Uploaded u;
-    if (g.format == QType::BF16 && g.layout == QuantLayout::Contiguous) {
-        u.buf.alloc(g.bytes);
-        h2d(u.buf.d, obj->data(), g.bytes);
-        u.w                = Weight{};
-        u.w.payload        = u.buf.d;
-        u.w.payload_bytes  = g.bytes;
-        u.w.qtype          = QType::BF16;
-        u.w.shape[0]       = n;   u.w.shape[1]       = k;
-        u.w.shape[2]       = 1;   u.w.shape[3]       = 1;
-        u.w.padded_shape[0] = n;  u.w.padded_shape[1] = k;
-        u.w.padded_shape[2] = 1;  u.w.padded_shape[3] = 1;
-        u.w.ndim           = 2;
-        u.w.qdata          = u.buf.d;
-        u.w.n              = n;   u.w.k              = k;
-        u.w.layout         = QuantLayout::Contiguous;
-        return u;
-    }
-    if (g.format == QType::FP8_E4M3FN_ROW_BF16 && g.layout == QuantLayout::RowScale) {
-        if (g.high_bytes != 0 || g.code_bytes != n * k || g.scale_bytes != n * 2 ||
-            g.scale_offset < g.code_bytes) {
-            throw std::runtime_error(ref.name + ": FP8 object is not a plain [codes][scales] plane");
-        }
-        const std::size_t total = static_cast<std::size_t>(g.code_bytes + g.scale_bytes);
+    if ((g.format == QType::BF16 && g.layout == QuantLayout::Contiguous) ||
+        (g.format == QType::FP8_E4M3FN_ROW_BF16 && g.layout == QuantLayout::RowScale)) {
+        const std::size_t total = object_device_bytes(g);
         u.buf.alloc(total);
-        h2d(u.buf.d, obj->data(), static_cast<std::size_t>(g.code_bytes));
-        h2d(static_cast<std::uint8_t*>(u.buf.d) + g.code_bytes, obj->data() + g.scale_offset,
-            static_cast<std::size_t>(g.scale_bytes));
-        u.w                = Weight{};
-        u.w.payload        = u.buf.d;
-        u.w.payload_bytes  = total;
-        u.w.qtype          = QType::FP8_E4M3FN_ROW_BF16;
-        u.w.shape[0]       = n;   u.w.shape[1]       = k;
-        u.w.shape[2]       = 1;   u.w.shape[3]       = 1;
-        u.w.padded_shape[0] = n;  u.w.padded_shape[1] = k;
-        u.w.padded_shape[2] = 1;  u.w.padded_shape[3] = 1;
-        u.w.ndim           = 2;
-        u.w.qdata          = u.buf.d;
-        u.w.qhigh          = nullptr;
-        u.w.high_plane_bytes = 0;
-        u.w.scales         = static_cast<std::uint8_t*>(u.buf.d) + g.code_bytes;
-        u.w.n              = n;   u.w.k              = k;
-        u.w.group          = k;   u.w.group_size     = static_cast<std::uint32_t>(k);
-        u.w.layout         = QuantLayout::RowScale;
-        u.w.scale_dtype    = DType::BF16;
-        u.w.scale_ne[0]    = n;   u.w.scale_ne[1]    = 1;
-        u.w.scale_ne[2]    = 1;   u.w.scale_ne[3]    = 1;
-        const std::int64_t ss = static_cast<std::int64_t>(n) * 2;
-        u.w.scale_nb[0]    = 2;   u.w.scale_nb[1]    = ss;
-        u.w.scale_nb[2]    = ss;  u.w.scale_nb[3]    = ss;
+        if (g.format == QType::BF16) {
+            h2d(u.buf.d, obj->data(), static_cast<std::size_t>(g.bytes));
+        } else {
+            h2d(u.buf.d, obj->data(), static_cast<std::size_t>(g.code_bytes));
+            h2d(static_cast<std::uint8_t*>(u.buf.d) + g.code_bytes, obj->data() + g.scale_offset,
+                static_cast<std::size_t>(g.scale_bytes));
+        }
+        fill_uploaded_weight(u.w, g, u.buf.d);
         return u;
     }
     throw std::runtime_error(ref.name + ": unsupported image weight representation");
@@ -252,6 +308,101 @@ inline Uploaded upload_streamed(const artifact::Reader& reader, const artifact::
 
 inline Uploaded upload_ref(const artifact::Reader& reader, const artifact::ParameterReference& ref) {
     return upload_streamed(reader, ref, nullptr);
+}
+
+// ---- bundle B fas 2: pinned host cache + copy-stream block upload ----
+
+// The DiT block host cache is pinned so the copy stream's H2D is genuinely asynchronous (a pageable
+// source forces a driver-side bounce that cannot overlap compute). cudaHostAllocWriteCombined is the
+// measured variant: good for pure H2D, slow for CPU reads, so it is opt-in (INFERNIX_IMAGE_HOST_CACHE_WC)
+// and kept only if the measurement says it wins.
+inline std::uint32_t host_cache_alloc_flags() {
+    const char* wc = std::getenv("INFERNIX_IMAGE_HOST_CACHE_WC");
+    return (wc != nullptr && wc[0] != '\0' && wc[0] != '0') ? cudaHostAllocWriteCombined
+                                                            : cudaHostAllocDefault;
+}
+
+struct PinnedBytes {
+    std::byte*    h = nullptr;
+    std::size_t   n = 0;
+    void alloc(std::size_t b) {
+        n = b;
+        if (b == 0) return;
+        cuda_ok(cudaHostAlloc(reinterpret_cast<void**>(&h), b, host_cache_alloc_flags()),
+                "cudaHostAlloc (image block cache)");
+    }
+    ~PinnedBytes() { if (h != nullptr) cudaFreeHost(h); }
+    PinnedBytes() = default;
+    PinnedBytes(const PinnedBytes&) = delete;
+    PinnedBytes& operator=(const PinnedBytes&) = delete;
+    PinnedBytes(PinnedBytes&& o) noexcept : h(o.h), n(o.n) { o.h = nullptr; o.n = 0; }
+    PinnedBytes& operator=(PinnedBytes&& o) noexcept {
+        if (this != &o) { if (h != nullptr) cudaFreeHost(h); h = o.h; n = o.n; o.h = nullptr; o.n = 0; }
+        return *this;
+    }
+};
+
+// Read one object straight into a pinned host buffer (the block cache read, once per job).
+inline PinnedBytes read_object_pinned(const artifact::Reader& reader,
+                                      const artifact::ParameterReference& ref) {
+    std::vector<std::byte> v = read_object(reader, ref);
+    PinnedBytes p;
+    p.alloc(v.size());
+    if (!v.empty()) { std::memcpy(p.h, v.data(), v.size()); }
+    return p;
+}
+
+// The nine DiT block roles in upload order, with their (uniform) geometry and slot offsets precomputed
+// once per job from block 0 -- every block has the same shapes, so the same layout applies. The async
+// copy uses these to lay the block out in a device slot and hand back the nine Weight operands.
+struct BlockCopyPlan {
+    std::array<artifact::ParameterReference, 9> refs;
+    std::array<ObjectGeom, 9>                   geom;
+    std::array<std::size_t, 9>                  offset;
+    std::array<std::size_t, 9>                  dev_bytes;
+    std::size_t                                 total = 0;
+};
+
+// Build the plan from one block's nine references (geometry is the same for every block).
+inline BlockCopyPlan make_block_copy_plan(const artifact::Reader& reader,
+                                          const artifact::ParameterReference refs[9]) {
+    BlockCopyPlan plan;
+    std::size_t off = 0;
+    for (int j = 0; j < 9; ++j) {
+        plan.refs[j] = refs[j];
+        plan.geom[j] = object_geom(reader.geometry(refs[j].binding.parts.front().object));
+        plan.offset[j]     = off;
+        plan.dev_bytes[j]  = object_device_bytes(plan.geom[j]);
+        off += plan.dev_bytes[j];
+    }
+    plan.total = off;
+    return plan;
+}
+
+// Issue one block's nine objects into [slot_base, slot_base + plan.total) as asynchronous H2D on the
+// copy stream, from the caller's pinned host cache rows, and fill w[9] to address the device copies.
+// `host[j]` points at the stored object bytes for role j (its size is checked against the geometry).
+inline void upload_block_async(cudaStream_t s, void* slot_base, const BlockCopyPlan& plan,
+                               const std::byte* const host[9], Weight w[9]) {
+    auto* base = static_cast<std::uint8_t*>(slot_base);
+    for (int j = 0; j < 9; ++j) {
+        const ObjectGeom&  g   = plan.geom[j];
+        const std::byte*   src = host[j];
+        std::uint8_t*      dst = base + plan.offset[j];
+        if (g.format == QType::BF16 && g.layout == QuantLayout::Contiguous) {
+            cuda_ok(cudaMemcpyAsync(dst, src, g.bytes, cudaMemcpyHostToDevice, s),
+                    "H2D async (image block BF16)");
+        } else if (g.format == QType::FP8_E4M3FN_ROW_BF16 && g.layout == QuantLayout::RowScale) {
+            cuda_ok(cudaMemcpyAsync(dst, src, g.code_bytes, cudaMemcpyHostToDevice, s),
+                    "H2D async (image block FP8 codes)");
+            cuda_ok(cudaMemcpyAsync(dst + g.code_bytes, src + g.scale_offset, g.scale_bytes,
+                                    cudaMemcpyHostToDevice, s),
+                    "H2D async (image block FP8 scales)");
+        } else {
+            throw std::runtime_error("image block: unsupported weight representation");
+        }
+        fill_uploaded_weight(w[j], g, dst);
+    }
 }
 
 } // namespace infernix::models::qwen_image

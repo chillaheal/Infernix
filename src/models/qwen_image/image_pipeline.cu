@@ -75,10 +75,64 @@ std::vector<float> temporal_timesteps(const std::vector<float>& t, std::size_t d
     return out;
 }
 
-// One DiT block's nine roles as raw artifact object bytes, cached in host RAM for the whole job
-// (device uploads come from here; the artifact is read once per object per job).
+// One DiT block's nine roles as raw artifact object bytes, cached in PINNED host RAM for the whole
+// job (the copy stream's H2D comes from here; the artifact is read once per object per job). Pinned
+// so the async copy is genuinely asynchronous (pageable source forces a driver-side bounce that
+// cannot overlap compute). The flags are chosen by host_cache_alloc_flags() (WC measured, default
+// cached).
 struct BlockBytes {
-    std::vector<std::byte> q, k, v, out, gate, up, down, query_norm, key_norm;
+    PinnedBytes q, k, v, out, gate, up, down, query_norm, key_norm;
+};
+
+// The bundle-B fas 2 copy lane: a non-blocking copy stream, two device block slots, and the events
+// that order the prefetch copies against the block compute enqueued on the job's (blocking) image
+// stream. A non-blocking stream does NOT implicitly serialize with a blocking stream the way the
+// legacy default stream does, which is what lets block i+1's H2D run while block i computes. The
+// slots live only for the DiT loop (freed before the VAE decode) and are owned by Buf, so the image
+// ledger still accounts them and the interlude's release gate sees them go to zero.
+struct CopyLane {
+    cudaStream_t stream = nullptr;
+    cudaEvent_t  copy_done[2] = {nullptr, nullptr}; // block l's nine objects landed in slot l%2
+    cudaEvent_t  freed[2]     = {nullptr, nullptr}; // block l's compute finished reading slot l%2
+    cudaEvent_t  slot_ready   = nullptr;            // the two slots exist (ordered vs the compute lane)
+    cudaEvent_t  cp0s = nullptr, cp0e = nullptr;    // timing sample of one block's transfer
+    Buf          slot[2];
+    void*        slot_p[2] = {nullptr, nullptr};
+    bool         active = false;
+
+    CopyLane() = default;
+
+    void start(cudaStream_t compute, std::size_t slot_bytes) {
+        cuda_ok(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "image copy stream");
+        for (int i = 0; i < 2; ++i) {
+            cuda_ok(cudaEventCreateWithFlags(&copy_done[i], cudaEventDisableTiming), "image copy event");
+            cuda_ok(cudaEventCreateWithFlags(&freed[i], cudaEventDisableTiming), "image free event");
+        }
+        cuda_ok(cudaEventCreateWithFlags(&slot_ready, cudaEventDisableTiming), "image slot event");
+        cuda_ok(cudaEventCreate(&cp0s), "image timing event"); // default timing flag
+        cuda_ok(cudaEventCreate(&cp0e), "image timing event");
+        for (int i = 0; i < 2; ++i) {
+            slot[i].alloc(slot_bytes); // stream-ordered on the compute lane's pool (g_image_stream)
+            slot_p[i] = slot[i].d;
+        }
+        cuda_ok(cudaEventRecord(slot_ready, compute), "image slot ready record");
+        cuda_ok(cudaStreamWaitEvent(stream, slot_ready, 0), "image slot ready wait");
+        active = true;
+    }
+    ~CopyLane() {
+        if (active) { (void)cudaStreamSynchronize(stream); }
+        if (stream != nullptr) { cudaStreamDestroy(stream); }
+        for (int i = 0; i < 2; ++i) {
+            if (copy_done[i] != nullptr) { cudaEventDestroy(copy_done[i]); }
+            if (freed[i] != nullptr)     { cudaEventDestroy(freed[i]); }
+        }
+        if (slot_ready != nullptr) { cudaEventDestroy(slot_ready); }
+        if (cp0s != nullptr) { cudaEventDestroy(cp0s); }
+        if (cp0e != nullptr) { cudaEventDestroy(cp0e); }
+        // Buf slot[0]/slot[1] free their device bytes via RAII after this body.
+    }
+    CopyLane(const CopyLane&) = delete;
+    CopyLane& operator=(const CopyLane&) = delete;
 };
 
 // One VAE weight set's execution context, shared by the job's decode and the reference-image encode
@@ -302,21 +356,11 @@ GeneratedImage run_image_job(artifact::Reader& reader, const DiTWeights& dit, co
                  " MiB | driver free " + std::to_string(driver_free / (1024 * 1024)) +
                  " MiB pool reserved " + std::to_string(pool_reserved / (1024 * 1024)) + " MiB");
     };
-    // Bundle B's attribution, measured only when a sink exists: how much of the loop is the block
-    // weights' host->device copies. Those copies are synchronous cudaMemcpy today, so the host clock
-    // around them IS their time (and their cost cannot be hidden by compute until they move to a copy
-    // stream). Everything the loop costs beyond this is kernels and the per-step host scheduler.
-    std::chrono::steady_clock::time_point upload_t0{};
-    double upload_ms = 0.0;
+    // Bundle B's attribution, measured only when a sink exists. In fas 2 the block copies are
+    // asynchronous on a copy stream, so a host clock around the enqueue is meaningless; the transfer
+    // time is measured on the device (one block's copy bracketed by events) and extrapolated over the
+    // uniform block count. upload_blocks/upload_bytes stay as the inventory.
     std::uint64_t upload_blocks = 0, upload_bytes = 0;
-    const auto upload_span_begin = [&] {
-        if (log_line) { upload_t0 = std::chrono::steady_clock::now(); }
-    };
-    const auto upload_span_end = [&] {
-        if (!log_line) { return; }
-        upload_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - upload_t0)
-                         .count();
-    };
     const std::size_t progress_units = inputs.timesteps.size() + 1;  // + the VAE decode unit
     const auto step    = [&](std::size_t units_done) {
         if (progress && !progress->step(units_done, progress_units)) {
@@ -375,16 +419,35 @@ GeneratedImage run_image_job(artifact::Reader& reader, const DiTWeights& dit, co
     for (std::size_t l = 0; l < dit.blocks.size(); ++l) {
         const auto& b = dit.blocks[l];
         BlockBytes& c = cache[l];
-        c.q          = read_object(reader, b.q);
-        c.k          = read_object(reader, b.k);
-        c.v          = read_object(reader, b.v);
-        c.out        = read_object(reader, b.attention_output);
-        c.gate       = read_object(reader, b.mlp_gate);
-        c.up         = read_object(reader, b.mlp_up);
-        c.down       = read_object(reader, b.mlp_down);
-        c.query_norm = read_object(reader, b.query_norm);
-        c.key_norm   = read_object(reader, b.key_norm);
+        c.q          = read_object_pinned(reader, b.q);
+        c.k          = read_object_pinned(reader, b.k);
+        c.v          = read_object_pinned(reader, b.v);
+        c.out        = read_object_pinned(reader, b.attention_output);
+        c.gate       = read_object_pinned(reader, b.mlp_gate);
+        c.up         = read_object_pinned(reader, b.mlp_up);
+        c.down       = read_object_pinned(reader, b.mlp_down);
+        c.query_norm = read_object_pinned(reader, b.query_norm);
+        c.key_norm   = read_object_pinned(reader, b.key_norm);
     }
+
+    // The copy-stream layout of one block, precomputed once from block 0 (every block has the same
+    // nine shapes). The two device slots, the events and the copy stream live in `lane`; block_w[s]
+    // holds the nine Weight operands for the slot of parity s as the copies land.
+    const artifact::ParameterReference block_refs[9] = {
+        dit.blocks[0].q, dit.blocks[0].k, dit.blocks[0].v, dit.blocks[0].attention_output,
+        dit.blocks[0].mlp_gate, dit.blocks[0].mlp_up, dit.blocks[0].mlp_down, dit.blocks[0].query_norm,
+        dit.blocks[0].key_norm};
+    const BlockCopyPlan block_plan = make_block_copy_plan(reader, block_refs);
+    Weight block_w[2][9];
+    // INFERNIX_IMAGE_OVERLAP=0 forces the serialized route (copy -> wait -> compute, no lookahead) on
+    // the SAME pinned host cache and copy stream, so a depth-0 run isolates the overlap itself from the
+    // pinned/async change. Default = overlap.
+    const bool overlap_prefetch = [] {
+        const char* e = std::getenv("INFERNIX_IMAGE_OVERLAP");
+        return !(e != nullptr && e[0] == '0');
+    }();
+    CopyLane lane;
+    bool     cp0_sampled = false;
 
     GeneratedImage out;
 
@@ -484,6 +547,10 @@ GeneratedImage run_image_job(artifact::Reader& reader, const DiTWeights& dit, co
     }
     log_mem("pre-loop resident");
 
+    // Bring up the copy lane (non-blocking copy stream + two device block slots + events) for the
+    // DiT loop; the slots are freed by its destructor before the VAE decode.
+    lane.start(stream, block_plan.total);
+
     // txt_in front-end, computed once per prompt (it depends only on the embeds, not on t or the
     // latent): ZeroCenterRMSNorm -> in_layer -> gelu(Tanh) -> out_layer. Separate in/out buffers: an
     // in-place GEMM is run-to-run non-deterministic (#33).
@@ -521,30 +588,55 @@ GeneratedImage run_image_job(artifact::Reader& reader, const DiTWeights& dit, co
         }
 
         // 32-block chain: d_joint in, ping-pong with d_hb; after an even block count the result is
-        // back in d_joint. Each block's weights are uploaded from the host cache and freed at the
-        // end of its block, so the resident set peaks at ~one block.
+        // back in d_joint. The nine weights of each block land on the copy stream into one of two
+        // device slots; block l+1's copy is issued before block l's compute so the transfer runs
+        // while the SM computes (fas 2). Events carry the ordering: copy_done[p] gates compute on
+        // slot p, freed[p] gates the next copy into slot p. INFERNIX_IMAGE_OVERLAP=0 disables the
+        // lookahead (copy -> wait -> compute, serialized) to isolate the overlap from the pinned/async
+        // change. Two blocks are resident during the loop, so the peak rises by ~one block.
         const int Si_p = static_cast<int>(S_p);
         void* hin = d_joint.d;
         void* hout = d_hb.d;
-        for (std::size_t l = 0; l < dit.blocks.size(); ++l) {
-            const BlockBytes& c = cache[l];
-            upload_span_begin();
-            Uploaded Wq     = upload_streamed(reader, dit.blocks[l].q, &c.q);
-            Uploaded Wk     = upload_streamed(reader, dit.blocks[l].k, &c.k);
-            Uploaded Wv     = upload_streamed(reader, dit.blocks[l].v, &c.v);
-            Uploaded Wout   = upload_streamed(reader, dit.blocks[l].attention_output, &c.out);
-            Uploaded Wgate  = upload_streamed(reader, dit.blocks[l].mlp_gate, &c.gate);
-            Uploaded Wup    = upload_streamed(reader, dit.blocks[l].mlp_up, &c.up);
-            Uploaded Wdown  = upload_streamed(reader, dit.blocks[l].mlp_down, &c.down);
-            Uploaded Wnq    = upload_streamed(reader, dit.blocks[l].query_norm, &c.query_norm);
-            Uploaded Wnk    = upload_streamed(reader, dit.blocks[l].key_norm, &c.key_norm);
-            upload_span_end();
-            ++upload_blocks;
-            upload_bytes += c.q.size() + c.k.size() + c.v.size() + c.out.size() + c.gate.size() +
-                            c.up.size() + c.down.size() + c.query_norm.size() + c.key_norm.size();
+        const std::size_t NB = dit.blocks.size();
 
-            run_block(hin, hout, Wq.w, Wk.w, Wv.w, Wout.w, Wup.w, Wgate.w, Wdown.w, Wnq.buf.d,
-                      Wnk.buf.d, d_mod.d, d_rot_p, d_ones.d, d_zeros.d, ws, Si_p, Di, Hi, Mi, tp_p, eps);
+        const auto issue_copy = [&](std::size_t l, int p) {
+            const BlockBytes& cc = cache[l];
+            const std::byte* host[9] = {cc.q.h, cc.k.h, cc.v.h, cc.out.h, cc.gate.h, cc.up.h,
+                                        cc.down.h, cc.query_norm.h, cc.key_norm.h};
+            const bool sample = !cp0_sampled && l == 0;
+            if (sample) { cuda_ok(cudaEventRecord(lane.cp0s, lane.stream), "copy timing start"); }
+            upload_block_async(lane.stream, lane.slot_p[p], block_plan, host, block_w[p]);
+            if (sample) { cuda_ok(cudaEventRecord(lane.cp0e, lane.stream), "copy timing end");
+                          cp0_sampled = true; }
+            cuda_ok(cudaEventRecord(lane.copy_done[p], lane.stream), "copy done record");
+            upload_bytes += cc.q.n + cc.k.n + cc.v.n + cc.out.n + cc.gate.n + cc.up.n + cc.down.n +
+                            cc.query_norm.n + cc.key_norm.n;
+        };
+
+        if (overlap_prefetch) { // prologue copy of block 0
+            cuda_ok(cudaStreamWaitEvent(lane.stream, lane.freed[0], 0), "slot 0 free wait");
+            issue_copy(0, 0);
+        }
+        for (std::size_t l = 0; l < NB; ++l) {
+            const int p = static_cast<int>(l & 1U);
+            if (!overlap_prefetch) {
+                cuda_ok(cudaStreamWaitEvent(lane.stream, lane.freed[p], 0), "slot free wait");
+                issue_copy(l, p);
+            } else if (l + 1 < NB) { // prefetch the next block into the other slot
+                const int pn = static_cast<int>((l + 1) & 1U);
+                cuda_ok(cudaStreamWaitEvent(lane.stream, lane.freed[pn], 0), "next slot free wait");
+                issue_copy(l + 1, pn);
+            }
+            cuda_ok(cudaStreamWaitEvent(stream, lane.copy_done[p], 0), "copy done wait");
+            Weight* W = block_w[p];
+            // The head-norm operands are BF16 Contiguous objects; their device address is the slot
+            // base plus that role's offset (Weight::qdata is const, and run_block takes void*).
+            auto* slot_base = static_cast<char*>(lane.slot_p[p]);
+            run_block(hin, hout, W[0], W[1], W[2], W[3], W[5], W[4], W[6],
+                      slot_base + block_plan.offset[7], slot_base + block_plan.offset[8],
+                      d_mod.d, d_rot_p, d_ones.d, d_zeros.d, ws, Si_p, Di, Hi, Mi, tp_p, eps, stream);
+            cuda_ok(cudaEventRecord(lane.freed[p], stream), "slot freed record");
+            ++upload_blocks;
             std::swap(hin, hout);
         }
         void* h_final = hin;
@@ -623,15 +715,40 @@ GeneratedImage run_image_job(artifact::Reader& reader, const DiTWeights& dit, co
 
     log_mem("DiT loop done");
     if (log_line) {
-        // One line for the whole loop: the copies' wall as a share of it is what bundle B's phases are
-        // judged on (prefetch/resident only buys what the copies actually cost).
-        char copy[32], loop[32];
-        std::snprintf(copy, sizeof(copy), "%.0f", upload_ms);
-        std::snprintf(loop, sizeof(loop), "%.0f",
-                      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - loop_t0).count());
+        // The loop wall is the honest total; the copy estimate is one block's transfer time (a device
+        // event pair around the first block's H2D on the copy stream) scaled over the uniform block
+        // count. asyncEngineCount/deviceOverlap say whether copy+compute overlap is even possible on
+        // this GPU -- if overlap is on yet the loop wall does not fall vs a serialized run, the copy
+        // is not actually hiding behind compute and that is reported rather than dressed as a win.
+        const double loop_ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - loop_t0).count();
+        double copy_ms = 0.0;
+        if (cp0_sampled) {
+            float ms = 0.0F;
+            // The transfer time of ONE block (the first H2D on the copy stream, so cold and
+            // representative of the worst per-block copy). Reported as-is, NOT scaled: the loop-wall
+            // reduction vs the §8 baseline is what shows the copy is hidden behind compute.
+            if (cudaEventSynchronize(lane.cp0e) == cudaSuccess &&
+                cudaEventElapsedTime(&ms, lane.cp0s, lane.cp0e) == cudaSuccess) {
+                copy_ms = static_cast<double>(ms);
+            }
+        }
+        // asyncEngineCount is the number of independent copy engines: >= 1 means an H2D on the copy
+        // stream can run concurrently with the SM compute. (CUDA 13 dropped cudaDeviceProp's
+        // deviceOverlap flag; asyncEngineCount is the surviving copy-overlap signal.)
+        static int s_async_engine = -1;
+        if (s_async_engine < 0) {
+            cudaDeviceProp prop{};
+            s_async_engine = (cudaGetDeviceProperties(&prop, 0) == cudaSuccess) ? prop.asyncEngineCount : 0;
+        }
+        char loopb[32], copyb[32];
+        std::snprintf(loopb, sizeof(loopb), "%.0f", loop_ms);
+        std::snprintf(copyb, sizeof(copyb), "%.0f", copy_ms);
         log_line("image job: timing | block uploads " + std::to_string(upload_blocks) +
-                 " blocks x 9 objects, bytes " + std::to_string(upload_bytes / (1024 * 1024)) +
-                 " MiB, copy wall " + copy + " ms, loop wall " + loop + " ms");
+                 " x 9 objects, bytes " + std::to_string(upload_bytes / (1024 * 1024)) +
+                 " MiB, loop wall " + loopb + " ms, block0 copy " + copyb + " ms (" +
+                 std::string(overlap_prefetch ? "overlap" : "serialized") + ", asyncEngineCount " +
+                 std::to_string(s_async_engine) + ")");
     }
     // ---- the VAE decode of the final latent ----
     // unpack [img_tokens,Cin] token-major (token h*Wl+w, feature c) -> [Cin,Hl,Wl] channel-major,

@@ -116,7 +116,7 @@ int main() {
             req.text_tokens     = kTextTokens;
             req.negative_tokens = c.neg_tokens;
             req.ref_tokens      = static_cast<std::uint32_t>(inputs.ref_latents.size() / dit.dims.image_in);
-            req.blocks_resident = 1;
+            req.blocks_resident = 2; // fas 2 streams two block slots at once (copy prefetch vs compute)
             const std::uint64_t predicted = image_device_need(req).total();
 
             reset_image_device_peak();
