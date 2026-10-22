@@ -216,14 +216,41 @@ uppmätt peak / marginal, MiB), med `blocks_resident=2` och allowance 5972:
 predicted-totalen är netto oförändrad (allowance sänkt med en blockstorlek väger upp blocks 1->2), så
 antagna storlekar är desamma och marginalen är kvar 5,6--6,7 GiB på varje rad.
 
-**Öppet sparande -- åtstrama `image_device_need` mot ledgern.** Tabellen ovan visar att
-`image_device_need().total()` är ~4x uppmätt peak på 512 (7 470 mot 1 845) och ~2,7x på 1024
-(10 712 mot 4 007). Så länge need är så konservativ 503:ar admittenten tidigare än vad enheten själva
-behöver -- det finns flera GiB tjänbar kapacitet som never används. Detta är en egen förbättring,
-fristående från fas 2: sänk `kImageWeightResidentBytes` (den är död marginal, se kommentaren i
-image_device_need.h) och/eller gör inventariens aktiveringstermer täta, och låt ledger-certen hålla
-predicted >= uppmätt peak med en avsiktlig (inte 4x) marginal. Behöver inte göras i denna fas; den ska
-göras med egen mätning och egen acceptans, inte som en sidoeffekt.
+**Åtstramning körd (2026-10-22).** Need överskattade med ~4x. `kImageWeightResidentBytes` sänktes
+5972 -> 3072 MiB (endast en konstant; ingen kernel, pipeline eller admittentlogik rörd, så
+räkningstiden och antagningsregeln är oförändrade). Kalibreringen tar inte cert-certens uppmätta peak
+som golv -- den matar nollifyllda trivialindata vars peak är lägre än en levande jobs -- utan den
+VERKLIGA per-steg-peak ur stage-bänken (`stage_bench_A_full_overlap.err.log`), som bär riktig
+prompt/negative/referens. Avdraget mellan verklig peak och inventariens uppräknade termer binder på
+ref/CFG-raderna (~1 180 MiB, där certens triviala sekvens underskattar mest); 3072 MiB lämnar ~1,9 GiB
+ovan det för 512 MiB golvmarginalen plus vad KV-poolen och LLM-restoren håller under en interlude.
+
+Certernas tre grön: `RESULT ledger=0 prod=0 failures=0 healthy=True`, prod-numerik bit-identisk.
+Per rad (MiB), predicted före/efter, certens uppmätta peak, verklig bench-peak, och den bindande
+marginalen predicted minus VERKLIG peak:
+
+| rad | predicted förr (5972) | predicted nu (3072) | cert-peak | verklig peak | marginal mot verklig | x verklig |
+|---|---|---|---|---|---|---|
+| 512 | 7 470 | 4 570 | 1 845 | 1 848 | 2 722 | 2,47 |
+| 768 | 8 821 | 5 921 | 2 746 | 2 749 | 3 172 | 2,15 |
+| 768 + referens | 8 835 | 5 935 | 2 760 | 3 615 | 2 320 | 1,64 |
+| 768 + CFG | 8 825 | 5 925 | 2 751 | 3 615 | 2 310 | 1,64 |
+| 1024 | 10 712 | 7 812 | 4 007 | 4 010 | 3 802 | 1,95 |
+
+Garantierna: (1) predicted >= uppmätt peak på varje rad, både mot certens och mot den verkliga peaken,
+med marginal > 512 MiB golv på varje rad (minst 2 310 på CFG) -- för storlekar utanför matrisen är
+modellen parametrisk i `s_max`/VAE-sidan så predicted växer UPP strukturellt, allowance täcker resten.
+(2) KV-tillväxt under interlude täckt: failures-certen (S6) körde ett scenario där KV-poolen växte till
+576 pages (522 MiB) medan bilden begärde 24 576 MiB -- den mjuka KV-remapen föll tillbaka till 512
+sidor istället för att OOM:a, och bilda jobbet blev klart (`failures=0`). (3) För-stort jobb nekas
+fortfarande (admittentkoden orörd, `prod=0`), och ett jobb vid den nya gränsen BLIR KLART: 1024-raden
+kördes end-to-end i ledger-certen till `live==0`, och vid antagningsgränsen gäller per konstruktion
+`verklig peak <= predicted <= tillgängligt`, så ett admitterat jobb får plats -- marginalen 2,3--3,8 GiB
+är själva garantin mot runtime-OOM.
+
+Det finns alltså flera GiB tjänbar kapacitet som nu admitteras i stället för att 503:as i onödan.
+Räkningstiden påverkades inte (constanten läses bara av serve-admittenten, inte av bänken), så
+bench-matrisan behöver inte köras om för tid; dess fem storlekar kördes end-to-end via certerna.
 
 ## Korsvisning
 

@@ -26,19 +26,27 @@ inline constexpr std::uint64_t kImageMiB          = 1024ULL * 1024ULL;
 
 // The operands and op scratch the inventory above does not enumerate: the DiT's top-level
 // projections, the VAE's weights, and whatever workspace the linear/conv/attention ops take per
-// call. The starting value was the measured peak this project has -- 6183 MiB for the certified
-// 512x512 route (image-spike/blackout_step8d.outer.log:30) -- deliberately conservative: an
-// over-estimated need refuses a job that might have run, while an under-estimated one OOMs it. The
-// ledger qualification (tests/models/qwen_image/test_image_need_ledger_real.cu) measures the split
-// and lowers this to what the route actually holds.
+// call. An over-estimated need refuses a job that might have run; an under-estimated one OOMs it.
 //
-// Bundle B fas 2: with the copy-stream prefetch, TWO DiT block slots are resident at once and are
-// counted explicitly by `blocks_resident * image_block_bytes` below. The old 6183 MiB allowance was
-// set when only one block was resident, so it already carried one block's worth inside this slack
-// term. Lowering it by one image_block_bytes (~211 MiB for the shipped dims) keeps the predicted
-// total -- and therefore the sizes the serving layer admits -- exactly as §8 measured them, while
-// modelling the second resident block honestly instead of double-counting it.
-inline constexpr std::uint64_t kImageWeightResidentBytes = 5972ULL * kImageMiB;
+// Two calibrations set this term:
+//   - the ledger qualification (test_image_need_ledger_real.cu) proves predicted >= measured for the
+//     certified inputs, and
+//   - the stage bench (image-spike/stage_bench_A_full_overlap.err.log) gives the REAL per-step ledger
+//     peak a live job reaches -- higher than the cert's, because the cert feeds zero-filled trivial
+//     inputs while a served job carries a real prompt/negative/reference. The cert alone would let
+//     this drift below what a live job actually holds.
+//
+// Subtracting the enumerated structural terms (dit_activations + latent_and_velocity + vae_peak +
+// rope_and_tables) from the real peak leaves the residual this term must absorb: ~772 MiB at 512,
+// ~322 at 768, and ~1180 at 768+ref / 768+CFG (the ref/CFG rows, where the real sequence is longest
+// and the cert's trivial inputs understate it most). The 1024 row's structural terms alone already
+// exceed its real peak, so its residual is negative. So the largest residual to cover is ~1184 MiB;
+// 3072 MiB leaves ~1.9 GiB on top of it for the 512 MiB interlude floor plus whatever the KV pool
+// and the LLM restore hold during the interlude. That puts the predicted total at ~1.6-2.5x the real
+// peak on every certified row -- down from the ~4x this term carried when it was the whole-measured-
+// peak proxy (6183, then 5972 after the second resident block was counted explicitly in bundle B
+// fas 2) -- without ever dropping predicted below the measured peak plus the 512 MiB floor.
+inline constexpr std::uint64_t kImageWeightResidentBytes = 3072ULL * kImageMiB;
 
 // One DiT block resident on device: the seven FP8 RowScale roles (four [hidden,hidden] and three
 // [intermediate,hidden], one byte per code) plus the two BF16 head norms. Derived from the bound
