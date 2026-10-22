@@ -210,3 +210,48 @@ machinery**: the in-process text-tower forward for a variable `prompt` (gap #1),
 condition images (gap #2), true-CFG (gap #3), `use_kv_cache=True` (gap #6), the condition-image multi-block
 rope (gap #4 tail, oracle-less + encoder-bound) — and the caller-facing `/v1/images/generations` binding that
 would expose these parameters as an HTTP endpoint (a separate task; the test harness sets them by env).
+
+## Engine constants behind those inputs
+
+The inputs above are the caller's. These are the engine's own fixed numbers: what a job is made of, how
+much it may ask for, and what it may hold. Each row is the name, what it decides, where it is bound, and
+what keeps it honest. This documents what exists; it does not propose a knob.
+
+### Representation and residency
+
+| Name | Decides | Bound at | Kept honest by |
+|---|---|---|---|
+| `kImageElementBytes` (2) | BF16 is the element type of every image activation, weight upload and intermediate | [`image_device_need.h:24`](../../src/models/qwen_image/image_device_need.h) | the ledger cert, which sizes its prediction with it and requires predicted ≥ measured ([`test_image_need_ledger_real.cu`](../../tests/models/qwen_image/test_image_need_ledger_real.cu)) |
+| 17 quantized roles FP8 E4M3 row-scaled, every other role direct BF16 | which operands the artifact may store in FP8 | [`image_weights.h:11-14`](../../src/models/qwen_image/image_weights.h) | the binder itself: a representation that differs from the recipe throws `artifact::ArtifactError` when the plan is built, before any yield |
+| `Residency::Streamed` for **all** image parameters | weights stay in the artifact's files and an object is staged only while a block needs it; peak is one object | [`image_weights.h:7-9`](../../src/models/qwen_image/image_weights.h) | the interlude certs, which run the production route on the VRAM the LLM yielded ([`test_image_interlude_prod_real.cu`](../../tests/models/qwen4_exp/test_image_interlude_prod_real.cu)) |
+| `kImageResidentBlocks` (2) | how many DiT block slots the shipped route keeps resident at once — one symbol for the pipeline's double-buffered copy slots, the serving layer's `blocks_resident`, and the allowance's calibration, so they cannot drift apart | [`image_device_need.h:33`](../../src/models/qwen_image/image_device_need.h) | the same cert stamps the value it measured, and the ledger cert refuses a row whose predicted total falls below its measured peak plus the floor |
+| `image_block_bytes(dims)` | one resident block's footprint (seven FP8 roles + two BF16 head norms), derived from the bound dims | [`image_device_need.h:62-65`](../../src/models/qwen_image/image_device_need.h) | a recipe change moves it with the dims; the resident term of the need is `blocks_resident × image_block_bytes` |
+
+### Memory the admission promises
+
+| Name | Decides | Bound at | Kept honest by |
+|---|---|---|---|
+| `kImageWeightResidentBytes` (3072 MiB) | the operands and op scratch the buffer inventory does not enumerate (DiT top-level projections, VAE weights, per-call workspace). Over-estimating refuses a job that could have run; under-estimating OOMs it. Calibrated to the residual left after the enumerated terms against a **live** job's per-step peak, not the cert's trivial inputs — currently ~1.6–2.5× the real peak | [`image_device_need.h:57`](../../src/models/qwen_image/image_device_need.h) | [`test_image_need_ledger_real.cu`](../../tests/models/qwen_image/test_image_need_ledger_real.cu) per row: predicted ≥ measured **and** ≥ measured + the floor; the stage bench supplies the live-job peak the cert alone would understate |
+| `kInterludeMarginBytes` (512 MiB) | the free VRAM left below what a job takes: a yield that lands a hair short fails inside the interlude, where the restoration is the thing that breaks | [`image_generation_service.cpp:42`](../../src/serve/image_generation_service.cpp) | the failure cert's scenarios, which drive a job that does not fit and expect refusal, not a broken engine ([`test_image_interlude_failures_real.cu`](../../tests/models/qwen4_exp/test_image_interlude_failures_real.cu)) |
+| the known over-count in the inventory | the structural terms are summed where the pipeline's buffers are partly simultaneous, which is why the 1024 row's structural terms alone already exceed its measured peak | [`image_device_need.h:47-56`](../../src/models/qwen_image/image_device_need.h) | deliberately left as conservatism: fixing it is a re-derivation of the inventory, not a constant. Recorded in the bundle B spec |
+
+### Caller-facing limits (the endpoint's, restated here with their binding)
+
+`docs/serving.md` is the authority on what a client may send; this table only points at where each limit is
+enforced in code and what tests it.
+
+| Name | Range / cap | Bound at | Kept honest by |
+|---|---|---|---|
+| `kMinimumImageDimension` / `kMaximumImageDimension` | every side a multiple of 32 in `[32, 2048]` | [`openai_images.h:60-61`](../../src/serve/openai_images.h) | `infernix_openai_images_schema_test` |
+| `kMinimumImageSteps` / `kMaximumImageSteps` | `[2, 100]`; floor because the schedule divides by `steps - 1`, ceiling bounds how long one request holds the yielded VRAM | [`openai_images.h:67-68`](../../src/serve/openai_images.h) | same schema test |
+| `kMinimumImageCFGScale` / `kMaximumImageCFGScale` | guidance in `[1, 20]`; above 1 doubles the per-step DiT forward | [`openai_images.h:50-51`](../../src/serve/openai_images.h) | same schema test |
+| `kMaximumImagePromptBytes` | 4096 bytes per prompt | [`openai_images.h:57`](../../src/serve/openai_images.h) | same schema test |
+| `kMaximumImageInputBytes` | a reference image's decoded payload at most 16 MiB | [`openai_images.h:54`](../../src/serve/openai_images.h) | same schema test, plus the chat tool's refusal of an oversized attachment (`infernix_chat_image_tool_test`) |
+| `kImageArtifactRoutePrefix` | `/v1/images/`, the only route that serves a finished picture | [`openai_images.h:45`](../../src/serve/openai_images.h) | the artifact route's id-shape gate (`infernix_http_routes_test`, `infernix_image_generation_service_test`) |
+| `kMaximumChatImageGenerations` | 4 pictures per chat request; each costs a full interlude | [`chat_image_tool.h:35`](../../src/serve/chat_image_tool.h) | `infernix_chat_image_tool_test` |
+| `kMaximumChatImageRounds` | 8 internal rounds per chat request, so bad arguments end as an ordinary answer | [`chat_image_tool.h:85`](../../src/serve/chat_image_tool.h) | `infernix_chat_image_tool_test` |
+| `image_retention_days` (14, `0` = off) | how long a generated picture stays on disk, which is how long its delivered URL answers before it is `404` | [`serve_options.h:90`](../../src/serve/serve_options.h), swept by `GeneratedImageRetention` ([`image_generation_service.h`](../../src/serve/image_generation_service.h)) | `infernix_image_generation_service_test`: kept inside retention, swept past it, never a picture an unfinished job owns, never a file that is not an artifact id, nothing when the retention is off |
+
+The chat tool's `image` argument is not a new kind of input: it resolves in the chat layer to the route's
+existing base64 `image` field, so everything above already covers it
+([`chat_image_tool.cpp`](../../src/serve/chat_image_tool.cpp), `infernix_chat_image_tool_test`).
