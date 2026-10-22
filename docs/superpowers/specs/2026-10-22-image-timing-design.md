@@ -147,6 +147,50 @@ blockuppsättningen kan bo kvar i det minnet som redan yieldas, på varje rad i 
 trafiken -- med fas 2 som den mätbara grinden före och efter, och prefetch som kvarlevande väg för de
 storlekar där aktiveringar äter budgeten.
 
+## 8b. Fas 2, körd 2026-10-22 (blockvikterna överlappar beräkningen)
+
+Implementation: blockens host-cache är pinned (`cudaHostAlloc`), de nio viktarna per block landar på en
+egen non-blocking copy-stream med event-styrda beroenden och två device-slots (block i+1 laddas medan
+block i räknar), och blockframåt körs nu på jobbets explicita image-stream i stället för legacy default
+stream (den tidigare legacy-`cudaMemcpy`-fällan är löst). Kernels och numerik är orörda.
+
+Samma bench, samma Engine och artifact, Release, svart fönster, en körning per rad. `loop` = loopen i
+run_image_job, `copy` = en blocks H2D mätt med device-event (block 0, kall respektive varm). ms:
+
+| rad | total | paus | device-job | loop | föreg. total | föreg. device | föreg. loop | block0-copy (varm) |
+|---|---|---|---|---|---|---|---|---|
+| 512×512 kall | 18 024 | 17 711 | 10 297 | 6 196 | 29 899 | 22 708 | 19 536 | 24→4 |
+| 512×512 varm | 13 234 | 13 234 | 10 321 | 6 337 | 25 655 | 22 165 | 19 142 | 4 |
+| 768×768 varm | 23 717 | 23 717 | 20 776 | 15 790 | 35 805 | 32 925 | 28 859 | 4 |
+| 768 + referens | 92 413 | 92 366 | 89 538 | 83 757 | 104 039 | 101 128 | 96 359 | 4 |
+| 768 + CFG | 42 453 | 42 376 | 36 638 | 31 624 | 72 736 | 62 713 | 58 579 | 4 |
+| 1024×1024 varm | 49 437 | 49 401 | 46 472 | 39 865 | 60 905 | 57 934 | 52 190 | 4 |
+
+**Överlappen inträffar, ärligt mätt.** `asyncEngineCount = 1` (en copy-engine) och `loop` föll till
+räknetid: på 512 var loopen i baslinjen ~19 s som var kopieringsbunden (synkron `cudaMemcpy` på legacy
+stream tvingade fram serialisering, ~15 ms/block); nu är en blocköverföring ~4 ms varm och ligger
+parallellt med SM:et, så loopen är ~6 s och ~kärnbindingsbunden. Andelen H2D som döljs av beräkningen är
+alltså i praktiken ~hela överföringen (loop ≈ räknetid; ~13 s av den tidigare loopen på 512 försvann).
+På de kärntunga raderna (768 + referens, 83 s loop) var kopieringen redan en liten del, så vinsten där är
+~13 %; vinsten är störst just där kopieringen dominerade (512, CFG: −67 % respektive −46 % loop).
+
+**Negativa fynd, dokumenterade så ingen provar om.**
+- *Write-combined är sämre.* `INFERNIX_IMAGE_HOST_CACHE_WC=1` mättes mot vanlig pinned cache på samma
+  rader: 512 device 11 093 vs 10 082, 768 20 466 vs 20 135 (WC långsammare överallt, CPU-läsningarna
+  från WC-minnet kostar). Valet mäldes alltså, inte antogs: **cache behålls, WC är av (env-flaggan finns
+  kvar men är inte standard).**
+- *Prefetch-djup ger ingen extra effekt.* `INFERNIX_IMAGE_OVERLAP=0` (ingen look-ahead, samma pinned
+  cache och copy-stream) gav samma loop som överlappet (512 6 125 vs 6 103; 768 15 316 vs 15 227).
+  Vinsten kommer från pinned + async copy-stream + explicit stream-styrt blockarbete, inte från
+  look-ahead-djupet: även utan look-ahead överlappar intilliggande block var för sig över de två
+  streamarna.
+
+**Admission och need.** Två block är residenta under loopen, så `image_device_need` behöver
+`blocks_resident = 2`. För att hålla den tjänade mängden oförändrad mot §8 sänktes
+`kImageWeightResidentBytes` med exakt en blockstorlek (6183 -> 5972 MiB), vilket gör predicted-totalen
+netto oförändrad: 1024 och 768 + CFG går alltså in som i baslinjen (de 503ade en kort stund i en
+mellanrunning medan allowance ännu var 6183 med två residenta block).
+
 ## 9. Verifiering
 
 1. Fas 0: baslinjetabellen körd och inklistrad här, två tal per upplösning.
@@ -155,6 +199,31 @@ storlekar där aktiveringar äter budgeten.
 3. A:s tre certer gröna i svartfönster efter varje fas (`RESULT ledger=0 prod=0 failures=0 healthy=True`).
 4. Vid kännförändring: orakelkvalifikation enligt `docs/maintainer/op-development.md`.
 5. Minneskravet: ledger-certen visar att `image_device_need().total()` aldrig hamnar under uppmätt peak.
+
+**Fas 2 körd (2026-10-22).** Bundle A:s tre certer gröna i svart fönster: `RESULT ledger=0 prod=0
+failures=0 healthy=True`. Prod-numeriken bit-identisk med baslinjen (`FINAL_LATENT 4.401e-02` tol 5e-1,
+`FINAL_IMAGE 5.097e-02` tol 3e-1) -- fas 2 rörde ingen numerik. Ledger-certen per rad (predicted /
+uppmätt peak / marginal, MiB), med `blocks_resident=2` och allowance 5972:
+
+| rad | predicted | uppmätt peak | marginal | förra (allow 6183, 1 block) |
+|---|---|---|---|---|
+| 512 | 7 470 | 1 845 | 5 625 | 7 473 / 1 429 / 6 044 |
+| 768 | 8 821 | 2 746 | 6 075 | 8 824 / 2 330 / 6 494 |
+| 768 + referens | 8 835 | 2 760 | 6 075 | 8 838 / 2 343 / 6 495 |
+| 768 + CFG | 8 825 | 2 751 | 6 074 | 8 828 / 2 334 / 6 494 |
+| 1024 | 10 712 | 4 007 | 6 705 | 10 715 / 3 591 / 7 124 |
+
+predicted-totalen är netto oförändrad (allowance sänkt med en blockstorlek väger upp blocks 1->2), så
+antagna storlekar är desamma och marginalen är kvar 5,6--6,7 GiB på varje rad.
+
+**Öppet sparande -- åtstrama `image_device_need` mot ledgern.** Tabellen ovan visar att
+`image_device_need().total()` är ~4x uppmätt peak på 512 (7 470 mot 1 845) och ~2,7x på 1024
+(10 712 mot 4 007). Så länge need är så konservativ 503:ar admittenten tidigare än vad enheten själva
+behöver -- det finns flera GiB tjänbar kapacitet som never används. Detta är en egen förbättring,
+fristående från fas 2: sänk `kImageWeightResidentBytes` (den är död marginal, se kommentaren i
+image_device_need.h) och/eller gör inventariens aktiveringstermer täta, och låt ledger-certen hålla
+predicted >= uppmätt peak med en avsiktlig (inte 4x) marginal. Behöver inte göras i denna fas; den ska
+göras med egen mätning och egen acceptans, inte som en sidoeffekt.
 
 ## Korsvisning
 
