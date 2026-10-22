@@ -35,10 +35,12 @@ och finns certifierat minne över, körs fas 3 före finjustering av fas 2.
 - Euler-steget körs på **host**: `velocity D2H`, `latent D2H`, räkna om i en scalarslinga, `h2d` tillbaka
   ([image_pipeline.cu:538-598](../../../src/models/qwen_image/image_pipeline.cu)), med två
   `cudaStreamSynchronize` per steg utöver det.
-- Inuti pausen ligger också text-tower-forward, VAE-decode, PNG-kodning
-  ([image_generation_service.cpp:215](../../../src/serve/image_generation_service.cpp)), base64
-  ([:308](../../../src/serve/image_generation_service.cpp)) och diskskriv
-  ([ :315-331](../../../src/serve/image_generation_service.cpp)).
+- I fas 0 låg även text-tower-forward, VAE-decode, PNG-kodning, base64 och diskskriv inuti pausen.
+  Fas 1 flyttade ut kodningen, base64:en och skrivningen (§8c); tower och VAE är kvar eftersom de
+  behöver det yieldade minnet. Routens värd-sida är nu `encode_png_rgba8`
+  ([image_generation_service.cpp:634](../../../src/serve/image_generation_service.cpp)) och
+  `save_generated_image` ([:339](../../../src/serve/image_generation_service.cpp)) efter interludet,
+  med `base64_encode_bytes` ([:311](../../../src/serve/image_generation_service.cpp)) i samma block.
 
 ## 2. Fas 0 -- baslinjen är en leverans
 
@@ -61,6 +63,8 @@ matris som ledger-certen, så varje senare fas kan jämföras mot samma siffror.
 **Grind:** fas 1–3 får inte börja utan tabellen, och ingen fas får påstå vinst utan en körd jämförelse.
 
 ## 3. Fas 1 -- host-arbetet ut ur pausen
+
+**Körd 2026-10-23. Resultat, de mätbara talen och vad som inte kunde mätas finns i §8c.**
 
 Gränsen läggs vid den sista nödvändiga D2H (den färdiga bilden i host-minne). Därefter frigörs leaset och
 LLM:n återupptas medan PNG-kodning, base64 och diskskriv körs klart på host.
@@ -109,6 +113,17 @@ Flytta `new_lat = lat + (sigma_next - sigma) * noise` till en kernel och låt la
 stegen, så de tre latent-överföringarna och de två extra synkroniseringarna per steg försvinner. Formeln och
 avrundningen till BF16 är oförändrad ([image_pipeline.cu:586-598](../../../src/models/qwen_image/image_pipeline.cu));
 är resultatet bit-exakt mot idag behövs ingen ny kvalifikation, annars körs den som fast path mot orakeln.
+
+**Beslut 2026-10-23: fas 3b lämnas ogjord, villkoret är inte uppfyllt.** Ordningen i §9 och i
+korsvisningen är att den får köras först om en timeline visar att de två synkroniseringarna per steg
+faktiskt lägger igen. Ingen sådan timeline finns: bänken rapporterar loopens vägg, block-uppladdningar och
+block0-kopiering, men ingen per-steg post för D2H/synk/väntan, och det enda måttet som finns pekar åt
+andre hållet — efter fas 2 är en blocköverföring ~4 ms varm och loopen ≈ räknetid (§8b), så loopen är
+kärnbindingsbunden och inte synkbindingsbunden. Att då flytta Euler-steget till enheten vore en
+kännförändring som körs som fast path utan ett mått som säger att den vinner något, vilket §7 kräver
+bevis för. Fas 3b återöppnas av en per-steg timeline (event-timers runt `velocity D2H`/`latent D2H`/
+`h2d` och de två `cudaStreamSynchronize`, eller nsys på en 512-rad) som visar väntetid utöver kernelernas
+egen tid; kostnaden för den mätningen är en timmes bänkarbete, inte en pipeline-ändring.
 
 ## 7. Numerik och routes
 
@@ -194,6 +209,60 @@ På de kärntunga raderna (768 + referens, 83 s loop) var kopieringen redan en l
 `kImageWeightResidentBytes` med exakt en blockstorlek (6183 -> 5972 MiB), vilket gör predicted-totalen
 netto oförändrad: 1024 och 768 + CFG går alltså in som i baslinjen (de 503ade en kort stund i en
 mellanrunning medan allowance ännu var 6183 med två residenta block).
+
+## 8c. Fas 1, körd 2026-10-23 (host-arbetet utanför pausen)
+
+Implementation (`1706a48`): device-jobbet returnerar `FinishedPicture` (RGBA8 + bredd/höjd) i stället
+för färdig PNG, interludet tar slut där, och `encode_png_rgba8` → `save_generated_image` → bas64/URL
+körs efter att `runner_->run` returnerat. Jobsvar och felbild är orörd: posten blir Succeeded först
+när filen finns, och ett kodnings- eller skrivfel ger fortfarande 500 `image_generation_failed` genom
+samma `job_started`-regel. Sista progress-enheten tas när bilden ligger på disk, inte när kodaren
+returnerade.
+
+Samma bench, samma Engine (`max_context=65536`, `expert_ram 8 GiB`) och artifact, Release, svart fönster
+01:20–01:25, en körning per rad (`image-spike/stage_bench_fas1_full.out.log`); föregående kolumn är
+fas 2:s körrad 23:17 (`stage_bench_A_full_overlap.out.log`). `utan paus` = `total - paus`, alltså det
+som den här fasen flyttade ut. ms:
+
+| rad | total | paus | device | utan paus | föreg. total | föreg. paus |
+|---|---|---|---|---|---|---|
+| 512×512 kall | 17 539 | 17 225 | 10 218 | 314 | 18 024 | 17 711 |
+| 512×512 varm | 12 788 | 12 778 | 9 983 | 10 | 13 234 | 13 234 |
+| 768×768 kall | 23 257 | 23 236 | 20 374 | 21 | 23 844 | 23 735 |
+| 768×768 varm | 23 035 | 23 014 | 20 150 | 21 | 23 717 | 23 717 |
+| 768 + referens | 89 621 | 89 561 | 86 712 | 60 | 92 413 | 92 366 |
+| 768 + CFG | 41 088 | 41 067 | 35 525 | 21 | 42 453 | 42 376 |
+| 1024×1024 | nekades | — | — | — | 49 437 | 49 401 |
+
+**Vad som är mätt, och vad som inte är det.** Det strukturella resultatet syns direkt: pausen slutar
+före kodningen, så 10–60 ms värdarbete (PNG-kodning + filskriv, utan base64 eftersom bänken körs med
+`response_format=url`) ligger nu utanför fönstret LLM:n är pausad. Pausen blev alltså kortare med just
+det beloppet, inte mer. §1:s uppskattning "fas 1 är värd 0,3–3,2 s" var `total - paus` i §8 — det vill
+sig prompt-rendering och probe, inte bildkodningen — och den siffran håller inte som vinst.
+Row-till-row-rörelsen mellan de två körrna är 0,3–2,8 s på HELA raden (total, paus och device rör sig
+tillsammans med ~2–3 %), alltså 5–100× större än effekten som ska mätas: den kan inte tillskrivas den
+här ändringen och ingen radvis "pausen föll med X ms"-poäng hävdas. Den 314 ms långa svansen på 512 kall
+fanns i föregående kör också (18 024 − 17 711 = 313) och är förstone-kostnad före paus, inte kodning.
+
+**1024-raden kunde inte mätas ikväll och varför det inte är fas 1.** Båda körningarna svarade
+`the image job needs 7815 MiB; the model can yield 8384 MiB with 15 MiB already free and 256 MiB reserved
+below the headroom` — admittenten nekar innan något yieldas, LLM:n är frisk, exakt som regeln ska.
+Probet körs före interludet och kan inte påverkas av kod som springer efter det, och talen replikerades
+identiskt i en andra körning med bara kallraderna (01:31), så nekas-tecken är inte den här ändringen.
+Beloppet är ett gränsfall, inte en omöjlig storlek: 8 384 MiB plan + 15 MiB fritt = 8 399 MiB mot
+7 815 + 512 marginal + 256 headroom = 8 583 MiB, alltså 184 MiB för kort. Samma storlek kördes end-to-end
+i ledger-certen tjugo minuter tidigare (`one megapixel: 1024x1024 predicted 7812 MiB, measured peak
+4007 MiB`, `TESTEXIT=0`), så det är bänk-processens gevning ikväll och inte produkten som satte gränsen.
+Varför planen erbjöd 8 384 MiB mot ≥11,5 GiB i 23:17-körningen är **inte utrett**; maskinen hade 5,4 GiB
+fritt av 63,7 GiB fysiskt minne under körningen och bänkens Engine är konfigurerad med `expert_ram 8 GiB`,
+men det sambandet är en misstanke, inte ett mått. 1024-radens fas 1-effekt står alltså som omätt, och
+dess `device`/`paus`-värden i tabellen är tomma i stället för uppskattade.
+
+**Numerik och certer.** Certerna körda före leveransen (`RESULT ledger=0 prod=0 failures=0 healthy=True`,
+svart fönster 01:11–01:17) och den certifierade routens numerik är identisk med före:
+schedule `timesteps=0.000e+00 sigmas=0.000e+00`, `FINAL_LATENT rel_fro=4.401e-02`,
+`FINAL_IMAGE rel_fro=5.097e-02`. Prod-certens ledger-peak läser 1 851 MiB mot 1 435 MiB i den äldre
+loggen från 16:21; den skillnaden är fas 2:s copy-stream-staging (`ed7ae5d`), som ligger mellan loggarna.
 
 ## 9. Verifiering
 
