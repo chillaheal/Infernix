@@ -116,7 +116,8 @@ int main() {
             req.text_tokens     = kTextTokens;
             req.negative_tokens = c.neg_tokens;
             req.ref_tokens      = static_cast<std::uint32_t>(inputs.ref_latents.size() / dit.dims.image_in);
-            req.blocks_resident = 2; // fas 2 streams two block slots at once (copy prefetch vs compute)
+            req.blocks_resident = kImageResidentBlocks; // same symbol the serving layer and the
+                             // pipeline's CopyLane assert; the allowance was calibrated at this value
             const std::uint64_t predicted = image_device_need(req).total();
 
             reset_image_device_peak();

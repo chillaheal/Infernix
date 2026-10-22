@@ -24,6 +24,14 @@ namespace infernix::models::qwen_image {
 inline constexpr std::uint64_t kImageElementBytes = 2;
 inline constexpr std::uint64_t kImageMiB          = 1024ULL * 1024ULL;
 
+// How many DiT block slots the shipped route keeps resident at once -- and the ONE number the need
+// model, the serving layer and the ledger cert must all agree on. The pipeline's CopyLane double-
+// buffers exactly this many slots (a static_assert in image_pipeline.cu pins it to 2), the serving
+// layer stamps it onto ImageDeviceNeedRequest::blocks_resident, and the cert requests the same value
+// the allowance below was calibrated against. A single symbol so `resident_weights` can never drift
+// from the slots actually allocated, nor from the blocks_resident the 3072 MiB allowance measured.
+inline constexpr std::uint32_t kImageResidentBlocks = 2;
+
 // The operands and op scratch the inventory above does not enumerate: the DiT's top-level
 // projections, the VAE's weights, and whatever workspace the linear/conv/attention ops take per
 // call. An over-estimated need refuses a job that might have run; an under-estimated one OOMs it.
@@ -88,7 +96,7 @@ struct ImageDeviceNeedRequest {
     std::uint32_t text_tokens     = 0;  // prompt rows the joint sequence carries
     std::uint32_t negative_tokens = 0;  // negative-prompt rows (0 without true CFG)
     std::uint32_t ref_tokens      = 0;  // reference-image latent tokens ahead of the target
-    std::uint32_t blocks_resident = 1;  // DiT blocks resident at once (the streamed route: one)
+    std::uint32_t blocks_resident = kImageResidentBlocks; // the shipped route's resident slots (2)
 };
 
 struct ImageDeviceNeed {

@@ -13,6 +13,7 @@
 #include "infernix/ops/silu_mul.h"
 #include "infernix/ops/vae_decoder.h"
 #include "models/qwen_image/dit_block.h"
+#include "models/qwen_image/image_device_need.h"
 #include "models/qwen_image/image_device_util.h"
 #include "models/qwen_image/rope.h"
 
@@ -91,6 +92,11 @@ struct BlockBytes {
 // slots live only for the DiT loop (freed before the VAE decode) and are owned by Buf, so the image
 // ledger still accounts them and the interlude's release gate sees them go to zero.
 struct CopyLane {
+    // The prefetch double-buffers exactly two slots (the [2] arrays and the i%2 parity below). This is
+    // the resident-block count the need model reserves for; if it ever changes, update the parity AND
+    // kImageResidentBlocks together -- the static_assert makes a silent drift between them a build error.
+    static_assert(kImageResidentBlocks == 2,
+                  "CopyLane double-buffers exactly two slots; keep kImageResidentBlocks at 2 or rework the parity.");
     cudaStream_t stream = nullptr;
     cudaEvent_t  copy_done[2] = {nullptr, nullptr}; // block l's nine objects landed in slot l%2
     cudaEvent_t  freed[2]     = {nullptr, nullptr}; // block l's compute finished reading slot l%2

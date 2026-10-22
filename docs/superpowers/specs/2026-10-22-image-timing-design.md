@@ -256,6 +256,33 @@ Det finns alltså flera GiB tjänbar kapacitet som nu admitteras i stället för
 Räkningstiden påverkades inte (constanten läses bara av serve-admittenten, inte av bänken), så
 bench-matrisan behöver inte köras om för tid; dess fem storlekar kördes end-to-end via certerna.
 
+**Garanti 0 verifierad (2026-10-23) -- predicted och measured mäter samma mängd.** Genomgång av de fyra
+räkenskapsfelen: `Buf` är modulens ENA device-allocator ([image_device_util.h:89-115](../../../src/models/qwen_image/image_device_util.h))
+och varje `Buf::alloc` adderar till `g_image_device_peak`, som är **max samtidiga** (inte en summa) --
+fel (2) och (4) är alltså på rätt sida: `image_device_need` summerar kategorier som en övre gräns, ledgern
+mäter max-samtidig, så `predicted >= measured` håller åt rätt håll. Varje bildvikt -- DiT-block, DiT-
+globala (`img_in`/`proj_out`/...), text-tower-lager och VAE -- är en `artifact::ParameterReference` som
+streamas på begäran ([image_weights.h:53-88](../../../src/models/qwen_image/image_weights.h)); inga
+persistenta device-vikter finns utanför `Buf`, vilket `live==0` mellan jobb bevisar -- fel (1) gäller
+inte. Fel (3) (allocated vs reserved) täcks av att marginalen ligger ovanför den sanna max-live-pekens
+pool-reserverade (bänk: pool reserved ~1 664--2 048 vid 512 mot ledger live 1 349). **Faktor ~4 har en
+räkenskapsförklaring:** allowance var gamla serialiserade routens hela-high-water-proxy (6 183), men fas
+2:s överlapp + streaming sänkte den sanna max-live till ~1 845 -- så att sänka till verklig-max-live +
+golv är FIXEN, inte en multiplier-fudge. Ledger-talet bekräftat täcka streamed-block-slots (`Buf slot[2]`
+= 448 MiB pre-loop live, 864 under DiT-loopen), tower (text_tower allocerar ENbart via `Buf`), VAE-planen
+(peak 1 845 nås vid VAE-decode) och latenten. Därför står `8dc9c63`: det är ingen OOM-generator.
+
+**`need` bundet till `blocks_resident` (2026-10-23).** En enda symbol `kImageResidentBlocks = 2`
+([image_device_need.h](../../../src/models/qwen_image/image_device_need.h)) binder now resident-block-
+talet: serve-admittenten och ledger-certen sätter `blocks_resident = kImageResidentBlocks`, och
+`CopyLane` har `static_assert(kImageResidentBlocks == 2)` (prefetchar betingat av exakt två slotar), så
+ett tyst glid mellan den modellerade reserven och de verkliga slotarna är ett byggfel. Allowance 3072
+kalibrerades vid detta tal. Admittentens **reservation** (`H = total − committed − future KV reserve −
+safety margin`) är orörd: KV-explicit-kapaciteten och `kv_hold_pages` håller redan KV-tillväxten utanför
+reserven, så marginalen behöver inte åter täcka den -- och som recensionen säger är det reserven, inte
+talet, som utesluter runtime-OOM. Skuggläge (loggat need-förslag mot mätt peak per rad) är frivilligt och
+ej byggt; säg till om det ska bli ett eget steg.
+
 ## Korsvisning
 
 En extern recension (ChatGPT, tråd `chatgpt.com/c/6ada33c3-7b5c-83ed-9312-418f740d8b61`, 2026-10-22)

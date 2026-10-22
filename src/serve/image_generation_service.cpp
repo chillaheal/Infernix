@@ -53,8 +53,9 @@ std::uint64_t image_need_bytes(std::int64_t width, std::int64_t height, std::siz
     req.text_tokens     = static_cast<std::uint32_t>(text_tokens);
     req.negative_tokens = static_cast<std::uint32_t>(negative_tokens);
     req.ref_tokens      = static_cast<std::uint32_t>(ref_tokens);
-    req.blocks_resident = 2; // fas 2: two DiT block slots are resident at once (copy prefetches i+1
-                             // while i computes), so the resident peak is two blocks, not one
+    req.blocks_resident = qi::kImageResidentBlocks; // the shipped route double-buffers two DiT block
+                             // slots (copy prefetches i+1 while i computes); the same symbol the
+                             // pipeline asserts and the cert requests, so the need can't drift from it
     return qi::image_device_need(req).total();
 }
 
