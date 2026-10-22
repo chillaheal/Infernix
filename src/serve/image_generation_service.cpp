@@ -455,7 +455,7 @@ void GeneratedImageRetention::run_loop() {
         wake_.wait_for(lock, kGeneratedImageSweepInterval, [this] { return done_; });
         if (done_) { break; }
         lock.unlock();
-        sweep_now();
+        (void)sweep_now();
         lock.lock();
     }
 }
