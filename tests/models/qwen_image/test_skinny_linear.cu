@@ -117,7 +117,10 @@ bool run_case(int N, int K, int tokens, double tol, bool show, const std::vector
             double s = 0.0;
             for (int k = 0; k < K; ++k) s += (double)from_bf16(wbits[(std::size_t)n * K + k]) *
                                              (double)from_bf16(xbits[(std::size_t)t * K + k]);
-            ref[(std::size_t)t * N + n] = to_bf16((float)s);
+            // Quantize to the route's BF16 boundary, then keep the VALUE: `got` arrives decoded, and a
+            // bit pattern stored as a float would compare 6.97 against its own encoding 16607. Equality
+            // of the decoded values is equality of the bits, so the gate stays bit-exact.
+            ref[(std::size_t)t * N + n] = from_bf16(to_bf16((float)s));
         }
 
     void* dw = nullptr;
