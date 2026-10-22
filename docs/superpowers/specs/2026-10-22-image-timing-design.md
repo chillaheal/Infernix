@@ -112,7 +112,42 @@ Fas 0–2 och 5 ändrar ingen numerik: samma kernel, samma reordning av arbete. 
 sammanfogen block-kernel är kännförändringar: de körs som fast paths, den exakta routen hålls bit-exakt,
 kvalificering mot naiv FP32/FP64-orakel på riktiga shapes plus prod-certens latent-/image-trösklar.
 
-## 8. Verifiering
+## 8. Baslinjen, körd 2026-10-22 (fas 0)
+
+`bench/image/image_stage_bench.cpp` i Release, svartfönster 18:52 och 19:15, Engine med
+`max_context=65536`, `expert_ram=8 GiB`, artifact `out/Qwen-Image-2.1-FP8-v2.infernix`. Logg:
+`image-spike/stage_bench.out.log` och `...stage_bench.err.log`. ms, en körning per rad.
+
+| rad | total | paus | device-job | loop | copy-span | uploaders | bytes |
+|---|---|---|---|---|---|---|---|
+| 512×512 kall | 29 899 | 29 578 | 22 708 | 19 536 | 19 100 | 1 280 | 266 350 MiB |
+| 512×512 varm | 25 655 | 24 997 | 22 165 | 19 142 | 18 710 | 1 280 | 266 350 MiB |
+| 768×768 kall | 35 932 | 35 931 | 33 010 | 28 934 | 28 197 | 1 280 | 266 350 MiB |
+| 768×768 varm | 35 805 | 35 785 | 32 925 | 28 859 | 28 127 | 1 280 | 266 350 MiB |
+| 768 + referens | 104 039 | 103 979 | 101 128 | 96 359 | 93 510 | 1 280 | 266 350 MiB |
+| 768 + CFG | 72 736 | 72 428 | 62 713 | 58 579 | 57 078 | 2 560 | 532 701 MiB |
+| 1024×1024 kall | 61 650 | 61 600 | 58 665 | 53 005 | 51 478 | 1 280 | 266 350 MiB |
+| 1024×1024 varm | 60 905 | 60 870 | 57 934 | 52 190 | 50 697 | 1 280 | 266 350 MiB |
+
+**Vad tabellen säger.** Varje bild flyttar 260 GiB blockvikter (520 GiB med CFG) över PCIe: 32 block à
+uppmätt 208 MiB, om och om i 40 steg. Pausen är 99 % av totalen på varje rad, så fas 1 (host ut ur pausen)
+är värd 0,3–3,2 s och inte mer.
+
+**Vad den INTE säger, och varför fas 2 ändå behövs först.** `copy-span` mäts med värdklocka runt kopieringen,
+men kopieringen är en synkron `cudaMemcpy` på legacy default stream — den väntar på att enheten är tom innan
+den startar. Spanset är därför en övre gräns för kopieringen och ett mått på att loopens arbeta är
+fullständigt serialiserat, inte ett bevis för att PCIe tar 97 % av tiden. Verklig kopiering av 208 MiB vid
+mätt~14 GiB/s är ~15 ms per block, ~13 s av loopen på 512 men bara ~13 % av referensradens 96 s: på långa
+sekvenser är det kärnorna som är långa, och väntetiden ser ut som kopiering. Fas 2 (egen copy-stream,
+event) är det som skiljer åt; först efter det kan man säga vad residenta block verkligen tjänar.
+
+**Beslutet fas 0 gav.** Det yieldade beloppet var 9 344–10 240 MiB och alla 32 block är 6,5 GiB: hela
+blockuppsättningen kan bo kvar i det minnet som redan yieldas, på varje rad i matrisen. Fas 3 körs därför
+-- inte som ett undantag från ordningen utan eftersom baslinjen visade att överföringarna är hela
+trafiken -- med fas 2 som den mätbara grinden före och efter, och prefetch som kvarlevande väg för de
+storlekar där aktiveringar äter budgeten.
+
+## 9. Verifiering
 
 1. Fas 0: baslinjetabellen körd och inklistrad här, två tal per upplösning.
 2. Efter varje fas: samma program, samma matris; paus och total redovisade för och efter, inklusive

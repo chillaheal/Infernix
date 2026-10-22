@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdint>
@@ -301,6 +302,21 @@ GeneratedImage run_image_job(artifact::Reader& reader, const DiTWeights& dit, co
                  " MiB | driver free " + std::to_string(driver_free / (1024 * 1024)) +
                  " MiB pool reserved " + std::to_string(pool_reserved / (1024 * 1024)) + " MiB");
     };
+    // Bundle B's attribution, measured only when a sink exists: how much of the loop is the block
+    // weights' host->device copies. Those copies are synchronous cudaMemcpy today, so the host clock
+    // around them IS their time (and their cost cannot be hidden by compute until they move to a copy
+    // stream). Everything the loop costs beyond this is kernels and the per-step host scheduler.
+    std::chrono::steady_clock::time_point upload_t0{};
+    double upload_ms = 0.0;
+    std::uint64_t upload_blocks = 0, upload_bytes = 0;
+    const auto upload_span_begin = [&] {
+        if (log_line) { upload_t0 = std::chrono::steady_clock::now(); }
+    };
+    const auto upload_span_end = [&] {
+        if (!log_line) { return; }
+        upload_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - upload_t0)
+                         .count();
+    };
     const std::size_t progress_units = inputs.timesteps.size() + 1;  // + the VAE decode unit
     const auto step    = [&](std::size_t units_done) {
         if (progress && !progress->step(units_done, progress_units)) {
@@ -512,6 +528,7 @@ GeneratedImage run_image_job(artifact::Reader& reader, const DiTWeights& dit, co
         void* hout = d_hb.d;
         for (std::size_t l = 0; l < dit.blocks.size(); ++l) {
             const BlockBytes& c = cache[l];
+            upload_span_begin();
             Uploaded Wq     = upload_streamed(reader, dit.blocks[l].q, &c.q);
             Uploaded Wk     = upload_streamed(reader, dit.blocks[l].k, &c.k);
             Uploaded Wv     = upload_streamed(reader, dit.blocks[l].v, &c.v);
@@ -521,6 +538,10 @@ GeneratedImage run_image_job(artifact::Reader& reader, const DiTWeights& dit, co
             Uploaded Wdown  = upload_streamed(reader, dit.blocks[l].mlp_down, &c.down);
             Uploaded Wnq    = upload_streamed(reader, dit.blocks[l].query_norm, &c.query_norm);
             Uploaded Wnk    = upload_streamed(reader, dit.blocks[l].key_norm, &c.key_norm);
+            upload_span_end();
+            ++upload_blocks;
+            upload_bytes += c.q.size() + c.k.size() + c.v.size() + c.out.size() + c.gate.size() +
+                            c.up.size() + c.down.size() + c.query_norm.size() + c.key_norm.size();
 
             run_block(hin, hout, Wq.w, Wk.w, Wv.w, Wout.w, Wup.w, Wgate.w, Wdown.w, Wnq.buf.d,
                       Wnk.buf.d, d_mod.d, d_rot_p, d_ones.d, d_zeros.d, ws, Si_p, Di, Hi, Mi, tp_p, eps);
@@ -547,6 +568,7 @@ GeneratedImage run_image_job(artifact::Reader& reader, const DiTWeights& dit, co
     };
 
     // ---- the flow-match denoise loop ----
+    const auto loop_t0 = std::chrono::steady_clock::now();
     const std::size_t n_steps = inputs.timesteps.size();
     for (std::size_t i = 0; i < n_steps; ++i) {
         const double sigma = inputs.sigmas[i], sigma_next = inputs.sigmas[i + 1];
@@ -600,6 +622,17 @@ GeneratedImage run_image_job(artifact::Reader& reader, const DiTWeights& dit, co
     }
 
     log_mem("DiT loop done");
+    if (log_line) {
+        // One line for the whole loop: the copies' wall as a share of it is what bundle B's phases are
+        // judged on (prefetch/resident only buys what the copies actually cost).
+        char copy[32], loop[32];
+        std::snprintf(copy, sizeof(copy), "%.0f", upload_ms);
+        std::snprintf(loop, sizeof(loop), "%.0f",
+                      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - loop_t0).count());
+        log_line("image job: timing | block uploads " + std::to_string(upload_blocks) +
+                 " blocks x 9 objects, bytes " + std::to_string(upload_bytes / (1024 * 1024)) +
+                 " MiB, copy wall " + copy + " ms, loop wall " + loop + " ms");
+    }
     // ---- the VAE decode of the final latent ----
     // unpack [img_tokens,Cin] token-major (token h*Wl+w, feature c) -> [Cin,Hl,Wl] channel-major,
     // denormalize with the VAE latents mean/std.
