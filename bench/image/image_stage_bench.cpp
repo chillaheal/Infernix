@@ -9,7 +9,9 @@
 //             PNG/base64 and the stored record.
 //   pause_ms  the interlude itself (the runner's run() wall): the window the LLM is paused and the
 //             submit door closed.
-//   device_ms the job executor's wall inside that window (DiT loop + VAE + PNG encode).
+//   device_ms the job executor's wall inside that window. Since fas 1 the executor stops at the
+//             finished pixels, so this is DiT loop + VAE only; the PNG/base64/disk work is counted in
+//             total_ms and no longer in pause_ms.
 //
 // Inside the job the pipeline reports its own stage lines (ledger, driver free, pool reserved, and the
 // block-upload share of the loop wall) through the logger handed to the executor; they land on stderr
@@ -95,24 +97,25 @@ private:
     std::unique_ptr<ImageInterludeRunner> inner_;
 };
 
-// The device job plus its PNG encode, measured inside the interlude.
+// The device job alone, measured inside the interlude: the encode, the base64 and the file are the
+// service's work after it, so they land in total_ms and not in pause_ms.
 class TimingExecutor {
 public:
     TimingExecutor(infernix::serve::ImageJobExecutor inner, TimingRunner* runner)
         : inner_(std::move(inner)), runner_(runner) {}
 
-    std::vector<std::uint8_t> operator()(const infernix::serve::OpenAIImagesRequest& request,
-                                        std::uint64_t seed,
-                                        std::span<const std::uint16_t> prompt_embeds,
-                                        std::span<const std::uint16_t> negative_embeds,
-                                        const infernix::serve::ReferencePixels* reference,
-                                        void* image_stream,
-                                        const std::shared_ptr<infernix::serve::ImageJobProgress>& progress) {
+    infernix::serve::FinishedPicture operator()(const infernix::serve::OpenAIImagesRequest& request,
+                                               std::uint64_t seed,
+                                               std::span<const std::uint16_t> prompt_embeds,
+                                               std::span<const std::uint16_t> negative_embeds,
+                                               const infernix::serve::ReferencePixels* reference,
+                                               void* image_stream,
+                                               const std::shared_ptr<infernix::serve::ImageJobProgress>& progress) {
         const auto t0 = std::chrono::steady_clock::now();
-        auto png      = inner_(request, seed, prompt_embeds, negative_embeds, reference, image_stream,
+        auto picture  = inner_(request, seed, prompt_embeds, negative_embeds, reference, image_stream,
                                progress);
         last_device_ms = ms_since(t0);
-        return png;
+        return picture;
     }
 
     double last_device_ms = 0.0;

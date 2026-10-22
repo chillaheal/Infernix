@@ -116,18 +116,34 @@ DiTDimsProvider fixed_dims() {
     };
 }
 
+// The picture a fake device job finishes with: RGBA8 pixels and their size, one solid shade. The
+// encode, the base64 and the file are the SERVICE's work after the interlude, so a fake stops here
+// and what belongs on disk is this encoder's output for these pixels.
+[[nodiscard]] FinishedPicture fake_picture(std::uint8_t shade) {
+    FinishedPicture picture;
+    picture.width  = 2U;
+    picture.height = 2U;
+    picture.rgba.assign(4U * 2U * 2U, shade);
+    for (std::size_t i = 0; i < 4U; ++i) picture.rgba[4U * i + 3] = 255U;
+    return picture;
+}
+
+[[nodiscard]] std::vector<std::uint8_t> expected_png(const FinishedPicture& picture) {
+    return infernix::media::encode::encode_png_rgba8(picture.width, picture.height, picture.rgba);
+}
+
 ImageJobExecutor fixed_executor() {
     return [](const OpenAIImagesRequest&, std::uint64_t, std::span<const std::uint16_t>,
               std::span<const std::uint16_t>, const ReferencePixels*, void*,
               const std::shared_ptr<ImageJobProgress>&) {
-        return std::vector<std::uint8_t>{0x01U, 0x02U};
+        return fake_picture(0x01U);
     };
 }
 
 ImageJobExecutor throwing_executor() {
     return [](const OpenAIImagesRequest&, std::uint64_t, std::span<const std::uint16_t>,
               std::span<const std::uint16_t>, const ReferencePixels*,
-              void*, const std::shared_ptr<ImageJobProgress>&) -> std::vector<std::uint8_t> {
+              void*, const std::shared_ptr<ImageJobProgress>&) -> FinishedPicture {
         throw std::runtime_error("image job exploded");
     };
 }
@@ -203,8 +219,10 @@ int main() {
         check(service.is_configured(), "full service is configured");
         const auto response = service.generate(sample_request(), 1000);
         check(response["created"] == 1000, "success stamps created");
-        check(response["data"].size() == 1U && response["data"][0]["b64_json"] == "AQI=",
-              "success returns the base64 PNG");
+        const std::string delivered = response["data"][0]["b64_json"].get<std::string>();
+        check(response["data"].size() == 1U &&
+                  delivered == base64_encode_bytes(expected_png(fake_picture(0x01U))),
+              "success returns the base64 of the PNG the service encoded after the interlude");
         const auto record = only_record(store);
         check(record != nullptr && record->state == ImageJobState::Succeeded &&
                   record->id == "img-1000-1" && record->response.contains("data"),
@@ -292,7 +310,7 @@ int main() {
                             std::span<const std::uint16_t>, const ReferencePixels*, void*,
                             const std::shared_ptr<ImageJobProgress>&) {
                 executor_ran = true;
-                return std::vector<std::uint8_t>{0x01U};
+                return fake_picture(0x01U);
             };
         ImageGenerationService service(std::move(runner), store, fixed_renderer(), fixed_provider(),
                                        fixed_dims(), watch);
@@ -350,7 +368,7 @@ int main() {
                                        std::span<const std::uint16_t>, std::span<const std::uint16_t>,
                                        const ReferencePixels* ref, void*,
                                        const std::shared_ptr<ImageJobProgress>&)
-            -> std::vector<std::uint8_t> {
+            -> FinishedPicture {
             saw_reference = ref != nullptr;
             if (ref != nullptr) {
                 plane_floats = ref->pixels.size();
@@ -362,7 +380,7 @@ int main() {
                 alpha_min                = *lo;
                 alpha_max                = *hi;
             }
-            return std::vector<std::uint8_t>{0x01U};
+            return fake_picture(0x01U);
         };
 
         ImageJobStore store(8, 1 << 20);
@@ -402,10 +420,10 @@ int main() {
                                        std::span<const std::uint16_t>,
                                        std::span<const std::uint16_t> negative,
                                        const ReferencePixels*, void*, const std::shared_ptr<ImageJobProgress>&)
-            -> std::vector<std::uint8_t> {
+            -> FinishedPicture {
             neg_size   = negative.size();
             seen_scale = request.true_cfg_scale;
-            return std::vector<std::uint8_t>{0x01U};
+            return fake_picture(0x01U);
         };
 
         ImageJobStore store(8, 1 << 20);
@@ -434,11 +452,11 @@ int main() {
         // Every generated image is also collected in an `images` directory under the working directory,
         // named after the stored job id (img-<created>-<sequence>), which is the served picture itself.
         PromptEmbedsProvider embeds = [](const TowerPrompt&) { return std::vector<std::uint16_t>(4U, 9U); };
-        const std::vector<std::uint8_t> picture{0x89U, 'P', 'N', 'G', 0x0AU};
+        const FinishedPicture picture = fake_picture(0x89U);
         ImageJobExecutor writer = [&](const OpenAIImagesRequest&, std::uint64_t,
                                       std::span<const std::uint16_t>, std::span<const std::uint16_t>,
                                       const ReferencePixels*, void*, const std::shared_ptr<ImageJobProgress>&)
-            -> std::vector<std::uint8_t> {
+            -> FinishedPicture {
             return picture;
         };
         ImageJobStore store(8, 1 << 20);
@@ -454,18 +472,19 @@ int main() {
             std::ifstream input(saved, std::ios::binary);
             on_disk.assign(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
         }
-        check(on_disk == picture, "generated image is written to images/<job id>.png in the cwd");
+        check(on_disk == expected_png(picture),
+              "generated image is written to images/<job id>.png in the cwd");
         std::filesystem::remove(saved);
     }
 
     // response_format url: the response carries an address on this process, and the id inside it is the
     // collection file on disk, so the delivered link resolves without the response payload.
     {
-        const std::vector<std::uint8_t> picture{0x89U, 'P', 'N', 'G', 0x0DU};
+        const FinishedPicture picture = fake_picture(0x0DU);
         ImageJobExecutor writer = [&](const OpenAIImagesRequest&, std::uint64_t,
                                       std::span<const std::uint16_t>, std::span<const std::uint16_t>,
                                       const ReferencePixels*, void*, const std::shared_ptr<ImageJobProgress>&)
-            -> std::vector<std::uint8_t> {
+            -> FinishedPicture {
             return picture;
         };
         ImageJobStore store(8, 1 << 20);
@@ -488,7 +507,7 @@ int main() {
             std::ifstream input(file, std::ios::binary);
             on_disk.assign(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
         }
-        check(on_disk == picture, "the delivered id resolves to the picture on disk");
+        check(on_disk == expected_png(picture), "the delivered id resolves to the picture on disk");
         check(generated_image_path("generations").empty() &&
                   generated_image_path("img-3000-1/../x").empty() &&
                   generated_image_path("").empty(),
@@ -509,10 +528,10 @@ int main() {
                                        std::span<const std::uint16_t>, std::span<const std::uint16_t>,
                                        const ReferencePixels*, void*,
                                        const std::shared_ptr<ImageJobProgress>& progress)
-            -> std::vector<std::uint8_t> {
+            -> FinishedPicture {
             progress->advance(24);
             progress->advance(97);
-            return std::vector<std::uint8_t>{0x01U};
+            return fake_picture(0x01U);
         };
         ImageJobStore store(8, 1 << 20);
         ImageGenerationService service(std::make_unique<FakeRunner>(), store, fixed_renderer(), fixed_provider(), fixed_dims(),
@@ -529,12 +548,12 @@ int main() {
                                       std::span<const std::uint16_t>, std::span<const std::uint16_t>,
                                       const ReferencePixels*, void*,
                                       const std::shared_ptr<ImageJobProgress>& progress)
-            -> std::vector<std::uint8_t> {
+            -> FinishedPicture {
             progress->stalled = true;
             if (!progress->advance(50)) {
                 throw std::runtime_error("image job: stalled, flagged by the serving watchdog");
             }
-            return std::vector<std::uint8_t>{0x01U};
+            return fake_picture(0x01U);
         };
         ImageJobStore stalled_store(8, 1 << 20);
         ImageGenerationService stalled_service(std::make_unique<FakeRunner>(), stalled_store,

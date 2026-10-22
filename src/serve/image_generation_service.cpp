@@ -140,17 +140,17 @@ public:
         return [logger](const std::string& line) { logger->info("{}", line); };
     }
 
-    std::vector<std::uint8_t> operator()(const OpenAIImagesRequest& request, std::uint64_t seed,
-                                         std::span<const std::uint16_t> prompt_embeds,
-                                         std::span<const std::uint16_t> negative_embeds,
-                                         const ReferencePixels* reference, void* image_stream,
-                                         const std::shared_ptr<ImageJobProgress>& progress) {
+    FinishedPicture operator()(const OpenAIImagesRequest& request, std::uint64_t seed,
+                               std::span<const std::uint16_t> prompt_embeds,
+                               std::span<const std::uint16_t> negative_embeds,
+                               const ReferencePixels* reference, void* image_stream,
+                               const std::shared_ptr<ImageJobProgress>& progress) {
         std::lock_guard lock(mutex_);
         ensure_locked();
 
-        // The pipeline's units (steps + VAE) map onto the job's 0-100; the PNG encode's unit is
-        // this executor's own, below. A null progress (a caller without a stored job) simply
-        // certifies the route unchanged.
+        // The pipeline's units (steps + VAE) map onto the job's 0-100; the job's last unit is the
+        // picture on disk, which the service claims after this returns. A null progress (a caller
+        // without a stored job) simply certifies the route unchanged.
         struct ProgressAdapter final : qi::ImageJobProgressView {
             explicit ProgressAdapter(ImageJobProgress* state) : state_(state) {}
             [[nodiscard]] bool step(std::size_t units_done, std::size_t units_total) override {
@@ -215,7 +215,7 @@ public:
             rgba[4ULL * i + 2] = static_cast<std::uint8_t>(to_unit8(out.channels[2 * pixels + i]));
             rgba[4ULL * i + 3] = 255U;
         }
-        return media::encode::encode_png_rgba8(out.width, out.height, rgba);
+        return FinishedPicture{std::move(rgba), out.width, out.height};
     }
 
 private:
@@ -586,6 +586,7 @@ RequestJson ImageGenerationService::generate(const OpenAIImagesRequest& request,
 
     std::atomic<bool> job_started{false};
     RequestJson response;
+    FinishedPicture finished;
     try {
         store_.advance(record.id, JobUpdate{.to = ImageJobState::WaitingForFrontier, .now = now});
         runner_->run(need, kInterludeMarginBytes,
@@ -619,22 +620,24 @@ RequestJson ImageGenerationService::generate(const OpenAIImagesRequest& request,
                              request.true_cfg_scale > kMinimumImageCFGScale
                                  ? prompt_embeds_(negative_prompt)
                                  : std::vector<std::uint16_t>{};
-                         const auto png = job_executor_(
+                         finished = job_executor_(
                              request, seed, prompt_embeds_(prompt), negative,
                              reference.has_value() ? &*reference : nullptr, context.image_stream,
                              record.progress);
-                         // The pipeline reported (steps + VAE)/100; the encoded PNG is the job's
-                         // last unit and the picture is complete.
-                         if (record.progress) { record.progress->advance(100); }
-                         save_generated_image(record.id, png);
-                         response = request.response_format == ImageResponseFormat::Url
-                                      ? make_openai_image_url_response(
-                                            now, {std::string(artifact_url_base) + record.id})
-                                      : make_openai_image_response(now,
-                                                                   {base64_encode_bytes(png)});
                          store_.advance(record.id, JobUpdate{.to = ImageJobState::Restoring, .now = now});
                          return true;
                      });
+        // The paused window ends with the last byte the DEVICE had to touch. The PNG encode, the
+        // base64 and the disk write are host work the yielded VRAM has no opinion about, so they run
+        // here -- after the engine reported the LLM restored (bundle B fas 1). A failure in this block
+        // is still a failed job whose restoration was confirmed: 500 image_generation_failed.
+        const auto png = media::encode::encode_png_rgba8(finished.width, finished.height, finished.rgba);
+        save_generated_image(record.id, png);
+        // The pipeline reported (steps + VAE)/100; the written picture is the job's last unit.
+        if (record.progress) { record.progress->advance(100); }
+        response = request.response_format == ImageResponseFormat::Url
+                     ? make_openai_image_url_response(now, {std::string(artifact_url_base) + record.id})
+                     : make_openai_image_response(now, {base64_encode_bytes(png)});
         store_.advance(record.id,
                        JobUpdate{.to = ImageJobState::Succeeded, .now = now,
                                  .response = nlohmann::json::parse(response.dump())});

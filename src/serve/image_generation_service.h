@@ -9,12 +9,12 @@
 //
 // Host-testable seams: the interlude behind ImageInterludeRunner (production: infernix::Engine),
 // the device job behind ImageJobExecutor (production: the artifact's streamed weights +
-// run_image_job + PNG encode), and the prompt behind PromptRendererProvider (host: tokenizer + chat
-// template) and PromptEmbedsProvider (device: the text tower forward). Every request is first sized
-// against the model's own buffer inventory and probed against the yield it would need: a job that
-// cannot fit is refused BEFORE the LLM quiesces. A second concurrent request is told the interlude is
-// already in flight (429); a Degraded engine answers 503 until the process restarts (the recovery unit
-// the C5 state machine defines).
+// run_image_job, ending at the finished pixels), the prompt behind PromptRendererProvider (host:
+// tokenizer + chat template) and PromptEmbedsProvider (device: the text tower forward). Every
+// request is first sized against the model's own buffer inventory and probed against the yield it
+// would need: a job that cannot fit is refused BEFORE the LLM quiesces. A second concurrent request
+// is told the interlude is already in flight (429); a Degraded engine answers 503 until the process
+// restarts (the recovery unit the C5 state machine defines).
 
 #include "infernix/engine.h"
 #include "models/qwen_image/image_weights.h"
@@ -65,6 +65,16 @@ struct ImageInterludeInFlight : std::runtime_error {
     ImageInterludeInFlight() : std::runtime_error("image interlude: another interlude is already in flight") {}
 };
 
+// The finished picture as the device job leaves it: RGBA8 bytes on the host, exactly what the PNG
+// encoder consumes. This is the boundary the LLM's pause ends at -- the encode, the base64 and the
+// disk write are host work that costs the resident model nothing and therefore happen after the
+// interlude has restored it (bundle B fas 1).
+struct FinishedPicture {
+    std::vector<std::uint8_t> rgba;
+    std::uint32_t width  = 0;
+    std::uint32_t height = 0;
+};
+
 // Seam over Engine's image interlude; the host test runs the job inline on a fake context.
 class ImageInterludeRunner {
 public:
@@ -91,19 +101,21 @@ public:
 // Production runner over the live Engine.
 [[nodiscard]] std::unique_ptr<ImageInterludeRunner> make_engine_interlude_runner(infernix::Engine& engine);
 
-// Produces the finished PNG bytes for one job, executed on the interlude's dedicated stream
-// (`image_stream`, a cudaStream_t). `prompt_embeds` is the token-major BF16 bit payload.
+// Produces one job's finished picture -- RGBA8 pixels and their size, `FinishedPicture` -- executed on
+// the interlude's dedicated stream (`image_stream`, a cudaStream_t). It stops at the last byte the
+// device touched: the encode, the base64 and the file are the service's work after the interlude.
+// `prompt_embeds` is the token-major BF16 bit payload.
 // `reference` carries the host-prepared reference-image plane (#75) whenever the request had an
 // `image` field; nullptr is plain text-to-image. `negative_embeds` carries the negative prompt's
 // BF16 bits when `request.true_cfg_scale` is above 1 (true CFG); empty means the single-forward route.
 // `progress` is the stored job's live progress state: the executor's pipeline reports each step
 // through it and honors its stall flag; a fake executor may ignore it.
 using ImageJobExecutor =
-    std::function<std::vector<std::uint8_t>(const OpenAIImagesRequest& request, std::uint64_t seed,
-                                            std::span<const std::uint16_t> prompt_embeds,
-                                            std::span<const std::uint16_t> negative_embeds,
-                                            const ReferencePixels* reference, void* image_stream,
-                                            const std::shared_ptr<ImageJobProgress>& progress)>;
+    std::function<FinishedPicture(const OpenAIImagesRequest& request, std::uint64_t seed,
+                                   std::span<const std::uint16_t> prompt_embeds,
+                                   std::span<const std::uint16_t> negative_embeds,
+                                   const ReferencePixels* reference, void* image_stream,
+                                   const std::shared_ptr<ImageJobProgress>& progress)>;
 
 // prompt -> prompt_embeds, split in the two halves the VRAM handoff needs: rendering is host work the
 // service does BEFORE it probes the yield, the tower forward needs device memory and runs inside it.
