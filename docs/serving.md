@@ -1048,6 +1048,15 @@ epoch in the response), and the route reads that file back. The artifact id is t
 name on disk, and it is matched only against the strict `img-<digits>-<digits>` shape — an id of any other
 form cannot name a file and answers `404`. No `revised_prompt` is returned in either form.
 
+A picture is kept for `--image-retention-days` (default 14), counted from when it was written, and a sweep
+that runs at start-up and then hourly removes the ones past that age. The id's stored job record goes with
+the file, so a retired picture's URL answers the same `404 image_not_found` as one that never existed:
+**the retention is how long a delivered link is promised**, and a picture worth keeping is a picture you
+copy out of the collection before it ends. Three things are never swept: a picture still inside its
+retention, a picture whose job has not reached a terminal state yet however old the file looks, and any
+file in the directory whose name is not an artifact id — the sweep only touches what this route drew.
+`--image-retention-days 0` switches the cleanup off and keeps every picture the server drew.
+
 Every failure names its code in the standard OpenAI error envelope:
 
 | HTTP | Code | When |
@@ -1063,7 +1072,7 @@ Every failure names its code in the standard OpenAI error envelope:
 | 503 | `image_engine_degraded` | the interlude could not confirm the model's VRAM was restored |
 | 500 | `image_generation_failed` | the job started and then failed |
 | 503 | `image_interlude_failed` | the interlude failed before the job started |
-| 404 | `image_not_found` | on `GET /v1/images/{id}`: that id names no job at all (wrong shape, or a job the store never held) |
+| 404 | `image_not_found` | on `GET /v1/images/{id}`: that id names no job at all (wrong shape, a job the store never held, or a picture whose retention has run out) |
 
 ### Reading a running job
 

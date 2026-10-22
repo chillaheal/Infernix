@@ -97,6 +97,7 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--thinking-budget-policy"},
     ServeOptionArity{"--image-artifact"},
     ServeOptionArity{"--image-text-processor"},
+    ServeOptionArity{"--image-retention-days"},
     ServeOptionArity{"--no-thinking-answer-room", false},
     ServeOptionArity{"--reasoning-loop"},
     ServeOptionArity{"--vision", false},
@@ -534,6 +535,10 @@ std::string serve_usage_text(const char* argv0) {
            "                             tokenizer_config.json, chat_template.jinja) that\n"
            "                             turns the raw prompt into the tower conditioning\n"
            "                             (default: the route stays 503 not_configured)\n"
+           "  --image-retention-days N   days a generated picture stays on disk, which is\n"
+           "                             how long its /v1/images/<id> URL answers; after\n"
+           "                             that the file is swept and the URL is 404\n"
+           "                             (default 14; 0 keeps every picture forever)\n"
            "  --log-stats-interval-ms N  throughput-log interval in ms\n"
            "                             (default 5000; 0 disables)\n"
            "  --log-colours on|off       colour the console stats lines (default off; on\n"
@@ -853,6 +858,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.image_artifact_path = require_value("--image-artifact");
             if (options.image_artifact_path.empty()) {
                 throw std::invalid_argument("--image-artifact must not be empty");
+            }
+        } else if (arg == "--image-retention-days") {
+            options.image_retention_days = parse_nonnegative_int(
+                require_value("--image-retention-days"), "image-retention-days");
+            if (options.image_retention_days > 3650) {
+                throw std::invalid_argument("--image-retention-days must be at most 3650");
             }
         } else if (arg == "--image-text-processor") {
             options.image_text_processor_path = require_value("--image-text-processor");

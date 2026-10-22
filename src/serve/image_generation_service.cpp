@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
@@ -350,6 +351,113 @@ std::filesystem::path save_generated_image(const std::string& id, std::span<cons
     output.close();
     if (!output) { throw std::runtime_error("image save: the write of " + file.string() + " did not finish"); }
     return file;
+}
+
+namespace {
+
+// Where the sweep looks. Taken through `generated_image_path` rather than spelled out again, so the
+// sweep cannot drift from the directory a picture is really written to.
+[[nodiscard]] std::filesystem::path generated_image_directory() {
+    return generated_image_path("img-0-0").parent_path();
+}
+
+constexpr std::chrono::seconds kGeneratedImageSweepInterval{std::chrono::hours(1).count()};
+
+} // namespace
+
+ImageRetentionResult sweep_generated_images(ImageJobStore& store, std::chrono::seconds retention,
+                                            std::chrono::system_clock::time_point now) {
+    ImageRetentionResult removed;
+    if (retention <= std::chrono::seconds::zero()) { return removed; }
+
+    const std::filesystem::path directory = generated_image_directory();
+    std::error_code error;
+    if (!std::filesystem::is_directory(directory, error)) { return removed; }
+
+    const auto cutoff = now - retention;
+    std::vector<std::filesystem::directory_entry> entries;
+    try {
+        for (const auto& entry : std::filesystem::directory_iterator(directory)) { entries.push_back(entry); }
+    } catch (const std::filesystem::filesystem_error&) {
+        // The directory vanished mid-listing (or was never readable): whatever was already seen is
+        // still worth a pass, and the next hour will find the rest.
+    }
+
+    for (const auto& entry : entries) {
+        const std::filesystem::path& file = entry.path();
+        if (file.extension() != ".png") { continue; }
+        const std::string id = file.stem().string();
+        // The route's own id shape, in the route's own place. Anything else that lives in the
+        // directory belongs to someone else and is left exactly where it is.
+        if (generated_image_path(id) != file) { continue; }
+
+        std::error_code time_error;
+        const auto written = std::filesystem::last_write_time(file, time_error);
+        if (time_error) { continue; }
+        if (std::chrono::clock_cast<std::chrono::system_clock>(written) > cutoff) { continue; }
+
+        // A job that has not ended still owns its file, however old the file looks: the writer stamps
+        // it before the lifecycle reaches a terminal state.
+        const std::shared_ptr<const StoredImageJob> record = store.get(id);
+        if (record != nullptr && !is_terminal(record->state)) { continue; }
+
+        std::uint64_t size = 0;
+        {
+            const std::uintmax_t bytes = std::filesystem::file_size(file, time_error);
+            if (!time_error) { size = static_cast<std::uint64_t>(bytes); }
+        }
+        std::filesystem::remove(file, time_error);
+        if (time_error) { continue; }
+        // The record goes with the picture. The artifact route answers a missing file from the stored
+        // job, so keeping a terminal record behind would leave the delivered URL answering a status
+        // object forever instead of the 404 that tells a client the picture is gone; and a record of a
+        // picture this server no longer has is not information worth keeping.
+        (void)store.erase(id);
+        ++removed.files;
+        removed.bytes += size;
+    }
+    return removed;
+}
+
+GeneratedImageRetention::GeneratedImageRetention(ImageJobStore& store, std::chrono::seconds retention,
+                                                 std::shared_ptr<spdlog::logger> logger)
+    : store_(store), retention_(retention), logger_(std::move(logger)) {
+    // Once at start-up: files left by a previous run of the server are already past due, and the
+    // first hour of this one should not be spent carrying them.
+    (void)sweep_now();
+    thread_ = std::thread([this] { run_loop(); });
+}
+
+GeneratedImageRetention::~GeneratedImageRetention() {
+    {
+        std::lock_guard lock(mutex_);
+        done_ = true;
+    }
+    wake_.notify_all();
+    if (thread_.joinable()) { thread_.join(); }
+}
+
+ImageRetentionResult GeneratedImageRetention::sweep_now() {
+    const ImageRetentionResult removed =
+        sweep_generated_images(store_, retention_, std::chrono::system_clock::now());
+    if (removed.files != 0 && logger_ != nullptr) {
+        logger_->info("image retention: removed {} picture file(s), {} MiB, past their retention of "
+                      "{} s",
+                      removed.files, removed.bytes / kMiB,
+                      static_cast<long long>(retention_.count()));
+    }
+    return removed;
+}
+
+void GeneratedImageRetention::run_loop() {
+    std::unique_lock lock(mutex_);
+    while (!done_) {
+        wake_.wait_for(lock, kGeneratedImageSweepInterval, [this] { return done_; });
+        if (done_) { break; }
+        lock.unlock();
+        sweep_now();
+        lock.lock();
+    }
 }
 
 ImageGenerationService::ImageGenerationService(std::unique_ptr<ImageInterludeRunner> runner,

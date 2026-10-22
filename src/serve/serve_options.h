@@ -84,6 +84,10 @@ struct ServeOptions {
     // tokenizer_config.json, chat_template.jinja) behind the raw-prompt text tower. Empty =>
     // the route keeps answering 503 image_generation_not_configured.
     std::string image_text_processor_path;
+    // --image-retention-days N: how long a generated picture stays on disk and its URL answers. The
+    // URL is the only handle a chat reply hands out, so this is the length of time a picture is
+    // promised; after it the file is swept and the route answers 404. 0 keeps every picture forever.
+    int image_retention_days = 14;
     int device                             = 0;
     KvCacheStorage kv_cache                = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;

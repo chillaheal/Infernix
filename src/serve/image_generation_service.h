@@ -26,6 +26,8 @@
 #include "serve/reference_image.h"
 #include "serve/request_json.h"
 
+#include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -35,6 +37,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace spdlog {
@@ -141,6 +144,52 @@ using DiTDimsProvider = std::function<infernix::models::qwen_image::DiTDims()>;
 // the picture is simply not available to draw from (never drawn here, or retired by the retention
 // sweep), which is what the tool tells the model.
 [[nodiscard]] std::vector<std::uint8_t> load_generated_image(std::string_view id);
+
+// What one retention pass removed, for the log line the caller reports.
+struct ImageRetentionResult {
+    std::size_t files = 0;
+    std::uint64_t bytes = 0;
+};
+
+// One pass of the retention policy over the same `images` collection the writer uses: a picture older
+// than `retention` is deleted when the job that drew it is terminal, or when no job names it any more
+// (its record aged out long before the file's URL was ever promised to expire). Three things keep the
+// sweep from being a janitor with a broad broom: only names that are this route's own job-id shape are
+// looked at, so a file another program put in the directory is not ours to delete; a job that is still
+// running is never touched; and `retention` of zero or less means keep everything, which is what the
+// server does when it starts with the retention switched off. A missing directory is the ordinary
+// state before the first picture, not an error. `now` is the caller's clock so the policy is testable
+// without waiting a day for the sun.
+[[nodiscard]] ImageRetentionResult sweep_generated_images(
+    ImageJobStore& store, std::chrono::seconds retention, std::chrono::system_clock::time_point now);
+
+// Runs that sweep once when the server starts and then every hour, until the object goes away -- which
+// is the server's own shutdown order, so no sweep is ever running against a store it reads. The hourly
+// interval is part of the policy, not a knob: a picture's URL is promised for its retention, and an
+// hour is how loosely that promise may then be kept.
+class GeneratedImageRetention {
+public:
+    GeneratedImageRetention(ImageJobStore& store, std::chrono::seconds retention,
+                            std::shared_ptr<spdlog::logger> logger);
+    ~GeneratedImageRetention();
+
+    GeneratedImageRetention(const GeneratedImageRetention&)            = delete;
+    GeneratedImageRetention& operator=(const GeneratedImageRetention&) = delete;
+
+    // The policy's own pass, exposed so a caller (and a test) may run it without owning a thread.
+    [[nodiscard]] ImageRetentionResult sweep_now();
+
+private:
+    void run_loop();
+
+    ImageJobStore& store_;
+    std::chrono::seconds retention_;
+    std::shared_ptr<spdlog::logger> logger_;
+    std::mutex mutex_;
+    std::condition_variable wake_;
+    bool done_ = false;
+    std::thread thread_;
+};
 
 class ImageGenerationService {
 public:

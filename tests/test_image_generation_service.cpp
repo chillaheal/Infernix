@@ -569,6 +569,98 @@ int main() {
               "the status object's percent does not read the job's live state");
     }
 
+    // Generated-image retention. The sweep is the only thing that ever removes a picture, so what it
+    // keeps and what it deletes is the promise a delivered URL rests on: a file older than the
+    // retention whose job has ended is gone, a fresh one and one an unfinished job still owns are not,
+    // and a file this route never drew is not the route's to touch.
+    {
+        ImageJobStore store(8, 1 << 20);
+        const std::filesystem::path directory = std::filesystem::current_path() / "images";
+        std::filesystem::create_directories(directory);
+        const std::chrono::seconds retention{14 * 24 * 60 * 60};
+        const auto now        = std::chrono::system_clock::now();
+
+        auto draw = [&](const std::string& id, std::chrono::seconds old) {
+            const std::filesystem::path file = generated_image_path(id);
+            {
+                std::ofstream out(file, std::ios::binary | std::ios::trunc);
+                out << "picture-bytes";
+            }
+            std::filesystem::last_write_time(file, std::chrono::file_clock::now() - old);
+        };
+        auto succeed = [&](const std::string& id, std::int64_t stamp) {
+            StoredImageJob job;
+            job.id = id;
+            store.put(job);
+            (void)store.advance(id, {ImageJobState::WaitingForFrontier, stamp});
+            (void)store.advance(id, {ImageJobState::Running, stamp});
+            (void)store.advance(id, {ImageJobState::Restoring, stamp});
+            (void)store.advance(id, {ImageJobState::Succeeded, stamp});
+        };
+
+        draw("img-10-1", std::chrono::days(20));
+        succeed("img-10-1", 10);
+        draw("img-11-1", std::chrono::days(1));
+        draw("img-12-1", std::chrono::days(20));   // terminal record missing: aged out long ago
+        draw("img-13-1", std::chrono::days(20));
+        {
+            StoredImageJob running;
+            running.id = "img-13-1";
+            store.put(running);
+            (void)store.advance("img-13-1", {ImageJobState::WaitingForFrontier, 1});
+            (void)store.advance("img-13-1", {ImageJobState::Running, 1});
+        }
+        // Two things the sweep must not decide about: a name that is not an artifact id, and a file
+        // that merely shares the directory.
+        { std::ofstream other(directory / "notes.txt", std::ios::trunc); other << "not a picture"; }
+        { std::ofstream shape(directory / "img-not-an-id.png", std::ios::binary | std::ios::trunc);
+          shape << "wrong shape"; }
+        std::filesystem::last_write_time(directory / "notes.txt",
+                                         std::chrono::file_clock::now() - std::chrono::days(60));
+        std::filesystem::last_write_time(directory / "img-not-an-id.png",
+                                         std::chrono::file_clock::now() - std::chrono::days(60));
+
+        const ImageRetentionResult first = sweep_generated_images(store, retention, now);
+        check(first.files == 2 && first.bytes == 2 * 13,
+              "the sweep took exactly the two pictures past their retention");
+        check(!std::filesystem::exists(generated_image_path("img-10-1")),
+              "a terminal job older than its retention lost its file");
+        check(store.get("img-10-1") == nullptr && store.get("img-13-1") != nullptr,
+              "a swept picture loses its record too, so its URL answers 404 instead of a status "
+              "object forever, while the job still protecting its picture keeps both");
+        check(std::filesystem::exists(generated_image_path("img-11-1")),
+              "a picture inside its retention keeps its file, so its URL still answers");
+        check(!std::filesystem::exists(generated_image_path("img-12-1")),
+              "a picture no job record names any more is swept once past its retention");
+        check(std::filesystem::exists(generated_image_path("img-13-1")),
+              "a picture a job that has not ended still owns is never swept out from under it");
+        check(std::filesystem::exists(directory / "notes.txt") &&
+                  std::filesystem::exists(directory / "img-not-an-id.png"),
+              "files this route never drew stay exactly where they are, id-shaped name or not");
+
+        // Retention off: the server that asked to keep everything keeps everything.
+        const ImageRetentionResult off = sweep_generated_images(store, std::chrono::seconds::zero(),
+                                                                now + std::chrono::days(365));
+        check(off.files == 0 && std::filesystem::exists(generated_image_path("img-11-1")),
+              "retention 0 removes nothing, however old the pictures are");
+
+        // A second pass over what survives finds nothing left to do (no double counting, no churn).
+        check(sweep_generated_images(store, retention, now).files == 0,
+              "a second sweep of the same directory removes nothing more");
+
+        // And no directory at all -- the state before this server drew its first picture -- is a
+        // no-op, not a throw. Everything the earlier checks left in the collection is emptied out
+        // first, since that is exactly what the end of this test does to it anyway.
+        std::error_code unused;
+        for (const auto& entry : std::filesystem::directory_iterator(directory)) {
+            if (entry.is_regular_file()) { std::filesystem::remove(entry.path(), unused); }
+        }
+        std::filesystem::remove(directory, unused);
+        check(!std::filesystem::exists(directory) &&
+                  sweep_generated_images(store, retention, now).files == 0,
+              "a missing images directory is an ordinary empty sweep");
+    }
+
     // Every check that reached a job wrote its picture into the working directory; leave nothing behind.
     if (const std::filesystem::path directory = std::filesystem::current_path() / "images";
         std::filesystem::is_directory(directory)) {

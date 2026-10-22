@@ -327,6 +327,8 @@ int main(int argc, char** argv) {
         // documented 503 image_generation_not_configured.
         std::unique_ptr<infernix::serve::ImageJobStore> image_jobs;
         std::unique_ptr<infernix::serve::ImageGenerationService> images;
+        // Declared after the store it reads, so the shutdown order is sweep-stopped then store-gone.
+        std::unique_ptr<infernix::serve::GeneratedImageRetention> image_retention;
         if (!options.image_artifact_path.empty()) {
             infernix::serve::PromptRendererProvider prompt_renderer;
             infernix::serve::PromptEmbedsProvider prompt_embeds;
@@ -346,6 +348,13 @@ int main(int argc, char** argv) {
                 infernix::serve::make_artifact_image_job_executor(options.image_artifact_path,
                                                                   logger));
             server.attach_images(*images);
+            // A picture's URL is the only handle a chat reply hands out, so the file behind it is kept
+            // for a stated number of days and then swept; 0 switches the cleanup off, and the server
+            // keeps everything it ever drew.
+            if (options.image_retention_days > 0) {
+                image_retention = std::make_unique<infernix::serve::GeneratedImageRetention>(
+                    *image_jobs, std::chrono::days(options.image_retention_days), logger);
+            }
         }
 
         const ServingScope serving_scope(stop_control, server);
