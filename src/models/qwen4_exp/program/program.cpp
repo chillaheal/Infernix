@@ -307,6 +307,11 @@ std::uint32_t kv_backed_pages() noexcept {
     return detail::ProgramImpl::has_active() ? detail::ProgramImpl::kv_backed_pages_testing() : 0;
 }
 
+void kv_hold_pages(std::uint32_t pages) {
+    if (!detail::ProgramImpl::has_active()) { throw std::runtime_error("Qwen4Exp: no Program is loaded to hold KV"); }
+    detail::ProgramImpl::kv_hold_testing(pages);
+}
+
 void set_expert_fault(std::uint32_t checks) noexcept { g_expert_fault.store(checks); }
 
 bool take_expert_fault() noexcept {

@@ -715,6 +715,11 @@ void set_kv_remap_fault(std::uint32_t checks) noexcept;
 // The elastic KV pool's limit in pages, so a test can see a remap shortfall the Engine reports only in
 // its diagnostics. 0 when no Program is loaded.
 std::uint32_t kv_backed_pages() noexcept;
+// Takes the elastic KV pool to at least `pages` through the same growth a long request drives, and leaves
+// it there, so a test can certify the yield's KV term and the restoration's shortfall. Throws when the
+// pool cannot reach that size. A test-only view of a state a held long context leaves: pages backed,
+// nothing in flight.
+void kv_hold_pages(std::uint32_t pages);
 } // namespace testing
 
 } // namespace infernix::models::qwen4_exp

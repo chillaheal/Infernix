@@ -11,9 +11,10 @@
 //   S5 door gate under load (C5c): a generation runs against an interlude whose job keeps the door
 //      closed; the worker starts no execution body across the yield and the request still
 //      completes at baseline ids (paused, never corrupted).
-//   S6 incomplete KV remap: with the restore's remap one chunk short, the pool stays at the size the
-//      yield left it (the unbacked pages never enter its limit), the door reopens and a later
-//      generation runs at baseline -- a shortfall is a smaller elastic pool, not a parked engine.
+//   S6 incomplete KV remap: with the elastic KV pool held above its 32768-token base, a 24 GiB yield
+//      then takes KV pages, and with the restore's remap one chunk short the pool stays at the size the
+//      yield left it (the unbacked pages never enter its limit), the door reopens and a later generation
+//      runs at baseline -- a shortfall is a smaller elastic pool, not a parked engine.
 //   S7 restoration fault -> Degraded (terminal, LAST): the thrown error names BOTH failures, the
 //      active request fails with the Degraded message, the door stays closed, is_available() is
 //      false, further submissions are refused and a second interlude throws. Process restart is
@@ -163,8 +164,12 @@ int main() {
         options.artifact_path         = qwen4;
         options.context_cache.enabled = false;
         options.enable_vision         = false;
-        options.max_context           = 4096;
-        options.kv_capacity           = infernix::KvCapacityPolicy::explicit_capacity(4096);
+        // The elastic KV pool's base is a constant 32768 tokens (kKvBaseTokens), so a capacity at or under
+        // it leaves the pool nothing to grow into -- and S6's remap needs a pool that grew. 40960 tokens is
+        // 640 pages against a 512-page base (kKvBaseTokens / kPagedKVPageSize), so pages sit above the
+        // floor the yield is allowed to take back.
+        options.max_context           = 40960;
+        options.kv_capacity           = infernix::KvCapacityPolicy::explicit_capacity(40960);
         options.kv_cache              = infernix::KvCacheStorage::Int8Group64;
         options.expert_ram_bytes      = 8 * kGiB;
         if (const char* ngram = std::getenv("INFERNIX_QWEN4_NGRAM")) { options.ngram_volume_path = ngram; }
@@ -294,20 +299,28 @@ int main() {
         // ---- S6: a KV remap the device cannot finish is a smaller pool, not a parked engine ----
         std::printf("[S6] incomplete KV remap restores softly\n");
         {
+            // A remap can only fall short where the yield unmapped KV, and the yield only touches KV above
+            // the pool's floor: its 32768-token base. A finished request hands its pages straight back to
+            // the expert frames when its lane releases, so the pool stands above that base only while a
+            // long context still holds it -- kv_hold_pages takes it there through the same growth that
+            // request drives. Then ask for more than the expert cache alone can lend, so the plan's KV
+            // term engages as well.
+            constexpr std::uint32_t kBasePages = 512; // kKvBaseTokens (32768) / kPagedKVPageSize (64)
+            state_ns::kv_hold_pages(kBasePages + 64);
             const std::uint32_t pages_before = state_ns::kv_backed_pages();
+            check(pages_before > kBasePages, "the elastic KV pool stands above its " + std::to_string(kBasePages) +
+                                                 "-page base (" + std::to_string(pages_before) + " pages)");
+
             (void)state_ns::begin_image_quiesce();
             std::uintptr_t lease = 0;
-            const std::uint64_t freed = state_ns::yield_image_vram(8 * kGiB, 0, lease);
+            const std::uint64_t freed = state_ns::yield_image_vram(24 * kGiB, 0, lease);
             check(lease != 0 && freed > 0, "the yield took VRAM from the Quiesced Program");
             const std::uint32_t pages_leased = state_ns::kv_backed_pages();
-            // The shortfall can only be injected where the yield actually unmapped KV. This Engine's
-            // elastic pool starts AT its capacity (kv_capacity equals max_context here), so a yield frees
-            // expert frames only; the scenario then says so instead of pretending to prove the remap path.
             const bool kv_shrank = pages_leased < pages_before;
             if (!kv_shrank) {
-                std::printf("SKIP: the yield unmapped no KV pages (the pool sits at its base of %u), so "
-                            "the remap below has nothing to fall short on\n",
-                            pages_before);
+                std::printf("SKIP: the yield unmapped no KV pages (%u of %u), so the remap below has "
+                            "nothing to fall short on\n",
+                            pages_leased, pages_before);
             }
             // The next remap stops one chunk short, which is what a driver out of physical memory leaves
             // behind. The pages past that point are not backed, so the pool must not claim them -- and

@@ -5039,6 +5039,23 @@ private:
         diagnostic("KV pool shrank to " + std::to_string(target) + " pages; expert cache " + std::to_string(frames) +
                    " -> " + std::to_string(residency_->frames()) + " frames");
     }
+    // Test support for the interlude's KV term: takes the elastic pool above its base through the same
+    // grow_kv a long request uses, then marks it busy so nothing hands the pages back before the yield
+    // runs. A request's own lane release shrinks the pool at once, so this is how a certification reaches
+    // the state a still-held long context leaves behind: pages backed, nothing in flight.
+    void hold_kv_pages(std::uint32_t pages) {
+        if (!kv_vmm_ || !pool_ || pages <= pool_->backed_pages()) { return; }
+        // grow_kv takes `need` as the pages that must end up AVAILABLE, and it rounds the backed count up
+        // to a growth unit, so the quote for a backed total of `pages` is that many minus what is already
+        // in use (backed - available), not what is free.
+        const std::uint32_t in_use = pool_->backed_pages() - pool_->available_pages();
+        if (!grow_kv(pages - in_use)) {
+            throw std::runtime_error("Qwen4Exp: the test cannot hold the KV pool at " + std::to_string(pages) +
+                                     " pages (backed " + std::to_string(pool_->backed_pages()) + ", capacity " +
+                                     std::to_string(pool_->capacity_pages()) + ")");
+        }
+        kv_busy();
+    }
 public:
     // ---- LLM<->image VRAM coexistence ----------------------------------------------------------
     // The two elastic pools are this process's whole device footprint (the sizing authority splits one
@@ -5563,6 +5580,7 @@ public:
     static std::uint32_t kv_backed_pages_testing() noexcept {
         return active_->pool_ ? active_->pool_->backed_pages() : 0;
     }
+    static void kv_hold_testing(std::uint32_t pages) { active_->hold_kv_pages(pages); }
     // Defined in program.cpp next to the other testing fault atomics: consumes one injected
     // restoration failure; the faulted release_from_yield throws before touching the pools.
     [[nodiscard]] static bool take_image_restore_fault() noexcept;
