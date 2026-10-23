@@ -9,6 +9,7 @@
 #include "runtime/expert_offload/expert_cache.h"
 #include "runtime/expert_offload/expert_residency.h"
 #include "runtime/expert_offload/expert_state.h"
+#include "runtime/expert_offload/expert_profile.h"
 #include "runtime/expert_offload/expert_offload.h"
 #include "runtime/expert_offload/expert_store.h"
 #include "runtime/expert_offload/expert_stream.h"

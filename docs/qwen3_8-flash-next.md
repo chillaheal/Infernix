@@ -434,7 +434,8 @@ infernix-serve <artifact>.infernix --ngram-volume <volume>.ngram --kv-dtype int8
   the last session's (measured +24 % plain and +30 % with MTP on a repeated coding prompt), and
   about as fast as a cold start when it does not; the other half stays free to fill quickly. With
   no saved state yet (a first start, or a file of another artifact), the engine seeds the same way
-  from a built-in calibrated expert order (NInfer's, ranked over 128 tasks in nine domains), which
+  from the artifact's shipped routing profile (`expert_profile`, container §9.3) when the pack carries
+  one, and otherwise from a built-in calibrated expert order (NInfer's, ranked over 128 tasks in nine domains), which
   every Qwen3.8-Flash-Next artifact uses (measured against an empty cache on the first request, MTP
   decode: +9 % on a coding prompt, +15 % on a math problem, +56 % with the SSD tier). `--expert-state
   FILE` moves the file; `--expert-state off` starts with an empty cache and no seed, as cold

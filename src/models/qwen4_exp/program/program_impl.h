@@ -2715,24 +2715,23 @@ public:
     }
 
     // ---- warm start (design §19.3.5 S4b) ----
-    // Fills the frames from the saved state, before the first request; without one (a first start,
-    // or a state of another artifact), from the calibrated expert order when the model has its shape.
-    // With the SSD tier, RAM is filled first (the frames load from it), then the seeds' RAM copies
-    // are released and their slots refilled with the next keys of the fill order, so the two levels
-    // hold different experts.
+    // Fills the frames before the first request from the first usable prior: the saved state, else the
+    // artifact's shipped routing profile (design §9.3 item 4), else the calibrated expert order when the
+    // model has its shape. With the SSD tier, RAM is filled first (the frames load from it), then the
+    // seeds' RAM copies are released and their slots refilled with the next keys of the fill order, so
+    // the two levels hold different experts.
     void warm_start_experts() {
         const auto keys = c_.num_hidden_layers * c_.moe.experts;
-        expert_cache::ExpertStateLoad load;
-        SeedSource source = SeedSource::None;
-        if (!options_.expert_state.empty() && options_.expert_cache) {
-            load = expert_cache::load_expert_state(options_.expert_state, options_.expert_state_identity, keys);
-            if (load.state) {
-                source = SeedSource::Saved;
-            } else if (has_calibrated_order()) {
-                diagnostic("expert cache: no saved state used: " + load.message, DiagnosticLevel::Debug);
-                load.state = calibrated_expert_order();
-                source     = SeedSource::Calibrated;
-            }
+        // The gate and the first two priors are the runtime's decision (host-testable); the compiled-in
+        // calibrated order is the model's last prior and is only reached when neither of them seeded.
+        expert_cache::ExpertStateLoad load =
+            expert_cache::warm_start_load(options_.expert_state, options_.expert_cache,
+                                          options_.expert_state_identity, keys, options_.expert_profile);
+        SeedSource source = !load.state ? SeedSource::None : load.shipped ? SeedSource::Shipped : SeedSource::Saved;
+        if (!load.state && options_.expert_cache && !options_.expert_state.empty() && has_calibrated_order()) {
+            diagnostic("expert cache: no saved state used: " + load.message, DiagnosticLevel::Debug);
+            load.state = calibrated_expert_order();
+            source     = SeedSource::Calibrated;
         }
         const expert_cache::SavedState* state = load.state ? &*load.state : nullptr;
         TierFill fill;
@@ -2743,7 +2742,7 @@ public:
 
 private:
     // Where the warm start's ranking and counts came from.
-    enum class SeedSource { None, Saved, Calibrated };
+    enum class SeedSource { None, Saved, Shipped, Calibrated };
 
     // The calibrated order (program/calibrated_order.h) ranks Qwen3.8-Flash-Next's experts: it
     // applies to every model of that shape (NInfer's guard), whatever the artifact's formats.
@@ -2849,6 +2848,7 @@ private:
                       "experts are read from the artifact when used",
                       slots, gib * slots, in_ram,
                       fill.source == SeedSource::Saved        ? "the saved ranking, then the last session's use counts"
+                      : fill.source == SeedSource::Shipped    ? "the shipped profile ranking, then its use counts"
                       : fill.source == SeedSource::Calibrated ? "the calibrated expert order"
                                                               : "spread across the layers",
                       released > 0 ? (", none of them among the " + std::to_string(released) + " in VRAM").c_str() : "",
@@ -2856,8 +2856,8 @@ private:
         diagnostic(line);
     }
 
-    // The frames' warm start from the saved state or the calibrated order; returns how many experts
-    // it loaded.
+    // The frames' warm start from the selected prior (saved state, shipped profile or calibrated
+    // order); returns how many experts it actually loaded.
     std::uint32_t warm_start_frames(const expert_cache::ExpertStateLoad& load, SeedSource source) {
         if (options_.expert_state.empty() || !options_.expert_cache) { return 0; }
         if (source == SeedSource::None) {
@@ -2878,6 +2878,10 @@ private:
             std::snprintf(line, sizeof(line),
                           "expert cache: restored the %u most-used experts from the last session (%.1f GiB in %.2f s)",
                           loaded, loaded_gib, seconds);
+        } else if (source == SeedSource::Shipped) {
+            std::snprintf(line, sizeof(line),
+                          "expert cache: seeded %u experts from the artifact's shipped routing profile (%.1f GiB in %.2f s)",
+                          loaded, loaded_gib, seconds);
         } else {
             std::snprintf(line, sizeof(line),
                           "expert cache: no saved state yet, so it starts with the %u highest-ranked experts of "
@@ -2887,7 +2891,9 @@ private:
         diagnostic(line);
         std::snprintf(line, sizeof(line), "expert cache warm start: %u of %u frames from %s", loaded,
                       residency_->frames(),
-                      source == SeedSource::Saved ? options_.expert_state.string().c_str() : "the calibrated order");
+                      source == SeedSource::Saved   ? options_.expert_state.string().c_str()
+                      : source == SeedSource::Shipped ? "the shipped profile"
+                                                      : "the calibrated order");
         diagnostic(line, DiagnosticLevel::Debug);
         expert_state_saved_  = std::chrono::steady_clock::now();
         expert_state_routed_ = residency_->stats().routed;

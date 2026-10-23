@@ -37,3 +37,6 @@ add_library(infernix_qwen4_exp_calibrated_order STATIC
 infernix_internal_includes(infernix_qwen4_exp_calibrated_order)
 target_link_libraries(infernix_qwen4_exp_calibrated_order PUBLIC infernix_expert_offload_cache)
 target_link_libraries(infernix_model_runtime PUBLIC infernix_qwen4_exp_calibrated_order)
+# The loader interprets the artifact's shipped expert routing profile (design §9.3 item 4), which
+# lives with the shared expert cache in src/runtime/expert_offload/sources.cmake.
+target_link_libraries(infernix_model_loading PUBLIC infernix_expert_offload_cache)

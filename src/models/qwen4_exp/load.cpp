@@ -6,6 +6,7 @@
 #include "core/ggml_format.h"
 #include "artifact/views.h"
 #include "models/qwen3_5/load/vision_overlay.h"
+#include "runtime/expert_offload/expert_profile.h"
 #include "models/registry.h"
 
 #include <cmath>
@@ -410,6 +411,7 @@ struct LoadPlan::Impl {
     std::vector<artifact::HostValues> input_scales; // [layer], W4A4 banks only (empty for W4A16)
     artifact::MaterializationPlan materialization;
     FrontendResources resources;
+    expert_cache::ExpertProfileLoad expert_profile; // the artifact's shipped routing profile, when it ships one
     InstanceInfo info;
     std::optional<qwen3_5::VisionOverlayLayout> vision_overlay; // vision offload
     std::uint64_t embedding_bytes = 0; // the token embedding's stored bytes (pinned)
@@ -451,6 +453,14 @@ std::uint32_t LoadPlan::public_token_count() const {
     return static_cast<std::uint32_t>(impl_->resources.public_token_count);
 }
 
+const std::optional<expert_cache::SavedState>& LoadPlan::expert_profile() const noexcept {
+    return impl_->expert_profile.profile;
+}
+
+const std::string& LoadPlan::expert_profile_message() const noexcept {
+    return impl_->expert_profile.message;
+}
+
 std::uint64_t LoadPlan::pinned_expert_bytes() const {
     const std::uint64_t pinned = impl_->materialization.pinned_capacity_bytes;
     const std::uint64_t other  = pinned_other_bytes();
@@ -489,6 +499,12 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     }
     artifact::Binder binder(reader);
     out->resources = bind_resources(binder, out->config);
+    // The shipped routing profile (design §9.3 item 4): one optional resource object; an unusable
+    // one is refused with a reason, and the warm start starts without a prior, as before.
+    if (const auto object = binder.find_resource("text", expert_cache::kExpertProfileRole)) {
+        out->expert_profile = expert_cache::parse_expert_profile(
+            binder.host_object(*object), out->config.text.num_hidden_layers * out->config.text.moe.experts);
+    }
     Bindings bindings(binder);
     out->weights = bind_text(bindings, out->config.text,
                              options.stream_experts ? Residency::Streamed : Residency::HostPinned);

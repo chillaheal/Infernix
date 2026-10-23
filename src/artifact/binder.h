@@ -57,6 +57,9 @@ public:
     [[nodiscard]] ObjectHandle resource(std::string_view component, std::string_view role);
     // Whether the component declares the resource (an optional role, e.g. text's sampling.json).
     [[nodiscard]] bool has_resource(std::string_view component, std::string_view role) const;
+    // A component's resource role that exists; nullopt when the component or the role is absent
+    // (optional resources, for example the shipped expert routing profile of artifact-container.md §9.3).
+    [[nodiscard]] std::optional<ObjectHandle> find_resource(std::string_view component, std::string_view role) const;
     [[nodiscard]] HostValues values(const Binding& binding, std::optional<QType> format = {});
     // evictable_alignment (a power of two, typically EvictableWeightPool::kChunkBytes)
     // chunk-aligns the first ranked object so the evictable suffix is chunk-aligned.
