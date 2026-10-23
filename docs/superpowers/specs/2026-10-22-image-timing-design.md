@@ -408,6 +408,39 @@ först, konservativ bana kvar för konfigurationer som inte validerats. Recensio
 gränsen: en modell kalibrerad mot max observerad peak plus marginal utesluter inte matematiskt en
 runtime-OOM så länge KV-tillväxten kan vara obegränsad — garantin kommer från reserven, inte från talet.
 
+### Tredje korsvisningen, 2026-10-23 (page-lock för blockcachen under expert-lagret)
+
+En ny recension (ChatGPT, tråd `chatgpt.com/c/6adb0791-2ef8-83eb-a141-6221b77f3aa9`) fick mätningarna från
+reproduktionen mot produktionsprofilen (`--expert-ram-mib 41500`): expert-lagret page-lockar 40,3 GiB
+värdminne, `cudaHostAlloc` vägrar samtliga 205 cache-objekt, och DiT-loopen går från 6455 ms (pinned) till
+19615 ms (pageable) medan bilden blir färdig med HTTP 200.
+
+Svaret är **C + B + A i den preferensordningen**, och att D är fel här:
+
+- **A, pageable fallback, är en tillgänglighetsgaranti och inte ett tillstånd att stanna i.** En hanterad
+  vägrad pinning får aldrig bli en 500:an, eftersom beräkningen är numeriskt ekvivalent utan lock. Det är
+  vad som landats i `PinnedBytes`, tillsammans med det klistriga CUDA-felet som annars dödar processen.
+- **B, pinna så mycket budgeten faktiskt tillåter**, är allokationspolicyn men degnerar till A så länge
+  expert-lagret håller nästan hela budgeten; och 205 separata allokationer bör bli ett fåtal slabbar med en
+  gemensamt förvaltad budget i stället för ett beslut per objekt.
+- **C, att släppa den pausade LLM:ens page-lock under interludet**, är den arkitektoniskt rätta åtgärden,
+  eftersom interludet är just det fönster då expert-lagret varken används av enheten eller av VRAM. Kravet
+  recensionen gav är implementationstekniskt: ett block som är låst via `cudaHostAlloc` kan bara släppas med
+  `cudaFreeHost`, så expert-arenan måste hållas som vanlig värdallokering och registreras av/med
+  `cudaHostRegister`/`cudaHostUnregister` runt interludet som en explicit tillståndsövergång (kviescera
+  överföringar, avregistrera, bilda bildcachen, kör jobbet, släpp bildbudgeten, återregistrera, återuppta).
+- **Varje återvinning måste försvaras med måttet, inte med mekanismen.** Skillnaden som står att tjäna är
+  13 160 ms per loop och är därmed taket för vad av- och återregistrering får kosta; avgörandet görs på
+  interludets totaltid och tid-till-första-token efter det, p50/p95/p99 över upprepade interluden, och på att
+  återställningen aldrig kan lämna processen i ett trasigt tillstånd.
+- **D, ren 500 vid vägrad pinning, är fel** eftersom användarens egen profil trots allt kan generera en
+  korrekt bild; **E, sänkt expert-RAM**, löser inte att page-lock är en delad resurs utan budget.
+
+Regeln recensionen påminde om som gäller den landade fallbacken: en `cudaMemcpyAsync` med pageable källa har
+annan asynkron-semantik och annan livstid för källbufferten än med pinned minne. I den landade varianten är
+det ofarligt eftersom cache-objekten fylls en gång per jobb och aldrig skrivs om innan deras händelse är
+väntad; ett framtida `cudaHostRegister`-register måste behålla den egenskapen.
+
 ## Explicitly not in scope
 
 - Mer än ett jobb åt gången, och att två bildjobb delar på minnet.
