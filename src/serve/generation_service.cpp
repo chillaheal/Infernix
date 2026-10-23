@@ -3,6 +3,7 @@
 
 #include "product/media_acquire/acquire.h"
 #include "serve/translate.h"
+#include "serve/image_generation_service.h"
 
 #include <algorithm>
 #include <chrono>
@@ -354,6 +355,18 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.ram_headroom_bytes       = options_.ram_headroom_bytes;
     engine_options.expert_ram_bytes         = options_.expert_ram_bytes;
     engine_options.expert_pin_bytes         = options_.expert_pin_bytes;
+    // An image job page-locks its DiT block cache inside the interlude, after the expert tier has
+    // pinned. Tell the Engine how much that is so the RAM ledger reserves it first: on a host where
+    // the tier already holds the GPU's shared memory, an unreserved cache cannot pin and its block
+    // loop runs three times slower. An image artifact that cannot be read must not stop the engine
+    // from serving chat, so the reserve stays zero and the image route reports its own error.
+    if (!options_.image_artifact_path.empty()) {
+        try {
+            engine_options.image_lane_pinned_bytes =
+                artifact_block_cache_bytes(options_.image_artifact_path);
+        } catch (const std::exception&) {
+        }
+    }
     engine_options.media_preprocess_threads = options_.media_preprocess_threads;
     engine_options.startup_observer         = std::move(startup_observer);
     engine_options.diagnostic_observer      = std::move(diagnostic_observer);

@@ -590,6 +590,12 @@ struct EngineOptions {
     // the GPU; the rest stays in RAM unpinned and the CPU serves it. Empty: what Windows lets the
     // process page-lock (the GPU's shared memory) after every other pin; no limit elsewhere.
     std::optional<std::uint64_t> expert_pin_bytes;
+    // Bytes a lane outside this Engine page-locks later, after startup. Serve sets it to the image
+    // pipeline's DiT block host cache when an image artifact is configured. The RAM ledger holds it
+    // back out of the experts' pinned share and the tier honours it as a reserve, because an expert
+    // tier that page-locked the GPU's shared memory first would otherwise leave the image lane
+    // nothing to pin -- and a block cache that cannot pin loses its copy/compute overlap.
+    std::uint64_t image_lane_pinned_bytes = 0;
     // Zero selects a bounded worker count from the detected host concurrency.
     std::uint32_t media_preprocess_threads = 0;
     bool enable_vision                     = false;

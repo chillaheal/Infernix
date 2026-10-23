@@ -264,6 +264,58 @@ schedule `timesteps=0.000e+00 sigmas=0.000e+00`, `FINAL_LATENT rel_fro=4.401e-02
 `FINAL_IMAGE rel_fro=5.097e-02`. Prod-certens ledger-peak läser 1 851 MiB mot 1 435 MiB i den äldre
 loggen från 16:21; den skillnaden är fas 2:s copy-stream-staging (`ed7ae5d`), som ligger mellan loggarna.
 
+## 8d. Page-lock-budgeten för bildcachen (C + B, körd 2026-10-23)
+
+**Mattillfallet.** I användarprofilen (`--expert-ram-mib 41500`, 63,7 GiB RAM) lägger expert-lagret beslag
+på GPU:ns delade systemminne innan något bildjobb körts. Då vägras blockcakens `cudaHostAlloc` (nio roller
+per block, 205 objekt) och DiT-loopen går från 6 455 ms (pinned) till 19 615 ms (pageable). Ett riktigt
+chattrequest som köade bakom interludet dog på kö-deadlinen (`504 request queue timeout` 09:00:30), så
+kostnaden är inte bara en siffra i en logg.
+
+**Den dynamiska C:n avvisas, och varför.** Att avregistrera den pausade LLM:ens expert-arena under interludet
+ser ut som den billiga vinsten, men arenan är enhetssynlig direkt: decode läser en pinned värdadress
+zero-copy (`host_expert_tier.cpp:686`, `moe_layer.cu:205-219`) och demotion skriver in i `slot_bytes()`
+(`expert_residency.cpp:316-318`). Där blir LLM:ens återvändande beroende av att `cudaHostRegister` lyckas
+igen, och lyckas det inte finns ingen mjuk väg: otillåten adressläsning, samma klass av klistrigt fel som
+nyss avbröt processen. En optimering får inte göra återvändandet osäkert. Behövs det senare kräver det en egen
+spec med egen bevisföring för just det steget.
+
+**Det som landade: reservationen, som redan fanns i ledgern.** Bildcakens behov är en *sen pin*, samma
+kategori som n-gram-tabellen. `demand.later_pinned` dras redan bort från pin room innan experterna fäster
+(`memory_plan.cpp:30-31, 52-53`) och går vidare till lagrets `pin_reserve` (`qwen4_exp_instance.cpp:315-320`
+till `program_impl.h:1055-1058`). Som saknades var att någon meddelat Engine hur mycket bilden kommer
+behöva. Därför: `EngineOptions::image_lane_pinned_bytes` (standard 0), `serve` räknar beloppet från
+artifacten genom samma bindning som jobbet använder (`artifact_block_cache_bytes` = `dims.layers *
+max_block_object_bytes`), och ett olästbart image-artifact stoppar inte chatten (reserven blir 0, bildvägen
+ger sitt eget fel). Kontraktstestet `test_image_lane_pin_reserve` kräver att en aviserad lane tar sina byte
+plus lock-overhead direkt från experternas pinna andel, och att `expert_pinned + expert_pageable ==
+expert_ram` (reserven flyttar RAM mellan pinat och opinat, den tappar det aldrig).
+
+**Mätt, samma repro som ovan (09:46-09:49, expert-ram 41500):**
+
+| | före reservationen | efter |
+|---|---|---|
+| expert-lagret pinat | 40,3 GiB | **38,8 GiB**, 1,7 GiB lämnat till CPU:n |
+| blockcache-objekt som inte kunde pinna | 205 av 205 | **155 av 205** |
+| DiT-loop | 19 615 ms | **18 013 ms** |
+
+**Reserverat rum är inte beviljat rum.** Reservationen gjorde vad ledgern lovar, men effekten blev liten av
+två skilda skäl. Först: lagret var redan RAM-takad av `--expert-ram-mib`, så reservationen flyttade bara
+1,7 GiB från pinat till opinat i själva lagret. Sedan: av det rum bilden fick ledigt beviljades bara
+50 av 205 objekt (~3 GiB av 6,5) när jobbet begärde dem på riktigt. Varför rummet inte räckte är inte
+attributionerat - candidaten är att processen pinat mer mellan startögonblickets `pin_room`-snapshot och
+jobbet än vad som fanns i bilden, men det är en misstanke, inte ett mått. Loopen föll därför 8 %, inte
+till 6 455 ms. Chat-raden i samma körning läste 53,4 tok/s mot 56,2 i en tidigare körning; raderna är inte
+jämförbara (307 mot 609 meddelanden, olika dflash2-accept) och får inte räknas som vare sig vinst eller
+förlust - frågan om vad reservationen kostar LLM:en är alltså fortfarande öppen och måste mätas på ett
+identiskt request.
+
+**Därför är C-lite inte en levererad vinst.** Nästa steg är att mäta vad som är verkligt pinnbart vid
+jobbstart (levande `pin_room` jämfört med snapshotet vid start, och vad som tagit rummet däremellan) och
+låta blockcachen ta hela block så länge rummet räcker, i stället för 205 objekt i tur och ordning.
+Dessförinnan bör ordningen mot `origin/main` väljas: dess `8f26864` flyttade hela offload-högen till
+`src/runtime/expert_offload` och rör därmed samma filer som denna reservation.
+
 ## 9. Verifiering
 
 1. Fas 0: baslinjetabellen körd och inklistrad här, två tal per upplösning.

@@ -140,6 +140,11 @@ using DiTDimsProvider = std::function<infernix::models::qwen_image::DiTDims()>;
 // before the yield) and cached by the service, so the artifact opens once per process.
 [[nodiscard]] DiTDimsProvider make_artifact_dit_dims_provider(const std::string& image_artifact_path);
 
+// The Host RAM one image job page-locks for its DiT block cache: every block's nine roles, held for
+// the whole job. Serve hands this to the Engine as `image_lane_pinned_bytes` so the RAM ledger
+// reserves it before the expert tier pins, and reads it through the same binding the job uses.
+[[nodiscard]] std::uint64_t artifact_block_cache_bytes(const std::string& image_artifact_path);
+
 // Standard-alphabet base64 (no line breaks), shared by the image route and its tests.
 [[nodiscard]] std::string base64_encode_bytes(std::span<const std::uint8_t> bytes);
 
