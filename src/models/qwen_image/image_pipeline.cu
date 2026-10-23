@@ -2,6 +2,7 @@
 
 #include "artifact/reader.h"
 #include "core/tensor.h"
+#include "core/vram_budget.h"
 #include "core/weight.h"
 #include "core/weight_view.h"
 #include "infernix/ops/add_bias.h"
@@ -337,6 +338,23 @@ std::uint64_t image_device_bytes_peak() noexcept { return g_image_device_peak.lo
 
 void reset_image_device_peak() noexcept { g_image_device_peak.store(g_image_device_live.load()); }
 
+std::uint64_t host_block_cache_bytes(const artifact::Reader& reader, const DiTWeights& dit) {
+    if (dit.blocks.empty()) { return 0; }
+    const DiTBlockWeights& b = dit.blocks.front();
+    // The nine roles of one block, in the order the cache fills them. Every block has the same
+    // shapes, so one block's stored bytes times the blocks is exactly what the job page-locks.
+    const artifact::ParameterReference refs[9] = {b.q,           b.k,
+                                                  b.v,           b.attention_output,
+                                                  b.mlp_gate,    b.mlp_up,
+                                                  b.mlp_down,    b.query_norm,
+                                                  b.key_norm};
+    std::uint64_t one_block = 0;
+    for (const auto& ref : refs) {
+        one_block += object_geom(reader.geometry(ref.binding.parts.front().object)).bytes;
+    }
+    return one_block * dit.blocks.size();
+}
+
 GeneratedImage run_image_job(artifact::Reader& reader, const DiTWeights& dit, const VaeWeights& vae,
                              const ImageJobInputs& inputs, cudaStream_t stream,
                              ImageJobProgressView* progress,
@@ -423,6 +441,23 @@ GeneratedImage run_image_job(artifact::Reader& reader, const DiTWeights& dit, co
     // ---- the block host cache: nine roles x layers, read from the artifact once per job ----
     // Objects the process cannot page-lock fall back to plain host memory (see PinnedBytes); the
     // counter is per job and the timing line below reports it, so a degraded overlap is visible.
+    // What the machine can still page-lock when the picture asks, beside the same quantity the RAM
+    // ledger planned with at Engine startup (before the expert tier had pinned anything). A cache
+    // that cannot pin then says what it found, instead of running its loop slower in silence.
+    if (log_line) {
+        const auto source       = open_vram_budget_source(0);
+        const VramSnapshot vram = source->query();
+        // The ledger's own margin (models/qwen4_exp/memory_plan.h's kPinRoomMarginBytes), restated
+        // here rather than reached across a model boundary.
+        constexpr std::uint64_t kMargin = 1ULL << 30;
+        const std::uint64_t need = host_block_cache_bytes(reader, dit);
+        const std::uint64_t used = vram.nonlocal_usage + kMargin;
+        const std::uint64_t room = vram.shared_system > used ? vram.shared_system - used : 0;
+        log_line("image job: host cache | need " + std::to_string(need >> 20) +
+                 " MiB, pin room live " + std::to_string(room >> 20) + " MiB (shared " +
+                 std::to_string(vram.shared_system >> 20) + " MiB, non-local used " +
+                 std::to_string(vram.nonlocal_usage >> 20) + " MiB)");
+    }
     unpinned_cache_objects().store(0);
     std::vector<BlockBytes> cache(dit.blocks.size());
     for (std::size_t l = 0; l < dit.blocks.size(); ++l) {

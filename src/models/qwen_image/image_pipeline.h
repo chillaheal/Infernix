@@ -115,6 +115,12 @@ public:
     [[nodiscard]] virtual bool step(std::size_t units_done, std::size_t units_total) = 0;
 };
 
+// The Host bytes one job page-locks for its DiT block cache: every block's nine roles, held for the
+// whole job. Summed from the stored geometry the cache itself allocates from, so a caller reserving
+// room for the cache (serve's RAM-ledger reservation) cannot drift from what the job really takes.
+[[nodiscard]] std::uint64_t host_block_cache_bytes(const artifact::Reader& reader,
+                                                  const DiTWeights& dit);
+
 [[nodiscard]] GeneratedImage run_image_job(artifact::Reader& reader, const DiTWeights& dit,
                                            const VaeWeights& vae, const ImageJobInputs& inputs,
                                            cudaStream_t stream,
