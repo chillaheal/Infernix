@@ -310,11 +310,25 @@ jämförbara (307 mot 609 meddelanden, olika dflash2-accept) och får inte räkn
 förlust - frågan om vad reservationen kostar LLM:en är alltså fortfarande öppen och måste mätas på ett
 identiskt request.
 
-**Därför är C-lite inte en levererad vinst.** Nästa steg är att mäta vad som är verkligt pinnbart vid
-jobbstart (levande `pin_room` jämfört med snapshotet vid start, och vad som tagit rummet däremellan) och
-låta blockcachen ta hela block så länge rummet räcker, i stället för 205 objekt i tur och ordning.
-Dessförinnan bör ordningen mot `origin/main` väljas: dess `8f26864` flyttade hela offload-högen till
-`src/runtime/expert_offload` och rör därmed samma filer som denna reservation.
+**C-lite togs bort igen, och staging-ringen är motbevisad (samma dag).** Reservationen fanns i `72dd291`
+men åker ut: på 41500 startar motorn då inte alls (`available 55,45 GiB`, behövt ~55,75 -> `cap_too_large`
+-> FATAL), och på 40200 samma visa. En intern reservation får aldrig göra ett explicit `--expert-ram-mib`
+omöjligt eller flaky att starta, beroende på vad som råkar vara ledigt i den ögonblicket. Alternativet
+"bunden pinnad staging-ring" (två slots om 208 MiB, cachen pageable) är mätt och forkastat: en 208 MiB
+värdkopering tar på denna maskinen **28,7 ms enkelspårad och 28,0 ms med fyra trådar** (7,1 GiB/s payload,
+bandbundet; `image-spike/memcpy_probe.py`, körd medan servern tjänar) mot **5,0 ms/block** för helt pinnad
+överföring och **15,3 ms/block** för driverns egen opinnade staging. Driverns staging är alltså snabbare
+än en explicit kopiering, så ringen ger en loop på ~37 s i stället för 19,6 s - den är en regression, inte
+en optimering. Proben `image job: host cache | need ... pin room live ...` och `host_block_cache_bytes`
+stannar (`458c7cb`): det är den som visar behovet **6,75 GiB** (6 912 MiB, vilket 208 MiB per block gånger
+32 block delar tillbaka ur timing-radens 266 350 MiB) mot ett levande utrymme på **1 859 MiB**.
+
+**Vad som återstår, ärligt namngivet.** Bildens latens kan bara förbättras genom att expert-lagret
+överlåter RAM/pin, och den enda säkra formen är en **mjuk** reservation som kryper så att ett explicit tak
+alltid startar, plus att LLM-kostnaden mäts på ett identiskt request (de 53,4 mot 56,2 tok/s vi har är
+olika begäranden och bevisar ingenting). 504:an bakom en bild är ett **schema**-problem, inte ett
+minnesproblem: interludet håller dörren 17–33 s mot en kö-deadline på ~30 s, och ingen av punkterna ovan
+löser den.
 
 ## 9. Verifiering
 

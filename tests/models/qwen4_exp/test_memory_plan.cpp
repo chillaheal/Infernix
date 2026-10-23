@@ -208,34 +208,6 @@ void test_pin_room() {
     require(pin_room(vram) == 48 * kGiB - 3 * kGiB - kPinRoomMarginBytes, "pin room = shared - usage - margin");
 }
 
-// A lane outside the Engine that page-locks after startup (serve's image block cache) is declared
-// as a later pin. On a host whose pin room the expert tier would otherwise take whole, that
-// declaration must come straight out of the experts' pinned share -- otherwise the lane's own
-// cudaHostAlloc is refused and its host->device overlap silently disappears.
-void test_image_lane_pin_reserve() {
-    HostMemoryDemand d = flash_next();
-    d.pin_room         = 47 * kGiB;
-    const HostMemoryLedger without = plan_host_memory(snapshot(60 * kGiB, 200 * kGiB), d);
-    const std::uint64_t      lane  = 6 * kGiB; // one DiT's whole block host cache
-    HostMemoryDemand         with_lane = d;
-    with_lane.later_pinned            += lane;
-    const HostMemoryLedger reserved = plan_host_memory(snapshot(60 * kGiB, 200 * kGiB), with_lane);
-    require(without.pin_limited && reserved.pin_limited, "both runs are bounded by the pin room");
-    require(without.expert_pinned > lane, "the experts held the room the lane now asks for");
-    // The overhead is ceiled on the whole pinned sum, not on the lane's bytes alone (memory_plan.cpp's
-    // with_lock_overhead), so the delta is the difference of the two sums' overheads.
-    const auto oh       = [](std::uint64_t x) { return x + (x * 25 + 9'999) / 10'000; };
-    const std::uint64_t before_pins = d.other_pinned + d.later_pinned;
-    require(without.expert_pinned - reserved.expert_pinned == oh(before_pins + lane) - oh(before_pins),
-            "a declared lane takes its bytes plus lock overhead out of the experts' pinned share (" +
-                std::to_string(without.expert_pinned - reserved.expert_pinned) + " vs " +
-                std::to_string(oh(before_pins + lane) - oh(before_pins)) + ")");
-    require(reserved.expert_pinned + reserved.expert_pageable == reserved.expert_ram,
-            "the reservation moves RAM between pinned and unpinned, it never loses it");
-    require(reserved.describe().find("later pins") != std::string::npos,
-            "the ledger line shows the lane's reservation: " + reserved.describe());
-}
-
 // ---------------------------------------------------------------- RT7
 
 constexpr std::uint64_t kRecord = 2'764'800; // one nvfp4_expert_rg16_v1 record of this model
@@ -572,7 +544,6 @@ int main() {
         test_starved_and_describe();
         test_expert_cap();
         test_pin_room();
-        test_image_lane_pin_reserve();
         test_graph_bound();
         test_display_headroom();
         test_internal_reserve();

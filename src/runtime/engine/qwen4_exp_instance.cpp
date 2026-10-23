@@ -178,10 +178,6 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     auto vram             = open_vram_budget_source(device.device, options.vram_past_budget);
     demand.pin_room       = models::qwen4_exp::pin_room(vram->query());
     demand.expert_pin_cap = options.expert_pin_bytes;
-    // A lane that pins after startup (serve's image block cache) is a later pin: the ledger keeps
-    // it out of the experts' pinned share and the tier reserves it, so the lane's page-lock either
-    // succeeds or says so, instead of silently losing its overlap to a tier that got there first.
-    demand.later_pinned += options.image_lane_pinned_bytes;
     // The n-gram table in RAM (design §12.5): pinned at Program start, so it is a later pin. Auto keeps it
     // only while every expert stays pinned in RAM with it; Ram keeps it whatever the experts' placement.
     const auto snapshot = host_memory_snapshot();

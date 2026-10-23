@@ -495,16 +495,6 @@ DiTDimsProvider make_artifact_dit_dims_provider(const std::string& image_artifac
     };
 }
 
-std::uint64_t artifact_block_cache_bytes(const std::string& image_artifact_path) {
-    artifact::Reader reader(image_artifact_path);
-    artifact::Binder binder(reader);
-    const qi::DiTWeights dit = qi::bind_dit(binder);
-    (void)std::move(binder).finish();
-    // The cache holds every block's nine roles for the whole job and the roles are uniform across
-    // blocks, so layers times one block's nine roles is exactly what the job page-locks.
-    return static_cast<std::uint64_t>(dit.dims.layers) * dit.max_block_object_bytes;
-}
-
 std::string ImageGenerationService::next_job_id(std::int64_t created) {
     std::lock_guard lock(sequence_mutex_);
     return "img-" + std::to_string(created) + "-" + std::to_string(++sequence_);
