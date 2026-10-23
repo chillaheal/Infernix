@@ -25,7 +25,7 @@
 #include "artifact/reader.h"
 #include "core/vram_budget.h"
 #include "models/qwen4_exp/program/program.h"
-#include "models/qwen4_exp/program/vram_monitor.h"
+#include "runtime/expert_offload/vram_monitor.h"
 #include "models/qwen_image/image_job.h"
 #include "models/qwen_image/image_pipeline.h"
 #include "models/qwen_image/image_weights.h"
@@ -135,7 +135,7 @@ int main() {
     try {
         auto real = infernix::open_vram_budget_source(0);
         infernix::testing::set_vram_budget_source([&] { return real->query(); });
-        infernix::models::qwen4_exp::testing::set_vram_grow_delay(3600.0);
+        infernix::runtime::expert_offload::testing::set_vram_grow_delay(3600.0);
 
         infernix::EngineOptions options;
         options.artifact_path         = qwen4;

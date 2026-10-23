@@ -25,7 +25,7 @@
 #include "infernix/engine.h"
 #include "infernix/ops/linear.h"
 #include "models/qwen4_exp/program/program.h"
-#include "models/qwen4_exp/program/vram_monitor.h"
+#include "runtime/expert_offload/vram_monitor.h"
 #include "ops/common/canonical_math.h"
 
 #include <cuda_runtime.h>
@@ -109,7 +109,7 @@ int main() {
     try {
         auto real = infernix::open_vram_budget_source(0);
         infernix::testing::set_vram_budget_source([&] { return real->query(); });
-        infernix::models::qwen4_exp::testing::set_vram_grow_delay(3600.0);
+        infernix::runtime::expert_offload::testing::set_vram_grow_delay(3600.0);
 
         infernix::EngineOptions options;
         options.artifact_path         = qwen4;
