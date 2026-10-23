@@ -1054,11 +1054,17 @@ private:
             // Deadlines advance only while admission is possible, so a request parked behind an interlude is
             // judged by the time it could actually have been admitted, not by the generation's wall clock.
             if (door_held) {
-                interlude_door_held_since_ = now;
+                if (interlude_door_held_since_ == Clock::time_point{}) { interlude_door_held_since_ = now; }
             } else if (interlude_door_held_since_ != Clock::time_point{}) {
-                const auto held = now - interlude_door_held_since_;
-                interlude_door_held_since_    = {};
-                for (const auto& request : pending_) { request->deadline += held; }
+                const auto hold_started = interlude_door_held_since_;
+                interlude_door_held_since_ = {};
+                // Each request keeps only the part of the hold that ran AFTER its own submission: one
+                // that arrives a moment before the door reopens has waited nothing, and must not be
+                // handed the whole generation as extra budget.
+                for (const auto& request : pending_) {
+                    const auto from = hold_started > request->submitted ? hold_started : request->submitted;
+                    if (now > from) { request->deadline += now - from; }
+                }
             }
             for (auto it = pending_.begin(); it != pending_.end();) {
                 if ((*it)->cancelled.load(std::memory_order_acquire)) {
@@ -2282,6 +2288,13 @@ private:
                         }
                     }
                     std::unique_lock lock(queue_mutex_);
+                    // This branch is the only code the loop reaches for the whole hold: the round body
+                    // below it, and with it expire_pending_requests(), is skipped by the continue. The
+                    // hold is therefore dated here, on the first pass through the branch after the
+                    // close, or no queue deadline would ever learn that admission was impossible.
+                    if (interlude_door_held_since_ == Clock::time_point{}) {
+                        interlude_door_held_since_ = Clock::now();
+                    }
                     queue_cv_.wait_for(lock, std::chrono::milliseconds(2), [this] {
                         return stopping_ || instance_.program->submit_door_open();
                     });
@@ -2521,7 +2534,9 @@ private:
     mutable std::mutex stats_mutex_;
     std::condition_variable queue_cv_;
     std::deque<std::shared_ptr<Request>> pending_;
-    Clock::time_point interlude_door_held_since_{}; // set while an interlude holds the submit door closed
+    // Dated the first time the loop observes the submit door closed for an interlude, and cleared by the
+    // sweep that credits the queue with the hold. Only queue_mutex_ writers touch it.
+    Clock::time_point interlude_door_held_since_{};
     std::size_t outstanding_              = 0;
     std::uint64_t next_request_id_        = 1;
     std::uint64_t next_publication_order_ = 1;

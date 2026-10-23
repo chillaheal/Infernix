@@ -1944,11 +1944,14 @@ CPU/media preparation and completed model results whose response has not yet bee
 capacity returns HTTP 429 with code `server_overloaded`. Token-count requests (Anthropic
 `count_tokens`, Responses `input_tokens`) run the same preparation without generating; a separate
 capacity of the same size bounds how many run at once, and beyond it they are rejected as
-overloaded, as generation requests are. The absolute
+overloaded, as generation requests are. The
 `--pending-timeout-ms` deadline starts before preparation, covers media acquisition and Engine FIFO
 waiting, and returns HTTP 503 with code `request_queue_timeout` if admission does not occur in time.
-Once admitted, a request may pause for resource pressure without restarting this initial-admission
-deadline. Fresh requests enter in FIFO order with a bounded bypass allowance when an earlier request
+Time during which an image interlude holds the admission door closed does not count against it: the
+engine then cannot admit anything at all for the whole length of a generation, which is routinely
+longer than the timeout, so a request parked behind one is judged only by the time admission was
+possible. Once admitted, a request may pause for resource pressure without restarting this
+initial-admission deadline. Fresh requests enter in FIFO order with a bounded bypass allowance when an earlier request
 cannot fit. There is no admission ETA or unbounded overflow queue.
 
 Input memory is bounded by the outstanding-request count and the per-request
