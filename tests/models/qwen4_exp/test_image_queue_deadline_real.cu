@@ -139,6 +139,17 @@ bool wait_for_door(bool open, std::chrono::milliseconds limit) {
     return state_ns::image_interlude_submit_open() == open;
 }
 
+// D2 needs a lane that is provably busy: the holder has to be RESIDENT before the second request is
+// submitted. Submitted on the same instant, the two threads race and the loser is the one that expires.
+bool wait_for_lane(infernix::Engine& engine, std::uint32_t resident, std::chrono::milliseconds limit) {
+    const auto until = std::chrono::steady_clock::now() + limit;
+    while (std::chrono::steady_clock::now() < until) {
+        if (engine.runtime_stats().running_requests >= resident) { return true; }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    return engine.runtime_stats().running_requests >= resident;
+}
+
 void check_llm_healthy(infernix::Engine& engine, const std::vector<infernix::TokenId>& baseline) {
     const auto after = engine.generate(engine.prepare(story()), greedy(200)).generated_token_ids;
     check(after == baseline, "a later generation still reproduces the baseline ids");
@@ -222,14 +233,19 @@ int main() {
         {
             LlmRun busy;
             start_llm_run(engine, busy, 600); // holds the single lane for well over the budget
+            check(wait_for_lane(engine, 1, std::chrono::seconds(10)),
+                  "the 600-token request is resident on the lane before the second one is submitted" +
+                  (busy.error.empty() ? std::string() : ", and the holder already failed: " + busy.error));
             const std::string message = expect_throw([&] {
                 engine.generate(engine.prepare(story()), greedy(8));
             });
             check(holds(message, "expired"),
                   "a request that cannot be admitted while the door is open still expires");
             busy.thread.join();
-            check(busy.error.empty(), "the lane-holding generation completed");
-            check(busy.ids.size() == 600, "the lane-holding generation produced its 600 tokens");
+            check(busy.error.empty(), "the lane-holding generation completed" +
+                  (busy.error.empty() ? std::string() : ": " + busy.error));
+            check(busy.ids.size() == 600, "the lane-holding generation produced its 600 tokens (got " +
+                  std::to_string(busy.ids.size()) + ")");
         }
         check_llm_healthy(engine, baseline);
 
