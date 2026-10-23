@@ -421,6 +421,9 @@ GeneratedImage run_image_job(artifact::Reader& reader, const DiTWeights& dit, co
     const std::size_t sD = s_max * D, sMlp = s_max * mlp0;
 
     // ---- the block host cache: nine roles x layers, read from the artifact once per job ----
+    // Objects the process cannot page-lock fall back to plain host memory (see PinnedBytes); the
+    // counter is per job and the timing line below reports it, so a degraded overlap is visible.
+    unpinned_cache_objects().store(0);
     std::vector<BlockBytes> cache(dit.blocks.size());
     for (std::size_t l = 0; l < dit.blocks.size(); ++l) {
         const auto& b = dit.blocks[l];
@@ -754,7 +757,8 @@ GeneratedImage run_image_job(artifact::Reader& reader, const DiTWeights& dit, co
                  " x 9 objects, bytes " + std::to_string(upload_bytes / (1024 * 1024)) +
                  " MiB, loop wall " + loopb + " ms, block0 copy " + copyb + " ms (" +
                  std::string(overlap_prefetch ? "overlap" : "serialized") + ", asyncEngineCount " +
-                 std::to_string(s_async_engine) + ")");
+                 std::to_string(s_async_engine) + ", host cache unpinned " +
+                 std::to_string(unpinned_cache_objects().load()) + " objects)");
     }
     // ---- the VAE decode of the final latent ----
     // unpack [img_tokens,Cin] token-major (token h*Wl+w, feature c) -> [Cin,Hl,Wl] channel-major,

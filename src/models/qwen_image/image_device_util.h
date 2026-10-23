@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -322,22 +323,57 @@ inline std::uint32_t host_cache_alloc_flags() {
                                                             : cudaHostAllocDefault;
 }
 
+// How many block-cache objects this job could NOT page-lock. A serving process that already
+// page-locked most of RAM for its expert tier leaves too little for the cache, and that is the normal
+// configuration rather than a shortage: the copy stream then stages through the driver (correct, just
+// not overlapped), so the job says so in its timing line instead of failing the picture.
+[[nodiscard]] inline std::atomic<std::size_t>& unpinned_cache_objects() {
+    static std::atomic<std::size_t> count{0};
+    return count;
+}
+
 struct PinnedBytes {
-    std::byte*    h = nullptr;
-    std::size_t   n = 0;
+    std::byte*  h      = nullptr;
+    std::size_t n      = 0;
+    bool        pinned = false;
+
     void alloc(std::size_t b) {
+        release();
         n = b;
         if (b == 0) return;
-        cuda_ok(cudaHostAlloc(reinterpret_cast<void**>(&h), b, host_cache_alloc_flags()),
-                "cudaHostAlloc (image block cache)");
+        if (cudaHostAlloc(reinterpret_cast<void**>(&h), b, host_cache_alloc_flags()) == cudaSuccess) {
+            pinned = true;
+            return;
+        }
+        // The refusal is handled here, but a failed runtime call also SETS the thread's last-error
+        // flag, and the next cudaGetLastError() anywhere (an unrelated op's check) would report this
+        // out-of-memory and abort the process for a condition that was already recovered. Consume it.
+        (void)cudaGetLastError();
+        h = static_cast<std::byte*>(::operator new[](b, std::nothrow));
+        if (h == nullptr) {
+            throw std::runtime_error("image block host cache: neither pinned nor plain memory is available");
+        }
+        ++unpinned_cache_objects();
     }
-    ~PinnedBytes() { if (h != nullptr) cudaFreeHost(h); }
+    void release() {
+        if (h == nullptr) return;
+        if (pinned) { cudaFreeHost(h); } else { ::operator delete[](h, std::nothrow); }
+        h      = nullptr;
+        pinned = false;
+    }
+    ~PinnedBytes() { release(); }
     PinnedBytes() = default;
     PinnedBytes(const PinnedBytes&) = delete;
     PinnedBytes& operator=(const PinnedBytes&) = delete;
-    PinnedBytes(PinnedBytes&& o) noexcept : h(o.h), n(o.n) { o.h = nullptr; o.n = 0; }
+    PinnedBytes(PinnedBytes&& o) noexcept : h(o.h), n(o.n), pinned(o.pinned) {
+        o.h = nullptr; o.n = 0; o.pinned = false;
+    }
     PinnedBytes& operator=(PinnedBytes&& o) noexcept {
-        if (this != &o) { if (h != nullptr) cudaFreeHost(h); h = o.h; n = o.n; o.h = nullptr; o.n = 0; }
+        if (this != &o) {
+            release();
+            h = o.h; n = o.n; pinned = o.pinned;
+            o.h = nullptr; o.n = 0; o.pinned = false;
+        }
         return *this;
     }
 };
