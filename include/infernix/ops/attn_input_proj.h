@@ -35,6 +35,14 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
                      cudaStream_t stream);
 
 /**
+ * The paired Q4/Q5 projection under a compute policy. Every policy computes A16; under
+ * A16ColumnInvariant a column's four outputs do not depend on the call's width or other columns.
+ */
+void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
+                     const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
+                     LinearPolicy policy, cudaStream_t stream);
+
+/**
  * Computes the single-parent Q/K/output-gate/V projection.
  *
  * The parent stores rows in physical order query, key, output gate, value while the public output
@@ -52,6 +60,11 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
  *   BF16.
  * - FP8_E4M3FN_ROW_BF16 RowScale `[14336,5120]`, with the same logical row and tensor shapes as
  *   BF16.
+ * - FP8_E4M3FN_ROW_F32 RowScale `[17408,3072]` (FP32 row multipliers and one static activation
+ *   scale), with row counts `[8192,512,8192,512]`. `x` is BF16 `[3072,T]`, q/gate are BF16
+ *   `[8192,T]`, and k/v are BF16 `[512,T]`. Its A8 route encodes `x` as
+ *   e4m3_rn_satfinite(fl32(x * fl32(1 / s))) with the parent's input scale s; it has no A8
+ *   residual route.
  *
  * `T` is the positive token extent of the Op contract. All three policies permit the BF16
  * and Q8_G32_FP16 A16 implementations. NVFP4 uses A16 under A16Only/AllowA8; AllowA4 permits the

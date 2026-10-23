@@ -342,11 +342,16 @@ __device__ inline void sampling_normalize_support(const SamplingConfig& cfg, flo
     __syncthreads();
 }
 
+// A logit as FP32 (exact for both storage types; FP32 logits are the lossless route's).
+__device__ __forceinline__ float sampling_logit(__nv_bfloat16 value) { return __bfloat162float(value); }
+__device__ __forceinline__ float sampling_logit(float value) { return value; }
+
 // All threads of the block must call. Small-column exact truncated support
 // builder used by unit tests and any <=256-token column. It sorts one shared
 // tile and then applies the same top-p/min-p renormalization as the large path.
+template <class Logit>
 __device__ inline void
-sampling_build_truncated_small(const __nv_bfloat16* logits, std::int64_t base, std::int32_t vocab,
+sampling_build_truncated_small(const Logit* logits, std::int64_t base, std::int32_t vocab,
                                const SamplingConfig& cfg, float* tile_val, int* tile_idx,
                                float* cand_val, int* cand_idx, float* prob, int* n_support,
                                const std::int32_t* overlay = nullptr, int overlay_len = 0) {
@@ -354,7 +359,7 @@ sampling_build_truncated_small(const __nv_bfloat16* logits, std::int64_t base, s
     const int cap = sampling_candidate_cap(cfg, vocab);
     if (tid < kSamplerTileItems) {
         if (tid < vocab) {
-            const float x = sampling_adjusted_logit(__bfloat162float(logits[base + tid]), tid, cfg,
+            const float x = sampling_adjusted_logit(sampling_logit(logits[base + tid]), tid, cfg,
                                                     overlay, overlay_len);
             tile_val[tid] = x;
             tile_idx[tid] = tid;
@@ -376,8 +381,9 @@ sampling_build_truncated_small(const __nv_bfloat16* logits, std::int64_t base, s
 // Single-block fallback for large columns when the finite multi-block workspace
 // route cannot represent the launch. It still reads each vocab entry once and
 // keeps a bounded per-thread top-20, so it avoids a top_k*vocab global reread.
+template <class Logit>
 __device__ inline void sampling_build_truncated_block_fast(
-    const __nv_bfloat16* logits, std::int64_t base, std::int32_t vocab, const SamplingConfig& cfg,
+    const Logit* logits, std::int64_t base, std::int32_t vocab, const SamplingConfig& cfg,
     float* merge_val, int* merge_idx, float* cand_val, int* cand_idx, float* prob, int* n_support,
     const std::int32_t* overlay = nullptr, int overlay_len = 0) {
     const int tid = threadIdx.x;
@@ -393,7 +399,7 @@ __device__ inline void sampling_build_truncated_block_fast(
 
     const int fast_cap = cap;
     for (int v = tid; v < vocab; v += blockDim.x) {
-        const float x = sampling_adjusted_logit(__bfloat162float(logits[base + v]), v, cfg, overlay,
+        const float x = sampling_adjusted_logit(sampling_logit(logits[base + v]), v, cfg, overlay,
                                                 overlay_len);
         sampling_insert_candidate(local_val, local_idx, fast_cap, x, v);
     }
@@ -419,6 +425,58 @@ __device__ inline void sampling_build_truncated_block_fast(
     }
     __syncthreads();
     sampling_normalize_support(cfg, cand_val, cand_idx, prob, n_support, fast_cap);
+}
+
+// Gumbel-max (SamplingConfig::gumbel_max): a support entry's score log p + g, g = -log(-log u) with u
+// from (seed, the produced token's position, kSamplePurposeGumbel, token) moved into (0, 1). Fixed
+// intrinsics, so every kernel scores an entry the same.
+__device__ __forceinline__ float sampling_gumbel_score(float p, unsigned long long seed, int position,
+                                                       int token) {
+    const float u = sampling_uniform(seed, position, kSamplePurposeGumbel, static_cast<unsigned int>(token)) +
+                    (1.0f / 33554432.0f);
+    return __fadd_rn(__logf(p), -__logf(-__logf(u)));
+}
+
+// thread-local: the Gumbel-max token over support entries 0..n-1 (idx_at(j), prob_at(j)); ties to
+// the lower entry (the higher-probability one).
+template <class IdxAt, class ProbAt>
+__device__ inline int sampling_gumbel_pick(IdxAt idx_at, ProbAt prob_at, int n, unsigned long long seed,
+                                           int position) {
+    int best       = idx_at(0);
+    float best_val = -CUDART_INF_F;
+    for (int j = 0; j < n; ++j) {
+        const int token = idx_at(j);
+        const float s   = sampling_gumbel_score(prob_at(j), seed, position, token);
+        if (s > best_val) {
+            best_val = s;
+            best     = token;
+        }
+    }
+    return best;
+}
+
+// warp-wide: lane j < n holds support entry j; every lane returns the same token as
+// sampling_gumbel_pick over those entries.
+__device__ inline int sampling_gumbel_pick_warp(int token, float p, int n, unsigned long long seed, int position) {
+    const int lane = threadIdx.x & 31;
+    float best_val = lane < n ? sampling_gumbel_score(p, seed, position, token) : -CUDART_INF_F;
+    int best_lane  = lane < n ? lane : 32;
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        const float v = __shfl_xor_sync(0xffffffffU, best_val, offset);
+        const int l   = __shfl_xor_sync(0xffffffffU, best_lane, offset);
+        if (v > best_val || (v == best_val && l < best_lane)) {
+            best_val  = v;
+            best_lane = l;
+        }
+    }
+    return __shfl_sync(0xffffffffU, token, best_lane < 32 ? best_lane : 0);
+}
+
+// The produced token's position for a draw at logical_position under `purpose` (sample()'s keys:
+// prefill passes the produced position, decode the input token's).
+__device__ __forceinline__ int sampling_produced_position(int logical_position, int purpose) {
+    return purpose == kSamplePurposePrefill ? logical_position : logical_position + 1;
 }
 
 // thread-0 helper: inverse-CDF pick over a normalized `prob[0..n-1]` support,

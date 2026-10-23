@@ -1,6 +1,6 @@
 infernix_add_test(infernix_qwen4_exp_expert_cache_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_expert_cache.cpp"
-  LIBRARIES infernix_qwen4_exp_expert_cache
+  LIBRARIES infernix_qwen4_exp_calibrated_order
   NEEDS_SOURCE_DIR)
 
 # The SSD tier's host level (design §19.3.7, R10 host part): slots, read agent, admission. CPU and disk.
@@ -11,12 +11,18 @@ infernix_add_test(infernix_qwen4_exp_host_expert_tier_test
 # The SSD tier's RAM-level controller (design §19.3.7 RT2), host only.
 infernix_add_test(infernix_qwen4_exp_host_tier_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_host_tier.cpp"
-  LIBRARIES infernix_qwen4_exp_expert_cache)
+  LIBRARIES infernix_expert_offload_cache)
 
 infernix_add_test(infernix_qwen4_exp_ngram_hash_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ngram_hash.cpp"
   LIBRARIES infernix_model_loading
   NEEDS_SOURCE_DIR)
+
+# The routed experts' activation precision as the config resolves it, with --expert-a4-activations
+# (host only, a synthetic directory).
+infernix_add_test(infernix_qwen4_exp_expert_activations_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_expert_activations.cpp"
+  LIBRARIES infernix_model_loading)
 
 # The n-gram volume reader on a synthetic volume (CPU and disk only).
 infernix_add_test(infernix_qwen4_exp_ngram_volume_test
@@ -35,6 +41,18 @@ infernix_add_test(infernix_qwen4_exp_score_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_score_real.cpp"
   LIBRARIES infernix_engine)
 set_tests_properties(infernix_qwen4_exp_score_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
+
+# The lossless route on the real artifact (docs/maintainer/lossless-route.md): deterministic, width- and
+# selection-invariant scores. Skips without INFERNIX_QWEN4_ARTIFACT.
+infernix_add_test(infernix_qwen4_exp_lossless_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_lossless_real.cpp"
+  LIBRARIES infernix_engine)
+set_tests_properties(infernix_qwen4_exp_lossless_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
+
+infernix_add_test(infernix_qwen4_exp_lossless_generation_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_lossless_generation_real.cpp"
+  LIBRARIES infernix_engine)
+set_tests_properties(infernix_qwen4_exp_lossless_generation_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
 
 # The SSD tier's in-place records on the real artifact (memory track R6, RT3/RT4): streamed records
 # read through DirectReadQueue equal the pinned load's bytes. Skips without INFERNIX_QWEN4_ARTIFACT.
@@ -185,11 +203,6 @@ infernix_add_test(infernix_qwen4_exp_sampled_drafts_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_sampled_drafts_real.cpp"
   LIBRARIES infernix_engine)
 set_tests_properties(infernix_qwen4_exp_sampled_drafts_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
-
-# The DFlash2 draft-length policy (--draft-tokens auto): the calibrated length and its calibration.
-infernix_add_test(infernix_qwen4_exp_draft_length_test
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_draft_length.cpp"
-  LIBRARIES infernix_engine)
 
 # A DFlash2 companion drafter (--draft-model): greedy tokens, concurrency, the ring through a prefix
 # resume and the sampler's output distribution.

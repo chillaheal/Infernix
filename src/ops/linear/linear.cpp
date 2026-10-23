@@ -1,8 +1,10 @@
 #include "core/weight.h"
 #include "infernix/ops/linear.h"
+#include "infernix/ops/rg16_linear.h"
 
 #include "ops/linear/bf16/bf16_dispatch.h"
 #include "ops/linear/fp8/fp8_dispatch.h"
+#include "ops/linear/mxfp8/mxfp8_dispatch.h"
 #include "ops/linear/nvfp4/nvfp4_dispatch.h"
 #include "ops/linear/q4/q4_dispatch.h"
 #include "ops/linear/q5/q5_dispatch.h"
@@ -112,6 +114,14 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
     case QType::FP8_E4M3FN_ROW_BF16:
         detail::fp8_dispatch(x, w, out, policy, routes, workspace, stream);
         return;
+    case QType::FP8_E4M3FN_G32_E8M0:
+        detail::mxfp8_dispatch(x, w, out, policy, stream);
+        return;
+    case QType::NVFP4_MUL:
+        // A dense nvfp4_rg16_v1 matrix: the canonical W4A16 projection (exact sums), every policy.
+        if (w.layout != QuantLayout::Rg16 || workspace == nullptr) { break; }
+        rg16_linear(x, w, out, *workspace, stream);
+        return;
     case QType::FP32:
     case QType::INT32:
         break;
@@ -121,12 +131,30 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
 
 } // namespace
 
+bool linear_column_invariant_route(QType qtype, std::int32_t output_rows,
+                                   std::int32_t input_rows) noexcept {
+    if (qtype == QType::Q4_G64_FP16) { return detail::q4_column_invariant_route(output_rows, input_rows); }
+    if (qtype == QType::Q6_G64_FP16) { return detail::q6_column_invariant_route(output_rows, input_rows); }
+    if (qtype == QType::Q8_G32_FP16) { return detail::q8_column_invariant_route(output_rows, input_rows); }
+    if (qtype == QType::FP8_E4M3FN_ROW_BF16) {
+        return detail::fp8_linear_column_invariant_route(output_rows, input_rows);
+    }
+    // nvfp4_rg16_v1 sums exactly: every route is column-invariant.
+    if (qtype == QType::NVFP4_MUL) { return true; }
+    return false;
+}
+
 std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_rows,
                                             std::int32_t input_rows, LinearPolicy policy,
                                             std::int32_t min_tokens, std::int32_t max_tokens) {
     validate_linear_policy(policy);
     if (min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("linear workspace: invalid token interval");
+    }
+    if (column_invariant(policy) && !linear_column_invariant_route(qtype, output_rows, input_rows)) {
+        // One A16 call per column.
+        return linear_workspace_capacity_bytes(qtype, output_rows, input_rows, LinearPolicy::A16Only,
+                                               1, 1);
     }
 
     switch (qtype) {
@@ -156,6 +184,11 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
     case QType::FP8_E4M3FN_ROW_BF16:
         return detail::fp8_linear_workspace_capacity_bytes(output_rows, input_rows, policy,
                                                            min_tokens, max_tokens);
+    case QType::FP8_E4M3FN_G32_E8M0:
+        return detail::mxfp8_linear_workspace_capacity_bytes(output_rows, input_rows, policy, min_tokens, max_tokens);
+    case QType::NVFP4_MUL:
+        // The encoded activations grow with the columns.
+        return rg16_linear_workspace_bytes(output_rows, input_rows, max_tokens);
     case QType::FP32:
     case QType::INT32:
         break;
@@ -168,6 +201,15 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
     validate_linear_semantics(x, w, out, policy);
     if (!valid_linear_routes(routes)) {
         throw std::invalid_argument("linear: unsupported route set");
+    }
+    if (column_invariant(policy) && !linear_column_invariant_route(w.qtype, w.n, w.k)) {
+        // No dedicated column-invariant route: the exact one-column route, once per column.
+        for (std::int32_t column = 0; column < x.ne[1]; ++column) {
+            const Tensor x_column = x.slice(1, column, 1);
+            Tensor out_column     = out.slice(1, column, 1);
+            linear(x_column, w, out_column, LinearPolicy::A16Only, workspace, stream);
+        }
+        return;
     }
     dispatch_linear(x, w, out, policy, routes, &workspace, stream);
 }

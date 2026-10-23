@@ -115,6 +115,13 @@ enum class LinearRoutes : std::uint8_t {
                                                           std::int32_t max_tokens);
 
 /**
+ * Whether the problem registers a dedicated column-invariant route. Without one,
+ * LinearPolicy::A16ColumnInvariant runs the exact A16 route once per column.
+ */
+[[nodiscard]] bool linear_column_invariant_route(QType qtype, std::int32_t output_rows,
+                                                 std::int32_t input_rows) noexcept;
+
+/**
  * @brief Applies a bias-free matrix projection independently to every input column.
  *
  * @details The ideal mathematical result is
@@ -136,8 +143,12 @@ enum class LinearRoutes : std::uint8_t {
  *
  * @par Supported execution domain
  * Registered execution uses RowSplit Q4_G64_FP16, Q5_G64_FP16, Q6_G64_FP16, or Q8_G32_FP16 weights
- * with FP16 scales, block-scaled NVFP4 weights, row-scaled FP8_E4M3FN_ROW_BF16 weights, plus
- * registered contiguous BF16 problems. Each format owns a finite registry of exact physical
+ * with FP16 scales, block-scaled NVFP4 weights, row-scaled FP8_E4M3FN_ROW_BF16 weights, group-scaled
+ * FP8_E4M3FN_G32_E8M0 (MXFP8) weights in G32ScaleRows16, plus registered contiguous BF16 problems.
+ * MXFP8 registers Qwen3.8-Flash-Next's `[16384,2560]`, `[13952,2560]`, `[2560,6144]`, `[1280,2560]`
+ * and `[2560,640]` at every positive T, with 16-bit activations under every policy; every route
+ * gives a column the same bits at every T, so A16ColumnInvariant needs nothing more. Each format
+ * owns a finite registry of exact physical
  * weight problems and selects its kernel internally; a valid encoding and alignment do not imply
  * arbitrary N/K support. FP8 currently registers `[N,K]` in `{[14336,5120], [16384,5120],
  * [34816,5120], [248320,5120], [5120,6144], [5120,17408]}` at every positive T. The current NVFP4
@@ -147,7 +158,10 @@ enum class LinearRoutes : std::uint8_t {
  * `[1152,1152]`, `[4304,1152]`, `[1152,4304]`, `[4608,4608]`, `[2560,4608]` and `[5120,4608]`,
  * each at every positive T. Text and MTP packed-weight problems accept every positive column
  * extent T. Registered packed-weight Vision problems accept raw-patch P in `{4,8,...,131072}` or
- * merged-token V in `[1,32768]`; a matrix column does not inherently represent a text token. FP32
+ * merged-token V in `[1,32768]`; a matrix column does not inherently represent a text token. A
+ * dense NVFP4_MUL matrix in QuantLayout::Rg16 (`nvfp4_rg16_v1`, Qwen3.5-122B-A10B's head
+ * `[248320,3072]`) runs rg16_linear at every positive T under every policy: the canonical W4A16
+ * product with exact sums, so it is column-invariant and needs the workspace overload. FP32
  * is unsupported.
  *
  * @par Numerical contract
@@ -169,10 +183,11 @@ enum class LinearRoutes : std::uint8_t {
  * compute under every policy at every positive T. NVFP4 uses A16 for A16Only and
  * AllowA8; AllowA4 permits the private resolver to select either a qualified A16 route or
  * activation quantization to NVFP4 at every positive T. The selected route depends only on the
- * registered problem, T and `routes`. A16ColumnInvariant selects one A16 route per registered problem for
- * every T, so each column's result is independent of the call's other columns. NVFP4 and FP8
- * register it for their text problems and Q8 for the [248320, 5120] vocabulary head; the other
- * formats and problems reject it.
+ * registered problem, T and `routes`. A16ColumnInvariant makes each column's result independent of
+ * the call's width and other columns, on every registered problem: a problem with a dedicated
+ * column-invariant route (linear_column_invariant_route: FP8's text problems, Q8 [248320, 5120],
+ * Q6 [248320, 5120], [248320, 2048] and [34816, 5120]) runs one A16 route for every T; any other
+ * runs its exact A16 route once per column (T = 1 each).
  *
  * @par Routes
  * Under LinearRoutes::Q8SlicedK, Q8 `[16384,2560]` and `[2560,6144]` (Qwen3.8-Flash-Next's GDN q/k/v/z

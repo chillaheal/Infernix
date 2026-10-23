@@ -115,7 +115,13 @@ int main() {
         check(ngram.speculative.ngram_draft_tokens == 15 && ngram.speculative.draft_tokens == 5 &&
                   ngram.speculative.ngram_min_match == 12,
               "ngram and neural widths were not kept separate");
+    const auto ngram_auto = parse({"infernix-serve", "model.ninfer", "--spec", "dflash2", "--draft-tokens",
+                                   "auto", "--ngram-draft-tokens", "auto"});
+    failures += check(ngram_auto.speculative.ngram_draft_tokens_auto &&
+                          ngram_auto.speculative.ngram_draft_tokens == 0,
+                      "the automatic ngram window was not selected");
     for (const auto& tail : std::vector<std::vector<std::string>>{{"--ngram-draft-tokens", "64"},
+                                                                  {"--ngram-draft-tokens", "sometimes"},
                                                                   {"--ngram-min-match", "3"},
                                                                   {"--spec", "none"}}) {
         std::vector<std::string> arguments{"infernix-serve",
@@ -149,6 +155,9 @@ int main() {
     failures += check(parse({"infernix-serve", "model.ninfer", "--expert-tail-skip", "7"}).expert_tail_skip == 7 &&
                           parse({"infernix-serve", "model.ninfer"}).expert_tail_skip == 0,
                       "--expert-tail-skip did not parse (default off)");
+    failures += check(parse({"infernix-serve", "model.ninfer", "--expert-a4-activations"}).expert_a4_activations &&
+                          !parse({"infernix-serve", "model.ninfer"}).expert_a4_activations,
+                      "--expert-a4-activations did not parse (default off)");
 
     const auto mtp_ngram = parse({"infernix-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens",
                                   "3", "--ngram-draft-tokens", "15"});
@@ -187,16 +196,11 @@ int main() {
             } catch (const std::invalid_argument&) { rejected = true; }
             failures += check(rejected, "unsupported neural/ngram pair admitted");
         }
-        // --draft-tokens auto: MTP and DFlash2 (Qwen3.8-Flash-Next's policy), the count left to the Engine.
-        bool auto_rejected = false;
-        try {
-            const auto automatic =
-                parse({"infernix-serve", "model.ninfer", "--spec", backend, "--draft-tokens", "auto"});
-            failures += check(automatic.speculative.draft_tokens_auto && automatic.speculative.draft_tokens == 0,
-                              "--draft-tokens auto did not select the automatic length");
-        } catch (const std::invalid_argument&) { auto_rejected = true; }
-        failures += check(auto_rejected == (backend == "dflash"),
-                          "--draft-tokens auto is accepted with --spec mtp and dflash2 only");
+        // --draft-tokens auto with every drafter, the ceiling left to the Engine.
+        const auto automatic =
+            parse({"infernix-serve", "model.ninfer", "--spec", backend, "--draft-tokens", "auto"});
+        failures += check(automatic.speculative.draft_tokens_auto && automatic.speculative.draft_tokens == 0,
+                          "--draft-tokens auto did not select the automatic length");
         const auto wide_single =
             parse({"infernix-serve", "model.ninfer", "--spec", backend, "--draft-tokens", "3",
                    "--ngram-draft-tokens", "63", "--max-concurrency", "1"});
@@ -1043,12 +1047,12 @@ int main() {
                           std::string::npos,
                       "serve help omits --use-original-nvfp4-prefill-kernel");
     failures += check(archive.fast_paths, "fast paths must default on");
-    failures += check(!parse({"infernix-serve", "model.ninfer", "--disable-fast-paths"}).fast_paths,
-                      "--disable-fast-paths was not preserved");
-    failures += check(serve_usage_text("infernix-serve").find("--disable-fast-paths") != std::string::npos,
-                      "serve help omits --disable-fast-paths");
+    failures += check(!parse({"infernix-serve", "model.ninfer", "--reproducible"}).fast_paths,
+                      "--reproducible was not preserved");
+    failures += check(serve_usage_text("infernix-serve").find("--reproducible") != std::string::npos,
+                      "serve help omits --reproducible");
     {
-        const auto timed = parse({"infernix-serve", "model.ninfer", "--disable-fast-paths", "--fast-path",
+        const auto timed = parse({"infernix-serve", "model.ninfer", "--reproducible", "--fast-path",
                                   "free-cache-resume", "--fast-path", "adaptive-speculation"});
         failures += check(timed.fast_path_candidates == std::vector<infernix::FastPath>{
                                                             infernix::FastPath::FreeCacheResume,

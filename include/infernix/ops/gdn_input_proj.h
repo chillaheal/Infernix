@@ -45,18 +45,34 @@ void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& valu
                     Tensor& qkv, Tensor& z, cudaStream_t stream);
 
 /**
+ * The two-parent Q4/Q5 projection under a compute policy. Every policy computes A16; under
+ * A16ColumnInvariant a column's qkv and z do not depend on the call's width or other columns.
+ */
+void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
+                    Tensor& qkv, Tensor& z, LinearPolicy policy, cudaStream_t stream);
+
+/**
  * Single-parent GDN projection. Registered parent forms are:
  *
  * - Q8_G32_FP16 RowSplit [12288,2048], with stored row counts [2048,2048,4096,4096];
  * - Q8_G32_FP16 [16384,2560] (Qwen3.8-Flash-Next), with stored row counts [2048,2048,6144,6144],
  *   on the routes linear selects for that shape, so qkv and z hold exactly the bits of the
  *   corresponding rows of linear's [16384,T] result;
+ * - FP8_E4M3FN_G32_E8M0 G32ScaleRows16 [16384,2560] (NVIDIA Qwen3.8-Flash-Next-FP4-Local, MXFP8),
+ *   with stored row counts [2048,2048,6144,6144], on linear's route for that shape under every
+ *   policy (16-bit activations, column-invariant at every T), so qkv and z hold exactly the bits of
+ *   the corresponding rows of linear's [16384,T] result;
  * - NVFP4 BlockScaleK16M128x4 [16384,5120], with stored row counts [2048,2048,6144,6144].
  * - FP8_E4M3FN_ROW_BF16 RowScale [16384,5120], with stored row counts
  *   [2048,2048,6144,6144].
+ * - FP8_E4M3FN_ROW_F32 RowScale [20480,3072] (Qwen3.5-122B-A10B: FP32 row multipliers and one
+ *   static activation scale s), with stored row counts [2048,2048,8192,8192]. Its A8 route
+ *   encodes x as e4m3_rn_satfinite(fl32(x * fl32(1 / s))); it has no A8 residual route.
  *
  * The first three ranges are written contiguously to qkv and the final range is written to z.
- * Q8 uses A16 under every policy. NVFP4 uses A16 under A16Only/AllowA8; AllowA4 permits
+ * Q8 uses A16 under every policy. Under A16ColumnInvariant a column's outputs do not depend on the
+ * call's width (gdn_input_proj_column_invariant_route). NVFP4 uses A16 under A16Only/AllowA8;
+ * AllowA4 permits
  * private activation quantization at every positive T. FP8 accepts all policies; AllowA8/AllowA4
  * selects A16 through T=7 and private activation quantization followed by A8 Tensor Core
  * contraction at every T>=8. Every route writes the two independent final allocations directly.
@@ -78,6 +94,16 @@ void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Ten
                     LinearPolicy policy, WorkspaceArena& workspace, cudaStream_t stream);
 
 /**
+ * Whether a single parent has a dedicated column-invariant route (NVFP4, FP8, MXFP8 and Q8
+ * [12288,2048]).
+ * Without one (Q8 [16384,2560]), LinearPolicy::A16ColumnInvariant runs the exact route once per
+ * column. The two-parent Q4/Q5 form always has one.
+ */
+[[nodiscard]] bool gdn_input_proj_column_invariant_route(QType parent_qtype,
+                                                         std::int32_t parent_rows,
+                                                         std::int32_t input_rows) noexcept;
+
+/**
  * Applies the A16-only single-parent GDN projection without transient workspace. With
  * LinearRoutes::Q8SlicedK, the Q8 [16384,2560] parent runs the q8-sliced-k fast routes linear selects
  * for that problem (include/infernix/ops/linear.h); every other parent runs its exact route.
@@ -94,6 +120,14 @@ void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Ten
  */
 [[nodiscard]] std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
     std::int32_t query_rows, std::int32_t key_rows, std::int32_t value_rows,
+    std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width);
+
+/**
+ * The same query for a compute policy. Under A16ColumnInvariant every B and W composes
+ * the projection and the convolution through one BF16 [C,B*W] projected plane.
+ */
+[[nodiscard]] std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+    std::int32_t query_rows, std::int32_t key_rows, std::int32_t value_rows, LinearPolicy policy,
     std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width);
 
 /**
@@ -149,10 +183,23 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
                                   cudaStream_t stream);
 
 /**
+ * The two-parent form under a compute policy. Every policy computes A16; A16ColumnInvariant
+ * composes the column-invariant projection and the convolution at every B and W, so a column's
+ * outputs and snapshots do not depend on the call's width, batch or other columns.
+ */
+void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
+                                  const Weight& value_z_weight, const Tensor& conv_weight,
+                                  Tensor& conv_states, const Tensor& valid_columns,
+                                  const Tensor& initial_state_slots,
+                                  const Tensor& snapshot_base_slots, Tensor& query, Tensor& key,
+                                  Tensor& value, Tensor& z, LinearPolicy policy, WorkspaceArena& ws,
+                                  cudaStream_t stream);
+
+/**
  * Single-parent form of gdn_input_proj_conv_snapshot. Registered parents are Q8_G32_FP16 RowSplit
- * [12288,2048], NVFP4 BlockScaleK16M128x4 [16384,5120], and FP8_E4M3FN_ROW_BF16 RowScale
- * [16384,5120], all in q/k/value/z row order. All policies permit Q8 A16. NVFP4 uses A16
- * under A16Only/AllowA8; AllowA4 may use A4. FP8 may use A8 under AllowA8/AllowA4. B=1 accepts
+ * [12288,2048], NVFP4 BlockScaleK16M128x4 [16384,5120], FP8_E4M3FN_ROW_BF16 RowScale
+ * [16384,5120] and FP8_E4M3FN_ROW_F32 RowScale [20480,3072], all in q/k/value/z row order. All
+ * policies permit Q8 A16. NVFP4 uses A16 under A16Only/AllowA8; AllowA4 may use A4. FP8 may use A8 under AllowA8/AllowA4. B=1 accepts
  * every positive W for FP8; the batched domain is B=2..8 and W=1..64. Tensor operands, the complete
  * FP8 parent, and live workspace must be mutually non-overlapping, except that the read-only
  * initial_state_slots and snapshot_base_slots selectors may alias each other; same-row state-slot
@@ -213,6 +260,11 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value
     std::int32_t query_rows, std::int32_t key_rows, std::int32_t value_rows,
     std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width);
 
+/// The same query for a compute policy; under A16ColumnInvariant every B and T composes.
+[[nodiscard]] std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
+    std::int32_t query_rows, std::int32_t key_rows, std::int32_t value_rows, LinearPolicy policy,
+    std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width);
+
 /**
  * Returns the transient capacity for a registered [16384,5120] NVFP4 or row-scaled FP8
  * record-producing profile. Fused and materialized A16 routes require no storage. AllowA4/AllowA8
@@ -250,12 +302,21 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& qk_weight,
                                 Tensor& query, Tensor& key, Tensor& value, Tensor& z,
                                 WorkspaceArena& workspace, cudaStream_t stream);
 
+/// The two-parent form under a compute policy (A16ColumnInvariant composes at every B and T).
+void gdn_input_proj_conv_record(const Tensor& x, const Weight& qk_weight,
+                                const Weight& value_z_weight, const Tensor& conv_weight,
+                                const Tensor& conv_states, const Tensor& valid_columns,
+                                const Tensor& initial_state_slots, Tensor& conv_record,
+                                Tensor& query, Tensor& key, Tensor& value, Tensor& z,
+                                LinearPolicy policy, WorkspaceArena& workspace,
+                                cudaStream_t stream);
+
 /**
  * Single-parent record-producing form. Registered parents are Q8_G32_FP16 [12288,2048], NVFP4
- * [16384,5120], and FP8_E4M3FN_ROW_BF16 [16384,5120]. All policies permit Q8 A16; NVFP4
- * uses A16 under A16Only/AllowA8 and may use A4 under AllowA4. FP8 may use A8 under
- * AllowA8/AllowA4. Record and snapshot share arithmetic route selection. Every tensor operand, the
- * complete FP8 parent, and live workspace must be mutually non-overlapping.
+ * [16384,5120], FP8_E4M3FN_ROW_BF16 [16384,5120] and FP8_E4M3FN_ROW_F32 [20480,3072]. All
+ * policies permit Q8 A16; NVFP4 uses A16 under A16Only/AllowA8 and may use A4 under AllowA4. FP8
+ * may use A8 under AllowA8/AllowA4. Record and snapshot share arithmetic route selection. Every
+ * tensor operand, the complete FP8 parent, and live workspace must be mutually non-overlapping.
  */
 void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z_weight,
                                 const Tensor& conv_weight, const Tensor& conv_states,

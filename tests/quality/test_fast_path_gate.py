@@ -121,6 +121,21 @@ def test_one_kl_budget_for_every_configuration(tmp_path):
         assert not criterion(failing, "mean KL excess").passed
 
 
+def test_stored_runs_are_decided_again_under_another_budget(tmp_path):
+    # --policy re-decides stored runs without measuring them again: the same 1.2e-3 excess passes
+    # the KL budget, fails a tighter one and passes a looser one, with the budget recorded.
+    root = make_prefill(tmp_path / "runs", windows=60, floor=0.003, excess=0.0012, noise=1e-5)
+    for name, extra, status, budget in (("default", [], 0, gate.POLICY.kl_budget),
+                                        ("tight", ["--policy", "kl_budget=1e-3"], 1, 1e-3),
+                                        ("loose", ["--policy", "kl_budget=1e-2"], 0, 1e-2)):
+        output = tmp_path / f"{name}.json"
+        assert gate.main(["evaluate-prefill", str(root), "--json", str(output)] + extra) == status
+        kl = next(c for c in json.loads(output.read_text(encoding="utf-8"))[0]["criteria"]
+                  if c["name"] == "mean KL excess")
+        assert kl["budget"] == budget
+    assert gate.main(["evaluate-prefill", str(root), "--policy", "kl=1e-2"]) == 2
+
+
 def test_a_zero_floor_configuration_can_pass(tmp_path):
     # Floor 0 (the exact route is the reference): the default's tail is 0, so the tail cap admits
     # a fast p99.9 up to tail_minimum.
@@ -424,7 +439,7 @@ def write_judge(path: Path, default: list[tuple[int, int, float]],
         return [{"offset": 100 * i, "tokens": t, "agree": a, "logprob": -r, "regret": r}
                 for i, (t, a, r) in enumerate(values)]
 
-    path.write_text(json.dumps({"reference": "a16_activations", "runs": [
+    path.write_text(json.dumps({"reference": "lossless", "runs": [
         {"file": "default.txt", "segments": segments(default)},
         {"file": "fast.txt", "segments": segments(fast)}]}), encoding="utf-8")
     return path
@@ -598,3 +613,43 @@ def test_without_a_cache_every_directory_computes_its_reference(tmp_path, inputs
         assert produce.calls == 1
     args = gate.parse_arguments(["decode", "model", "--out", "x", "--reference-cache", "none"])
     assert args.reference_cache is None
+
+
+def write_range(path: Path, first: int, count: int, *, kind: str = "run", kv: str = "int8") -> Path:
+    """Segments first .. first + count - 1 of one back-to-back set (the forced tool's --first-segment)."""
+    segments, offset = [], 0
+    for index in range(first + count):
+        prompt = [512, 2048, 8192][index % 3]
+        if index >= first:
+            segments.append({"offset": offset, "prompt_tokens": prompt, "logprobs": [-float(index)] * 64})
+        offset += prompt + 64
+    body = {"artifact": "model.infernix", "forced_tokens": 64, "segments": segments}
+    if kind == "reference":
+        body.update({"kind": "reference", "top_tokens": 4})
+    else:
+        body.update({"mode": "plain", "kv_dtype": kv, "fast_paths": [], "underflows": 1,
+                     "preemptions": first})
+    path.write_text(json.dumps(body), encoding="utf-8")
+    return path
+
+
+def test_consecutive_segment_ranges_join_into_one_run(tmp_path):
+    whole = gate.load_forced(write_range(tmp_path / "whole.json", 0, 9))
+    first = write_range(tmp_path / "first.json", 0, 4)
+    rest = write_range(tmp_path / "rest.json", 4, 5)
+    joined = gate.concat_forced([first, rest], tmp_path / "joined.json")
+    assert joined["segments"] == whole["segments"]
+    assert gate.load_forced(tmp_path / "joined.json")["segments"] == whole["segments"]
+    # A run's counters add up; a reference joins the same way.
+    assert joined["underflows"] == 2 and joined["preemptions"] == 4
+    reference = gate.concat_forced([write_range(tmp_path / "r0.json", 0, 4, kind="reference"),
+                                    write_range(tmp_path / "r1.json", 4, 5, kind="reference")],
+                                   tmp_path / "reference.json")
+    assert len(reference["segments"]) == 9
+    # A gap, another order or another run's header is refused.
+    with pytest.raises(gate.MeasurementError, match="starts at corpus token"):
+        gate.concat_forced([first, write_range(tmp_path / "gap.json", 5, 4)], tmp_path / "x.json")
+    with pytest.raises(gate.MeasurementError, match="starts at corpus token"):
+        gate.concat_forced([rest, first], tmp_path / "x.json")
+    with pytest.raises(gate.MeasurementError, match="kv_dtype"):
+        gate.concat_forced([first, write_range(tmp_path / "bf16.json", 4, 5, kv="bf16")], tmp_path / "x.json")

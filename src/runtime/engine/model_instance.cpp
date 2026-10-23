@@ -2,17 +2,24 @@
 #include "artifact/reader.h"
 #include "artifact/formats.h"
 #include "core/decode_graph.h"
+#include "core/host_memory.h"
 #include "core/startup.h"
+#include "core/vram_budget.h"
 #include "models/qwen3_5/load.h"
 #include "models/qwen3_5/measurement.h"
+#include "models/qwen3_5/program/offload.h"
 #include "models/qwen3_5/program/planning/fast_paths.h"
 #include "runtime/engine/diagnostics.h"
+#include "runtime/engine/expert_memory.h"
+#include "runtime/expert_offload/route_trace.h"
+#include "runtime/expert_offload/vram_monitor.h"
 
 #include <algorithm>
 #include <system_error>
 #include <string>
 #include <filesystem>
 #include <chrono>
+#include <limits>
 #include <map>
 #include <optional>
 #include <set>
@@ -29,7 +36,8 @@ using Clock = std::chrono::steady_clock;
 constexpr std::size_t kGraphRetryHeadroomBytes = std::size_t{1} << 30;
 } // namespace
 
-void validate_engine_options(const EngineOptions& options, models::Architecture architecture) {
+void validate_engine_options(const EngineOptions& options, models::Architecture architecture,
+                             bool offloaded_experts) {
     if (options.artifact_path.empty()) {
         throw std::invalid_argument("Engine artifact_path must not be empty");
     }
@@ -47,8 +55,10 @@ void validate_engine_options(const EngineOptions& options, models::Architecture 
             throw std::invalid_argument("Engine explicit kv_capacity must be nonzero");
         }
         // Qwen3.5's headroom is what automatic KV capacity leaves; an explicit capacity has none
-        // (Qwen3.8-Flash-Next's is what its expert cache leaves, with any KV capacity).
-        if (architecture == models::Architecture::Qwen3_5 && options.vram_headroom_bytes.has_value()) {
+        // (with offloaded experts, as on Qwen3.8-Flash-Next, it is what the expert cache leaves,
+        // with any KV capacity).
+        if (architecture == models::Architecture::Qwen3_5 && !offloaded_experts &&
+            options.vram_headroom_bytes.has_value()) {
             throw std::invalid_argument(
                 "Qwen3.5 applies --vram-headroom-mib only with --kv-capacity auto");
         }
@@ -94,10 +104,14 @@ void validate_engine_options(const EngineOptions& options, models::Architecture 
         throw std::invalid_argument(
             "the original NVFP4 prefill kernel requires the NVFP4 KV cache (--kv-dtype nvfp4)");
     }
-    // 16-bit activations are the reference the fast paths are measured against.
-    if (options.a16_activations && (options.fast_paths || !options.fast_path_candidates.empty())) {
-        throw std::invalid_argument(
-            "16-bit activations (the quality reference) run the exact route: disable fast paths");
+    // The lossless route is what the fast paths are measured against; the design reference is the lossless
+    // route with the configuration's declared steps (FP4-Local's optional W4A4 experts among them).
+    if (options.lossless && (options.fast_paths || !options.fast_path_candidates.empty() ||
+                             (options.expert_a4_activations && !options.reference))) {
+        throw std::invalid_argument("the lossless route runs no fast path: disable fast paths");
+    }
+    if (options.reference && (!options.lossless || options.purpose != EnginePurpose::CausalScoring)) {
+        throw std::invalid_argument("the design reference (--reference) is the lossless route's causal scoring");
     }
 }
 
@@ -153,8 +167,10 @@ std::string hybrid_cache_fingerprint(const EngineOptions& options, const std::st
     out += ";chunk=" + std::to_string(options.prefill_chunk);
     out += ";host_state=" +
            std::to_string(static_cast<int>(options.context_cache.hybrid.host_state_precision));
-    // Fast paths change the numbers cached KV and state hold.
+    // Fast paths change the numbers cached KV and state hold; the lossless route keeps its own (V as
+    // BF16, its state layout).
     out += ";fast=" + std::to_string(options.fast_paths ? 1 : 0);
+    out += ";lossless=" + std::to_string(options.lossless ? 1 : 0);
     for (const FastPath path : options.fast_path_candidates) { out += std::string(",") + fast_path_name(path); }
     out += ";build=" + options.context_cache.hybrid.persistent_identity;
     return out;
@@ -171,7 +187,13 @@ std::size_t current_free_device_bytes() {
 
 } // namespace
 
-EngineOptions normalize_engine_options(EngineOptions options, models::Architecture architecture) {
+bool artifact_offloads_experts(const std::filesystem::path& artifact) {
+    const artifact::Reader reader(artifact);
+    return reader.directory().bindings.contains("text/layers/0/moe/experts");
+}
+
+EngineOptions normalize_engine_options(EngineOptions options, models::Architecture architecture,
+                                       bool offloaded_experts) {
     switch (options.purpose) {
     case EnginePurpose::Generation:
         break;
@@ -193,7 +215,7 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
 
     ContextCacheOptions& cache = options.context_cache;
     if (options.speculative.ngram_archive_bytes != 0 &&
-        options.speculative.ngram_draft_tokens == 0) {
+        options.speculative.ngram_draft_tokens == 0 && !options.speculative.ngram_draft_tokens_auto) {
         throw std::invalid_argument(
             "the cross-request ngram archive requires ngram drafting; enable --ngram-draft-tokens");
     }
@@ -205,6 +227,35 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
     }
     const std::uint32_t concurrency = options.max_concurrency;
     const bool qwen4_exp            = architecture == models::Architecture::Qwen4Exp;
+    // Offloaded routed experts (Qwen3.8-Flash-Next, Qwen3.5-122B-A10B) share the offload defaults.
+    const bool offloaded            = qwen4_exp || offloaded_experts;
+    // --draft-tokens auto where no draft length beats plain decode (the configuration's measurement,
+    // models::qwen3_5::auto_drafts_nothing): the engine decodes without a drafter, which it then
+    // never binds, before any setting follows the speculative backend.
+    // Forced adaptive policies (--fast-path adaptive-speculation with adaptive-dflash or adaptive-mtp) keep
+    // the drafter: they choose per round, down to no draft (design §12.2's A/B).
+    const auto forced = [&](FastPath path) {
+        return std::find(options.fast_path_candidates.begin(), options.fast_path_candidates.end(), path) !=
+               options.fast_path_candidates.end();
+    };
+    const bool forced_adaptive = forced(FastPath::AdaptiveSpeculation) &&
+                                 (forced(FastPath::AdaptiveDFlash) || forced(FastPath::AdaptiveMtp));
+    if (!qwen4_exp && options.speculative.draft_tokens_auto && options.speculative.backend != SpeculativeBackend::None &&
+        models::qwen3_5::auto_drafts_nothing(offloaded_experts) && !forced_adaptive) {
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                           "--draft-tokens auto: plain decode is faster than any draft length here (each verified "
+                           "draft brings its own offloaded-expert misses), so the engine decodes without a "
+                           "drafter");
+        options.speculative.backend           = SpeculativeBackend::None;
+        options.speculative.draft_tokens      = 0;
+        options.speculative.draft_tokens_auto = false;
+        options.speculative.proposal_head     = ProposalHead::Full;
+    }
+    // The automatic copy window is measured on the Qwen3.5 family's drafters only.
+    if (options.speculative.ngram_draft_tokens_auto && qwen4_exp) {
+        throw std::invalid_argument("--ngram-draft-tokens auto applies to Qwen3.8-27B / Qwen3.6-35B-A3B; "
+                                    "give Qwen3.8-Flash-Next a window (docs/qwen3_8-flash-next.md)");
+    }
     // The model's default prefill chunk. Qwen3.8-Flash-Next's exact route split at 1,024, 4,096
     // and 12,288 tokens gave identical bits (36 perplexity windows of 14,336 tokens; its calls
     // split on the 16-token GDN grid and its routes are column-invariant), and wide chunks prefill
@@ -212,28 +263,47 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
     // pp32768 9,639 -> 11,211 tok/s from 4,096 to 16,384 (pp65536 9,887 -> 11,268; 26 fewer expert
     // frames of ~8,560). The Qwen3.5 family keeps 1,024: its prefill bits follow the chunk grid,
     // and idle-wide-prefill already widens its idle steps (16,384 measured 3.5 % slower at
-    // pp16384 and pp32768 on the 27B).
-    if (options.prefill_chunk == 0) { options.prefill_chunk = qwen4_exp ? 16384U : 1024U; }
-    if (options.expert_tail_skip != 0 && !qwen4_exp) {
-        throw std::invalid_argument("--expert-tail-skip applies to Qwen3.8-Flash-Next (its offloaded experts) only");
+    // pp16384 and pp32768 on the 27B). A Qwen3.5 artifact with offloaded experts starts from
+    // Flash-Next's 16,384: small chunks are link-bound there (122B design §10).
+    if (options.prefill_chunk == 0) { options.prefill_chunk = offloaded ? 16384U : 1024U; }
+    if (options.expert_tail_skip != 0 && !offloaded) {
+        throw std::invalid_argument("--expert-tail-skip applies to artifacts with offloaded experts only");
+    }
+    // The lossless route's offloaded experts read each call's job counts on the host, so its rounds run
+    // eagerly (as Qwen3.8-Flash-Next's lossless rounds do).
+    if (options.lossless && offloaded_experts && !qwen4_exp) { options.use_cuda_graph = false; }
+    // --vision-offload auto with offloaded experts: the tower stays in pinned RAM and the expert cache
+    // lends each encode window's device memory (122B design D8), as on Qwen3.8-Flash-Next.
+    if (offloaded_experts && options.vision_offload == VisionOffload::Auto) { options.vision_offload = VisionOffload::On; }
+    if (options.expert_a4_activations && !qwen4_exp) {
+        throw std::invalid_argument("--expert-a4-activations applies to nvidia/Qwen3.8-Flash-Next-FP4-Local only");
     }
     // An approximation whose output depends on the cache state: never on the exact route.
     if (options.expert_tail_skip != 0 && !options.fast_paths) {
-        throw std::invalid_argument("--expert-tail-skip is approximate; the exact route (--disable-fast-paths) refuses it");
+        throw std::invalid_argument("--expert-tail-skip is approximate; the reproducible route (--reproducible) refuses it");
     }
-    // An automatic MTP draft length chooses up to the model's most drafts unless given a ceiling:
-    // Qwen3.8-Flash-Next verifies 8 columns column-invariantly, the Qwen3.5 planner captures 5.
-    // Qwen3.8-Flash-Next's DFlash2 drafter takes the same per-round policy.
+    // An automatic draft length chooses up to the model's most drafts unless given a ceiling: MTP on
+    // Qwen3.8-Flash-Next verifies 8 columns column-invariantly, the Qwen3.5 planner captures 5. The
+    // block drafters propose their whole block: Qwen3.8-Flash-Next's DFlash2 7; the Qwen3.5 planner
+    // resolves its DFlash and DFlash2 blocks per configuration (resolve_auto_draft_length).
+    const bool block_drafter = options.speculative.backend == SpeculativeBackend::DFlash ||
+                               options.speculative.backend == SpeculativeBackend::DFlash2;
     if (options.speculative.draft_tokens_auto) {
-        if (options.speculative.backend != SpeculativeBackend::Mtp &&
-            !(qwen4_exp && options.speculative.backend == SpeculativeBackend::DFlash2)) {
-            throw std::invalid_argument("--draft-tokens auto requires --spec mtp (Qwen3.8-Flash-Next: also dflash2)");
+        if (options.speculative.backend != SpeculativeBackend::Mtp && !block_drafter) {
+            throw std::invalid_argument("--draft-tokens auto requires --spec mtp, dflash or dflash2");
         }
-        if (options.speculative.draft_tokens == 0) { options.speculative.draft_tokens = qwen4_exp ? 7U : 5U; }
-    } else if (std::find(options.fast_path_candidates.begin(), options.fast_path_candidates.end(),
-                         FastPath::AdaptiveMtp) != options.fast_path_candidates.end()) {
-        throw std::invalid_argument("--fast-path adaptive-mtp is the policy of --draft-tokens auto; "
-                                    "a fixed --draft-tokens N drafts N");
+        if (options.speculative.draft_tokens == 0 && (qwen4_exp || !block_drafter)) {
+            options.speculative.draft_tokens = qwen4_exp ? 7U : 5U;
+        }
+    } else {
+        for (const FastPath policy : {FastPath::AdaptiveMtp, FastPath::AdaptiveDFlash}) {
+            if (std::find(options.fast_path_candidates.begin(), options.fast_path_candidates.end(), policy) !=
+                options.fast_path_candidates.end()) {
+                throw std::invalid_argument(std::string("--fast-path ") + fast_path_name(policy) +
+                                            " is the policy of --draft-tokens auto; a fixed --draft-tokens N "
+                                            "drafts N");
+            }
+        }
     }
     // The draft-confidence gate exists only on Qwen3.8-Flash-Next's one-row MTP rounds; another
     // model refuses it rather than ignoring a tuning value.
@@ -257,7 +327,7 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
         // route's output would depend on load (model-quality 6.1).
         if (!options.fast_paths && hybrid.host_state_precision != HybridHostStatePrecision::Fp32) {
             throw std::invalid_argument(
-                "--cache-host-state fp24 and bf16 are lossy; --disable-fast-paths requires fp32");
+                "--cache-host-state fp24 and bf16 are lossy; --reproducible and --lossless require fp32");
         }
         if (qwen4_exp) {
             // Qwen3.8-Flash-Next's snapshots are born in the Host tier (design §19.3.1): it needs
@@ -359,28 +429,159 @@ ModelInstance::ModelInstance(std::unique_ptr<models::qwen3_5::Model> source,
 ModelInstance::~ModelInstance() = default;
 
 ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) {
-    validate_engine_options(options, models::Architecture::Qwen3_5);
+    bool offloaded_experts = false;
+    try {
+        offloaded_experts = artifact_offloads_experts(options.artifact_path);
+    } catch (const std::exception&) {} // an unreadable artifact is reported below, after the option checks
+    validate_engine_options(options, models::Architecture::Qwen3_5, offloaded_experts);
     const auto start = Clock::now();
     StartupPhaseScope inspect(options.startup_observer, StartupPhase::ArtifactInspect);
     artifact::Reader reader(options.artifact_path);
     inspect.complete();
     StartupPhaseScope binding(options.startup_observer, StartupPhase::TargetPlan);
     auto plan = models::qwen3_5::plan_load(reader, models::load_options(options, models::Architecture::Qwen3_5));
-    plan.set_host_reserve(options.ram_headroom_bytes);
+    // Offloaded experts (Qwen3.5-122B-A10B design §11.2): the RAM ledger places the routed banks in
+    // pinned RAM or in the SSD tier before anything is pinned or read.
+    std::optional<ExpertRamPlan> expert_ram;
+    if (options.expert_tail_skip != 0) {
+        // normalize_engine_options admitted it for an artifact with offloaded experts.
+        const auto& moe = std::get<models::qwen3_5::MoeConfig>(plan.config().text.ffn);
+        if (options.expert_tail_skip >= moe.num_experts_per_tok) {
+            throw std::invalid_argument("--expert-tail-skip takes a top-" + std::to_string(moe.num_experts_per_tok) +
+                                        " rank 1-" + std::to_string(moe.num_experts_per_tok - 1) + " (0: off)");
+        }
+        if (options.purpose != EnginePurpose::Generation || options.lossless) {
+            throw std::invalid_argument("--expert-tail-skip applies to generation (its decode rounds) only, not "
+                                        "on the lossless route");
+        }
+    }
+    if (plan.offloaded_experts()) {
+        const auto vram   = open_vram_budget_source(device.device, options.vram_past_budget);
+        auto demand = expert_ram_demand(
+            options, {.expert_banks = plan.pinned_expert_bytes(), .other_pinned = plan.pinned_other_bytes()},
+            options.context_cache.enabled ? options.context_cache.host_capacity_bytes.value_or(0U) : 0U,
+            vram->query());
+        // The frontend's caches grow to their caps after planning: the grammar cache, the n-gram
+        // archive, and with vision the decoded-media cache and its live items.
+        demand.pageable = options.grammar_cache_bytes + options.speculative.ngram_archive_bytes +
+                          (options.enable_vision ? options.media_cache_bytes + options.media_live_bytes : 0U);
+        expert_ram = plan_expert_ram(options, demand, host_memory_snapshot());
+        if (expert_ram->tier) {
+            auto streamed           = models::load_options(options, models::Architecture::Qwen3_5);
+            streamed.stream_experts = true;
+            plan                    = models::qwen3_5::plan_load(reader, streamed);
+        }
+        plan.set_host_reserve(options.ram_headroom_bytes, expert_ram->demand.later_pinned);
+    } else {
+        plan.set_host_reserve(options.ram_headroom_bytes);
+    }
+    // The Program's offloaded experts: the engine's options from these options and the ledger's tier.
+    std::optional<models::qwen3_5::detail::ProgramOffloadOptions> offload_options;
+    if (expert_ram) {
+        offload_options.emplace();
+        auto& o              = offload_options->engine;
+        o.vram_headroom      = options.vram_headroom_bytes;
+        o.vram_past_budget   = options.vram_past_budget;
+        o.expert_tail_skip   = options.expert_tail_skip;
+        o.route_trace        = options.route_trace_path.empty() ? runtime::expert_offload::testing::route_trace()
+                                                                : options.route_trace_path;
+        o.vram_grow_delay_seconds = runtime::expert_offload::testing::vram_grow_delay();
+        // The CPU expert team keeps its default 6 workers: on the 122B, 4 measured 6 % slower and 8, 10
+        // and 12 no faster (design §0.2), as on Flash-Next.
+        // The lossless route computes every expert on the GPU: no CPU split. Its wide passes read the
+        // prefill stream's ring (each missing expert copied once per pass, under the earlier layers).
+        if (options.lossless) { o.prefill_cpu_split = false; }
+        if (!options.expert_state_path.empty()) {
+            // The state belongs to the artifact: its experts and their records, not the build or KV format.
+            std::error_code error;
+            const auto size         = std::filesystem::file_size(options.artifact_path, error);
+            const auto time         = std::filesystem::last_write_time(options.artifact_path, error);
+            o.expert_state          = options.expert_state_path;
+            o.expert_state_identity = "artifact=" + std::filesystem::absolute(options.artifact_path).string() +
+                                      ";size=" + std::to_string(error ? 0U : size) +
+                                      ";mtime=" + std::to_string(error ? 0 : time.time_since_epoch().count());
+        }
+        if (expert_ram->tier) {
+            o.expert_ram_bytes      = expert_ram->expert_ram_bytes;
+            o.expert_unpinned_bytes = expert_ram->expert_unpinned_bytes;
+            o.later_pinned_bytes    = expert_ram->later_pinned_bytes;
+            o.expert_stripe         = options.expert_stripe_path;
+        } else if (!options.expert_stripe_path.empty()) {
+            publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                               "--expert-stripe is not used: every expert fits in RAM, so none is read from disk");
+        }
+        if (options.expert_tail_skip != 0) {
+            publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Warning,
+                               "--expert-tail-skip %u: decode and verification rounds skip a routed expert missing "
+                               "from VRAM that every token routes at rank %u or lower; output changes (lower "
+                               "quality) for faster decode",
+                               options.expert_tail_skip, options.expert_tail_skip);
+        }
+        offload_options->diagnostic = [observer = options.diagnostic_observer](const std::string& text,
+                                                                                DiagnosticLevel level) {
+            report_diagnostic(observer, level, text);
+        };
+    }
     binding.complete();
+    // Offloaded experts: the dense weights must fit beside the headroom, and land in device memory
+    // (WDDM can place an allocation in shared system memory silently); the expert frames take what the
+    // Program leaves (ExpertOffload::size_frames warns when few fit).
+    std::unique_ptr<VramBudgetSource> spill_source;
+    std::optional<SpillGuard> spill;
+    std::uint64_t dense_bytes = 0;
+    if (expert_ram) {
+        spill_source              = open_vram_budget_source(device.device, options.vram_past_budget);
+        dense_bytes               = plan.materialization().device_capacity_bytes;
+        const VramSnapshot before = spill_source->query();
+        const std::uint64_t headroom =
+            runtime::expert_offload::display_headroom(before.display, false, options.vram_headroom_bytes);
+        if (dense_bytes + headroom > before.device_free) {
+            throw std::runtime_error("the model's dense weights (" + std::to_string(dense_bytes >> 20) +
+                                     " MiB) do not fit in the free device memory (" +
+                                     std::to_string(before.device_free >> 20) + " MiB) beside the " +
+                                     std::to_string(headroom >> 20) + " MiB VRAM headroom; free VRAM");
+        }
+        spill.emplace(*spill_source);
+        spill->begin();
+    }
     auto model =
         models::qwen3_5::materialize_model(std::move(plan), device, &options.startup_observer);
     device.synchronize();
+    if (spill) {
+        if (const std::uint64_t spilled = spill->end(dense_bytes); spilled != 0) {
+            throw std::runtime_error(std::to_string(spilled >> 20) +
+                                     " MiB of the dense weights were placed in shared system memory by the driver's "
+                                     "sysmem fallback: free VRAM and start again");
+        }
+    }
     StartupPhaseScope frontend(options.startup_observer, StartupPhase::FrontendInitialize);
+    // --ngram-draft-tokens auto: the configuration's copy window, before the frontend decides
+    // whether prompts build copy sources.
+    if (options.speculative.ngram_draft_tokens_auto) {
+        if (const std::uint32_t window = models::qwen3_5::resolve_auto_ngram(*model, options); window != 0) {
+            publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                               "--ngram-draft-tokens auto: copy proposals of up to %u drafts, minimum match %u",
+                               window, options.speculative.ngram_min_match);
+        } else {
+            publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                               "--ngram-draft-tokens auto: no copy window was measured faster for this "
+                               "artifact, drafter and route, so copy proposals are off");
+            if (options.speculative.ngram_archive_bytes != 0) {
+                throw std::invalid_argument("--ngram-archive-mib needs copy proposals, which "
+                                            "--ngram-draft-tokens auto leaves off here");
+            }
+        }
+    }
     auto instance = std::make_unique<ModelInstance>(std::move(model), options);
     frontend.complete();
     std::optional<StartupPhaseScope> planning;
     planning.emplace(options.startup_observer, StartupPhase::TargetFinalize);
-    // --draft-tokens auto where adaptive-mtp does not run: the configuration's fastest fixed length.
+    // --draft-tokens auto where its policy does not run: the configuration's fastest fixed length.
     if (const std::uint32_t fixed = models::qwen3_5::resolve_auto_draft_length(instance->parameters, options)) {
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
-                           "--draft-tokens auto: adaptive-mtp is not selected for this artifact (or fast paths "
-                           "are disabled), so every round drafts %u, its fastest fixed length",
+                           "--draft-tokens auto: %s is not selected for this artifact (or fast paths are "
+                           "disabled), so every round drafts %u, its fastest fixed length",
+                           options.speculative.backend == SpeculativeBackend::Mtp ? "adaptive-mtp" : "adaptive-dflash",
                            fixed);
     }
     const auto signature = models::qwen3_5::prefill_signature(*instance->model);
@@ -391,15 +592,28 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
         options.context_cost.preset_path);
     const std::size_t base_headroom = options.vram_headroom_bytes.value_or(kDefaultKvCapacityHeadroomBytes);
     std::size_t retry_headroom      = 0;
+    // Offloaded experts take the VRAM the Program leaves (their frames are sized after its fixed
+    // allocations), so an automatic KV capacity is every lane's full context, as on
+    // Qwen3.8-Flash-Next, rather than the free VRAM.
+    KvCapacityPolicy kv_policy = options.kv_capacity;
     std::uint32_t planned_prefill_chunk = 0, planned_idle_width = 0;
     std::optional<StartupPhaseScope> program;
     for (int attempt = 0;; ++attempt) {
         if (!planning) { planning.emplace(options.startup_observer, StartupPhase::TargetFinalize); }
         auto planner    = models::qwen3_5::make_sequence_planner(instance->parameters, device, options);
+        if (expert_ram && options.kv_capacity.mode == KvCapacityMode::Automatic) {
+            // Every lane's full context in whole pages (a lane's last page holds its context's tail).
+            const std::uint64_t page   = planner.capacity_curve().main_page_tokens;
+            const std::uint64_t tokens = static_cast<std::uint64_t>(options.max_concurrency) *
+                                         ((static_cast<std::uint64_t>(options.max_context) + page - 1U) / page) * page;
+            if (tokens > std::numeric_limits<std::uint32_t>::max()) {
+                throw std::invalid_argument("--max-context x --max-concurrency exceeds the KV capacity range");
+            }
+            kv_policy = KvCapacityPolicy::explicit_capacity(static_cast<std::uint32_t>(tokens));
+        }
         const std::size_t free_bytes = current_free_device_bytes();
         const std::size_t headroom   = base_headroom + retry_headroom;
-        auto resolution =
-            resolve_kv_capacity(options.kv_capacity, planner.capacity_curve(), free_bytes, headroom);
+        auto resolution = resolve_kv_capacity(kv_policy, planner.capacity_curve(), free_bytes, headroom);
         // idle-wide-prefill: plan the widest idle width (4096, 2048, then 1024 tokens, as the chunk is
         // rounded) whose larger prefill buffers and workspace keep the KV capacity: an explicit one
         // whole, an automatic one down to every lane's full context. None fitting keeps chunk-wide steps.
@@ -413,7 +627,7 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
                 auto wide = models::qwen3_5::make_sequence_planner(instance->parameters, device,
                                                                    options, width);
                 if (const auto fitted =
-                        resolve_kv_capacity_beside(options.kv_capacity, wide.capacity_curve(),
+                        resolve_kv_capacity_beside(kv_policy, wide.capacity_curve(),
                                                    free_bytes, headroom, resolution, lane_page_groups)) {
                     planner    = std::move(wide);
                     resolution = *fitted;
@@ -430,6 +644,7 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
         // Automatic tree widths on a target that cannot verify trees resolve to chain verification.
         options.speculative.draft_tree_auto = sequence.draft_tree_auto();
         instance->kv_capacity_resolution    = resolution;
+        instance->kv_capacity_resolution.mode = options.kv_capacity.mode; // auto stays reported as auto
         planned_prefill_chunk = sequence.prefill_chunk();
         planned_idle_width    = sequence.idle_prefill_width();
         planning->complete();
@@ -437,12 +652,13 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
         program.emplace(options.startup_observer, StartupPhase::ProgramInitialize);
         try {
             instance->program = models::qwen3_5::create_program(instance->parameters, std::move(sequence),
-                                                                device, options.startup_observer);
+                                                                device, options.startup_observer,
+                                                                offload_options ? &*offload_options : nullptr);
         } catch (const GraphMemoryExhausted& error) {
             // The CUDA Graphs needed more device memory than their allowance left (the driver's
             // per-executable cost varies): an automatic KV capacity retries once with
             // kGraphRetryHeadroomBytes more headroom, so fewer KV pages; an explicit one cannot shrink.
-            if (attempt > 0 || options.kv_capacity.mode != KvCapacityMode::Automatic) { throw; }
+            if (attempt > 0 || kv_policy.mode != KvCapacityMode::Automatic) { throw; }
             retry_headroom = kGraphRetryHeadroomBytes;
             program.reset();
             publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Warning,
@@ -496,13 +712,22 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
     }
     summary.weight_formats.assign(formats.begin(), formats.end());
     {
-        const models::qwen3_5::FastPathSelection fast = models::qwen3_5::select_fast_paths(
-            *instance->model, options, instance->parameters.invariant_text.has_value());
+        const models::qwen3_5::FastPathSelection fast =
+            models::qwen3_5::select_fast_paths(*instance->model, options);
         summary.fast_path_configuration = models::qwen3_5::describe(fast.configuration);
         for (const FastPath path : fast.paths) { summary.fast_paths.emplace_back(fast_path_name(path)); }
         summary.fast_paths_disabled = !options.fast_paths;
-        summary.request_invariant   = fast.request_invariant();
-        summary.request_invariance_capable = fast.invariant_capable;
+        // A tail skip depends on what the expert cache holds.
+        summary.request_invariant = fast.request_invariant() && options.expert_tail_skip == 0;
+        // Decode and verification run the column-invariant parameters unless batched-decode runs.
+        if (fast.invariant(FastPath::BatchedDecode)) {
+            for (const auto& entry : instance->parameters.column_by_column) {
+                summary.column_by_column_projections.push_back(
+                    entry.role + " " + std::string(artifact::format_name(entry.qtype)) + " [" +
+                    std::to_string(entry.rows) + "," + std::to_string(entry.cols) + "] x" +
+                    std::to_string(entry.count));
+            }
+        }
         summary.prefill_chunk       = planned_prefill_chunk;
         if (fast.selected(FastPath::IdleWidePrefill)) { summary.idle_prefill_width = planned_idle_width; }
     }

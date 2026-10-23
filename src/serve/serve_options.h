@@ -55,6 +55,7 @@ struct ServeOptions {
     std::optional<std::size_t> vram_headroom_bytes; // empty: the model's automatic headroom
     bool vram_past_budget = false;
     std::uint32_t expert_tail_skip = 0; // EngineOptions::expert_tail_skip
+    bool expert_a4_activations     = false; // EngineOptions::expert_a4_activations
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
@@ -62,7 +63,8 @@ struct ServeOptions {
     bool original_int8_prefill_kernel  = false;
     std::uint32_t prefill_split_workspace_mib = kDefaultPrefillSplitWorkspaceMiB;
     bool original_nvfp4_prefill_kernel = false;
-    bool fast_paths                    = true; // off with --disable-fast-paths (EngineOptions)
+    bool fast_paths                    = true; // off with --reproducible or --lossless (EngineOptions)
+    bool lossless                      = false; // --lossless (EngineOptions)
     // --fast-path NAME (repeatable): also run these, qualified or not (qualification and timing
     // runs; EngineOptions::fast_path_candidates).
     std::vector<FastPath> fast_path_candidates;

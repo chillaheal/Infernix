@@ -67,6 +67,7 @@ The built-in recipes are ordinary Python functions in
 | `qwen3_8_27b_nvfp4_orcarouter` | orcarouter GPTQ layout: imported NVFP4 MLP for layers 0–55, imported FP8 for the last eight layers' MLP and every attention/GDN projection, FP8 embedding and vocabulary weights from BF16 | `quantized` |
 | `qwen3_8_flash_next_nvfp4` | Qwen3.8-Flash-Next recipe A: every tensor as NVIDIA stores it (routed experts as exact `nvfp4_mul` banks, the FP8 n-gram table in its own volume); only the MTP drafter re-quantized (Q8 projections, Q4 experts) ([guide](qwen3_8-flash-next.md)) | None |
 | `qwen3_8_flash_next_nvfp4_dense8` | Recipe B (Dense8): recipe A plus Q8 for the dense projection classes that dominate per-token weight reads (GDN, QSA output, shared experts, hyper-connection mixers, PLE projections, `lm_head`) | None |
+| `qwen3_8_flash_next_fp4_local` | NVIDIA's QAD Qwen3.8-Flash-Next-FP4-Local, bit-exact: `nvfp4_mul` expert banks (NVFP4-CSF scales restored) with their calibrated activation scales, run W4A16 by default and W4A4 with `--expert-a4-activations`, MXFP8 GDN/QSA/shared-expert projections as `fp8_e4m3fn_g32_e8m0`, FP32 norms kept, the NVFP4 n-gram table in its own volume; drafter and vision MLPs re-quantized/rounded ([guide](qwen3_8-flash-next.md#nvidia-fp4-local-checkpoint)) | None |
 
 These names select conversion choices. Runtime execution is selected from the architecture,
 configuration and actual bindings stored in the artifact. `--name` sets the public model name;
@@ -211,6 +212,7 @@ The converter currently writes these formats:
 | `bf16`, `fp32`, `int32` | `cast_direct` | Direct words through the source reader |
 | `q4_g64_fp16`, `q5_g64_fp16`, `q6_g64_fp16`, `q8_g32_fp16` | `grouped_absmax` | Supply a custom method/source if needed |
 | `fp8_e4m3fn_row_bf16` | `fp8_row_maxabs` | `import_encoded` |
+| `fp8_e4m3fn_g32_e8m0` (MXFP8) | None | `import_encoded` (ModelOpt MXFP8 sources) |
 | `nvfp4` | `nvfp4_absmax`, `nvfp4_mse` | `import_encoded` |
 
 `grouped_absmax` stores one FP16 scale per group and signed integer codes. `fp8_row_maxabs` first
@@ -222,7 +224,8 @@ positive finite E4M3FN group scale and keeps the one with the least squared reco
 max-magnitude target at the same divisor. Both round codes to nearest with ties to even. They quantize weights only: an `AllowA4` use still needs its activation
 divisor supplied through `recipe.use`, so for an uncalibrated parent use `A16Only`.
 `import_encoded` preserves compatible code and scale words, including NVFP4's matrix weight divisor.
-It does not dequantize and requantize them.
+It does not dequantize and requantize them. `cast_direct` rounds exact binary64 source values (an
+MXFP8 or weight-only NVFP4 matrix's) to BF16 once, to nearest even.
 
 The exact numeric and packing rules are in [numeric formats](maintainer/tensor-formats.md) and
 [storage layouts](maintainer/storage-layouts.md). Source format names alone do not establish
@@ -526,6 +529,15 @@ Text includes `tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja` a
 ```text
 --resource chat_template.jinja=/path/to/chat_template.jinja
 ```
+
+`--resource sampling.json=PATH` adds the optional text resource `sampling.json`: a checkpoint's
+recommended sampling presets, which the runtime uses as its defaults in place of the
+architecture's (process flags and request fields still override them). It holds a `thinking` and a
+`non_thinking` preset, each with `temperature` [0,2], `top_k` [1,20], `top_p` [0,1], `min_p` [0,1],
+`presence_penalty` and `frequency_penalty` [-2,2], and optionally `repetition_penalty` (only 1: the
+sampler has none), plus an optional `source` string. The converter and the runtime refuse a missing,
+unknown or out-of-range value. [ornith-1.5-122b.json](../tools/convert/sampling/ornith-1.5-122b.json)
+is Ornith-1.5-122B's model-card set.
 
 The official conversion examples select these maintained templates:
 

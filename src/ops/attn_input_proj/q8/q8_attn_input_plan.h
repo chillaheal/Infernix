@@ -27,6 +27,9 @@ enum class Q8AttnInputScheduleId {
     DFlash2MmaR32C64K128,
     DFlash2MmaR32C64,
     DFlash2MmaR64C128,
+    // Request-invariant exact route of the four-output parents (35B-A3B, 122B-A10B): one sliced-K
+    // reduction at every width.
+    ColumnInvariant,
 };
 
 struct Q8AttnInputProblem {
@@ -44,14 +47,18 @@ struct Q8AttnInputPlan {
 
 const char* q8_attn_input_schedule_name(Q8AttnInputScheduleId schedule) noexcept;
 bool q8_attn_input_admits(const Q8AttnInputProblem& problem) noexcept;
-Q8AttnInputPlan q8_attn_input_resolve_plan(const Q8AttnInputProblem& problem);
+// column_invariant is registered for the four-output parents ([9216,2048] and [17408,3072]) only.
+Q8AttnInputPlan q8_attn_input_resolve_plan(const Q8AttnInputProblem& problem,
+                                           bool column_invariant = false);
 
 void q8_attn_input_execute_plan(const Q8AttnInputPlan& plan, const Tensor& x, const Weight& weight,
-                                Tensor& q, Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream);
+                                Tensor& q, Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream,
+                                bool column_invariant = false);
 void q8_attn_input_execute_plan(const Q8AttnInputPlan& plan, const Tensor& x, const Weight& weight,
                                 Tensor& q, Tensor& k, Tensor& v, cudaStream_t stream);
 void q8_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
-                            Tensor& k, Tensor& v, cudaStream_t stream);
+                            Tensor& k, Tensor& v, cudaStream_t stream,
+                            bool column_invariant = false);
 void q8_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k, Tensor& v,
                             cudaStream_t stream);
 

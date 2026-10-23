@@ -12,6 +12,7 @@ from tools.artifact.layouts import encoded_size
 from tools.artifact.formats import (
     DirectFormat,
     Fp8BlockFormat,
+    Fp8GroupFormat,
     Fp8RowFormat,
     GgmlFormat,
     Nvfp4Format,
@@ -21,6 +22,7 @@ from tools.artifact.formats import (
 )
 from tools.artifact.schema import ACTIVATION_POLICIES, TensorSpec
 from .methods import (
+    AUXILIARY_ROLES,
     AuxiliaryValue,
     MethodInput,
     PrepareRequest,
@@ -74,6 +76,8 @@ def default_layout(format: str) -> str:
         return "contiguous_le_v1"
     if isinstance(kind, Fp8RowFormat):
         return "row_scale_v1"
+    if isinstance(kind, Fp8GroupFormat):
+        return "g32_scale_rows16_v1"
     if isinstance(kind, Nvfp4Format):
         return "block_scale_k16_m128x4_v1"
     if isinstance(kind, Nvfp4MulFormat):
@@ -255,9 +259,9 @@ class Recipe:
         if auxiliaries is not None:
             for role, value in auxiliaries.items():
                 if not isinstance(value, AuxiliaryValue):
-                    if role != "activation_input_divisor":
+                    if role not in AUXILIARY_ROLES:
                         raise TypeError("provide an AuxiliaryValue for this role")
-                    value = AuxiliaryValue.activation_divisor(value)
+                    value = AUXILIARY_ROLES[role](value)
                 self.auxiliary_overrides[(*key, role)] = value
 
     def separate(self, selectors) -> None:
@@ -497,12 +501,12 @@ class Recipe:
             for (parameter, source_input, role), value in auxiliary_values.items():
                 if (parameter, source_input) != (name, input_name):
                     continue
-                if role == "activation_input_divisor":
+                if role in AUXILIARY_ROLES:
                     if value.format != "fp32" or value.shape != ():
                         raise ValueError(
-                            f"{name}: activation divisor must be an FP32 scalar"
+                            f"{name}: {role} must be an FP32 scalar"
                         )
-                    AuxiliaryValue.activation_divisor(value.data)
+                    AUXILIARY_ROLES[role](value.data)
                 layout = default_layout(value.format)
                 if len(value.data) != encoded_size(layout, value.format, value.shape):
                     raise ValueError(f"{name}/{role}: auxiliary data length is invalid")

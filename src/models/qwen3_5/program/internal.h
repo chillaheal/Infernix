@@ -1,5 +1,6 @@
 #pragma once
 
+#include "models/qwen3_5/execution/lossless.h"
 #include "models/qwen3_5/execution/parameters.h"
 #include "models/qwen3_5/program/program.h"
 #include "infernix/ops/gated_delta_net.h"
@@ -26,7 +27,8 @@ inline constexpr std::uint32_t kMaximumDFlashDraftTokens = 15;
 // LinearPolicy::A16ColumnInvariant (without it, a8_decode and a4_decode let wide rounds of FP8 and
 // NVFP4 projections take the artifact's 8- or 4-bit activations, a8_residual_decode the FP8
 // projections the A8 residual profile and a4_residual_decode the NVFP4 MLP projections the A4
-// residual profile, else they stay at 16 bits);
+// residual profile, else they stay at 16 bits), except calls of one column under
+// single_column_decode (batched_columns);
 // row_invariant_partition sizes
 // every attention row's key partition by that row alone; fixed_speculation verifies the
 // configured chain at a fixed width;
@@ -42,6 +44,8 @@ struct ExecutionSchedule {
     std::size_t split_workspace_bytes = ops::kCausalPromptSplitWorkspaceDefaultBytes;
     bool decode_split64               = false;
     bool column_invariant_decode      = false;
+    // single-column-decode: decode and verification calls of one column run the batched route.
+    bool single_column_decode         = false;
     bool a8_decode                    = true;
     bool a4_decode                    = true;
     bool a8_residual_decode           = false;
@@ -52,12 +56,36 @@ struct ExecutionSchedule {
     bool held_extent                  = false;
     // adaptive-mtp: MTP rounds choose their draft length (only where speculation is adaptive).
     bool adaptive_mtp                 = false;
+    // adaptive-dflash: DFlash and DFlash2 all-neural rounds propose, then choose their verify
+    // width (only where speculation is adaptive).
+    bool adaptive_dflash              = false;
+    // MTP rounds write each next draft's drafter probability (MtpConfidencePolicy's input; MTP with
+    // offloaded experts).
+    bool mtp_draft_confidence         = false;
     ops::LinearRoutes linear_routes   = ops::LinearRoutes::Exact;
-    // batched-decode: the decode and verification rounds' MLP down projections take its tiles
-    // (ops::LinearRoutes::WideDownTile).
-    bool wide_down_tile               = false;
     // gdn-f16-accumulate: the chunked GDN calls' arithmetic.
     ops::GdnChunkArithmetic gdn_arithmetic = ops::GdnChunkArithmetic::Exact;
+    // The lossless route (EngineOptions::lossless, docs/maintainer/lossless-route.md): every layer
+    // execution::lossless_layer, FP32 logits. A CausalScoring Program scores each window in one pass (the
+    // window form, lossless_keys 0); a Generation Program runs prefill chunks and decode rounds through
+    // the KV cache (the lossless bf16 profile) and the recurrent state slots (the cache form, keys up to
+    // lossless_keys, max_context) without speculation; decode rounds run as the CUDA Graphs of the
+    // ordinary rounds (their attention key bound the graph profile's).
+    bool lossless              = false;
+    std::int32_t lossless_keys = 0;
+    // The design reference (EngineOptions::reference, with lossless; lossless-route.md §3b): the window form
+    // with the declared activation quantization and the KV format's codec.
+    execution::LosslessDesign lossless_design{};
+    // The reproducible and lossless routes: sampled requests draw by Gumbel-max
+    // (ops::SamplingConfig::gumbel_max), so speculation returns plain sampling's text.
+    bool gumbel_sampling = false;
+
+    // Whether a decode or verification call of `columns` columns runs batched-decode's route: its
+    // projections' column-count routes (Parameters::decode_text without column invariance) and the
+    // MLP down projections' tiles (ops::LinearRoutes::WideDownTile).
+    [[nodiscard]] bool batched_columns(std::int64_t columns) const noexcept {
+        return !column_invariant_decode || (single_column_decode && columns == 1);
+    }
 
     // A prefill chunk's envelope.
     [[nodiscard]] ops::CausalAttentionExecutionEnvelope

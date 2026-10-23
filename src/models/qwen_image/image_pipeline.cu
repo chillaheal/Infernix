@@ -447,7 +447,7 @@ GeneratedImage run_image_job(artifact::Reader& reader, const DiTWeights& dit, co
     if (log_line) {
         const auto source       = open_vram_budget_source(0);
         const VramSnapshot vram = source->query();
-        // The ledger's own margin (models/qwen4_exp/memory_plan.h's kPinRoomMarginBytes), restated
+        // The ledger's own margin (runtime/expert_offload/memory_plan.h's kPinRoomMarginBytes), restated
         // here rather than reached across a model boundary.
         constexpr std::uint64_t kMargin = 1ULL << 30;
         const std::uint64_t need = host_block_cache_bytes(reader, dit);

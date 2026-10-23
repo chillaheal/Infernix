@@ -62,7 +62,7 @@ RoundStateLayout begin_round_state_layout(LayoutBuilder& builder, const RoundSta
             builder.add(sizeof(OrdinaryDecodeIngress), 256, "ordinary decode ingress");
         ordinary.egress = builder.add(sizeof(OrdinaryDecodeEgress), 256, "ordinary decode egress");
         ordinary.logits = add_tensor(
-            builder, DType::BF16,
+            builder, spec.fp32_logits ? DType::FP32 : DType::BF16,
             {spec.output_rows, checked_i32(spec.batch_capacity, "RoundState batch capacity")},
             "ordinary decode logits");
         ordinary.hidden =
@@ -77,7 +77,8 @@ RoundStateLayout begin_round_state_layout(LayoutBuilder& builder, const RoundSta
     }
     layout.rope_delta = add_tensor(builder, DType::I32, {1}, "step rope delta");
     if (!spec.causal_scoring) {
-        layout.logits = add_tensor(builder, DType::BF16, {spec.output_rows, 1}, "step logits");
+        layout.logits = add_tensor(builder, spec.fp32_logits ? DType::FP32 : DType::BF16, {spec.output_rows, 1},
+                                   "step logits");
     }
     layout.text_kv_table_row = add_tensor(builder, DType::I32, {1}, "step Text KV table row");
     if (!spec.causal_scoring) {
@@ -247,6 +248,22 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
             builder, DType::BF16, {layout.spec.hidden, columns, batch}, "DFlash target hidden");
         decode.target_continuation_hidden = add_tensor(
             builder, DType::BF16, {layout.spec.hidden, batch}, "DFlash target continuation hidden");
+        if (layout.spec.block_drafts != 0) {
+            if (layout.spec.block_drafts > layout.spec.draft_window) {
+                throw std::invalid_argument("RoundState DFlash block exceeds the draft window");
+            }
+            const auto block = static_cast<std::int32_t>(layout.spec.block_drafts);
+            decode.block_drafts =
+                add_tensor(builder, DType::I32, {block, batch}, "DFlash block proposal drafts");
+            decode.block_confidence = add_tensor(builder, DType::FP32, {block, batch},
+                                                 "DFlash block proposal confidence");
+            if (layout.spec.backend == SpeculativeBackend::DFlash2) {
+                decode.block_candidates = add_tensor(builder, DType::I32, {16, block, batch},
+                                                     "DFlash2 block proposal candidate ids");
+                decode.block_q = add_tensor(builder, DType::FP32, {16, block, batch},
+                                            "DFlash2 block proposal q");
+            }
+        }
     }
     layout.complete = true;
 }
@@ -327,6 +344,8 @@ MtpDecodeState::MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& l
     next_drafts =
         egress_tensor(offsetof(MtpDecodeEgress, next_drafts), DType::I32, {batch, neural_drafts});
     next_extents     = egress_tensor(offsetof(MtpDecodeEgress, next_extents), DType::I32, {batch});
+    next_probabilities = egress_tensor(offsetof(MtpDecodeEgress, next_probabilities), DType::FP32,
+                                       {batch, neural_drafts});
     verify_ids       = layout.verify_ids.bind(backing);
     target_positions = layout.target_positions.bind(backing);
     target_argmax    = layout.target_argmax.bind(backing);
@@ -373,7 +392,8 @@ MtpDecodeState MtpDecodeState::narrowed(std::uint32_t k, std::uint32_t next_k) c
          {&result.ar_positions, &result.ar_rope_positions, &result.ar_valid_columns}) {
         *tensor = tensor->slice(1, 0, steps);
     }
-    result.next_drafts = next_drafts.slice(1, 0, static_cast<std::int32_t>(next_k));
+    result.next_drafts        = next_drafts.slice(1, 0, static_cast<std::int32_t>(next_k));
+    result.next_probabilities = next_probabilities.slice(1, 0, static_cast<std::int32_t>(next_k));
     return result;
 }
 
@@ -484,6 +504,10 @@ DFlashDecodeState::DFlashDecodeState(DeviceSpan backing, const DFlashDecodeState
     target_logits              = layout.target_logits.bind(backing);
     target_hidden              = layout.target_hidden.bind(backing);
     target_continuation_hidden = layout.target_continuation_hidden.bind(backing);
+    if (layout.block_drafts) { block_drafts = layout.block_drafts->bind(backing); }
+    if (layout.block_candidates) { block_candidates = layout.block_candidates->bind(backing); }
+    if (layout.block_q) { block_q = layout.block_q->bind(backing); }
+    if (layout.block_confidence) { block_confidence = layout.block_confidence->bind(backing); }
 }
 
 void constrain_round_logits(const RoundState& io, const Tensor& logits, const Tensor* argmax,
@@ -496,7 +520,7 @@ void constrain_round_logits(const RoundState& io, const Tensor& logits, const Te
         throw std::logic_error("constrained logits are wider than the descriptor table");
     }
     const auto count = static_cast<std::int32_t>(columns);
-    Tensor matrix(logits.data, DType::BF16, {rows, count});
+    Tensor matrix(logits.data, logits.dtype, {rows, count});
     Tensor descriptors = io.constraint->descriptor_view(count);
     Tensor records     = io.constraint->record_view(count);
     // Observation is always on: its staged lists are -1 for columns nothing observes.

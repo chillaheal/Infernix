@@ -3,6 +3,7 @@
 
 #include "core/arena.h"
 #include "core/gdn_replay_records.h"
+#include "core/vmm_arena.h"
 #include "infernix/ops/gdn_replay.h"
 #include "infernix/ops/sampling.h"
 #include "infernix/ops/speculative_tree.h"
@@ -10,6 +11,8 @@
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 
 #include "models/qwen3_5/program/planning/startup.h"
+#include "models/qwen3_5/program/speculative/dflash_width_policy.h"
+#include "models/qwen3_5/program/speculative/mtp_confidence_policy.h"
 #include "models/qwen3_5/program/speculative/mtp_draft_policy.h"
 #include "models/qwen3_5/program/speculative/tree_width_controller.h"
 #include "models/qwen3_5/program/storage/draft_context.h"
@@ -20,6 +23,7 @@
 #include "models/qwen3_5/execution/vision.h"
 #include "models/qwen3_5/program/vision_prefill.h"
 #include "models/qwen3_5/program/ngram_proposer.h"
+#include "models/qwen3_5/program/offload.h"
 #include "models/qwen3_5/program/prefix/hybrid_cache.h"
 #include "runtime/prefix_cache/cost.h"
 #include "runtime/prefix_cache/prefix_index.h"
@@ -28,6 +32,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <limits>
@@ -154,17 +159,23 @@ struct DecodeGraphFamily {
     DecodeGraphExecutable& install(DecodeGraphProfile& profile);
 };
 
-// A Forward stage publishes these IDs before target execution finishes. Program owns the
-// pinned storage and external event together; both outlive the graphs that reference them.
+// A Forward stage publishes these IDs before target execution finishes; an adaptive-dflash
+// proposal graph publishes its block's IDs and their drafter probabilities (DFlash2) or
+// log-probabilities (DFlash) before the round's width is chosen. Program owns the pinned storage
+// and external event together; both outlive the graphs that reference them.
 struct DFlashDraftHandoff {
     PinnedHostBuffer ids;
+    PinnedHostBuffer probabilities;
     CudaCompletionEvent ready;
 
     DFlashDraftHandoff(const DeviceContext& device, std::size_t count)
-        : ids(count * sizeof(TokenId)), ready(device) {}
+        : ids(count * sizeof(TokenId)), probabilities(count * sizeof(float)), ready(device) {}
 
     [[nodiscard]] std::span<TokenId> tokens() const noexcept {
         return {static_cast<TokenId*>(ids.data()), ids.size() / sizeof(TokenId)};
+    }
+    [[nodiscard]] std::span<float> confidence() const noexcept {
+        return {static_cast<float*>(probabilities.data()), probabilities.size() / sizeof(float)};
     }
 };
 
@@ -197,10 +208,15 @@ struct SequenceState {
     std::uint32_t mtp_kv_valid            = 0;
     std::uint32_t dflash_context_frontier = 0;
     std::array<TokenId, qwen3_5::kMtpDecodeMaximumDrafts> mtp_drafts{};
+    // The drafter's probability of each draft (ops::argmax_probability; 1 where none was computed),
+    // the confidence policy's input (MtpConfidencePolicy).
+    std::array<float, qwen3_5::kMtpDecodeMaximumDrafts> mtp_draft_probabilities{};
     std::uint32_t mtp_draft_count = 0;
     // adaptive-mtp: the request's learned draft acceptance and draft-length memory. It moves with
     // the sequence into a paused request's ResumeState and back at its resume binding.
     MtpLaneDraftState mtp_draft;
+    // adaptive-dflash: the request's drafter calibration and probe schedule; it moves as mtp_draft.
+    DFlashLaneDraftState dflash_draft;
     bool tail_hidden_valid        = false;
     bool endpoint_valid           = false;
 };
@@ -217,6 +233,11 @@ struct RequestControl {
     ops::SamplingConfig sampling_host;
     GenerationTimings timings;
     SpeculativeStats speculative_stats;
+    // Offloaded experts: the residency's, CPU service's and SSD tier's counters when the request was
+    // admitted.
+    runtime::expert_offload::ExpertResidency::Stats cache_at_admission;
+    std::uint64_t cpu_served_at_admission = 0;
+    std::optional<runtime::expert_offload::HostExpertTier::Stats> tier_at_admission;
     std::shared_ptr<const RequestBasePlanImpl> base;
     std::optional<UnitDemand> permit;
     std::optional<RecoveryPermit> recovery;
@@ -340,8 +361,9 @@ struct HybridLaneState {
 
 class ProgramImpl {
 public:
+    // `offload`: with offloaded experts, the instance's resolved options (null otherwise).
     ProgramImpl(const execution::Parameters&, const SequencePlanImpl&, DeviceContext&,
-                const StartupObserver&);
+                const StartupObserver&, const ProgramOffloadOptions* offload = nullptr);
     ~ProgramImpl() noexcept;
     [[nodiscard]] RequestBasePlan plan_request(PreparedPromptData&&,
                                                const runtime::ResolvedExecutionOptions&);
@@ -436,6 +458,14 @@ public:
     // The adaptive-mtp draft-length policy (FastPath::AdaptiveMtp): present when the plan captures
     // a neural MTP family per draft length; each all-neural MTP round then runs the length it picks.
     std::optional<MtpDraftPolicy> mtp_draft_policy;
+    // The adaptive-dflash verify-width policy (FastPath::AdaptiveDFlash): present when the plan
+    // captures split neural families; each all-neural DFlash round then runs its proposal graph
+    // (dflash_propose_graphs, the whole block) and verifies the width the policy picks.
+    std::optional<DFlashWidthPolicy> dflash_width_policy;
+    DecodeGraphFamily dflash_propose_graphs;
+    // adaptive-dflash's batch length: all-neural chain rounds of several rows run the plain
+    // batch-only family of this many drafts (0: the policy chooses their width too).
+    std::uint32_t dflash_batch_drafts = 0;
     // The last MTP round's start, all-neural draft length (0: not a policy round) and batch size,
     // closing its start-to-start cycle for the policy's round-cost learning.
     struct MtpCostRound {
@@ -443,7 +473,18 @@ public:
         std::uint32_t drafts = 0;
         std::uint32_t batch  = 0;
     } mtp_cost_round;
+    // Confidence-gated MTP extents (ExecutionSchedule::mtp_draft_confidence): each row verifies the
+    // prefix of its drafts the policy picks from their drafter probabilities; the last MTP round's
+    // start, batch size and verified draft columns close its cycle for the policy's cost fit.
+    std::optional<MtpConfidencePolicy> mtp_confidence;
+    struct MtpConfidenceRound {
+        std::chrono::steady_clock::time_point start{};
+        std::uint32_t batch   = 0; // 0: none yet
+        std::uint32_t columns = 0;
+    } mtp_confidence_round;
     const std::uint32_t ngram_draft_window;
+    // Rounds of several rows propose copies of at most this many drafts.
+    const std::uint32_t ngram_batch_window;
     const std::uint32_t ngram_min_match;
     const SpeculativeBackend speculative_backend;
     const KvCacheStorage kv_storage;
@@ -461,6 +502,34 @@ public:
     DeviceArena persistent;
     DeviceArena workspace_storage;
     WorkspaceArena work;
+    // Elastic text KV (PersistentLayout::text_kv_region_bytes; elastic_kv.cpp): the text KV page planes'
+    // reserved region, mapped from kv_base_pages up as requests need pages, with memory taken from the
+    // expert frames; null when the planes are in the persistent arena. Declared before `decoder`, which
+    // points into it.
+    static constexpr std::size_t kKvChunkBytes   = 2ULL << 20; // mapping unit
+    static constexpr std::uint32_t kKvGrowPages  = 64;         // growth unit (4,096 tokens)
+    static constexpr std::chrono::seconds kKvIdleShrink{60};
+    std::unique_ptr<VmmRange> kv_vmm;
+    DeviceKVPagePoolLayout kv_layout;
+    std::uint32_t kv_base_pages = 0;
+    // The last binding, growth, release or idle shrink (steady-clock ticks), and whether the pool backs
+    // more than its base: the expert cache's monitor thread reads both (kv_idle_due) to wake an idle
+    // engine for the evicting shrink.
+    std::atomic<std::int64_t> kv_busy_ticks{0};
+    std::atomic<bool> kv_grown{false};
+    void kv_busy() noexcept { kv_busy_ticks.store(std::chrono::steady_clock::now().time_since_epoch().count()); }
+    // Pages the elastic text pool could still back (0 without one).
+    [[nodiscard]] std::uint32_t kv_growable_pages() const noexcept;
+    // Maps (and zeroes) the region's chunks pages [0, pages) need; false when the device has none.
+    [[nodiscard]] bool map_kv(std::uint32_t pages);
+    // Raises the text pool's backed pages so `need` pages are free, taking the memory from the expert
+    // frames (between a prompt's calls, its stream and wide leases go back first if they hold them).
+    [[nodiscard]] bool grow_kv(std::uint32_t need);
+    // Between requests: lowers the backed pages to the free top (not below the base) and returns the
+    // memory to the frames; `evict` (idle for kKvIdleShrink) first releases the prefix cache's idle
+    // device blocks that have host copies.
+    void shrink_kv(bool evict);
+    [[nodiscard]] bool kv_idle_due() const noexcept;
     std::unique_ptr<qwen3_5::DecoderState> decoder;
     std::unique_ptr<LogicalKVPageStore> text_kv_pages;
     std::unique_ptr<KVAddressSpaceStore> text_kv_addresses;
@@ -474,6 +543,9 @@ public:
     // their own width for every batch size and record/fold through the dense view of that width.
     std::vector<NarrowReplayView> narrow_replay_views;
     std::optional<DFlashPersistentState> dflash;
+    // An artifact with offloaded experts: the Program's experts and their engine (offload.h); null
+    // otherwise.
+    std::unique_ptr<ProgramOffload> offload;
     qwen3_5::RoundState io;
     Tensor prefill_hidden;
     std::optional<Tensor> score_hidden;
@@ -588,6 +660,14 @@ public:
     // Whether a lane other than `lane` is generating (Active or Pending): its next decode or
     // control round waits behind any prefill step.
     [[nodiscard]] bool other_lane_generating(std::uint32_t lane) const noexcept;
+    // Whether a lane other than `lane` is prefilling (its next pass may stream over the lent ring).
+    [[nodiscard]] bool other_lane_prefilling(std::uint32_t lane) const noexcept;
+    // Offloaded experts, after a verification round's synchronization (ProgramOffload::end_round):
+    // row r committed counts[r] tokens (the longest row advances the round), and its first
+    // live_counts[r] columns count as expert uses (empty: counts; a tree round's: every verified
+    // column, its accepted path not being a prefix of them).
+    void end_offloaded_round(std::span<const std::uint32_t> lanes, std::uint32_t width,
+                             std::span<const std::int32_t> counts, std::span<const std::int32_t> live_counts = {});
     [[nodiscard]] UnitDemand next_unit(const SequenceState&, const RequestControl&,
                                        ExecutionUnitKind, std::uint32_t tokens) const;
     void require_unit(std::uint32_t lane, ExecutionUnitKind, std::uint32_t tokens = 0) const;
@@ -694,14 +774,22 @@ public:
     // ReplaySSM record view and fold plan for a speculative round verified at verify_drafts.
     [[nodiscard]] const GdnReplayRecords* round_replay_records(std::uint32_t verify_drafts) const;
     [[nodiscard]] const ops::GdnReplayFoldPlan& round_replay_fold(std::uint32_t verify_drafts) const;
-    // The narrowest family of `kind` that verifies at least `drafts` proposals per row.
+    // The narrowest family of `kind` that verifies at least `drafts` proposals per row, among the
+    // split (adaptive-dflash width) families or the others.
     [[nodiscard]] SpeculativeRoundFamily& round_family(SpeculativeRoundKind kind,
-                                                       std::uint32_t drafts = 0);
+                                                       std::uint32_t drafts = 0, bool split = false);
     [[nodiscard]] std::vector<NgramProposer::Match>
     propose_ngram(std::span<const std::uint32_t> lanes,
                   std::span<const runtime::RoundBudget> budgets);
+    // A row's copy proposal; a copy replaces the neural proposal only when it offers more than
+    // `neural_drafts` drafts or fills the n-gram window.
     [[nodiscard]] NgramProposer::Match propose_ngram_one(std::uint32_t lane,
-                                                         const runtime::RoundBudget& budget);
+                                                         const runtime::RoundBudget& budget,
+                                                         std::uint32_t neural_drafts,
+                                                         std::uint32_t window);
+    // The drafts a round of batch_rows rows would propose neurally: the drafter's window, or
+    // adaptive-dflash's batch length for several rows.
+    [[nodiscard]] std::uint32_t ngram_copy_floor(std::uint32_t batch_rows) const noexcept;
     // Moves the prepared prompt's ngram index and archive snapshot into an admitted request.
     static void take_ngram_index(RequestControl& request, const RequestBasePlanImpl& base);
     [[nodiscard]] runtime::BatchedGeneratedRound decode_ordinary_batch(

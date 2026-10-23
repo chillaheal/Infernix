@@ -238,6 +238,30 @@ void print_generation_summary(const infernix::GenerationResult& result,
     print_metric("CUDA Graph allowance", format_bytes(memory.cuda_graph_allowance_bytes));
     print_metric("CUDA Graph memory used", format_bytes(memory.cuda_graph_measured_bytes));
     print_metric("planned device total", format_bytes(reserved));
+    if (const auto& cache = memory.expert_cache) {
+        print_metric("expert cache frames",
+                     std::to_string(cache->frames) + " (" + format_bytes(cache->frames * cache->frame_bytes) + ", " +
+                         format_percent(cache->frames, cache->routed_experts) + " of " +
+                         std::to_string(cache->routed_experts) + " experts; " + std::to_string(cache->startup_frames) +
+                         " at startup)");
+        print_metric("expert staging", format_bytes(cache->staging_bytes));
+        print_metric("expert host RAM", format_bytes(cache->host_ram_bytes) +
+                                            (cache->ssd_tier ? " (the rest read from the artifact)" : " (every expert)"));
+        if (cache->kv_capacity_pages != 0) {
+            print_metric("elastic KV", std::to_string(cache->kv_backed_pages) + " of " +
+                                           std::to_string(cache->kv_capacity_pages) + " pages backed (" +
+                                           format_bytes(cache->kv_backed_bytes) + ")");
+        }
+    }
+
+    if (const auto& experts = result.expert_cache; experts && experts->routed != 0) {
+        print_metric("expert cache hits", format_percent(experts->hits, experts->routed) + " of " +
+                                                std::to_string(experts->routed) + " routed");
+        if (experts->decode_routed != 0) {
+            print_metric("expert cache decode hits", format_percent(experts->decode_hits, experts->decode_routed) +
+                                                       " of " + std::to_string(experts->decode_routed) + " routed");
+        }
+    }
 
     const infernix::SpeculativeStats& speculative = result.speculative;
     if (speculative.enabled) {
@@ -364,12 +388,15 @@ int main(int argc, char** argv) {
         engine_options.vram_headroom_bytes      = cli.vram_headroom_bytes;
         engine_options.vram_past_budget         = cli.vram_past_budget;
         engine_options.expert_tail_skip         = cli.expert_tail_skip;
+        engine_options.expert_a4_activations    = cli.expert_a4_activations;
         engine_options.prefill_chunk            = cli.prefill_chunk;
         engine_options.kv_cache                 = cli.kv_cache;
         engine_options.original_int8_prefill_kernel = cli.original_int8_prefill_kernel;
         engine_options.prefill_split_workspace_mib  = cli.prefill_split_workspace_mib;
         engine_options.original_nvfp4_prefill_kernel = cli.original_nvfp4_prefill_kernel;
-        engine_options.fast_paths                    = cli.fast_paths;
+        // The lossless route runs no fast path.
+        engine_options.fast_paths                    = cli.fast_paths && !cli.lossless;
+        engine_options.lossless                      = cli.lossless;
         engine_options.fast_path_candidates          = cli.fast_path_candidates;
         engine_options.speculative              = cli.speculative;
         engine_options.enable_vision            = cli.enable_vision;

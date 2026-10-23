@@ -317,21 +317,30 @@ NInfer (measured with `master` at `81c8ce09` and the Windows port).
 
 ## Quality
 
-Infernix runs two routes:
+Infernix runs three routes:
 
-- **The exact route** (`--disable-fast-paths`) gives bit-identical output from run to run and from
-  release to release. Where an artifact's formats allow it (the NVFP4 Qwen3.8-27B and the NVFP4,
-  FP8 and GGUF Flash-Next imports, for example), it is also request-invariant: other requests, concurrency,
-  prefix-cache state and memory pressure do not change a request's output.
+- **The lossless route** (`--lossless`; Qwen3.5/3.6/3.8 and Qwen3.8-Flash-Next, generation and scoring)
+  computes the model's own arithmetic exactly:
+  every operation of its Hugging Face forward pass correctly rounded to the dtype it has there
+  (weights decoded exactly, sums exact). Its output depends on the request and the artifact alone,
+  not on the build, the prefill chunk, prefill or decode, other requests or the prefix cache; it is slower
+  than the other routes
+  ([definition](docs/maintainer/lossless-route.md)).
+- **The reproducible route** (`--reproducible`) gives bit-identical output from run to run and from
+  release to release. It is also request-invariant (other requests, concurrency, prefix-cache state
+  and memory pressure do not change a request's output), and speculation does not change it: a
+  sampled request draws each token by Gumbel-max keyed by its seed, position and token, so drafts
+  are verified against the token plain decoding would draw.
 - **Fast paths** (on by default) are faster kernels and scheduling choices that change the
   arithmetic. Each one runs only for the kernels it was qualified on, only after passing the quality
   gate below, and only where it was measured faster.
 
 ### The quality gate
 
-A fast path is measured against a high-precision reference: the same model with 16-bit activations
-in every layer and a BF16 KV cache. Infernix charges a path only for the distance it adds beyond
-the exact route's own, so the quantization a model already carries is not counted against it.
+A fast path is measured against a high-precision reference: the lossless route (`--lossless`, every
+operation of the model's Hugging Face forward pass correctly rounded) with a BF16 KV cache. Infernix
+charges a path only for the distance it adds beyond the reproducible route's own, so the
+quantization a model already carries is not counted against it.
 
 - **Prefill**: teacher-forced over a 1.04M-token corpus at four chunk sizes, measuring the KL
   divergence from the reference and top-1 token agreement.
@@ -408,7 +417,7 @@ infernix-serve.exe Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix-00001-of-00003.i
 Qwen3.8-27B on a 32 GB RTX 5090:
 
 ```bat
-infernix-serve.exe qwen3_8_27b_nvfp4-nvidia.ninfer --max-context 240000 --max-concurrency 2 --spec dflash2 --draft-tokens 7 --lm-head-draft --ngram-draft-tokens 15 --ngram-min-match 12 --kv-dtype int8 --preserve-thinking --host-context-mib 52000 --prefill-chunk 4096 --kv-capacity auto --tolerant-tool-calls
+infernix-serve.exe qwen3_8_27b_nvfp4-nvidia.ninfer --max-context 240000 --max-concurrency 2 --spec dflash2 --draft-tokens auto --lm-head-draft --ngram-draft-tokens auto --kv-dtype int8 --preserve-thinking --host-context-mib 52000 --prefill-chunk 4096 --kv-capacity auto --tolerant-tool-calls
 ```
 
 Add `--prefix-cache-file PATH` to keep the prefix cache across restarts. Stop the server with
@@ -456,6 +465,7 @@ repository's model card gives its files, requirements, recommended command, qual
 | [Qwen3.8-Flash-Next-FP8-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-FP8-Infernix) | [Qwen/Qwen3.8-Flash-Next-FP8](https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8) | Qwen's FP8 checkpoint bit-exact, with Qwen's BF16 n-gram table: the most accurate conversion and the slowest (about 44 tok/s plain), since its 112.6 GiB of experts exceed what a 96 GB machine can pin and the SSD tier reads the rest. |
 | [Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix) | [orcarouter/Qwen3.8-Flash-Next-Uncensored-NVFP4](https://huggingface.co/orcarouter/Qwen3.8-Flash-Next-Uncensored-NVFP4) | An abliterated build whose refusal behaviour has been removed (see its model card). Its weight-only NVFP4 experts and FP8 dense projections are kept bit-exact and run with BF16 activations; the other dense classes are stored in 8 bits as in Dense8. Perplexity 4.772 (Strata's base-model GGUF 4.844, NVIDIA Dense8 4.653: abliteration changes the weights). Needs Infernix `windows-2026.10.09.2` or later. |
 | [Swift-1.5-Qwen3.8-Flash-Next-NVFP4-Dense8-Infernix](https://huggingface.co/Wallawalla47/Swift-1.5-Qwen3.8-Flash-Next-NVFP4-Dense8-Infernix) | [ukisai/Swift-1.5-Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-NVFP4) | UkisAI's fine-tune that thinks with fewer tokens (see its model card), converted like NVIDIA Dense8: experts bit-exact, dense projections in 8 bits. Smoke-tested; its quality and speed are not yet measured. |
+| [Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix) | [nvidia/Qwen3.8-Flash-Next-FP4-Local](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-FP4-Local) | NVIDIA's quantization-aware-distilled FP4 checkpoint, bit-exact: NVFP4 routed experts, MXFP8 dense projections and an NVFP4 n-gram table, which ships with the model as its own volume. Experts run with 16-bit activations as NVIDIA serves them; `--expert-a4-activations` opts into 4-bit activations with NVIDIA's calibrated scales (changes the output). Perplexity 3.4865 against 3.4854 for the FP8 conversion on the quick corpus. **Support is preliminary: optimisation is still in progress.** |
 
 Every Flash-Next conversion can draft with **[Qwen3.8-Flash-Next-DFlash2-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-DFlash2-Infernix)**
 (**recommended**, 776 MB), Inco AI's
@@ -506,10 +516,19 @@ the formats.
 The `neroued` artifacts are NInfer's (Infernix loads `.ninfer` files unchanged); their model cards
 are versioned in [`model-cards/`](model-cards/) beside those of the other repositories.
 
+### Qwen3.5-122B-A10B
+
+A 122B-parameter mixture-of-experts model on one 32 GB GPU: the routed experts (60.75 GiB) live in host
+RAM behind a VRAM expert cache, as for Flash-Next ([guide](docs/qwen3_5-122b.md)). **Support is preliminary: it runs and is verified, but optimisation is still in progress, so expect speeds to change.**
+
+| Repository | Converted from | What it is |
+|---|---|---|
+| **[Ornith-1.5-122B-NVFP4-Infernix](https://huggingface.co/Wallawalla47/Ornith-1.5-122B-NVFP4-Infernix)** | [ornith-ai/Ornith-1.5-122B-NVFP4](https://huggingface.co/ornith-ai/Ornith-1.5-122B-NVFP4) | Every weight the model computes with exactly as the checkpoint stores it (NVFP4 experts, FP8 projections), plus the MTP drafter, the [DFlash2 drafter](https://huggingface.co/incoai/Ornith-1.5-122B-DFlash2) re-quantized, the vision tower, a Q4 proposal head for `--lm-head-draft` and the model card's sampling defaults. About 90-96 tok/s plain decode, 6,500 tok/s prefill at 32K, and MTP with 2 drafts about 5 % faster than plain decode on sampled requests ([performance](docs/qwen3_5-122b.md#performance-rtx-5090-one-request-bf16-kv-default-route)). |
+
 ## Documentation
 
 [CLI](docs/cli.md), [serving](docs/serving.md), [Qwen3.8-Flash-Next](docs/qwen3_8-flash-next.md),
-[perplexity](docs/perplexity.md), [performance](docs/performance.md) and the
+[Qwen3.5-122B-A10B](docs/qwen3_5-122b.md), [perplexity](docs/perplexity.md), [performance](docs/performance.md) and the
 [documentation map](docs/README.md).
 
 ## Contributing

@@ -2,6 +2,7 @@
 #include "models/qwen3_5/execution/text.h"
 #include "models/qwen3_5/execution/attention.h"
 #include "models/qwen3_5/execution/gdn.h"
+#include "models/qwen3_5/execution/lossless.h"
 #include "models/qwen3_5/execution/ffn.h"
 #include "models/qwen3_5/execution/mtp.h"
 #include "models/qwen3_5/execution/workspace.h"
@@ -253,6 +254,9 @@ TextContext::TextContext(DeviceContext& ctx, const execution::Parameters& weight
         throw std::invalid_argument("MTP TextContext requires MTP round state");
     }
     set_linear_state_slots(0, 0);
+    // Offloaded experts: decode and verification rounds take their graphed route; a prefill pass sets
+    // its own (set_offloaded_experts).
+    offloaded_experts_ = io_.offloaded_experts;
     embed_      = &parameters_.text.token_embedding;
     final_norm_ = &parameters_.text.final_norm;
     lm_head_    = &parameters_.text.output_head;
@@ -628,23 +632,28 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
     }
 }
 
-void TextContext::proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& proposal_tokens) {
+void TextContext::proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& proposal_tokens,
+                                  Tensor* probabilities) {
     auto proposal_scope = work_.scope();
     const int T         = hidden.ne[1];
     require_tensor_shape(hidden, DType::BF16, {dimension(config_.hidden_size), T},
                          "proposal hidden");
     require_tensor_shape(proposal_tokens, DType::I32, {T}, "proposal tokens");
     require_tensor_window(logits, DType::BF16, dimension(config_.vocab_size), T, "proposal logits");
+    if (probabilities != nullptr) { require_tensor_shape(*probabilities, DType::FP32, {T}, "proposal probabilities"); }
     nvtx::ScopedRange proposal_range(nvtx::Name::MtpProposal, nvtx::Category::Mtp,
                                      static_cast<std::uint64_t>(T));
+    // The drafter's probability of each selected row, over the head's rows (a shortlist head: its
+    // own rows), before the row ids map to token ids.
     if (proposal_head_ != nullptr) {
         Tensor proposal_logits = work_.alloc(DType::BF16, {proposal_head_n_, T});
         project(hidden, *proposal_head_, proposal_logits, work_, ctx_.stream);
-        ops::argmax(proposal_logits, proposal_tokens,
-                    proposal_head_ids_
-                        ? proposal_head_n_
-                        : dimension(parameters_.model.resources().public_token_count),
-                    ctx_.stream);
+        const std::int32_t valid_rows =
+            proposal_head_ids_ ? proposal_head_n_ : dimension(parameters_.model.resources().public_token_count);
+        ops::argmax(proposal_logits, proposal_tokens, valid_rows, ctx_.stream);
+        if (probabilities != nullptr) {
+            ops::argmax_probability(proposal_logits, proposal_tokens, *probabilities, valid_rows, ctx_.stream);
+        }
         if (proposal_head_ids_ != nullptr) {
             ops::proposal_remap_token_ids(proposal_tokens, proposal_head_ids_, proposal_head_n_,
                                           ctx_.stream);
@@ -652,8 +661,11 @@ void TextContext::proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& 
     } else {
         Tensor output_logits = matrix_window(logits, T);
         project(hidden, mtp_->output_head, output_logits, work_, ctx_.stream);
-        ops::argmax(output_logits, proposal_tokens,
-                    dimension(parameters_.model.resources().public_token_count), ctx_.stream);
+        const std::int32_t valid_rows = dimension(parameters_.model.resources().public_token_count);
+        ops::argmax(output_logits, proposal_tokens, valid_rows, ctx_.stream);
+        if (probabilities != nullptr) {
+            ops::argmax_probability(output_logits, proposal_tokens, *probabilities, valid_rows, ctx_.stream);
+        }
     }
 }
 
@@ -749,11 +761,29 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
                          "ordinary decode Linear Attention destination slots");
     require_tensor_shape(hidden, DType::BF16, {dimension(config_.hidden_size), batch},
                          "ordinary decode hidden");
-    require_tensor_shape(logits, DType::BF16, {dimension(config_.vocab_size), batch},
-                         "ordinary decode logits");
+    require_tensor_shape(logits, execution_schedule_.lossless ? DType::FP32 : DType::BF16,
+                         {dimension(config_.vocab_size), batch}, "ordinary decode logits");
 
     cudaStream_t stream = ctx_.stream;
     work_.reset();
+    if (execution_schedule_.lossless) {
+        // The cache form, one column per lane; FP32 logits.
+        Tensor x = work_.alloc(DType::BF16, {dimension(config_.hidden_size), batch});
+        ops::embedding(ids, *embed_, x, stream);
+        const Tensor rope_table = lossless_rope_window(config_, rope_positions, work_, stream);
+        LosslessCache cache{.positions         = &cache_positions,
+                            .table_rows        = &kv_table_rows,
+                            .source_slots      = &linear_state_source_slots,
+                            .destination_slots = &linear_state_destination_slots,
+                            .sequences         = batch,
+                            .max_keys          = static_cast<std::int32_t>(envelope.max_visible_keys),
+                            .key_capacity      = execution_schedule_.lossless_keys};
+        run_lossless_layers(x, rope_table, &cache);
+        lossless_final_norm(x, *final_norm_, config_, hidden, stream);
+        lossless_head(hidden, lm_head_->weight, logits, work_, stream);
+        work_.reset();
+        return;
+    }
     {
         ScopedPositions cache_binding(active_cache_positions_, cache_positions);
         ScopedPositions rope_binding(active_rope_positions_, rope_positions);
@@ -771,7 +801,7 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
         NullTap tap;
         run_layers(x, Phase::Verify, tap);
         ops::rmsnorm(x, *final_norm_, config_.rms_norm_eps, true, hidden, stream);
-        project(hidden, phase_text(Phase::Verify).output_head, logits, work_, stream);
+        project(hidden, phase_text(Phase::Verify, batch).output_head, logits, work_, stream);
     }
     work_.reset();
 }
@@ -836,7 +866,7 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
         Tensor flat_logits = logits.view({dimension(config_.vocab_size), columns});
         Tensor flat_tokens = target_tokens.view({columns});
         ops::rmsnorm(x, *final_norm_, config_.rms_norm_eps, true, flat_hidden, stream);
-        project(flat_hidden, phase_text(Phase::Verify).output_head, flat_logits, work_, stream);
+        project(flat_hidden, phase_text(Phase::Verify, columns).output_head, flat_logits, work_, stream);
         ops::argmax(flat_logits, flat_tokens,
                     dimension(parameters_.model.resources().public_token_count), stream);
     }
@@ -903,17 +933,35 @@ void TextContext::mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidd
     ScopedValue<const Tensor*> valid_binding(active_valid_columns_, &valid_columns);
     ScopedValue<std::int32_t> batch_binding(active_sequence_batch_, batch);
     ScopedValue<std::int32_t> width_binding(active_sequence_width_, width);
+    ScopedValue<const MtpParameters*> drafter_binding(mtp_, batch_mtp());
     mtp_forward_core(ids, hidden, cache_positions, rope_positions, envelope, mtp_hidden, nullptr);
 }
 
-void TextContext::mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor& draft_tokens) {
+void TextContext::mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor& draft_tokens,
+                                    Tensor* probabilities) {
     const std::int32_t batch = hidden.ne[1];
     require_tensor_shape(hidden, DType::BF16, {dimension(config_.hidden_size), batch},
                          "MTP proposal batch hidden");
     require_tensor_shape(logits, DType::BF16, {dimension(config_.vocab_size), batch},
                          "MTP proposal batch logits");
     require_tensor_shape(draft_tokens, DType::I32, {batch}, "MTP proposal batch tokens");
-    proposal_argmax(hidden, logits, draft_tokens);
+    ScopedValue<const MtpParameters*> drafter_binding(mtp_, batch_mtp());
+    ScopedValue<const LinearParameters*> head_binding(proposal_head_, batch_proposal_head());
+    proposal_argmax(hidden, logits, draft_tokens, probabilities);
+}
+
+const MtpParameters* TextContext::batch_mtp() const noexcept {
+    return execution_schedule_.column_invariant_decode && parameters_.invariant_mtp
+               ? &*parameters_.invariant_mtp
+               : mtp_;
+}
+
+const LinearParameters* TextContext::batch_proposal_head() const noexcept {
+    // Only the artifact's own proposal head has an invariant copy.
+    const bool own = parameters_.proposal && proposal_head_ == &parameters_.proposal->head;
+    return execution_schedule_.column_invariant_decode && own && parameters_.invariant_proposal_head
+               ? &*parameters_.invariant_proposal_head
+               : proposal_head_;
 }
 
 void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase ph) {
@@ -1172,20 +1220,34 @@ ops::SparseMoeHints TextContext::next_projection_hints(int layer) const {
 }
 
 void TextContext::mlp_tail(const BlockParameters& weights, Tensor& x, Phase ph,
-                           const ops::SparseMoeHints& hints) {
+                           const ops::SparseMoeHints& hints, std::size_t layer) {
     Tensor h = workspace::post_mixer_hidden(work_, config_, x.ne[1]);
     ops::rmsnorm(x, weights.post_attention_norm, config_.rms_norm_eps, true, h, ctx_.stream);
     const std::int32_t width = row_width(x.ne[1]);
+    // An offloaded MoE layer: decode and verification rounds (graphed) take the fork and the
+    // landings; a prefill chunk the route the Program chose for it (streamed, split).
+    OffloadedMoeContext offloaded;
+    if (std::holds_alternative<OffloadedMoeParameters>(weights.ffn)) {
+        const TextParameters& text = phase_text(ph, x.ne[1]);
+        offloaded.experts          = offloaded_experts_;
+        offloaded.call             = ph == Phase::Verify ? OffloadedCall{.graphed = true} : offloaded_prefill_;
+        offloaded.next             = layer + 1 < text.layers.size() ? &text.layers[layer + 1] : nullptr;
+        // A verification round's padding past each row's drafts routes no expert.
+        if (ph == Phase::Verify && offloaded_experts_ != nullptr && active_valid_columns_ != nullptr && active_sequence_batch_ != 0 && width > 1) {
+            offloaded.call.mask = {static_cast<const std::int32_t*>(active_valid_columns_->data), width};
+        }
+    }
     ffn(h, weights.ffn, x, hints, work_, ctx_.execution_view(), false,
         wide_residual_verification(ph, width, width), execution_schedule_.linear_routes,
-        ph == Phase::Verify && execution_schedule_.wide_down_tile ? ops::LinearRoutes::WideDownTile
-                                                                   : ops::LinearRoutes::Exact);
+        ph == Phase::Verify && execution_schedule_.batched_columns(x.ne[1]) ? ops::LinearRoutes::WideDownTile
+                                                                             : ops::LinearRoutes::Exact,
+        offloaded.experts != nullptr ? &offloaded : nullptr);
 }
 
 template <class Tap>
 void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
     const bool prefill = ph == Phase::Prefill;
-    const TextParameters& text = phase_text(ph);
+    const TextParameters& text = phase_text(ph, x.ne[1]);
     for (std::size_t layer = 0; layer < text.layers.size(); ++layer) {
         const auto& block  = text.layers[layer];
         const bool full    = config_.layer_types[layer] == MixerKind::FullAttention;
@@ -1215,7 +1277,7 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                                                 : nvtx::Name::VerifyPostMixer,
                                         nvtx::Category::PostMixer, layer);
                 auto scope = work_.scope();
-                mlp_tail(block, x, ph, next_projection_hints(static_cast<int>(layer)));
+                mlp_tail(block, x, ph, next_projection_hints(static_cast<int>(layer)), layer);
             }
             if constexpr (Tap::enabled) {
                 tap.capture_layer(static_cast<int>(layer), x, ctx_.stream);
@@ -1233,6 +1295,34 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
 void TextContext::run_layers(Tensor& x, Phase ph) {
     NullTap tap;
     run_layers(x, ph, tap);
+}
+
+void TextContext::run_lossless_layers(Tensor& x, const Tensor& rope_table, LosslessCache* cache) {
+    cudaStream_t s = ctx_.stream;
+    for (std::size_t layer = 0; layer < parameters_.text.layers.size(); ++layer) {
+        const bool full    = config_.layer_types[layer] == MixerKind::FullAttention;
+        const auto compact = dimension(config_.compact_layer_indices[layer]);
+        if (layer < layer_ready_.size()) { CUDA_CHECK(cudaStreamWaitEvent(s, layer_ready_[layer], 0)); }
+        if (cache != nullptr) {
+            if (full) {
+                cache->kv = text_kv_layer(static_cast<std::uint32_t>(compact));
+            } else {
+                const LinearAttentionStateLayerView states = state_.layer_view(static_cast<std::uint32_t>(compact));
+                cache->conv_states      = states.conv;
+                cache->recurrent_states = states.recurrent;
+            }
+        }
+        auto scope = work_.scope();
+        try {
+            lossless_layer(parameters_.text.layers[layer], config_, config_.layer_types[layer], rope_table, x, work_,
+                           s, cache, execution_schedule_.lossless_design, offloaded_experts_,
+                           &offloaded_prefill_);
+        } catch (const std::exception& error) {
+            throw std::runtime_error("text/layers/" + std::to_string(layer) +
+                                     " lossless columns=" + std::to_string(x.ne[1]) + ": " + error.what());
+        }
+    }
+    layer_ready_ = {};
 }
 
 template <class Tap>
@@ -1372,21 +1462,64 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                     1, visual_begin, static_cast<std::int32_t>(local_scatter_indices.size()));
                 ops::scatter(embeddings, indices_device, x, s);
             }
-            if constexpr (Tap::enabled) { tap.begin(x); }
-            run_layers(x, Phase::Prefill, tap);
-            if constexpr (requires { tap.capture_positions(positions, s); }) {
-                tap.capture_positions(positions, s);
-            }
+            Tensor xf;
+            if (execution_schedule_.lossless) {
+                if (multimodal != nullptr) { throw std::logic_error("the lossless route takes text prompts"); }
+                const Tensor rope_table = lossless_rope_window(config_, rope_positions, work_, s);
+                if (execution_schedule_.lossless_keys == 0) {
+                    // The window form, one pass over the window (the planner requires the chunk to cover
+                    // it): attention over its own keys, GDN and convolution from zero state.
+                    if (base != 0 || len != T || prefill_hidden_.data == nullptr) {
+                        throw std::logic_error("the lossless route scores a text window in one pass");
+                    }
+                    run_lossless_layers(x, rope_table, nullptr);
+                } else {
+                    // The cache form: the chunk continues the sequence from the lane's state slots.
+                    Tensor slots = work_.alloc(DType::I32, {2});
+                    Tensor source = slots.slice(0, 0, 1), destination = slots.slice(0, 1, 1);
+                    ops::set_i32_scalar(source, linear_state_source_slot_, s);
+                    ops::set_i32_scalar(destination, linear_state_destination_slot_, s);
+                    const Tensor& rows =
+                        active_kv_table_rows_ != nullptr ? *active_kv_table_rows_ : io_.text_kv_table_row;
+                    LosslessCache cache{.positions         = &positions,
+                                        .table_rows        = &rows,
+                                        .source_slots      = &source,
+                                        .destination_slots = &destination,
+                                        .sequences         = 1,
+                                        .max_keys          = base_i + t0 + len,
+                                        .key_capacity      = execution_schedule_.lossless_keys};
+                    run_lossless_layers(x, rope_table, &cache);
+                }
+                xf = prefill_hidden_.data != nullptr
+                         ? matrix_window(prefill_hidden_, len)
+                         : work_.alloc(DType::BF16, {dimension(config_.hidden_size), len});
+                lossless_final_norm(x, *final_norm_, config_, xf, s);
+            } else {
+                if constexpr (Tap::enabled) { tap.begin(x); }
+                run_layers(x, Phase::Prefill, tap);
+                if constexpr (requires { tap.capture_positions(positions, s); }) {
+                    tap.capture_positions(positions, s);
+                }
 
-            Tensor xf = prefill_hidden_.data != nullptr
-                            ? matrix_window(prefill_hidden_, len)
-                            : work_.alloc(DType::BF16, {dimension(config_.hidden_size), len});
-            ops::rmsnorm(x, *final_norm_, config_.rms_norm_eps, true, xf, s);
+                xf = prefill_hidden_.data != nullptr
+                         ? matrix_window(prefill_hidden_, len)
+                         : work_.alloc(DType::BF16, {dimension(config_.hidden_size), len});
+                ops::rmsnorm(x, *final_norm_, config_.rms_norm_eps, true, xf, s);
+            }
+            // Offloaded experts: the pass's routes reach the host for the cache update the Program
+            // applies after the pass's synchronization (ProgramOffload::end_prefill_pass).
+            if (offloaded_experts_ != nullptr && offloaded_experts_->engine != nullptr) {
+                offloaded_experts_->engine->enqueue_route_download(s, len);
+            }
 
             if (is_last) {
                 Tensor last_xf = xf.slice(1, len - 1, 1);
                 Tensor logits  = matrix_window(io_.logits, 1);
-                project(last_xf, *lm_head_, logits, work_, s);
+                if (execution_schedule_.lossless) {
+                    lossless_head(last_xf, lm_head_->weight, logits, work_, s); // FP32 logits
+                } else {
+                    project(last_xf, *lm_head_, logits, work_, s);
+                }
                 // Set io_.pos to the bonus token's absolute position (base + T) before picking so
                 // the sampler RNG is keyed by it (prefill purpose keeps it distinct from the first
                 // decode step, which reuses the same io_.pos).

@@ -63,6 +63,8 @@ struct PrefillContext {
     // the landing batch, which the cache's next poll() frees, so each chunk function calls this
     // immediately before its pass and nothing outside the chunk call can hold the view.
     std::function<std::span<const cudaEvent_t>()> take_layer_ready;
+    // Offloaded experts (RoundState::offloaded_experts): this pass's route through them.
+    OffloadedCall offloaded_call;
 };
 
 struct OrdinaryBatchContext {
@@ -95,6 +97,9 @@ struct DFlashBatchContext {
     Tensor& continuation_hidden_store;
     std::span<TokenId> host_drafts;
     CudaCompletionEvent& drafts_ready;
+    // adaptive-dflash: the pinned copies of the block proposal's per-draft probabilities (DFlash2)
+    // or log-probabilities (DFlash), [K * B] row-major by row, beside host_drafts.
+    std::span<float> host_confidence{};
     bool ngram                           = false;
     std::uint32_t neural_proposal_drafts = 0;
     // A DFlash2 tree round: the drafter's lattice becomes a per-row draft tree verified at the
@@ -200,8 +205,11 @@ void ordinary_decode_batch(OrdinaryBatchContext& state, std::int32_t batch_size,
                            DecodeGraphExecutable* executable);
 
 // Executes one exact-B MTP verification/alignment/proposal transaction. Each row may carry a
-// different current and next proposal extent while the model traversal remains batched.
-enum class SpeculativePhase { Forward, Finish };
+// different current and next proposal extent while the model traversal remains batched. A DFlash
+// round's Forward drafts and runs the target, Finish accepts; adaptive-dflash splits Forward into
+// Propose (context append and the drafter's whole block, published to the host with each draft's
+// probability) and Verify (the round's chosen width of that block through the target).
+enum class SpeculativePhase { Forward, Finish, Propose, Verify };
 
 void capture_mtp_decode_batch(MtpBatchContext& state, std::int32_t batch_size, std::uint32_t k,
                               MtpCausalAttentionEnvelopes envelopes,

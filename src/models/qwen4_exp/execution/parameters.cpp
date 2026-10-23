@@ -303,6 +303,34 @@ Parameters::Parameters(const Model& source) : model(source) {
     for (std::size_t i = 0; i < banks.size(); ++i) {
         scales_.copy_from_host(banks[i].scales.data(), per_layer, per_layer * i);
     }
+    std::vector<ops::offloaded_moe::LosslessExpertDesign> lossless_design(banks.size());
+    if (c.lossless) {
+        // The weights' own multipliers (an NVFP4 bank's scale tail); zeros for banks without them. The design
+        // reference adds a W4A4 bank's input scales (its declared A4 activations).
+        lossless_scales_ = DeviceBuffer(per_layer * banks.size());
+        for (std::size_t i = 0; i < banks.size(); ++i) {
+            std::vector<ops::offloaded_moe::ExpertScales> scales(c.moe.experts);
+            const float* m = banks[i].planes.multipliers;
+            if (banks[i].planes.gate_up_format == QType::NVFP4_MUL && m == nullptr) {
+                throw std::invalid_argument("Qwen4Exp lossless: an NVFP4 bank without its multipliers");
+            }
+            const bool a4 = c.design_reference && banks[i].activation == ops::offloaded_moe::ExpertActivation::kA4;
+            if (a4 && (banks[i].planes.gate_up_format != QType::NVFP4_MUL || banks[i].scales.size() != c.moe.experts)) {
+                throw std::invalid_argument("Qwen4Exp design reference: a W4A4 bank needs NVFP4 records and its input scales");
+            }
+            bool separate_up = false;
+            for (std::uint32_t e = 0; m != nullptr && e < c.moe.experts; ++e) {
+                const ops::offloaded_moe::ExpertScales in = a4 ? banks[i].scales[e] : ops::offloaded_moe::ExpertScales{};
+                scales[e] = {in.input_gate, in.input_up, in.input_down, m[3 * std::size_t(e)], m[3 * std::size_t(e) + 1],
+                             m[3 * std::size_t(e) + 2]};
+                separate_up = separate_up || in.input_up != in.input_gate;
+            }
+            lossless_design[i] = !a4          ? ops::offloaded_moe::LosslessExpertDesign::kNone
+                                 : separate_up ? ops::offloaded_moe::LosslessExpertDesign::kA4SeparateUp
+                                               : ops::offloaded_moe::LosslessExpertDesign::kA4;
+            lossless_scales_.copy_from_host(scales.data(), per_layer, per_layer * i);
+        }
+    }
 
     for (std::size_t i = 0; i < w.layers.size(); ++i) {
         const auto& layer = w.layers[i];
@@ -336,6 +364,11 @@ Parameters::Parameters(const Model& source) : model(source) {
         out.moe.bank           = &banks[i];
         out.moe.device_scales  = reinterpret_cast<const ops::offloaded_moe::ExpertScales*>(
             static_cast<const std::byte*>(scales_.p) + per_layer * i);
+        if (c.lossless) {
+            out.moe.lossless_scales = reinterpret_cast<const ops::offloaded_moe::ExpertScales*>(
+                static_cast<const std::byte*>(lossless_scales_.p) + per_layer * i);
+            out.moe.lossless_design = lossless_design[i];
+        }
         if (layer.ple) {
             const auto& p = *layer.ple;
             out.ple       = PleParameters{prepare.linear({p.key_projection, p.value_projection}),

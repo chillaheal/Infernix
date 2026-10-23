@@ -1,4 +1,5 @@
 #include "infernix/engine.h"
+#include "graph_prepare_probe.h"
 #include "speculative_page_boundary.h"
 
 #include <algorithm>
@@ -116,10 +117,17 @@ infernix::PromptInput initial_conversation() {
     infernix::PromptInput input;
     input.options.enable_thinking   = false;
 
+    // The prefix cache publishes a snapshot only 64 or more tokens past the root
+    // (prefix_cache::kMinimumTapSeparation), so the boundary restore's first turn is this long.
     infernix::ChatMessage user;
     user.role = infernix::ChatRole::User;
     user.parts.push_back(infernix::MessagePart{
-        .kind = infernix::MessagePartKind::Text, .text = "Name one prime number.", .media = {}});
+        .kind  = infernix::MessagePartKind::Text,
+        .text  = "A teacher is preparing a short exercise on number theory for a class of twelve-year-olds. "
+                 "The class has already met even and odd numbers, factors and multiples, and the idea that "
+                 "some numbers can only be divided evenly by one and by themselves. Before the lesson, she "
+                 "wants a single example to write on the board. Name one prime number.",
+        .media = {}});
     input.messages.push_back(std::move(user));
     return input;
 }
@@ -158,7 +166,7 @@ infernix::PromptInput altered_history_after_boundary() {
     return input;
 }
 
-int verify_dflash_load(const infernix::Engine& engine) {
+int verify_dflash_load(const infernix::Engine& engine, bool graphs_prepared) {
     const infernix::LoadSummary load = engine.load_summary();
     if (load.architecture != "Qwen3_5MoeForCausalLM" || load.model_name.empty() ||
         load.host_to_device_bytes == 0 || load.artifact_bytes_read < load.host_to_device_bytes) {
@@ -178,11 +186,10 @@ int verify_dflash_load(const infernix::Engine& engine) {
         std::cerr << "DFlash Engine has an invalid frozen memory layout\n";
         return 1;
     }
-    if (memory.cuda_graph_measured_bytes == 0 ||
-        memory.cuda_graph_measured_bytes > memory.cuda_graph_allowance_bytes) {
-        std::cerr << "DFlash Engine CUDA Graphs used " << memory.cuda_graph_measured_bytes
-                  << " bytes against an allowance of " << memory.cuda_graph_allowance_bytes
-                  << '\n';
+    if (!graphs_prepared || memory.cuda_graph_measured_bytes > memory.cuda_graph_allowance_bytes) {
+        std::cerr << "DFlash Engine CUDA Graphs " << (graphs_prepared ? "prepared" : "not prepared")
+                  << ", used " << memory.cuda_graph_measured_bytes << " bytes against an allowance of "
+                  << memory.cuda_graph_allowance_bytes << '\n';
         return 1;
     }
     return 0;
@@ -234,6 +241,11 @@ int exercise_boundary_restore(infernix::Engine& engine) {
         engine.generate(engine.prepare(initial_conversation()), greedy_options(2, true));
     if (first.generated_token_ids.size() != 2) {
         std::cerr << "DFlash boundary fixture did not establish resident state\n";
+        return 1;
+    }
+    if (first.prompt.prompt_tokens < 64) {
+        std::cerr << "DFlash boundary fixture is too short for a snapshot: " << first.prompt.prompt_tokens
+                  << " tokens\n";
         return 1;
     }
 
@@ -404,8 +416,9 @@ int run(const char* artifact) {
         }
     }
 
-    infernix::Engine engine(dflash_engine_options(artifact, infernix::ProposalHead::Optimized, 4352));
-    if (const int result = verify_dflash_load(engine); result != 0) { return result; }
+    const infernix::test::GraphPrepareProbe graphs;
+    infernix::Engine engine(graphs.attached(dflash_engine_options(artifact, infernix::ProposalHead::Optimized, 4352)));
+    if (const int result = verify_dflash_load(engine, graphs.prepared()); result != 0) { return result; }
     infernix::test::speculative_page_boundary(engine);
     engine.reset_memory_peaks();
     const infernix::GenerationResult dflash =

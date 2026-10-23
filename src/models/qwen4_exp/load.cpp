@@ -12,6 +12,7 @@
 #include <cstring>
 #include <algorithm>
 #include <map>
+#include <stdexcept>
 #include <utility>
 
 namespace infernix::models::qwen4_exp {
@@ -41,10 +42,9 @@ struct PendingWeight {
 // Logical demands of the selected model; each parameter is declared exactly once.
 class Bindings {
 public:
-    // a16_activations binds every Use A16Only (LoadOptions::a16_activations). first_id: the
-    // WeightId of this binder's first parameter (a companion artifact's follow the main artifact's).
-    Bindings(artifact::Binder& binder, bool a16_activations, std::size_t first_id = 0)
-        : binder_(binder), a16_activations_(a16_activations), first_id_(first_id) {}
+    // first_id: the WeightId of this binder's first parameter (a companion artifact's follow the main
+    // artifact's).
+    explicit Bindings(artifact::Binder& binder, std::size_t first_id = 0) : binder_(binder), first_id_(first_id) {}
 
     WeightId parameter(std::string name, Shape shape, std::string_view input = {},
                        std::optional<QType> exact_format = {},
@@ -60,8 +60,7 @@ public:
             if (!use.auxiliaries.empty()) {
                 throw ArtifactError(name + ": Qwen4Exp weights carry no Use auxiliaries");
             }
-            pending.policy = a16_activations_ ? ops::LinearPolicy::A16Only
-                                              : linear_policy(*use.activation_policy);
+            pending.policy = linear_policy(*use.activation_policy);
         }
         const WeightId id{first_id_ + weights.size()};
         ids_.emplace(std::move(name), id);
@@ -73,11 +72,24 @@ public:
         return parameter(std::move(name), std::move(shape), {}, format, residency);
     }
 
+    // A norm weight read in FP32 by its Ops: BF16, or FP32 where the artifact stores it so (NVIDIA
+    // FP4-Local's trained hyper-connection and PLE norms).
+    WeightId norm(std::string name, Shape shape) {
+        const auto& bindings = binder_.reader().directory().bindings;
+        const auto found     = bindings.find(name);
+        const bool fp32      = found != bindings.end() && !found->second.parts.empty() &&
+                          binder_.reader().geometry(found->second.parts.front().object).format == QType::FP32;
+        return direct(std::move(name), std::move(shape), fp32 ? QType::FP32 : QType::BF16);
+    }
+
+    [[nodiscard]] bool stored(std::string_view name) const {
+        return binder_.reader().directory().bindings.contains(name);
+    }
+
     std::vector<PendingWeight> weights;
 
 private:
     artifact::Binder& binder_;
-    bool a16_activations_ = false;
     std::size_t first_id_ = 0;
     std::map<std::string, WeightId, std::less<>> ids_;
 };
@@ -86,7 +98,7 @@ HyperConnectionWeights bind_hc(Bindings& b, const TextConfig& c, const std::stri
                                bool combine) {
     const std::uint64_t width = c.residual_width(), rank = c.hc.rank;
     HyperConnectionWeights out;
-    out.norm = b.direct(prefix + "norm", {width});
+    out.norm = b.norm(prefix + "norm", {width});
     out.down = b.parameter(prefix + "down", {rank, width}, prefix + "input");
     out.up   = b.parameter(prefix + "up", {width, rank}, prefix + "mix_activation");
     if (combine) {
@@ -147,10 +159,20 @@ MoeWeights bind_moe(Bindings& b, const TextConfig& c, const std::string& prefix,
     // NVFP4 banks (nvfp4_mul), block-FP8 banks or a GGUF import's ggml banks; plan_load checks the
     // layouts.
     out.experts      = b.parameter(p + "experts", {e, h, c.moe.intermediate}, input, std::nullopt, experts);
-    // A bank whose use allows A4 is W4A4 and carries its activation scales; an A16-only bank is
-    // W4A16 (design §16.2.1) and has none.
-    if (b.weights.at(out.experts.index).policy != ops::LinearPolicy::A16Only) {
+    // parse_config chose the arithmetic. A W4A4 bank (§16.2) permits 4-bit activations and carries
+    // its activation scales; an A16-only bank is W4A16 (design §16.2.1) and has none. A bank whose
+    // 4-bit activations are optional permits them and carries its scales, which only W4A4 reads.
+    // 16-bit activations everywhere bind every Use A16Only and leave stored scales unread.
+    const bool a4_permitted = b.weights.at(out.experts.index).policy != ops::LinearPolicy::A16Only;
+    if (!c.moe.a16_experts) {
+        if (!a4_permitted) { throw ArtifactError(p + "experts: 4-bit activations need a Use that permits them"); }
         out.input_scales = b.parameter(p + "expert_input_scales", {e, 3}, {}, QType::FP32, Residency::Values);
+    } else if (c.moe.a4_optional) {
+        if (!b.stored(p + "expert_input_scales")) {
+            throw ArtifactError(p + "expert_input_scales: optional 4-bit activations need the activation scales");
+        }
+    } else if (a4_permitted) {
+        throw ArtifactError(p + "experts: a bank that permits 4-bit activations needs its activation scales");
     }
     return out;
 }
@@ -161,12 +183,16 @@ PleWeights bind_ple(Bindings& b, const TextConfig& c, const std::string& prefix)
     PleWeights out;
     out.key_projection   = b.parameter(p + "key_projection", {width, dim}, input);
     out.value_projection = b.parameter(p + "value_projection", {h, dim}, input);
-    out.key_norm         = b.direct(p + "key_norm", {width});
-    out.query_norm       = b.direct(p + "query_norm", {width});
-    out.conv_norm        = b.direct(p + "conv_norm", {width});
+    out.key_norm         = b.norm(p + "key_norm", {width});
+    out.query_norm       = b.norm(p + "query_norm", {width});
+    out.conv_norm        = b.norm(p + "conv_norm", {width});
     out.convolution      = b.direct(p + "convolution", {c.ple.conv_kernel, width});
-    // An FP8 table's per-tensor scale; IQ4_NL rows carry their scales.
+    // An FP8 table's per-tensor scale (BF16) or an NVFP4 table's multiplier (FP32); IQ4_NL and BF16 rows
+    // carry their own.
     if (c.ple.table.format == NgramRowFormat::Fp8E4m3) { out.ngram_scale = b.direct(p + "ngram_scale", {1}); }
+    if (c.ple.table.format == NgramRowFormat::Nvfp4) {
+        out.ngram_scale = b.direct(p + "ngram_scale", {1}, QType::FP32);
+    }
     return out;
 }
 
@@ -374,19 +400,6 @@ std::vector<ops::offloaded_moe::ExpertScales> expert_scales(const ExpertBankPlan
     return out;
 }
 
-// A W4A16 bank's scalars (design §16.2.1): no input scales, alpha = the stored multipliers.
-std::vector<ops::offloaded_moe::ExpertScales> a16_expert_scales(const ExpertBankPlanes& planes, const std::string& name) {
-    std::vector<ops::offloaded_moe::ExpertScales> out(planes.experts);
-    for (std::uint32_t e = 0; e < planes.experts; ++e) {
-        const float* m = planes.multipliers + 3 * std::size_t(e);
-        for (int i = 0; i < 3; ++i) {
-            if (!std::isfinite(m[i]) || m[i] <= 0) { throw ArtifactError(name + ": expert multipliers must be positive finite FP32"); }
-        }
-        out[e] = {0.0F, 0.0F, 0.0F, m[0], m[1], m[2]};
-    }
-    return out;
-}
-
 } // namespace
 
 struct LoadPlan::Impl {
@@ -476,7 +489,7 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     }
     artifact::Binder binder(reader);
     out->resources = bind_resources(binder, out->config);
-    Bindings bindings(binder, options.a16_activations);
+    Bindings bindings(binder);
     out->weights = bind_text(bindings, out->config.text,
                              options.stream_experts ? Residency::Streamed : Residency::HostPinned);
     if (out->config.vision) {
@@ -505,17 +518,10 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
             out->weights.proposal = proposal;
         }
     }
-    // Every layer's bank has the same arithmetic: the activation policy of the first. The
-    // 16-bit-activation reference runs W4A4 banks W4A16 and leaves their activation scales unused.
-    const bool a16 = !out->weights.layers.front().moe.input_scales.valid();
-    if (a16 != out->config.text.moe.a16_experts && !options.a16_activations) {
-        throw ArtifactError("Qwen4Exp: the expert banks' activation policy disagrees with their activation scales");
-    }
-    for (const auto& layer : out->weights.layers) {
-        if (layer.moe.input_scales.valid() == a16) {
-            throw ArtifactError("Qwen4Exp: every layer's expert bank needs the same activation policy");
-        }
-        if (!out->config.text.moe.a16_experts) {
+    // Every layer's bank runs the arithmetic parse_config chose (bind_moe checked each against it);
+    // W4A4 banks read their activation scales.
+    if (!out->config.text.moe.a16_experts) {
+        for (const auto& layer : out->weights.layers) {
             out->input_scales.push_back(
                 binder.values(bindings.weights.at(layer.moe.input_scales.index).reference.binding, QType::FP32));
         }
@@ -585,7 +591,7 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
             d.fused_head          = !d.ggml_head && (proposal ? tensor.format == "q4_g64_fp16" && d.head_rows == 131072U
                                                               : tensor.format == "q8_g32_fp16");
         }
-        Bindings draft(draft_binder, options.a16_activations, out->pending.size());
+        Bindings draft(draft_binder, out->pending.size());
         out->draft_first     = out->pending.size();
         out->weights.dflash2 = bind_dflash2(draft, *out->config.dflash2, out->config.text);
         for (auto& weight : draft.weights) { out->pending.push_back(std::move(weight)); }
@@ -690,8 +696,14 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
             bank.scales = expert_scales(bank.planes, data->input_scales.at(i),
                                         bound.at(layers[i].moe.input_scales.index).name);
         } else {
+            // A W4A16 bank's scalars (design §16.2.1): no input scales, alpha = the stored multipliers.
             bank.activation = ops::offloaded_moe::ExpertActivation::kA16;
-            bank.scales     = a16_expert_scales(bank.planes, bound.at(layers[i].moe.experts.index).name);
+            try {
+                bank.scales = runtime::expert_offload::a16_expert_scales(bank.planes,
+                                                                         bound.at(layers[i].moe.experts.index).name);
+            } catch (const std::invalid_argument& error) {
+                throw ArtifactError(error.what());
+            }
         }
         banks.push_back(std::move(bank));
     }

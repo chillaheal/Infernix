@@ -39,7 +39,8 @@ bool fused_text_qk_norm_rope(const Tensor& positions, const RopeConfig& rope,
            rms_norm_eps == kFusedTextNormEpsilon && positions.ne[1] == 1 &&
            attention.head_dim == 256 && rope.rotary_dim == 64 &&
            ((attention.num_attention_heads == 16 && attention.num_key_value_heads == 2) ||
-            (attention.num_attention_heads == 24 && attention.num_key_value_heads == 4));
+            (attention.num_attention_heads == 24 && attention.num_key_value_heads == 4) ||
+            (attention.num_attention_heads == 32 && attention.num_key_value_heads == 2));
 }
 
 } // namespace
@@ -61,7 +62,8 @@ void attention_projection(const Tensor& hidden, const AttentionParameters& param
                           Tensor& query, Tensor& gate, Tensor& key, Tensor& value,
                           WorkspaceArena& workspace, cudaStream_t stream) {
     if (const auto* pair = std::get_if<ops::PairedProjectionWeights>(&parameters.projection)) {
-        ops::attn_input_proj(hidden, pair->first, pair->second, query, gate, key, value, stream);
+        ops::attn_input_proj(hidden, pair->first, pair->second, query, gate, key, value,
+                             pair->policy, stream);
     } else {
         const auto& single = std::get<LinearParameters>(parameters.projection);
         ops::attn_input_proj(hidden, single.weight, query, gate, key, value, single.policy,

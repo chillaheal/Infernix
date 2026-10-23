@@ -12,15 +12,17 @@ std::uint32_t page_count(std::uint32_t capacity) {
     return 1U + (capacity - 1U) / static_cast<std::uint32_t>(kPagedKVPageSize);
 }
 
-PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std::uint32_t capacity,
-                              std::int32_t kv_heads, std::int32_t head_dim, KvCacheStorage storage,
-                              std::int32_t table_rows, std::uint32_t physical_page_groups) {
+PagedKVCacheLayout plan_cache(LayoutBuilder& builder, LayoutBuilder& pages_builder, std::uint32_t layers,
+                              std::uint32_t capacity, std::int32_t kv_heads, std::int32_t head_dim,
+                              KvCacheStorage storage, std::int32_t table_rows, std::uint32_t physical_page_groups,
+                              bool lossless) {
     if (layers == 0 ||
         layers > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) ||
         kv_heads <= 0 || head_dim <= 0 || table_rows <= 0) {
         throw std::invalid_argument("Paged KV cache geometry is invalid");
     }
-    const PagedKVStorageLayout layer_storage = paged_kv_storage_layout(storage, head_dim);
+    const PagedKVStorageLayout layer_storage =
+        lossless ? paged_kv_lossless_storage_layout(head_dim) : paged_kv_storage_layout(storage, head_dim);
 
     const std::uint32_t logical_pages = page_count(capacity);
     if (physical_page_groups < logical_pages) {
@@ -45,8 +47,8 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
     }
     return PagedKVCacheLayout{
         .pages = plan_device_kv_page_pool(
-            builder, DeviceKVPagePoolSpec{.page_group_count = physical_page_groups,
-                                          .geometry         = std::move(geometry)}),
+            pages_builder, DeviceKVPagePoolSpec{.page_group_count = physical_page_groups,
+                                                .geometry         = std::move(geometry)}),
         .execution_tables = plan_kv_execution_tables(
             builder,
             KVExecutionTableSpec{.logical_page_capacity = logical_pages, .table_rows = table_rows}),
@@ -59,21 +61,25 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
 
 } // namespace
 
-DecoderStateLayout plan_decoder_state(LayoutBuilder& builder, const DecoderStateSpec& spec) {
+DecoderStateLayout plan_decoder_state(LayoutBuilder& builder, const DecoderStateSpec& spec,
+                                      LayoutBuilder* text_pages) {
     DecoderStateLayout layout;
-    layout.text_kv = plan_cache(builder, spec.full_attention_layers, spec.capacity, spec.kv_heads,
-                                spec.attention_head_dim, spec.kv_storage, spec.kv_table_rows,
-                                spec.text_physical_page_groups);
+    layout.text_kv = plan_cache(builder, text_pages != nullptr ? *text_pages : builder, spec.full_attention_layers,
+                                spec.capacity, spec.kv_heads, spec.attention_head_dim, spec.kv_storage,
+                                spec.kv_table_rows, spec.text_physical_page_groups, spec.lossless);
     if (spec.enable_mtp) {
-        layout.mtp_kv = plan_cache(builder, spec.mtp_layers, spec.capacity, spec.kv_heads,
+        layout.mtp_kv = plan_cache(builder, builder, spec.mtp_layers, spec.capacity, spec.kv_heads,
                                    spec.attention_head_dim, spec.kv_storage, spec.kv_table_rows,
-                                   spec.mtp_physical_page_groups);
+                                   spec.mtp_physical_page_groups, spec.lossless);
     }
     return layout;
 }
 
 PagedKVCache::PagedKVCache(DeviceSpan backing, const PagedKVCacheLayout& layout)
-    : pages_(backing, layout.pages), execution_tables_(backing, layout.execution_tables, pages_),
+    : PagedKVCache(backing, backing, layout) {}
+
+PagedKVCache::PagedKVCache(DeviceSpan pages, DeviceSpan tables, const PagedKVCacheLayout& layout)
+    : pages_(pages, layout.pages), execution_tables_(tables, layout.execution_tables, pages_),
       layers_(layout.layers), max_context_(layout.max_context), kv_heads_(layout.kv_heads),
       layer_storage_(layout.layer_storage) {
     if (pages_.plane_count() !=
@@ -138,8 +144,8 @@ std::size_t DecoderStateLayout::kv_payload_bytes() const noexcept {
     return text_kv.payload_bytes() + (mtp_kv ? mtp_kv->payload_bytes() : 0);
 }
 
-DecoderState::DecoderState(DeviceSpan backing, const DecoderStateLayout& layout)
-    : text_kv(backing, layout.text_kv) {
+DecoderState::DecoderState(DeviceSpan backing, const DecoderStateLayout& layout, DeviceSpan text_pages)
+    : text_kv(text_pages.data != nullptr ? text_pages : backing, backing, layout.text_kv) {
     if (layout.mtp_kv) { mtp_kv.emplace(backing, *layout.mtp_kv); }
 }
 

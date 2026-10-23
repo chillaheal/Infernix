@@ -42,6 +42,29 @@ infernix_add_op_test(infernix_linear_fp8_a8_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_fp8_a8.cpp"
   LIBRARIES infernix_linear_test_support)
 
+# MXFP8 (fp8_e4m3fn_g32_e8m0) with 16-bit activations: NVIDIA FP4-Local's Flash-Next shapes.
+infernix_add_op_test(infernix_linear_mxfp8_a16_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_mxfp8_a16.cpp" "${CMAKE_CURRENT_LIST_DIR}/../dirty_shared_memory.cu"
+  LIBRARIES infernix_linear_test_support)
+
+# FP4-Local's MXFP8 shared expert on its own stream beside the offloaded routed experts, as the
+# Qwen4Exp decode overlaps them: every output equals the serialized run's bits.
+infernix_add_op_test(infernix_mxfp8_moe_overlap_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_mxfp8_overlap.cu"
+  LIBRARIES infernix_linear_test_support)
+
+# Recipe C's FP8 shared expert on its own stream beside the offloaded routed experts, as the Qwen4Exp
+# decode overlaps them: every output equals the serialized run's bits.
+infernix_add_op_test(infernix_fp8_moe_overlap_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_fp8_moe_overlap.cu"
+  LIBRARIES infernix_linear_test_support)
+
+# The TMA-staged FP8 A8 route on its own stream beside the offloaded routed experts: every output equals
+# the serialized run's bits (the consumers' proxy fence; unfenced it fails here, the other TMA routes do not).
+infernix_add_op_test(infernix_tma_moe_overlap_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_tma_moe_overlap.cu"
+  LIBRARIES infernix_linear_test_support)
+
 infernix_add_op_test(infernix_linear_bf16_a16_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_bf16_a16.cpp"
   LIBRARIES infernix_linear_test_support)

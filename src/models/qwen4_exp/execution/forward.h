@@ -10,7 +10,7 @@
 #include "core/gdn_replay_records.h"
 #include "core/linear_attention_state.h"
 #include "core/tensor.h"
-#include "models/qwen4_exp/execution/expert_stream.h"
+#include "models/qwen4_exp/expert_offload.h"
 #include "models/qwen4_exp/execution/parameters.h"
 #include "models/qwen4_exp/execution/fast_path_flags.h"
 #include "infernix/ops/offloaded_sparse_moe.h"
@@ -46,16 +46,10 @@ struct ForwardKV {
     Tensor block_tables;                 // I32 [pages per row, rows]
 };
 
-// The CPU's share of a gated prefill call's experts (design §19.3.12): from the call's columns per
-// expert in one layer, marks in `cpu` the experts the CPU serves, which must be non-resident and
-// have at most ops::offloaded_moe::kMaxCpuColumns columns (the narrow route, placement-invariant),
-// and returns their number. Owned by the Program, which knows the link and the CPU's rates.
-class CpuSplitPolicy {
-public:
-    virtual ~CpuSplitPolicy() = default;
-    virtual std::uint32_t choose(std::uint32_t layer, std::span<const std::int32_t> columns,
-                                 std::span<std::uint8_t> cpu) const = 0;
-};
+// The CPU's share of a gated prefill call's experts (design §19.3.12) is the shared component's
+// CpuSplitPolicy (runtime/expert_offload/expert_offload.h): the experts it marks must be non-resident
+// and have at most ops::offloaded_moe::kMaxCpuColumns columns (the narrow route, placement-invariant).
+// Owned by the Program, which knows the link and the CPU's rates.
 
 // Where each layer's routed experts live: device frames for resident experts, the pinned host
 // bank otherwise.
@@ -162,7 +156,8 @@ struct ForwardBatch {
                              // pooled-block token (ops::QsaBatch::block_start_rope)
     Tensor ngram_rows; // U8 [row bytes, heads, T]: each column's n-gram rows
     // The rows' format when it is not the artifact's table's (another volume, resolve_ngram_volume),
-    // and an FP8 volume's scale (BF16 [1]) when it is not the artifact's ngram_scale.
+    // and an FP8 volume's scale (BF16 [1]) or an NVFP4 volume's multiplier (FP32 [1]) when it is not
+    // the artifact's ngram_scale.
     std::optional<NgramRowFormat> ngram_format;
     Tensor ngram_scale;
     const NgramRowGate* ngram_gate = nullptr; // when set: ngram_rows are written by the gate
@@ -197,6 +192,10 @@ struct ForwardBatch {
     // With a gated stream (ExpertStream::gated): each layer's routing decides, through
     // ForwardExperts::split, which experts the stream copies and which the CPU serves.
     bool split          = false;
+    // The lossless route (TextConfig::lossless): 0 for a scored window (one sequence from zero state over
+    // its own keys); for generation, a bound on every column's position + 1, and the call runs the cache
+    // form: K/V, pooled keys and tails, PLE history and GDN state through the lanes' slots and rows.
+    std::int32_t lossless_keys = 0;
 };
 
 // One call of the MTP drafter (design §11.2). Cell c of a sequence pairs a residual at position c
@@ -303,6 +302,10 @@ public:
     [[nodiscard]] static std::size_t workspace_bytes(
         const TextConfig& config, std::int32_t columns, std::int32_t max_context, KvCacheStorage storage,
         ops::offloaded_moe::WideA16 wide_a16 = ops::offloaded_moe::WideA16::kExact);
+    // The lossless route's workspace for a call of `columns` (TextConfig::lossless): a scored window, or with
+    // key_capacity > 0 the cache form over up to `sequences` sequences with keys up to key_capacity.
+    [[nodiscard]] static std::size_t lossless_workspace_bytes(const TextConfig& config, std::int32_t columns,
+                                                              std::int32_t key_capacity = 0, std::int32_t sequences = 1);
     // Extra workspace of the MTP drafter: K/V-only calls over up to `kv_columns` columns (chunks
     // run them inside run()) and full steps over `draft_columns` sequences.
     [[nodiscard]] static std::size_t mtp_workspace_bytes(const TextConfig& config, std::int32_t kv_columns,
@@ -311,6 +314,39 @@ public:
 
 private:
     void ple(const PleParameters& p, Tensor& residual, const ForwardBatch& batch);
+    // The call's PLE embedding (BF16 [embed, T]): its n-gram rows, decoded exactly and rounded to BF16.
+    Tensor ple_embedding(const PleParameters& p, const ForwardBatch& batch);
+    // The layer's routed-expert source without a call's scheduling (frames, host records, staging, the
+    // CPU channel, the SSD tier, the bank's formats).
+    [[nodiscard]] ops::MoeExpertSource expert_source(const MoeParameters& p, std::uint32_t layer) const;
+    // The --lossless route (forward_lossless.cpp; docs/maintainer/lossless-route.md §2a, §3a): every
+    // operation correctly rounded, a scored window per call or (ForwardBatch::lossless_keys) the cache form.
+    void check_lossless_call(const ForwardBatch& batch) const;
+    void lossless_project(const Tensor& x, const LinearParameters& p, std::int32_t row_begin, std::int32_t rows,
+                          Tensor& out, std::int32_t out_row);
+    // Projections of one input (rows of a LinearParameters, or of a plain Weight) that share its encode:
+    // those with the same input permutation run as one ops::lossless_linear_shared call.
+    struct LosslessPart {
+        const LinearParameters* p = nullptr; // or
+        const Weight* weight      = nullptr;
+        std::int32_t row_begin    = 0;
+        std::int32_t rows         = 0;
+        Tensor* out               = nullptr;
+        std::int32_t out_row      = 0;
+    };
+    void lossless_project_shared(const Tensor& x, std::span<const LosslessPart> parts);
+    Tensor lossless_mix(const HyperConnectionParameters& p, const Tensor& residual, Tensor* inject);
+    void lossless_ple(const PleParameters& p, Tensor& residual, const ForwardBatch& batch);
+    Tensor lossless_gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index, const ForwardBatch& batch);
+    Tensor lossless_attention_block(const AttentionParameters& p, const Tensor& x, std::uint32_t index,
+                                    const ForwardBatch& batch);
+    Tensor lossless_cached_attention(const AttentionParameters& p, const Tensor& qn, const Tensor& kn, const Tensor& v,
+                                     const Tensor& iqn, const Tensor& ik, const Tensor& inv_freq, std::uint32_t index,
+                                     const ForwardBatch& batch);
+    Tensor lossless_moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer);
+    void lossless_layer(std::uint32_t layer, const ForwardBatch& batch, Tensor& residual);
+    // The final mixer and the LM head over residuals (BF16 [S*H, n]) into FP32 logits [V, n].
+    void lossless_head(const Tensor& residuals, Tensor& logits);
     // The block's mixed input (into `into` when given, else the workspace).
     Tensor mix(const HyperConnectionParameters& p, const Tensor& residual, Tensor* inject, Tensor* into = nullptr);
     // The layer's token mixer (GDN or QSA attention) over its mixed input.

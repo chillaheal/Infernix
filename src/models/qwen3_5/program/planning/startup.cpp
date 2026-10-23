@@ -1,13 +1,16 @@
 #include "models/qwen3_5/execution/attention.h"
 #include "models/qwen3_5/execution/ffn.h"
 #include "models/qwen3_5/execution/gdn.h"
+#include "models/qwen3_5/execution/lossless.h"
 #include "models/qwen3_5/execution/mtp.h"
+#include "models/qwen3_5/execution/offloaded_moe.h"
 #include "models/qwen3_5/program/planning/fast_paths.h"
 #include "models/qwen3_5/program/planning/graph_profiles.h"
 #include "models/qwen3_5/program/planning/idle_prefill.h"
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/program/planning/startup.h"
 #include "models/qwen3_5/program/prefix/hybrid_host_layout.h"
+#include "models/qwen3_5/program/speculative/dflash_width_policy.h"
 #include "models/qwen3_5/program/speculative/mtp_draft_policy.h"
 #include "models/qwen3_5/execution/vision.h"
 #include "models/qwen3_5/execution/workspace.h"
@@ -81,7 +84,7 @@ bool tree_verification_supported(const execution::Parameters& parameters) {
         if (gdn == nullptr) { continue; }
         const auto* single = std::get_if<ops::SingleProjectionWeight>(&gdn->projection);
         if (single == nullptr || (single->weight.qtype != QType::NVFP4 &&
-                                  single->weight.qtype != QType::FP8_E4M3FN_ROW_BF16)) {
+                                  !is_fp8_row(single->weight.qtype))) {
             return false;
         }
     }
@@ -102,6 +105,11 @@ TreeWidthPlan resolve_tree_widths(const execution::Parameters& parameters,
     return plan;
 }
 
+bool plan_has_split(const SequencePlanImpl& plan) {
+    return std::any_of(plan.round_shapes.begin(), plan.round_shapes.end(),
+                       [](const SpeculativeRoundShape& shape) { return shape.split; });
+}
+
 bool plan_has_tree(const SequencePlanImpl& plan) {
     return std::any_of(plan.round_shapes.begin(), plan.round_shapes.end(),
                        [](const SpeculativeRoundShape& shape) {
@@ -111,14 +119,37 @@ bool plan_has_tree(const SequencePlanImpl& plan) {
 
 // The speculative round families an engine captures. Neural rounds verify at the drafter's window
 // and n-gram copy rounds at the n-gram window, for every backend. With adaptive-mtp every shorter
-// MTP draft length has its own neural family; lengths outside the batch lengths serve one row.
+// MTP draft length has its own neural family; lengths outside the batch lengths serve one row. With
+// adaptive-dflash the neural rounds instead verify, after a proposal of the whole block, one of the
+// policy's widths (dflash_width_policy.h), each a split family; widths outside the batch widths
+// serve one row. With a batch length (batch_drafts) there are no batch widths: rounds of several
+// rows run a plain neural family of that length.
 std::vector<SpeculativeRoundShape> speculative_round_shapes(const EngineOptions& options,
                                                             const TreeWidthPlan& tree_widths,
-                                                            bool adaptive_mtp) {
+                                                            bool adaptive_mtp, bool adaptive_dflash,
+                                                            std::uint32_t batch_drafts) {
     const SpeculativeOptions& spec = options.speculative;
     std::vector<SpeculativeRoundShape> shapes;
     if (spec.backend == SpeculativeBackend::None) { return shapes; }
-    shapes.push_back({SpeculativeRoundKind::Neural, spec.draft_tokens});
+    if (adaptive_dflash && is_masked_draft_backend(spec.backend)) {
+        const bool plain_batches = batch_drafts != 0 && options.max_concurrency > 1;
+        const std::vector<std::uint32_t> batch =
+            plain_batches ? std::vector<std::uint32_t>{} : dflash_policy_widths(spec.draft_tokens, true);
+        for (const std::uint32_t width : dflash_policy_widths(spec.draft_tokens, false)) {
+            const bool batches = std::find(batch.begin(), batch.end(), width) != batch.end();
+            shapes.push_back({.kind          = SpeculativeRoundKind::Neural,
+                              .verify_drafts = width - 1U,
+                              .single_row    = options.max_concurrency > 1 && !batches,
+                              .split         = true});
+        }
+        if (plain_batches) {
+            shapes.push_back({.kind          = SpeculativeRoundKind::Neural,
+                              .verify_drafts = std::min(batch_drafts, spec.draft_tokens),
+                              .batch_only    = true});
+        }
+    } else {
+        shapes.push_back({SpeculativeRoundKind::Neural, spec.draft_tokens});
+    }
     if (adaptive_mtp && spec.backend == SpeculativeBackend::Mtp) {
         for (std::uint32_t k = 1; k < spec.draft_tokens; ++k) {
             shapes.push_back({SpeculativeRoundKind::Neural, k,
@@ -129,13 +160,29 @@ std::vector<SpeculativeRoundShape> speculative_round_shapes(const EngineOptions&
     if (spec.ngram_draft_tokens != 0) {
         // Copy rounds take the narrowest n-gram family that holds their longest copy, so short
         // copies do not pay for the whole window. Narrower families lie strictly between the
-        // neural window (rows without a copy keep their neural proposal) and the n-gram window.
+        // neural proposal a copy must exceed (ProgramImpl::ngram_copy_floor: the neural window,
+        // or adaptive-dflash's batch length) and the n-gram window.
+        std::uint32_t copy_floor = spec.draft_tokens;
+        if (adaptive_dflash && is_masked_draft_backend(spec.backend) && batch_drafts != 0 &&
+            options.max_concurrency > 1) {
+            copy_floor = std::min(copy_floor, batch_drafts);
+        }
         for (const std::uint32_t narrow : {7U, 15U, 31U}) {
-            if (narrow > spec.draft_tokens && narrow < spec.ngram_draft_tokens) {
+            if (narrow > copy_floor && narrow < spec.ngram_draft_tokens) {
                 shapes.push_back({SpeculativeRoundKind::Ngram, narrow});
             }
         }
-        shapes.push_back({SpeculativeRoundKind::Ngram, spec.ngram_draft_tokens});
+        // Where batched copies stop at a narrower window, the widest family serves one row.
+        const bool narrow_batches = spec.ngram_batch_draft_tokens != 0 &&
+                                    spec.ngram_batch_draft_tokens < spec.ngram_draft_tokens;
+        if (narrow_batches && std::none_of(shapes.begin(), shapes.end(), [&](const SpeculativeRoundShape& s) {
+                return s.kind == SpeculativeRoundKind::Ngram && s.verify_drafts == spec.ngram_batch_draft_tokens;
+            })) {
+            shapes.push_back({SpeculativeRoundKind::Ngram, spec.ngram_batch_draft_tokens});
+        }
+        shapes.push_back({.kind          = SpeculativeRoundKind::Ngram,
+                          .verify_drafts = spec.ngram_draft_tokens,
+                          .single_row    = narrow_batches && options.max_concurrency > 1});
     }
     // One tree family per distinct tree width.
     for (const std::uint32_t nodes : tree_widths.widths()) {
@@ -228,6 +275,11 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                     "MTP Paged KV physical pages exceed int32"));
     LayoutBuilder builder;
     PersistentLayout out;
+    // Offloaded experts take the VRAM the Program leaves, so a generation Program's text KV pages grow
+    // from them on demand (elastic KV): planned in their own region, backed beyond kElasticKvBaseTokens
+    // as requests need. (Every capacity plans the region the same way, so the plan stays affine in it.)
+    const bool elastic_kv = parameters.model.offloaded_experts() && !plan.causal_scoring;
+    LayoutBuilder text_pages;
     out.decoder = qwen3_5::plan_decoder_state(
         builder, qwen3_5::DecoderStateSpec{
                      .full_attention_layers     = config.full_attention_layers,
@@ -236,11 +288,17 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                      .kv_heads                  = dimension(config.attention->num_key_value_heads),
                      .attention_head_dim        = dimension(config.attention->head_dim),
                      .kv_storage                = plan.kv_storage,
+                     .lossless                  = plan.execution_schedule.lossless,
                      .enable_mtp                = plan.features.mtp(),
                      .kv_table_rows             = static_cast<std::int32_t>(plan.max_concurrency),
                      .text_physical_page_groups = physical_pages,
                      .mtp_physical_page_groups  = mtp_physical_pages,
-                 });
+                 },
+        elastic_kv ? &text_pages : nullptr);
+    if (elastic_kv) {
+        out.text_kv_region_bytes = text_pages.finish(kArenaAlign, "elastic text KV pages");
+        out.text_kv_base_pages   = std::min(physical_pages, page_count(kElasticKvBaseTokens));
+    }
     qwen3_5::StateImageSpec state_image_spec{
         .linear =
             {
@@ -364,7 +422,9 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                                          .batch_capacity = plan.max_concurrency,
                                          .draft_window   = plan.draft_window,
                                          .backend        = plan.speculative_backend,
-                                         .causal_scoring = plan.causal_scoring});
+                                         .causal_scoring = plan.causal_scoring,
+                                         .fp32_logits    = plan.execution_schedule.lossless,
+                                         .block_drafts   = plan_has_split(plan) ? plan.neural_draft_window : 0U});
     out.prefill_hidden =
         add_tensor(builder, DType::BF16, {dimension(config.hidden_size), effective_prefill_chunk},
                    "step prefill hidden");
@@ -413,6 +473,14 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     const auto chunk  = static_cast<std::int32_t>(chunk_u32);
     const auto drafts = static_cast<std::int32_t>(plan.draft_window);
     const auto verify = drafts + 1;
+    // Offloaded experts (122B design §10): a pass wider than kOffloadedMoeStaticColumns runs on a
+    // workspace the expert cache lends for the whole pass (ProgramOffload::begin_pass), so the
+    // Program's own workspace plans prefill to that width and *_prefill_wide records a full pass's.
+    // The lossless route's layers keep their own path (execution/lossless.cpp) and lend nothing.
+    const bool lent_prefill =
+        !plan.execution_schedule.lossless && chunk > execution::kOffloadedMoeStaticColumns &&
+        std::holds_alternative<execution::OffloadedMoeParameters>(parameters.text.layers.front().ffn);
+    const std::int32_t prefill_width = lent_prefill ? execution::kOffloadedMoeStaticColumns : chunk;
     // Every launch takes the schedule's fast-path permission, which sizes partials (see
     // execution/text.cpp).
     const ops::CausalAttentionExecutionEnvelope text_envelope =
@@ -454,20 +522,13 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         };
         scratch(layout, wide_verification ? std::max(bytes(true), bytes(false)) : bytes(false));
     };
-    const auto target_body = [&](WorkspaceLayoutBuilder& layout, std::int32_t first,
-                                 std::int32_t last, TextPhase phase, GdnWorkspacePath path,
-                                 std::int32_t batch_size, std::int32_t min_width,
-                                 std::int32_t max_width,
-                                 ops::CausalAttentionExecutionEnvelope envelope) {
+    const auto target_layers = [&](WorkspaceLayoutBuilder& layout,
+                                   const execution::TextParameters& text, std::int32_t first,
+                                   std::int32_t last, TextPhase phase, GdnWorkspacePath path,
+                                   std::int32_t batch_size, std::int32_t min_width,
+                                   std::int32_t max_width,
+                                   ops::CausalAttentionExecutionEnvelope envelope) {
         const bool wide_verification = wide_residual_verification(phase, min_width, max_width);
-        const execution::TextParameters& text =
-            phase == TextPhase::Verify
-                ? parameters.decode_text(plan.execution_schedule.column_invariant_decode,
-                                         {plan.execution_schedule.a8_decode,
-                                          plan.execution_schedule.a4_decode,
-                                          plan.execution_schedule.a8_residual_decode,
-                                          plan.execution_schedule.a4_residual_decode})
-                : parameters.text;
         for (const auto& block : text.layers) {
             {
                 auto stage = layout.scope();
@@ -529,30 +590,60 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         }
         if (!plan.causal_scoring) { linear_scratch(layout, text.output_head, first, last); }
     };
+    // Decode and verification calls run Parameters::decode_text: the column-invariant copy unless
+    // batched_columns, which single-column-decode grants to one-column calls only, so a family that
+    // can run one column also sizes the batched route there.
+    const auto target_body = [&](WorkspaceLayoutBuilder& layout, std::int32_t first,
+                                 std::int32_t last, TextPhase phase, GdnWorkspacePath path,
+                                 std::int32_t batch_size, std::int32_t min_width,
+                                 std::int32_t max_width,
+                                 ops::CausalAttentionExecutionEnvelope envelope) {
+        if (phase != TextPhase::Verify) {
+            target_layers(layout, parameters.text, first, last, phase, path, batch_size, min_width,
+                          max_width, envelope);
+            return;
+        }
+        const auto& schedule = plan.execution_schedule;
+        const execution::DecodePrecision precision{schedule.a8_decode, schedule.a4_decode,
+                                                   schedule.a8_residual_decode,
+                                                   schedule.a4_residual_decode};
+        target_layers(layout, parameters.decode_text(!schedule.batched_columns(last), precision), first,
+                      last, phase, path, batch_size, min_width, max_width, envelope);
+        if (first == 1 && schedule.batched_columns(1) != schedule.batched_columns(last)) {
+            target_layers(layout, parameters.decode_text(false, precision), 1, 1, phase, path,
+                          batch_size, min_width, max_width, envelope);
+        }
+    };
+    // The drafter the MTP sizing below plans: its own routes (the prompt's drafts), or its
+    // column-invariant copy (Parameters::invariant_mtp), which the exact route's batched draft
+    // calls run.
+    const execution::MtpParameters* drafter = parameters.mtp ? &*parameters.mtp : nullptr;
+    const execution::LinearParameters* drafter_proposal =
+        parameters.proposal ? &parameters.proposal->head : nullptr;
     const auto mtp_post_mixer = [&](WorkspaceLayoutBuilder& layout, int first, int last) {
-        linear_scratch(layout, parameters.mtp->output, first, last);
-        scratch(layout, execution::ffn_workspace_bytes(parameters.mtp->ffn, first, last, true));
+        linear_scratch(layout, drafter->output, first, last);
+        scratch(layout, execution::ffn_workspace_bytes(drafter->ffn, first, last, true));
     };
     const auto proposal_scratch = [&](WorkspaceLayoutBuilder& layout, std::int32_t columns) {
         if (plan.proposal_head == ProposalHead::Optimized) {
             matrix(layout, DType::BF16, dimension(parameters.proposal->rows), columns);
-            linear_scratch(layout, parameters.proposal->head, columns, columns);
+            linear_scratch(layout, *drafter_proposal, columns, columns);
         } else {
-            linear_scratch(layout, parameters.mtp->output_head, columns, columns);
+            linear_scratch(layout, drafter->output_head, columns, columns);
         }
     };
     const auto mtp_stem = [&](WorkspaceLayoutBuilder& layout, std::int32_t tokens,
                               bool preembedded) {
         (void)workspace::mtp_stem(layout, config, tokens, !preembedded);
-        linear_scratch(layout, parameters.mtp->input_projection, 1, tokens);
+        linear_scratch(layout, drafter->input_projection, 1, tokens);
     };
     const auto mtp_full_core = [&](WorkspaceLayoutBuilder& layout, std::int32_t tokens,
                                    ops::CausalAttentionExecutionEnvelope envelope) {
         auto core = layout.scope();
         mtp_stem(layout, tokens, false);
         (void)workspace::mtp_attention_projection(layout, config, tokens);
-        scratch(layout, execution::mtp_projection_workspace_bytes(parameters.mtp->projection,
-                                                                  tokens, tokens));
+        scratch(layout, execution::mtp_projection_workspace_bytes(drafter->projection, tokens,
+                                                                  tokens));
         (void)workspace::mtp_attention_results(layout, config, tokens);
         scratch(layout, ops::causal_softmax_attention_workspace_capacity_bytes(
                             {dimension(config.attention->head_dim),
@@ -583,13 +674,13 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
             mtp_stem(layout, last, preembedded);
             matrix(layout, DType::BF16, dimension(config.attention->key_width()), last);
             matrix(layout, DType::BF16, dimension(config.attention->key_width()), last);
-            scratch(layout, execution::mtp_kv_workspace_bytes(parameters.mtp->projection,
+            scratch(layout, execution::mtp_kv_workspace_bytes(drafter->projection,
                                                               *config.attention, first, last));
             matrix(layout, DType::BF16, dimension(config.attention->key_width()), last);
         }
         matrix(layout, DType::BF16, dimension(config.attention->query_width()), 1);
         matrix(layout, DType::BF16, dimension(config.attention->query_width()), 1);
-        scratch(layout, execution::mtp_query_gate_workspace_bytes(parameters.mtp->projection,
+        scratch(layout, execution::mtp_query_gate_workspace_bytes(drafter->projection,
                                                                   *config.attention, 1, 1));
         matrix(layout, DType::BF16, dimension(config.attention->query_width()), 1);
         matrix(layout, DType::I32, 3, 1);
@@ -606,21 +697,46 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     };
 
     WorkspacePlan out;
-    WorkspaceLayoutBuilder text_prefill;
-    text_common_root(text_prefill, chunk);
-    target_body(text_prefill, 1, chunk, qwen3_5::TextPhase::Prefill, GdnWorkspacePath::Prefill, 1,
-                1, chunk, prefill_envelope);
-    if (!plan.causal_scoring) {
-        scratch(text_prefill,
-                ops::sampling_workspace_capacity_bytes(
-                    dimension(parameters.model.resources().public_token_count), 1, 1));
-    }
-    out.text_prefill = finish(text_prefill);
+    // A text prefill pass of `width` columns (its roots, layers, head and first-token sampling).
+    const auto plan_text_prefill = [&](std::int32_t width) {
+        WorkspaceLayoutBuilder text_prefill;
+        text_common_root(text_prefill, width);
+        // The lossless route's cache form (generation): its sequences and key capacity size the attention.
+        execution::LosslessCache lossless_shape{.sequences    = 1,
+                                                .key_capacity = plan.execution_schedule.lossless_keys};
+        const execution::LosslessCache* lossless_cache =
+            plan.execution_schedule.lossless_keys != 0 ? &lossless_shape : nullptr;
+        if (plan.execution_schedule.lossless) {
+            // The chunk's rotary table and (cache form) state slots, then the widest layer
+            // (execution/lossless.cpp's own allocations), the hidden output and the head's FP32 logits.
+            (void)text_prefill.alloc_bytes(execution::lossless_rope_window_bytes(config, width));
+            if (lossless_cache != nullptr) { matrix(text_prefill, DType::I32, 2, 1); }
+            for (std::size_t layer = 0; layer < parameters.text.layers.size(); ++layer) {
+                scratch(text_prefill, execution::lossless_layer_workspace_bytes(
+                                          parameters.text.layers[layer], config, config.layer_types[layer], width,
+                                          lossless_cache, plan.execution_schedule.lossless_design));
+            }
+            matrix(text_prefill, DType::BF16, dimension(config.hidden_size), width);
+            scratch(text_prefill, execution::lossless_head_workspace_bytes(parameters.text.output_head.weight, 1));
+        } else {
+            target_body(text_prefill, 1, width, qwen3_5::TextPhase::Prefill, GdnWorkspacePath::Prefill, 1,
+                        1, width, prefill_envelope);
+        }
+        if (!plan.causal_scoring) {
+            scratch(text_prefill,
+                    ops::sampling_workspace_capacity_bytes(
+                        dimension(parameters.model.resources().public_token_count), 1, 1));
+        }
+        return finish(text_prefill);
+    };
+    out.text_prefill      = plan_text_prefill(prefill_width);
+    out.text_prefill_wide = lent_prefill ? plan_text_prefill(chunk) : 0;
 
     if (plan.causal_scoring) {
         WorkspaceLayoutBuilder causal_score;
-        matrix(causal_score, DType::BF16, dimension(config.vocab_size),
-               static_cast<std::int32_t>(kCausalScoreTile));
+        // The lossless route's logits are FP32.
+        matrix(causal_score, plan.execution_schedule.lossless ? DType::FP32 : DType::BF16,
+               dimension(config.vocab_size), static_cast<std::int32_t>(kCausalScoreTile));
         matrix(causal_score, DType::I32, 1, static_cast<std::int32_t>(kCausalScoreTile));
         matrix(causal_score, DType::FP32, 1, static_cast<std::int32_t>(kCausalScoreTile));
         // Top tokens and candidates: ids and log-probabilities of each.
@@ -628,7 +744,12 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
             matrix(causal_score, dtype, static_cast<std::int32_t>(kMaximumScoreTopTokens),
                    static_cast<std::int32_t>(kCausalScoreTile));
         }
-        linear_scratch(causal_score, parameters.text.output_head, 1, kCausalScoreTile);
+        if (plan.execution_schedule.lossless) {
+            scratch(causal_score, execution::lossless_head_workspace_bytes(
+                                      parameters.text.output_head.weight, static_cast<std::int32_t>(kCausalScoreTile)));
+        } else {
+            linear_scratch(causal_score, parameters.text.output_head, 1, kCausalScoreTile);
+        }
         out.causal_score = finish(causal_score);
     }
 
@@ -637,8 +758,23 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
              ++batch) {
             WorkspaceLayoutBuilder ordinary;
             matrix(ordinary, DType::BF16, dimension(config.hidden_size), batch);
-            target_body(ordinary, batch, batch, qwen3_5::TextPhase::Verify,
-                        GdnWorkspacePath::Snapshot, batch, 1, 1, text_envelope);
+            if (plan.execution_schedule.lossless) {
+                // TextContext::ordinary_decode_batch's lossless allocations: the rotary table, the widest
+                // layer of the cache form over `batch` sequences, the head.
+                (void)ordinary.alloc_bytes(execution::lossless_rope_window_bytes(config, batch));
+                const execution::LosslessCache shape{.sequences    = batch,
+                                                     .key_capacity = plan.execution_schedule.lossless_keys};
+                for (std::size_t layer = 0; layer < parameters.text.layers.size(); ++layer) {
+                    scratch(ordinary, execution::lossless_layer_workspace_bytes(
+                                          parameters.text.layers[layer], config, config.layer_types[layer], batch,
+                                          &shape));
+                }
+                scratch(ordinary,
+                        execution::lossless_head_workspace_bytes(parameters.text.output_head.weight, batch));
+            } else {
+                target_body(ordinary, batch, batch, qwen3_5::TextPhase::Verify,
+                            GdnWorkspacePath::Snapshot, batch, 1, 1, text_envelope);
+            }
             scratch(ordinary,
                     ops::sampling_workspace_capacity_bytes(
                         dimension(parameters.model.resources().public_token_count), batch, batch));
@@ -647,34 +783,53 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     }
 
     if (plan.features.mtp()) {
-        WorkspaceLayoutBuilder mtp_prefill;
-        text_common_root(mtp_prefill, chunk);
-        target_body(mtp_prefill, 1, chunk, qwen3_5::TextPhase::Prefill, GdnWorkspacePath::Prefill,
-                    1, 1, chunk, prefill_envelope);
-        matrix(mtp_prefill, DType::I32, 1, chunk);
-        if (plan.features.vision) {
-            matrix(mtp_prefill, DType::BF16, dimension(config.hidden_size), chunk);
-            (void)workspace::visual_scatter_indices(mtp_prefill, chunk);
-        }
-        mtp_prefill_chunk(mtp_prefill, 1, chunk, plan.features.vision);
-        for (std::int32_t i = 1; i < drafts; ++i) {
-            matrix(mtp_prefill, DType::BF16, dimension(config.hidden_size), 1);
-            mtp_full_call(mtp_prefill, 1, text_envelope, true);
-        }
-        out.mtp_prefill = finish(mtp_prefill);
+        const auto plan_mtp_prefill = [&](std::int32_t width) {
+            WorkspaceLayoutBuilder mtp_prefill;
+            text_common_root(mtp_prefill, width);
+            target_body(mtp_prefill, 1, width, qwen3_5::TextPhase::Prefill, GdnWorkspacePath::Prefill,
+                        1, 1, width, prefill_envelope);
+            matrix(mtp_prefill, DType::I32, 1, width);
+            if (plan.features.vision) {
+                matrix(mtp_prefill, DType::BF16, dimension(config.hidden_size), width);
+                (void)workspace::visual_scatter_indices(mtp_prefill, width);
+            }
+            mtp_prefill_chunk(mtp_prefill, 1, width, plan.features.vision);
+            for (std::int32_t i = 1; i < drafts; ++i) {
+                matrix(mtp_prefill, DType::BF16, dimension(config.hidden_size), 1);
+                mtp_full_call(mtp_prefill, 1, text_envelope, true);
+            }
+            return finish(mtp_prefill);
+        };
+        out.mtp_prefill      = plan_mtp_prefill(prefill_width);
+        out.mtp_prefill_wide = lent_prefill ? plan_mtp_prefill(chunk) : 0;
 
-        WorkspaceLayoutBuilder mtp_batch;
-        mtp_full_call(mtp_batch, verify, text_envelope, false);
-        WorkspaceLayoutBuilder mtp_ar;
-        mtp_full_call(mtp_ar, 1, text_envelope, true);
-        WorkspaceLayoutBuilder mtp_align;
-        mtp_full_call(mtp_align, 1, text_envelope, false);
-        WorkspaceLayoutBuilder mtp_proposal;
-        proposal_scratch(mtp_proposal, 1);
+        // A round's draft calls run either drafter copy: each is sized.
+        std::vector<std::pair<const execution::MtpParameters*, const execution::LinearParameters*>>
+            drafters{{drafter, drafter_proposal}};
+        if (plan.execution_schedule.column_invariant_decode && parameters.invariant_mtp) {
+            drafters.emplace_back(&*parameters.invariant_mtp,
+                                  parameters.invariant_proposal_head
+                                      ? &*parameters.invariant_proposal_head
+                                      : nullptr);
+        }
         const std::size_t accept = ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
             dimension(parameters.model.resources().public_token_count), drafts, drafts, 1, 1);
-        out.mtp_round = std::max({accept, finish(mtp_batch), finish(mtp_ar), finish(mtp_proposal)});
-        out.ordinary_round = std::max(out.ordinary_round, finish(mtp_align));
+        out.mtp_round = accept;
+        for (const auto& [mtp, proposal] : drafters) {
+            drafter          = mtp;
+            drafter_proposal = proposal;
+            WorkspaceLayoutBuilder mtp_batch;
+            mtp_full_call(mtp_batch, verify, text_envelope, false);
+            WorkspaceLayoutBuilder mtp_ar;
+            mtp_full_call(mtp_ar, 1, text_envelope, true);
+            WorkspaceLayoutBuilder mtp_align;
+            mtp_full_call(mtp_align, 1, text_envelope, false);
+            WorkspaceLayoutBuilder mtp_proposal;
+            proposal_scratch(mtp_proposal, 1);
+            out.mtp_round =
+                std::max({out.mtp_round, finish(mtp_batch), finish(mtp_ar), finish(mtp_proposal)});
+            out.ordinary_round = std::max(out.ordinary_round, finish(mtp_align));
+        }
 
         for (std::int32_t batch = 1; batch <= static_cast<std::int32_t>(plan.max_concurrency);
              ++batch) {
@@ -683,14 +838,19 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
             matrix(target, DType::BF16, dimension(config.hidden_size), aggregate);
             target_body(target, aggregate, aggregate, qwen3_5::TextPhase::Verify,
                         GdnWorkspacePath::ReplayRecord, batch, verify, verify, verify_envelope);
+            const std::size_t batch_accept =
+                ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
+                    dimension(parameters.model.resources().public_token_count), drafts, drafts,
+                    batch, batch);
+            out.mtp_round = std::max({out.mtp_round, finish(target), batch_accept});
 
             const auto mtp_decode_core = [&](WorkspaceLayoutBuilder& layout, std::int32_t width) {
                 const std::int32_t tokens = batch * width;
                 auto core                 = layout.scope();
                 mtp_stem(layout, tokens, false);
                 (void)workspace::mtp_attention_projection(layout, config, tokens);
-                scratch(layout, execution::mtp_projection_workspace_bytes(
-                                    parameters.mtp->projection, tokens, tokens));
+                scratch(layout, execution::mtp_projection_workspace_bytes(drafter->projection,
+                                                                          tokens, tokens));
                 (void)workspace::mtp_attention_results(layout, config, tokens);
                 scratch(layout, ops::causal_softmax_attention_workspace_capacity_bytes(
                                     {dimension(config.attention->head_dim),
@@ -701,20 +861,21 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                 (void)workspace::mtp_post_attention(layout, config, tokens);
                 mtp_post_mixer(layout, tokens, tokens);
             };
-
-            WorkspaceLayoutBuilder alignment;
-            mtp_decode_core(alignment, verify);
-            WorkspaceLayoutBuilder ar;
-            mtp_decode_core(ar, 1);
-            WorkspaceLayoutBuilder proposal;
-            proposal_scratch(proposal, batch);
-            const std::size_t batch_accept =
-                ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
-                    dimension(parameters.model.resources().public_token_count), drafts, drafts,
-                    batch, batch);
-            out.mtp_round = std::max({out.mtp_round, finish(target), finish(alignment), finish(ar),
-                                      finish(proposal), batch_accept});
+            for (const auto& [mtp, proposal_head] : drafters) {
+                drafter          = mtp;
+                drafter_proposal = proposal_head;
+                WorkspaceLayoutBuilder alignment;
+                mtp_decode_core(alignment, verify);
+                WorkspaceLayoutBuilder ar;
+                mtp_decode_core(ar, 1);
+                WorkspaceLayoutBuilder proposal;
+                proposal_scratch(proposal, batch);
+                out.mtp_round = std::max(
+                    {out.mtp_round, finish(alignment), finish(ar), finish(proposal)});
+            }
         }
+        drafter          = &*parameters.mtp;
+        drafter_proposal = parameters.proposal ? &parameters.proposal->head : nullptr;
     }
 
     if (plan.features.masked_draft()) {
@@ -737,7 +898,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                     linear_scratch(layout, parameters.draft->feature_projection,
                                    local_width * batch, local_width * batch);
                     scratch(layout, ops::context_kv_materialize_workspace_capacity_bytes(
-                                        batch, local_width, local_width));
+                                        static_cast<std::int32_t>(draft->num_hidden_layers), batch,
+                                        local_width, local_width));
                     return finish(layout);
                 }
                 (void)workspace::dflash_context(layout, config, *draft, tokens);
@@ -939,7 +1101,11 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
         parameters.model.config().text.full_attention_layers == 0) {
         throw std::invalid_argument("Qwen3.5 Program requires at least one full-attention layer");
     }
-    if (parameters.model.options() != models::load_options(options, Architecture::Qwen3_5)) {
+    // The RAM ledger, not the options, decides whether offloaded banks stay in the artifact (the SSD
+    // tier): the loaded model's choice stands.
+    auto expected           = models::load_options(options, Architecture::Qwen3_5);
+    expected.stream_experts = parameters.model.options().stream_experts;
+    if (parameters.model.options() != expected) {
         throw std::invalid_argument(
             "loaded components do not match the requested execution options");
     }
@@ -1044,6 +1210,9 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
          options.speculative.ngram_min_match > 64)) {
         throw std::invalid_argument("ngram requires MTP/DFlash/DFlash2, K1..63 and match 4..64");
     }
+    if (options.speculative.ngram_batch_draft_tokens > options.speculative.ngram_draft_tokens) {
+        throw std::invalid_argument("the batched ngram window must lie within the ngram window");
+    }
 }
 
 std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlanningInputs& inputs,
@@ -1065,9 +1234,11 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->draft_window         = inputs.draft_window;
     impl->neural_draft_window  = inputs.neural_draft_window;
     impl->round_shapes         = inputs.round_shapes;
+    impl->dflash_width_costs   = inputs.dflash_width_costs;
     impl->tree_widths          = inputs.tree_widths;
     impl->draft_tree_paths     = inputs.draft_tree_paths;
     impl->ngram_draft_window   = inputs.ngram_draft_window;
+    impl->ngram_batch_window   = inputs.ngram_batch_window;
     impl->ngram_min_match      = inputs.ngram_min_match;
     impl->speculative_backend  = inputs.speculative_backend;
     impl->proposal_head        = inputs.proposal_head;
@@ -1117,24 +1288,37 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
             // MTP Finish keeps the Forward profiles; DFlash Finish has one executable per exact B.
             // Every MTP round proposes the next round's drafts at its neural family's draft length
             // (copy rounds at the configured neural depth).
-            const bool mtp = impl->speculative_backend == SpeculativeBackend::Mtp;
+            const bool mtp      = impl->speculative_backend == SpeculativeBackend::Mtp;
+            bool split          = false;
+            bool split_batches  = false;
             for (const SpeculativeRoundShape& shape : impl->round_shapes) {
                 const std::uint32_t ar_depth = mtp_proposal_drafts(shape, impl->neural_draft_window);
+                split                        = split || shape.split;
+                split_batches                = split_batches || (shape.split && !shape.single_row);
                 const auto profiles =
-                    mtp ? mtp_graph_profiles(impl->capacity, shape.verify_drafts, ar_depth)
-                        : dflash_graph_profiles(impl->speculative_backend, impl->capacity,
-                                                shape.verify_drafts);
+                    mtp           ? mtp_graph_profiles(impl->capacity, shape.verify_drafts, ar_depth)
+                    : shape.split ? dflash_verify_graph_profiles(impl->capacity, shape.verify_drafts)
+                                  : dflash_graph_profiles(impl->speculative_backend, impl->capacity,
+                                                          shape.verify_drafts);
                 // A tree family serves only the batch sizes that may verify its width. Chain
                 // families serve every batch size: a round with a constrained row verifies the
-                // chain whatever the tree table selects. A single-row family serves one row.
+                // chain whatever the tree table selects. A single-row family serves one row, a
+                // batch-only family every other batch size.
                 std::uint32_t batch_sizes = 0;
                 for (std::uint32_t b = 1; b <= impl->max_concurrency; ++b) {
                     batch_sizes += (shape.kind != SpeculativeRoundKind::Tree ||
                                     impl->tree_widths.tree(b, shape.verify_drafts + 1U)) &&
-                                   (!shape.single_row || b == 1U);
+                                   (!shape.single_row || b == 1U) && (!shape.batch_only || b > 1U);
                 }
                 const std::uint64_t forward = graph_topology_classes(profiles);
                 executables += (forward + (mtp ? forward : 1U)) * batch_sizes;
+            }
+            // adaptive-dflash's proposal graphs: the drafter's profiles at the whole block, for every
+            // batch size a split family serves.
+            if (split) {
+                executables += static_cast<std::uint64_t>(graph_topology_classes(dflash_graph_profiles(
+                                   impl->speculative_backend, impl->capacity, impl->neural_draft_window))) *
+                               (split_batches ? impl->max_concurrency : 1U);
             }
         }
         impl->graph_allowance_bytes = checked_add(
@@ -1143,8 +1327,10 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
             "CUDA Graph allowance");
     }
 
+    // An elastic text KV region counts whole: the frames give it back as it grows.
     impl->device_reservation_bytes = checked_add(
-        checked_add(impl->persistent.bytes, impl->workspace.capacity, "sequence memory plan"),
+        checked_add(checked_add(impl->persistent.bytes, impl->persistent.text_kv_region_bytes, "elastic KV region"),
+                    impl->workspace.capacity, "sequence memory plan"),
         impl->graph_allowance_bytes, "sequence graph allowance");
     return impl;
 }
@@ -1166,11 +1352,27 @@ static_assert(std::size_t{kDefaultPrefillSplitWorkspaceMiB} << 20 ==
 // route at prefill widths when that path is selected.
 ExecutionSchedule execution_schedule(const execution::Parameters& parameters,
                                      const EngineOptions& options) {
-    // Request invariance is possible where every Text projection registers a column-invariant
-    // route (docs/maintainer/model-quality.md, 6.1); each request-coupling fast
-    // path gives up one part of it.
-    const FastPathSelection fast_paths =
-        select_fast_paths(parameters.model, options, parameters.invariant_text.has_value());
+    // The lossless route: causal scoring takes each window in one pass (its attention reads the window's
+    // own keys); generation runs text through bf16 KV (V stored as BF16), without speculation.
+    if (options.lossless) {
+        if (options.purpose == EnginePurpose::CausalScoring && options.prefill_chunk < options.max_context) {
+            throw std::invalid_argument("the Qwen3.5 lossless route scores a window in one pass: its prefill_chunk "
+                                        "must cover max_context");
+        }
+        if (options.purpose == EnginePurpose::Generation &&
+            (options.kv_cache != KvCacheStorage::BFloat16 ||
+             options.speculative.backend != SpeculativeBackend::None || options.enable_vision)) {
+            throw std::invalid_argument("Qwen3.5 lossless generation takes text requests with bf16 KV and no "
+                                        "speculation");
+        }
+        if (options.reference && options.kv_cache != KvCacheStorage::BFloat16) {
+            throw std::invalid_argument("the Qwen3.5 design reference scores with bf16 KV (its other KV codecs are "
+                                        "not implemented yet)");
+        }
+    }
+    // The exact route is request-invariant (docs/maintainer/model-quality.md, 6.1); each request-coupling
+    // fast path gives up one part of it, and each part holds whenever its coupling path is not selected.
+    const FastPathSelection fast_paths = select_fast_paths(parameters.model, options);
     return {.fast = uses_fast_int8_prefill(options) ||
                     (options.kv_cache == KvCacheStorage::Nvfp4Group16 &&
                      !options.original_nvfp4_prefill_kernel),
@@ -1178,24 +1380,34 @@ ExecutionSchedule execution_schedule(const execution::Parameters& parameters,
             .split_workspace_bytes   = std::size_t{options.prefill_split_workspace_mib} << 20,
             .decode_split64          = fast_paths.selected(FastPath::DecodeSplit64),
             .column_invariant_decode = fast_paths.invariant(FastPath::BatchedDecode),
-            .a8_decode =
-                !fast_paths.invariant_capable || fast_paths.selected(FastPath::BatchedA8Decode),
-            .a4_decode =
-                !fast_paths.invariant_capable || fast_paths.selected(FastPath::BatchedA4Decode),
+            .single_column_decode    = fast_paths.selected(FastPath::SingleColumnDecode),
+            .a8_decode               = fast_paths.selected(FastPath::BatchedA8Decode),
+            .a4_decode               = fast_paths.selected(FastPath::BatchedA4Decode),
             .a8_residual_decode      = fast_paths.selected(FastPath::BatchedA8ResidualDecode),
             .a4_residual_decode      = fast_paths.selected(FastPath::BatchedA4ResidualDecode),
-            .row_invariant_partition = fast_paths.invariant(FastPath::BatchSplitAttention),
-            .fixed_speculation       = fast_paths.invariant(FastPath::AdaptiveSpeculation),
-            .grid_cache              = fast_paths.invariant(FastPath::FreeCacheResume),
-            .held_extent             = fast_paths.invariant(FastPath::Preemption),
+            .row_invariant_partition = !fast_paths.selected(FastPath::BatchSplitAttention),
+            .fixed_speculation       = !fast_paths.selected(FastPath::AdaptiveSpeculation),
+            .grid_cache              = !fast_paths.selected(FastPath::FreeCacheResume),
+            .held_extent             = !fast_paths.selected(FastPath::Preemption),
             .adaptive_mtp            = fast_paths.selected(FastPath::AdaptiveMtp) &&
-                                       !fast_paths.invariant(FastPath::AdaptiveSpeculation),
-            .linear_routes           = fast_paths.selected(FastPath::Q4W4A8) ? ops::LinearRoutes::Q4W4A8
+                                       fast_paths.selected(FastPath::AdaptiveSpeculation),
+            .adaptive_dflash         = fast_paths.selected(FastPath::AdaptiveDFlash) &&
+                                       fast_paths.selected(FastPath::AdaptiveSpeculation),
+            // Only offloaded experts make an unverified draft column free (the verification's
+            // masked padding routes no expert); elsewhere trimming drafts saves nothing.
+            .mtp_draft_confidence    = options.speculative.backend == SpeculativeBackend::Mtp &&
+                                       parameters.model.offloaded_experts(),
+            .linear_routes         = fast_paths.selected(FastPath::Q4W4A8) ? ops::LinearRoutes::Q4W4A8
                                                                              : ops::LinearRoutes::Exact,
-            .wide_down_tile          = fast_paths.selected(FastPath::BatchedDecode),
             .gdn_arithmetic          = fast_paths.selected(FastPath::GdnF16Accumulate)
                                            ? ops::GdnChunkArithmetic::Fp16Accumulate
-                                           : ops::GdnChunkArithmetic::Exact};
+                                           : ops::GdnChunkArithmetic::Exact,
+            .lossless                = options.lossless,
+            .lossless_keys           = options.lossless && options.purpose == EnginePurpose::Generation
+                                           ? static_cast<std::int32_t>(options.max_context)
+                                           : 0,
+            .lossless_design         = {.active = options.reference, .kv = options.kv_cache},
+            .gumbel_sampling         = !options.fast_paths || options.lossless};
 }
 // The fast INT8, NVFP4, VQ2 and K4V2 prompt kernels and the MXFP8 tiled kernel of FP8 and K8V4 KV
 // run one 128-row CTA of one query head per SM; BF16 KV and the original INT8 and NVFP4 kernels use
@@ -1220,7 +1432,9 @@ bool prefill_attention_runs_waves(const EngineOptions& options) {
 std::uint32_t prefill_step_width(const execution::Parameters& parameters,
                                  const EngineOptions& options, std::uint32_t requested) {
     requested = std::min(requested, options.max_context);
-    if (!prefill_attention_runs_waves(options)) { return requested; }
+    // The lossless route's attention is its own (no prompt waves): its window form needs the whole
+    // window in one pass.
+    if (options.lossless || !prefill_attention_runs_waves(options)) { return requested; }
     const auto& attention = *parameters.model.config().text.attention;
     const auto wave = static_cast<std::uint32_t>(ops::causal_softmax_attention_prompt_wave_tokens(
         {static_cast<std::int32_t>(attention.head_dim),
@@ -1237,7 +1451,7 @@ std::uint32_t effective_prefill_chunk(const execution::Parameters& parameters,
 std::vector<std::uint32_t> idle_prefill_widths_impl(const execution::Parameters& parameters,
                                                     const EngineOptions& options) {
     if (options.purpose != EnginePurpose::Generation ||
-        !select_fast_paths(parameters.model, options, parameters.invariant_text.has_value())
+        !select_fast_paths(parameters.model, options)
              .selected(FastPath::IdleWidePrefill)) {
         return {};
     }
@@ -1251,21 +1465,51 @@ std::vector<std::uint32_t> idle_prefill_widths_impl(const execution::Parameters&
 
 std::uint32_t resolve_auto_draft_length_impl(const execution::Parameters& parameters,
                                              EngineOptions& options) {
-    if (!options.speculative.draft_tokens_auto || execution_schedule(parameters, options).adaptive_mtp) {
+    // A block drafter's automatic ceiling, unless given: the configuration's block.
+    if (options.speculative.draft_tokens_auto && is_masked_draft_backend(options.speculative.backend) &&
+        options.speculative.draft_tokens == 0) {
+        options.speculative.draft_tokens = dflash_auto_ceiling(
+            select_fast_paths(parameters.model, options).configuration, options.speculative.backend);
+    }
+    const ExecutionSchedule schedule = execution_schedule(parameters, options);
+    if (!options.speculative.draft_tokens_auto || schedule.adaptive_mtp || schedule.adaptive_dflash) {
         return 0;
     }
-    // adaptive-mtp acts only where speculation is adaptive; a qualification run that names it must
-    // also name adaptive-speculation on an artifact that can be request-invariant.
-    if (std::find(options.fast_path_candidates.begin(), options.fast_path_candidates.end(),
-                  FastPath::AdaptiveMtp) != options.fast_path_candidates.end()) {
-        throw std::invalid_argument("--fast-path adaptive-mtp acts only where speculation is adaptive: "
-                                    "add --fast-path adaptive-speculation");
+    // The policies act only where speculation is adaptive; a qualification run that names one must
+    // also name adaptive-speculation.
+    for (const FastPath policy : {FastPath::AdaptiveMtp, FastPath::AdaptiveDFlash}) {
+        if (std::find(options.fast_path_candidates.begin(), options.fast_path_candidates.end(), policy) !=
+            options.fast_path_candidates.end()) {
+            throw std::invalid_argument(std::string("--fast-path ") + fast_path_name(policy) +
+                                        " acts only where speculation is adaptive: add --fast-path "
+                                        "adaptive-speculation");
+        }
     }
     const FastPathSelection fast =
-        select_fast_paths(parameters.model, options, parameters.invariant_text.has_value());
+        select_fast_paths(parameters.model, options);
     options.speculative.draft_tokens_auto = false;
-    options.speculative.draft_tokens      = auto_fixed_draft_tokens(fast.configuration);
+    options.speculative.draft_tokens =
+        std::min(options.speculative.draft_tokens,
+                 auto_fixed_draft_tokens(fast.configuration, options.speculative.backend));
     return options.speculative.draft_tokens;
+}
+
+std::uint32_t resolve_auto_ngram_impl(const Model& model, EngineOptions& options) {
+    SpeculativeOptions& spec = options.speculative;
+    if (!spec.ngram_draft_tokens_auto) { return spec.ngram_draft_tokens; }
+    const FastPathSelection fast = select_fast_paths(model, options);
+    // Fixed speculation verifies every round at the n-gram window (decode_dflash_batch,
+    // decode_mtp_batch): auto keeps copies off there.
+    const bool adaptive        = fast.selected(FastPath::AdaptiveSpeculation);
+    const bool adaptive_drafts = spec.draft_tokens_auto && (fast.selected(FastPath::AdaptiveMtp) ||
+                                                            fast.selected(FastPath::AdaptiveDFlash));
+    const NgramSettings settings =
+        adaptive ? auto_ngram_settings(fast.configuration, spec.backend, adaptive_drafts) : NgramSettings{};
+    spec.ngram_draft_tokens_auto  = false;
+    spec.ngram_draft_tokens       = settings.window;
+    spec.ngram_batch_draft_tokens = settings.window != 0 ? settings.batch_window : 0U;
+    if (settings.window != 0) { spec.ngram_min_match = settings.min_match; }
+    return settings.window;
 }
 
 std::unique_ptr<qwen3_5::detail::SequencePlannerImpl>
@@ -1280,19 +1524,38 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         }
     }
     TreeWidthPlan tree_widths = resolve_tree_widths(parameters, options);
-    // Fixed speculation (the exact route of an invariance-capable artifact) verifies the chain at a
+    // Fixed speculation (the exact route, and any route without adaptive-speculation) verifies the chain at a
     // fixed width every round and never picks a tree (decode_mtp/dflash rounds), so no tree family is
     // planned or captured: its column-invariant attention workspace does not hold the tree route.
     if (execution_schedule(parameters, options).fixed_speculation) { tree_widths = TreeWidthPlan{}; }
-    const bool adaptive_mtp = execution_schedule(parameters, options).adaptive_mtp;
-    // resolve_auto_draft_length made --draft-tokens auto a fixed length wherever adaptive-mtp does
+    // Fixed speculation verifies every copy round at the n-gram window, which a narrower batched
+    // window would leave without a family for its batches.
+    if (execution_schedule(parameters, options).fixed_speculation &&
+        options.speculative.ngram_batch_draft_tokens != 0 &&
+        options.speculative.ngram_batch_draft_tokens != options.speculative.ngram_draft_tokens) {
+        throw std::invalid_argument("a batched ngram window needs adaptive speculation");
+    }
+    const bool adaptive_mtp    = execution_schedule(parameters, options).adaptive_mtp;
+    const bool adaptive_dflash = execution_schedule(parameters, options).adaptive_dflash;
+    // adaptive-dflash verifies its policy's chain widths. Automatic trees of K + 5 and K + 9 columns
+    // on its 15-draft block ran slower than the chain they replace (2026-10-22, NVFP4 27B, one
+    // request: 20 and 24 columns -1.0 to -1.9 % by the same-text estimate), and the tree controller
+    // times the chain only when the policy verifies the whole block, so automatic widths resolve to
+    // chains there.
+    if (adaptive_dflash) {
+        tree_widths.automatic.clear();
+        tree_widths.automatic_max_batch = 0;
+    }
+    // resolve_auto_draft_length made --draft-tokens auto a fixed length wherever its policy does
     // not act; without it the rounds would silently draft the ceiling.
-    if (options.speculative.draft_tokens_auto && !adaptive_mtp) {
-        throw std::logic_error("--draft-tokens auto reached planning without adaptive-mtp; "
+    if (options.speculative.draft_tokens_auto && !adaptive_mtp && !adaptive_dflash) {
+        throw std::logic_error("--draft-tokens auto reached planning without its policy; "
                                "resolve_auto_draft_length was not applied");
     }
-    const std::vector<SpeculativeRoundShape> round_shapes =
-        speculative_round_shapes(options, tree_widths, adaptive_mtp);
+    const FastPathConfiguration configuration = select_fast_paths(parameters.model, options).configuration;
+    const std::vector<SpeculativeRoundShape> round_shapes = speculative_round_shapes(
+        options, tree_widths, adaptive_mtp, adaptive_dflash,
+        dflash_batch_drafts(configuration, options.speculative.backend));
     std::uint32_t draft_window = 0;
     for (const SpeculativeRoundShape& shape : round_shapes) {
         draft_window = std::max(draft_window, shape.verify_drafts);
@@ -1301,9 +1564,11 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .parameters          = &parameters,
         .neural_draft_window = options.speculative.draft_tokens,
         .round_shapes        = round_shapes,
+        .dflash_width_costs  = dflash_width_costs(configuration, options.speculative.backend),
         .tree_widths         = std::move(tree_widths),
         .draft_tree_paths    = options.speculative.draft_tree_paths,
         .ngram_draft_window  = options.speculative.ngram_draft_tokens,
+        .ngram_batch_window  = options.speculative.ngram_batch_draft_tokens,
         .ngram_min_match     = options.speculative.ngram_min_match,
         .capacity            = options.max_context,
         .max_concurrency     = options.max_concurrency,
@@ -1315,7 +1580,11 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .speculative_backend  = options.speculative.backend,
         .kv_storage           = options.kv_cache,
         .proposal_head        = options.speculative.proposal_head,
-        .features             = models::load_options(options, Architecture::Qwen3_5),
+        // The loaded model's options (validate_target_options checked them against these options): they
+        // carry the RAM ledger's tier choice.
+        .features             = parameters.model.options(),
+        // Lossless decode rounds are captured too: nothing on their path waits for the host, and the
+        // attention's launches depend on the round's shape, not on its key bound.
         .use_cuda_graph       = options.use_cuda_graph,
         .causal_scoring       = options.purpose == EnginePurpose::CausalScoring,
         .device               = options.device,

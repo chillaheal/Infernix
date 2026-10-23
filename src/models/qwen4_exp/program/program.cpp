@@ -295,10 +295,6 @@ bool ProgramImpl::take_kv_remap_fault() noexcept {
 
 namespace testing {
 
-namespace {
-std::atomic<std::uint32_t> g_expert_fault{0};
-} // namespace
-
 void set_image_restore_fault(std::uint32_t checks) noexcept { g_restore_fault.store(checks); }
 
 void set_kv_remap_fault(std::uint32_t checks) noexcept { g_kv_remap_fault.store(checks); }
@@ -310,16 +306,6 @@ std::uint32_t kv_backed_pages() noexcept {
 void kv_hold_pages(std::uint32_t pages) {
     if (!detail::ProgramImpl::has_active()) { throw std::runtime_error("Qwen4Exp: no Program is loaded to hold KV"); }
     detail::ProgramImpl::kv_hold_testing(pages);
-}
-
-void set_expert_fault(std::uint32_t checks) noexcept { g_expert_fault.store(checks); }
-
-bool take_expert_fault() noexcept {
-    std::uint32_t left = g_expert_fault.load(std::memory_order_relaxed);
-    while (left != 0) {
-        if (g_expert_fault.compare_exchange_weak(left, left - 1)) { return left == 1; }
-    }
-    return false;
 }
 
 bool has_image_yield_program() noexcept { return detail::ProgramImpl::has_active(); }

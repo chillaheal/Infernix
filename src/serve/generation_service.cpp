@@ -332,6 +332,7 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.vram_headroom_bytes      = options_.vram_headroom_bytes;
     engine_options.vram_past_budget         = options_.vram_past_budget;
     engine_options.expert_tail_skip         = options_.expert_tail_skip;
+    engine_options.expert_a4_activations    = options_.expert_a4_activations;
     engine_options.max_concurrency          = options_.max_concurrency;
     engine_options.max_pending_requests     = options_.max_pending_requests;
     engine_options.pending_timeout_ms       = options_.pending_timeout_ms;
@@ -339,7 +340,9 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.original_int8_prefill_kernel = options_.original_int8_prefill_kernel;
     engine_options.prefill_split_workspace_mib  = options_.prefill_split_workspace_mib;
     engine_options.original_nvfp4_prefill_kernel = options_.original_nvfp4_prefill_kernel;
-    engine_options.fast_paths                    = options_.fast_paths;
+    // The lossless route runs no fast path.
+    engine_options.fast_paths                    = options_.fast_paths && !options_.lossless;
+    engine_options.lossless                      = options_.lossless;
     engine_options.fast_path_candidates          = options_.fast_path_candidates;
     engine_options.kv_cache                  = options_.kv_cache;
     engine_options.enable_vision             = options_.enable_vision;

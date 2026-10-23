@@ -16,6 +16,7 @@
 #include "models/qwen3_5/state/state_image.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "models/qwen3_5/program/round_buffers.h"
+#include "models/qwen3_5/execution/offloaded_moe.h"
 
 #include <array>
 #include <cstddef>
@@ -25,6 +26,8 @@
 #include <vector>
 
 namespace infernix::models::qwen3_5::execution {
+
+struct LosslessCache;
 
 using Phase = qwen3_5::TextPhase;
 
@@ -111,6 +114,13 @@ public:
     // before that layer's work (the layer's cached state is still being copied in).
     void set_layer_ready(std::span<const cudaEvent_t> events) noexcept { layer_ready_ = events; }
 
+    // The Program's offloaded experts (an artifact with offloaded MoE layers; null otherwise) and a
+    // prefill chunk's route through them: decode and verification rounds take the graphed route.
+    void set_offloaded_experts(OffloadedExperts* experts, OffloadedCall prefill = {}) noexcept {
+        offloaded_experts_ = experts;
+        offloaded_prefill_ = prefill;
+    }
+
     void set_mtp_proposal_extent(std::uint32_t extent) noexcept { mtp_proposal_extent_ = extent; }
 
     void set_linear_state_slots(std::int32_t source_slot, std::int32_t destination_slot);
@@ -174,7 +184,9 @@ public:
                                   const Tensor& state_destination_slots,
                                   ops::CausalAttentionExecutionEnvelope envelope,
                                   Tensor& mtp_hidden);
-    void mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor& draft_tokens);
+    // `probabilities` (FP32 [batch], optional): each draft's drafter probability (ops::argmax_probability).
+    void mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor& draft_tokens,
+                           Tensor* probabilities = nullptr);
     void mtp_forward_batch(const Tensor& ids, const Tensor& hidden, const Tensor& positions,
                            ops::CausalAttentionExecutionEnvelope envelope, Tensor& mtp_hidden,
                            int logits_column, Tensor* logits, Tensor* draft_token,
@@ -199,18 +211,27 @@ private:
     void attn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase);
     void gdn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase);
     void mlp_tail(const BlockParameters& weights, Tensor& x, Phase phase,
-                  const ops::SparseMoeHints& hints);
+                  const ops::SparseMoeHints& hints, std::size_t layer);
     [[nodiscard]] ops::SparseMoeHints next_projection_hints(int layer) const;
     // Per-request width of a bound sequence batch; an unbatched call is one row of all columns.
     [[nodiscard]] std::int32_t row_width(std::int32_t columns) const noexcept {
         return active_sequence_batch_ != 0 ? active_sequence_width_ : columns;
     }
     void run_layers(Tensor& x, Phase phase);
-    // The parameters a phase's projections run with (Parameters::decode_text for decode and
-    // verification).
-    [[nodiscard]] const TextParameters& phase_text(Phase phase) const noexcept {
+    // The lossless route's layers (execution/lossless.h) over x, the window form for a null cache, else
+    // the cache form with each layer's KV cache and state pools filled in; each layer first waits for its
+    // restored state (set_layer_ready).
+    void run_lossless_layers(Tensor& x, const Tensor& rope_table, LosslessCache* cache);
+    // The drafter and proposal head a batched draft call runs with: their column-invariant copies
+    // on the exact route (Parameters::invariant_mtp), whose drafts then do not depend on the other
+    // rows; the prompt's drafts keep the drafter's own routes.
+    [[nodiscard]] const MtpParameters* batch_mtp() const noexcept;
+    [[nodiscard]] const LinearParameters* batch_proposal_head() const noexcept;
+    // The parameters a phase's projections run with over `columns` columns (Parameters::decode_text
+    // for decode and verification).
+    [[nodiscard]] const TextParameters& phase_text(Phase phase, std::int64_t columns) const noexcept {
         return phase == Phase::Verify
-                   ? parameters_.decode_text(execution_schedule_.column_invariant_decode,
+                   ? parameters_.decode_text(!execution_schedule_.batched_columns(columns),
                                              {execution_schedule_.a8_decode,
                                               execution_schedule_.a4_decode,
                                               execution_schedule_.a8_residual_decode,
@@ -241,7 +262,8 @@ private:
                            const Tensor& positions, const Tensor& rope_positions,
                            ops::CausalAttentionExecutionEnvelope envelope, bool final_chunk,
                            Tensor* final_hidden, Tensor* logits, Tensor* draft_token);
-    void proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& proposal_tokens);
+    void proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& proposal_tokens,
+                         Tensor* probabilities = nullptr);
 
     struct MultimodalPrefill {
         std::span<const int> token_ids;
@@ -298,6 +320,8 @@ private:
     Tensor* rewrite_checkpoint_hidden_output_ = nullptr;
     std::uint32_t mtp_proposal_extent_        = 0;
     std::span<const cudaEvent_t> layer_ready_;
+    OffloadedExperts* offloaded_experts_ = nullptr;
+    OffloadedCall offloaded_prefill_;
 
     const Weight* embed_                        = nullptr;
     const Tensor* final_norm_                   = nullptr;

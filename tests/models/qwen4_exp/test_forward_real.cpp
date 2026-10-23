@@ -7,12 +7,15 @@
 //   infernix_qwen4_exp_forward_real_test TOKENS --dump-logits OUT.bin [--chunk N] [--kv KV]
 //       [--dump-from P] [TOKENS --dump-logits OUT.bin [--chunk N] [--kv KV] [--dump-from P]]...
 //   infernix_qwen4_exp_forward_real_test TOKENS --cpu-columns [--kv KV]
+//   infernix_qwen4_exp_forward_real_test TOKENS --decode-widths [--kv KV]
 //
 // KV is a KV-cache storage: bf16 (default), int8, fp8, nvfp4 or k8v4.
 //
 // With --cpu-columns the test checks that calls the Program serves with the CPU expert service
 // (decode widths, and prefill calls up to 255 columns with the assist) give the GPU route's logits
-// bit for bit (check_cpu_columns).
+// bit for bit (check_cpu_columns). With --decode-widths it checks that a decode row's bits do not
+// depend on how many rows share the call, 1 to 8, in every block and the logits
+// (check_decode_widths).
 // TOKENS is a comma-separated id list, or @FILE holding ids separated by commas or whitespace; the
 // options after a TOKENS apply to it. With --dump-logits the test scores the text teacher-forced
 // instead: it prefills it in chunks of N (default 256) with FP32 logits at every position, writes
@@ -20,7 +23,11 @@
 // position) and prints the perplexity. With --dump-from P only positions from P on are written and
 // scored (long texts: the logits of every position would not fit on disk). Several such texts are
 // scored in order with one model load. --rope-yarn-factor F, anywhere, loads the model with that text
-// YaRN factor (contexts up to the native positions times F).
+// YaRN factor (contexts up to the native positions times F); --expert-a4-activations, anywhere, runs
+// nvidia/Qwen3.8-Flash-Next-FP4-Local's routed experts with 4-bit activations; and
+// --stream-experts, anywhere, leaves the expert banks in the artifact and reads each layer's records
+// into a pinned buffer before the layer runs (artifacts whose experts exceed the pinned ceiling, such
+// as the FP8 import; not with --cpu-columns).
 // Otherwise the test prefills all but the last token as one chunk,
 // then decodes the last token twice in one batch (two sequences with identical histories), and
 // checks that both decode rows equal each other bit for bit and agree with a single prefill of
@@ -53,6 +60,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iterator>
 #include <memory>
@@ -114,8 +122,69 @@ double seconds_since(std::chrono::steady_clock::time_point t) {
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count();
 }
 
+// --stream-experts: the banks stay in the artifact (LoadOptions::stream_experts; an FP8 import's 120 GB of
+// experts exceed the pinned ceiling). Before each layer runs, all of that layer's records are read into
+// one pinned, mapped buffer, which every layer's host-record table points into, and the Forward reads them
+// zero-copy as it does from the RAM tier.
+class StreamedExperts {
+public:
+    StreamedExperts(const q4::ExpertStore& store, const q4::execution::Parameters& parameters)
+        : store_(store), experts_(store.experts()) {
+        for (std::uint32_t l = 0; l < store.layers(); ++l) {
+            if (parameters.layers[l].moe.bank->planes.record_stride != store.record_bytes(l)) {
+                throw std::runtime_error("streamed experts: a bank's record stride differs from its store's");
+            }
+        }
+        const std::size_t bytes = static_cast<std::size_t>(experts_) * store.record_bytes();
+        check(cudaHostAlloc(reinterpret_cast<void**>(&host_), bytes, cudaHostAllocMapped), "cudaHostAlloc");
+        void* mapped = nullptr;
+        check(cudaHostGetDevicePointer(&mapped, host_, 0), "cudaHostGetDevicePointer");
+        std::vector<const std::uint8_t*> table(static_cast<std::size_t>(store.layers()) * experts_);
+        for (std::uint32_t l = 0; l < store.layers(); ++l) {
+            for (std::uint32_t e = 0; e < experts_; ++e) {
+                table[static_cast<std::size_t>(l) * experts_ + e] =
+                    static_cast<const std::uint8_t*>(mapped) + static_cast<std::size_t>(e) * store.record_bytes(l);
+            }
+        }
+        table_ = DeviceBuffer(table.size() * sizeof(void*));
+        table_.copy_from_host(table.data(), table.size() * sizeof(void*), 0);
+        for (const auto& path : store.files()) {
+            files_.emplace_back(path, std::ios::binary);
+            if (!files_.back()) { throw std::runtime_error("streamed experts: cannot open " + path.string()); }
+        }
+    }
+    ~StreamedExperts() { cudaFreeHost(host_); }
+    StreamedExperts(const StreamedExperts&)            = delete;
+    StreamedExperts& operator=(const StreamedExperts&) = delete;
+
+    // Layer l's device table of host-record pointers.
+    [[nodiscard]] const std::uint8_t* const* table(std::uint32_t layer) const {
+        return static_cast<const std::uint8_t* const*>(table_.p) + static_cast<std::size_t>(layer) * experts_;
+    }
+    // Reads every record of `layer` into the buffer; the caller has synchronized the device first.
+    void load(std::uint32_t layer) {
+        for (std::uint32_t e = 0; e < experts_; ++e) {
+            std::uint8_t* record = host_ + static_cast<std::size_t>(e) * store_.record_bytes(layer);
+            for (const auto& segment : store_.segments(layer, e)) {
+                auto& file = files_.at(segment.file);
+                file.seekg(static_cast<std::streamoff>(segment.offset));
+                file.read(reinterpret_cast<char*>(record + segment.at), segment.bytes);
+                if (!file) { throw std::runtime_error("streamed experts: short read"); }
+            }
+        }
+    }
+
+private:
+    const q4::ExpertStore& store_;
+    std::uint32_t experts_ = 0;
+    std::uint8_t* host_    = nullptr;
+    DeviceBuffer table_;
+    std::vector<std::ifstream> files_;
+};
+
 // Every slot's recurrent state, KV pages for `rows` sequences of up to `context` tokens, and no
-// resident experts (every expert is read zero-copy from the pinned bank).
+// resident experts (every expert is read zero-copy from the pinned bank, or with streamed banks from
+// the layer's records read into a pinned buffer before the layer runs).
 struct Harness {
     Harness(const q4::execution::Parameters& parameters, DeviceContext& device, std::int32_t context, std::int32_t columns,
             std::int32_t rows, KvCacheStorage storage)
@@ -225,6 +294,10 @@ struct Harness {
         for (std::uint32_t l = 0; l < c.num_hidden_layers; ++l) {
             experts.frames.push_back(static_cast<const std::int32_t*>(frames_backing.p) + l * c.moe.experts);
         }
+        if (parameters.model.expert_store()) {
+            streamed = std::make_unique<StreamedExperts>(*parameters.model.expert_store(), parameters);
+            for (std::uint32_t l = 0; l < c.num_hidden_layers; ++l) { experts.host_tables.push_back(streamed->table(l)); }
+        }
         work_capacity = q4::execution::Forward::workspace_bytes(c, columns, context, storage);
         work          = std::make_unique<WorkspaceArena>(work_capacity);
         state_view    = state;
@@ -261,8 +334,32 @@ struct Harness {
     std::int32_t pages_per_row = 0;
     std::size_t work_capacity  = 0;
     std::unique_ptr<WorkspaceArena> work;
+    std::unique_ptr<StreamedExperts> streamed; // with streamed banks only
     std::unique_ptr<q4::execution::Forward> forward;
 };
+
+// One call of the harness's Forward: run(), or with streamed banks the same steps layer by layer
+// (Forward::run's composition, bit for bit), each layer's records read before it runs.
+void run_call(Harness& harness, DeviceContext& device, const q4::execution::ForwardBatch& batch, Tensor& logits,
+              const q4::execution::ForwardTap* tap = nullptr) {
+    if (!harness.streamed) {
+        harness.forward->run(batch, logits, tap);
+        return;
+    }
+    auto& forward = *harness.forward;
+    const auto& c = harness.config;
+    forward.begin_call(batch, &logits);
+    DeviceBuffer backing(static_cast<std::size_t>(c.residual_width()) * batch.ids.ne[0] * 2);
+    Tensor residual(backing.p, DType::BF16, {static_cast<std::int32_t>(c.residual_width()), batch.ids.ne[0]});
+    forward.embed(batch, residual);
+    for (std::uint32_t l = 0; l < c.num_hidden_layers; ++l) {
+        device.synchronize(); // the previous layer's experts are no longer read
+        harness.streamed->load(l);
+        forward.layer(l, batch, residual, tap);
+    }
+    forward.finish(batch, residual, &logits);
+    device.synchronize();
+}
 
 // Device copies of one call's inputs.
 struct Call {
@@ -311,7 +408,7 @@ Call make_call(const q4::TextConfig& c, const q4::NgramVolume& volume, const std
     const std::size_t bytes = padded_bytes(ids.size() * i32) + padded_bytes(positions.size() * i32) +
                               padded_bytes(rope.size() * i32) + padded_bytes(block_rope.size() * i32) +
                               padded_bytes(slots.size() * i32) + padded_bytes(rows.size() * i32) +
-                              padded_bytes(last.size() * i32) + padded_bytes(ngram.size());
+                              padded_bytes(last.size() * i32) + padded_bytes(ngram.size()) + padded_bytes(2);
     call.buffer = DeviceBuffer(bytes);
     auto* base = static_cast<std::byte*>(call.buffer.p);
     std::size_t offset = 0;
@@ -332,6 +429,10 @@ Call make_call(const q4::TextConfig& c, const q4::NgramVolume& volume, const std
     call.batch.ngram_rows = Tensor(put(ngram.data(), ngram.size()), DType::U8,
                                    {static_cast<std::int32_t>(row_bytes), static_cast<std::int32_t>(heads), columns});
     call.batch.ngram_format = volume.table().format;
+    // An FP8 volume that is not the artifact's own carries its per-tensor scale (as the Engine passes it).
+    if (const auto scale = volume.table().fp8_scale) {
+        call.batch.ngram_scale = Tensor(put(&*scale, sizeof(*scale)), DType::BF16, {1});
+    }
     call.host_slots       = std::move(slots);
     call.host_rows        = std::move(rows);
     call.batch.host_slots = call.host_slots;
@@ -403,7 +504,8 @@ bool check_cpu_columns(const q4::execution::Parameters& parameters, DeviceContex
                                              .pcie_divisor = 3,
                                              .wide_from    = moe::kMaxCpuColumns + 1,
                                              .wide_jobs    = moe::kMaxCpuJobs,
-                                             .cpus         = {}});
+                                             .cpus         = {},
+                                             .activation   = parameters.layers.front().moe.bank->activation});
         auto sources           = harness.experts_view;
         sources.staging_base   = static_cast<std::uint8_t*>(staging.p);
         sources.staging_slots  = kStagingSlots;
@@ -453,6 +555,111 @@ bool check_cpu_columns(const q4::execution::Parameters& parameters, DeviceContex
     return ok;
 }
 
+// --decode-widths: the last token decoded in batches of 1..8 identical sequences (after identical
+// prefills) must give every row the solo row's bits in every block's residual, routes, mixer and
+// MoE inputs and outputs, and logits (the Forward's share of the exact route's request invariance);
+// prints the first block and tap that differs per width.
+bool check_decode_widths(const q4::execution::Parameters& parameters, DeviceContext& device,
+                         const q4::NgramVolume& volume, const std::vector<std::int32_t>& tokens,
+                         std::int32_t context, KvCacheStorage kv) {
+    const auto& c        = parameters.model.config().text;
+    const auto n         = static_cast<std::int32_t>(tokens.size());
+    const auto blocks    = static_cast<std::size_t>(c.num_hidden_layers);
+    const auto W         = static_cast<std::int32_t>(c.residual_width());
+    const auto K         = static_cast<std::int32_t>(c.moe.top_k);
+    const auto H         = static_cast<std::int32_t>(c.hidden_size);
+    const auto vocab     = static_cast<std::size_t>(c.vocab_size);
+    constexpr int kMaxWidth = 8;
+    // Per block: residual [W], routes [K] (as 2-byte halves), four io taps [H]: one column's values.
+    const std::size_t column_words = static_cast<std::size_t>(W) + 2 * K + 4 * static_cast<std::size_t>(H);
+    std::vector<std::vector<std::uint16_t>> solo; // [block] one column
+    std::vector<float> solo_logits;
+    bool ok = true;
+    for (std::int32_t width = 1; width <= kMaxWidth; ++width) {
+        Harness harness(parameters, device, context, n, width, kv);
+        DeviceBuffer logits(vocab * width * sizeof(float));
+        for (std::int32_t slot = 0; slot < width; ++slot) {
+            auto head = make_call(c, volume, {tokens}, 0, n - 1, {slot}, {slot});
+            Tensor head_logits(logits.p, DType::FP32, {static_cast<std::int32_t>(vocab), 1});
+            harness.forward->run(head.batch, head_logits);
+        }
+        const std::size_t residual_bytes = static_cast<std::size_t>(W) * width * 2;
+        const std::size_t route_bytes    = static_cast<std::size_t>(K) * width * 4;
+        const std::size_t io_bytes       = static_cast<std::size_t>(H) * width * 2;
+        const std::size_t block_bytes    = residual_bytes + route_bytes + 4 * io_bytes;
+        DeviceBuffer taps(blocks * block_bytes);
+        std::vector<Tensor> residual_taps, route_taps, io_taps[4];
+        auto* base = static_cast<std::byte*>(taps.p);
+        for (std::size_t b = 0; b < blocks; ++b) {
+            std::byte* at = base + b * block_bytes;
+            residual_taps.emplace_back(at, DType::BF16, std::initializer_list<std::int32_t>{W, width});
+            route_taps.emplace_back(at + residual_bytes, DType::I32, std::initializer_list<std::int32_t>{K, width});
+            for (std::size_t kind = 0; kind < 4; ++kind) {
+                io_taps[kind].emplace_back(at + residual_bytes + route_bytes + kind * io_bytes, DType::BF16,
+                                           std::initializer_list<std::int32_t>{H, width});
+            }
+        }
+        q4::execution::ForwardTap tap{&residual_taps, &route_taps, &io_taps[0], &io_taps[1], &io_taps[2], &io_taps[3]};
+        std::vector<std::int32_t> slots(static_cast<std::size_t>(width));
+        std::iota(slots.begin(), slots.end(), 0);
+        auto step = make_call(c, volume, std::vector<std::vector<std::int32_t>>(static_cast<std::size_t>(width), tokens),
+                              n - 1, 1, slots, slots);
+        Tensor step_logits(logits.p, DType::FP32, {static_cast<std::int32_t>(vocab), width});
+        harness.forward->run(step.batch, step_logits, &tap);
+        device.synchronize();
+        std::vector<std::byte> host(blocks * block_bytes);
+        taps.copy_to_host(host.data(), host.size(), 0);
+        const auto all_logits = to_float(logits, vocab * width);
+        // Column `col` of block b as one word vector: residual, routes, then the four io taps.
+        const auto column = [&](std::size_t b, std::int32_t col) {
+            std::vector<std::uint16_t> out(column_words);
+            const std::byte* at = host.data() + b * block_bytes;
+            std::memcpy(out.data(), at + static_cast<std::size_t>(col) * W * 2, static_cast<std::size_t>(W) * 2);
+            std::memcpy(out.data() + W, at + residual_bytes + static_cast<std::size_t>(col) * K * 4,
+                        static_cast<std::size_t>(K) * 4);
+            for (std::size_t kind = 0; kind < 4; ++kind) {
+                std::memcpy(out.data() + W + 2 * K + kind * H,
+                            at + residual_bytes + route_bytes + kind * io_bytes + static_cast<std::size_t>(col) * H * 2,
+                            static_cast<std::size_t>(H) * 2);
+            }
+            return out;
+        };
+        if (width == 1) {
+            for (std::size_t b = 0; b < blocks; ++b) { solo.push_back(column(b, 0)); }
+            solo_logits.assign(all_logits.begin(), all_logits.begin() + static_cast<std::ptrdiff_t>(vocab));
+            std::printf("width 1: reference row recorded\n");
+            continue;
+        }
+        static const char* kTaps[] = {"residual", "routes", "mixer in", "mixer out", "moe in", "moe out"};
+        for (std::int32_t col = 0; col < width; ++col) {
+            std::string first = "none";
+            for (std::size_t b = 0; b < blocks && first == "none"; ++b) {
+                const auto got = column(b, col);
+                for (std::size_t i = 0; i < column_words; ++i) {
+                    if (got[i] != solo[b][i]) {
+                        const std::size_t part = i < static_cast<std::size_t>(W)         ? 0
+                                                 : i < static_cast<std::size_t>(W + 2 * K) ? 1
+                                                                                           : 2 + (i - W - 2 * K) / H;
+                        first = "block " + std::to_string(b) + " " + kTaps[part];
+                        break;
+                    }
+                }
+            }
+            const bool logits_same = std::equal(solo_logits.begin(), solo_logits.end(),
+                                                all_logits.begin() + static_cast<std::ptrdiff_t>(col * vocab));
+            if (first != "none" || !logits_same) {
+                std::printf("width %d row %d: first difference at %s; logits %s\n", width, col, first.c_str(),
+                            logits_same ? "equal" : "differ");
+                ok = false;
+            }
+        }
+        std::printf("width %d checked\n", width);
+    }
+    std::printf(ok ? "every decode width equals the solo row bit for bit\n"
+                   : "FAIL: a decode width changes a row's bits\n");
+    return ok;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -469,16 +676,27 @@ int main(int argc, char** argv) {
         std::int32_t dump_from = 0;
         KvCacheStorage kv      = KvCacheStorage::BFloat16;
         bool cpu_columns   = false;
+        bool decode_widths = false;
     };
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     try {
         std::vector<Job> jobs;
-        models::LoadOptions load; // --rope-yarn-factor F (anywhere): the model's YaRN factor
+        // Anywhere: --rope-yarn-factor F (the model's YaRN factor) and --expert-a4-activations (NVIDIA
+        // FP4-Local's optional 4-bit expert activations).
+        models::LoadOptions load;
         for (int i = 1; i < argc; ++i) {
             const std::string arg = argv[i];
             if (arg == "--rope-yarn-factor") {
                 if (i + 1 >= argc) { throw std::invalid_argument("--rope-yarn-factor needs a value"); }
                 load.rope_yarn_factor = std::stof(argv[++i]);
+                continue;
+            }
+            if (arg == "--expert-a4-activations") {
+                load.expert_a4_activations = true;
+                continue;
+            }
+            if (arg == "--stream-experts") {
+                load.stream_experts = true;
                 continue;
             }
             if (arg.rfind("--", 0) != 0) {
@@ -489,6 +707,11 @@ int main(int argc, char** argv) {
             if (arg == "--cpu-columns") {
                 if (jobs.empty()) { throw std::invalid_argument("--cpu-columns needs a token list before it"); }
                 jobs.back().cpu_columns = true;
+                continue;
+            }
+            if (arg == "--decode-widths") {
+                if (jobs.empty()) { throw std::invalid_argument("--decode-widths needs a token list before it"); }
+                jobs.back().decode_widths = true;
                 continue;
             }
             if (jobs.empty() || i + 1 >= argc) { throw std::invalid_argument(arg + " needs a token list before it and a value"); }
@@ -582,7 +805,7 @@ int main(int argc, char** argv) {
                     const std::int32_t width = std::min(chunk, n - first);
                     auto call = make_call(c, volume, {tokens}, first, width, {0}, {0}, true);
                     Tensor chunk_logits(logits.p, DType::FP32, {static_cast<std::int32_t>(vocab), width});
-                    harness.forward->run(call.batch, chunk_logits, job.blocks_path.empty() ? nullptr : &block_tap);
+                    run_call(harness, device, call.batch, chunk_logits, job.blocks_path.empty() ? nullptr : &block_tap);
                     device.synchronize();
                     if (!job.blocks_path.empty()) {
                         // [position][block][mixer in, mixer out, moe in, moe out][H]
@@ -630,8 +853,10 @@ int main(int argc, char** argv) {
         const std::string& routes_path    = job.routes_path;
         const std::string& blocks_path    = job.blocks_path;
         if (job.cpu_columns) {
+            if (load.stream_experts) { throw std::invalid_argument("--cpu-columns reads a pinned bank: not with --stream-experts"); }
             return check_cpu_columns(parameters, device, volume, tokens, context, job.kv) ? 0 : 1;
         }
+        if (job.decode_widths) { return check_decode_widths(parameters, device, volume, tokens, context, job.kv) ? 0 : 1; }
         Harness harness(parameters, device, context, n, 3, job.kv);
         DeviceBuffer logits(vocab * 2 * sizeof(float));
         print_memory("harness");
@@ -662,7 +887,7 @@ int main(int argc, char** argv) {
         }
         q4::execution::ForwardTap tap{&residual_taps, &route_taps, &io_taps[0], &io_taps[1], &io_taps[2], &io_taps[3]};
         t0 = std::chrono::steady_clock::now();
-        harness.forward->run(full.batch, full_logits, &tap);
+        run_call(harness, device, full.batch, full_logits, &tap);
         device.synchronize();
         const auto dump = [&](const std::string& path, std::size_t offset, std::size_t bytes) {
             if (path.empty()) { return; }
@@ -690,12 +915,12 @@ int main(int argc, char** argv) {
         for (std::int32_t slot : {1, 2}) {
             auto head = make_call(c, volume, {tokens}, 0, n - 1, {slot}, {slot});
             Tensor head_logits(logits.p, DType::FP32, {static_cast<std::int32_t>(vocab), 1});
-            harness.forward->run(head.batch, head_logits);
+            run_call(harness, device, head.batch, head_logits);
         }
         auto step = make_call(c, volume, {tokens, tokens}, n - 1, 1, {1, 2}, {1, 2});
         Tensor step_logits(logits.p, DType::FP32, {static_cast<std::int32_t>(vocab), 2});
         t0 = std::chrono::steady_clock::now();
-        harness.forward->run(step.batch, step_logits);
+        run_call(harness, device, step.batch, step_logits);
         device.synchronize();
         std::printf("batched decode of 2 sequences: %.1f ms\n", seconds_since(t0) * 1e3);
         const auto decode = to_float(logits, 2 * vocab);

@@ -101,10 +101,12 @@ struct Schedule {
     static_assert(kUnitRunBytes % 16 == 0, "bulk copies move multiples of 16 bytes");
 };
 
-// Two-term A4 (W4A16 fast path): each stage holds both terms' activation tiles beside one weight
-// tile, and two stages (39 KB) keep two CTAs per SM.
+// A4 residual (W4A16 fast paths): each stage holds every term's activation tile beside one weight
+// tile, and two stages (39 KB at two terms, 48 KB at three) keep two CTAs per SM.
+template <int Terms>
 struct ScheduleResidual : Schedule {
-    static constexpr int kTerms  = kResidualTerms;
+    static_assert(Terms >= 2 && Terms <= kMaxResidualTerms);
+    static constexpr int kTerms  = Terms;
     static constexpr int kStages = 2;
     static constexpr std::uint32_t kStageBytes =
         kTerms * (kBlockTokens * kCodeRowBytes + kBlockTokens * kScaleWordsPerRow * 4) + kRowGroups * kUnitRunBytes;
@@ -340,6 +342,7 @@ __global__ __launch_bounds__(S::kThreads, S::kMinBlocksPerSm) void grouped_kerne
                     }
                 }
             }
+            fence_reads_before_async_refill(); // the shared reads before the TMA and bulk refills
             __syncwarp();
             if (lane == 0) { cta_mbarrier_arrive(&shared.empty[stage]); }
         }

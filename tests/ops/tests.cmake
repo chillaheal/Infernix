@@ -47,10 +47,49 @@ infernix_add_op_test(infernix_offloaded_moe_ggml_test
 infernix_add_op_test(infernix_offloaded_moe_fp8_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_fp8.cu"
   LIBRARIES infernix_ops)
+# Qwen3.5-122B-A10B's expert geometry (H 3072, I 1024) through the layer route (frames, zero-copy,
+# staged, forked and CPU-served misses; narrow and wide widths) against the exact host expert, bit for
+# bit, and its combine against the FP64 formula.
+infernix_add_op_test(infernix_offloaded_moe_qwen3_5_122b_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_qwen3_5_122b.cu"
+  LIBRARIES infernix_ops)
+# fp8_e4m3fn_row_f32 (Qwen3.5-122B-A10B): the static A8 encoding bit for bit, and the attention, GDN
+# and residual projections against FP64 under A16, static A8 and the column-invariant route.
+infernix_add_op_test(infernix_fp8_row_f32_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_fp8_row_f32.cpp"
+  LIBRARIES infernix_ops)
+# The canonical W4A16 projection of Qwen3.5-122B-A10B's nvfp4_rg16_v1 head (GEMV and integer
+# tensor-core routes, FP32 and BF16 outputs) against the CPU engine's exact row sums, bit for bit.
+infernix_add_op_test(infernix_rg16_linear_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_rg16_linear.cu"
+  LIBRARIES infernix_ops)
 # GGUF block projections against an independent exact oracle (every ggml format, K, width).
 infernix_add_op_test(infernix_ggml_linear_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ggml_linear.cpp"
   LIBRARIES infernix_ops)
+# The --lossless route's projections: every output the correctly rounded exact sum (tensor-core route
+# and exact fallback), against a host wide-integer oracle.
+infernix_add_op_test(infernix_lossless_linear_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_lossless_linear.cpp"
+  LIBRARIES infernix_ops)
+# Its correctly rounded binary32/BF16 functions against an exact decimal oracle (every BF16 input and
+# random binary32 ones); the Python driver writes the vectors and runs the executable.
+add_executable(infernix_lossless_cr_math_test "${CMAKE_CURRENT_LIST_DIR}/test_lossless_cr_math.cu")
+infernix_test_includes(infernix_lossless_cr_math_test)
+target_link_libraries(infernix_lossless_cr_math_test PRIVATE infernix_ops)
+infernix_op_oracle_options(infernix_lossless_cr_math_test)
+add_test(NAME infernix_lossless_cr_math_test
+  COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_LIST_DIR}/lossless_cr_oracle.py
+          $<TARGET_FILE:infernix_lossless_cr_math_test>)
+# Its elementwise and row operations (norms, gates, the GDN convolution) against an exact oracle that
+# follows docs/maintainer/lossless-route.md §2 step by step.
+add_executable(infernix_lossless_ops_test "${CMAKE_CURRENT_LIST_DIR}/test_lossless_ops.cu")
+infernix_test_includes(infernix_lossless_ops_test)
+target_link_libraries(infernix_lossless_ops_test PRIVATE infernix_ops)
+infernix_op_oracle_options(infernix_lossless_ops_test)
+add_test(NAME infernix_lossless_ops_test
+  COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_LIST_DIR}/lossless_ops_oracle.py
+          $<TARGET_FILE:infernix_lossless_ops_test>)
 infernix_add_op_test(infernix_linear_topk_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_linear_topk.cu"
   LIBRARIES infernix_ops)
@@ -87,7 +126,8 @@ infernix_add_op_test(infernix_softmax_attention_test
   LIBRARIES infernix_ops
   ARGS --non-causal-only)
 # The causal cases, one entry per KV format: together they run exactly the cases of a run without
-# --kv-dtype, and `ctest -j` can run them concurrently.
+# --kv-dtype, and `ctest -j` runs them beside the other tests, one attention entry at a time
+# (infernix_attention_oracle below).
 foreach(kv_dtype bf16 int8 fp8 nvfp4 k8v4)
   add_test(NAME infernix_softmax_attention_${kv_dtype}_test
     COMMAND infernix_softmax_attention_test --kv-dtype ${kv_dtype})
@@ -157,6 +197,10 @@ infernix_add_op_test(infernix_speculative_round_test
 infernix_add_op_test(infernix_speculative_tree_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_speculative_tree.cpp"
   LIBRARIES infernix_ops)
+
+infernix_add_op_test(infernix_gumbel_speculation_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gumbel_speculation.cpp"
+  LIBRARIES infernix_ops)
 set_tests_properties(infernix_speculative_tree_test PROPERTIES TIMEOUT 600)
 
 infernix_add_op_test(infernix_attn_input_proj_test
@@ -213,6 +257,17 @@ foreach(kv_dtype bf16 int8 fp8 nvfp4 k8v4)
     PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
 endforeach()
 
+# Every softmax attention entry's oracle runs on all host threads (ops/host_parallel.h) and its
+# kernels fill the GPU, so entries started together only oversubscribe both: the bf16 entry, 62 s
+# alone, timed out at 900 s beside five others (2026-10-22). They take turns; other tests still run
+# beside them.
+set(infernix_attention_oracle_tests infernix_softmax_attention_test infernix_softmax_attention_extended_test)
+foreach(kv_dtype bf16 int8 fp8 nvfp4 k8v4)
+  list(APPEND infernix_attention_oracle_tests infernix_softmax_attention_${kv_dtype}_test
+    infernix_softmax_attention_wide_${kv_dtype}_test)
+endforeach()
+set_tests_properties(${infernix_attention_oracle_tests} PROPERTIES RESOURCE_LOCK infernix_attention_oracle)
+
 add_test(NAME infernix_sparse_moe_wide_test
   COMMAND infernix_sparse_moe_test --wide-only)
 set_tests_properties(infernix_sparse_moe_wide_test
@@ -254,6 +309,13 @@ infernix_add_op_test(infernix_hyper_connection_stream_mean_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_hyper_connection_stream_mean.cpp"
   LIBRARIES infernix_ops)
 set_tests_properties(infernix_hyper_connection_stream_mean_test PROPERTIES SKIP_RETURN_CODE 77)
+
+# NVIDIA FP4-Local's PLE: NVFP4 n-gram rows decoded bit-exactly (one rounding of the exact product)
+# and the gate with FP32 norm weights, against FP64.
+infernix_add_op_test(infernix_ple_nvfp4_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ple_nvfp4.cpp"
+  LIBRARIES infernix_linear_test_support)
+set_tests_properties(infernix_ple_nvfp4_test PROPERTIES SKIP_RETURN_CODE 77)
 
 # Canonical W4A4 arithmetic and the CPU expert engine; host-only, needs no GPU.
 infernix_add_op_test(infernix_offloaded_moe_cpu_test
@@ -307,6 +369,9 @@ infernix_add_op_test(infernix_qsa_select_test
 infernix_add_op_test(infernix_offloaded_moe_layer_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_layer.cu"
   LIBRARIES infernix_ops)
+# Its idle-service check bounds a call's latency to 10 ms beyond the GPU's own; beside other GPU tests
+# the same call's time ranged 40-75 ms and the check failed five times (2026-10-22), so it runs alone.
+set_tests_properties(infernix_offloaded_moe_layer_test PROPERTIES RUN_SERIAL TRUE)
 
 # The wide route (experts with more than eight columns) against its FP64 W4A4 oracle.
 infernix_add_op_test(infernix_offloaded_moe_wide_test

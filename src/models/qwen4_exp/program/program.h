@@ -15,7 +15,7 @@
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "models/qwen3_5/ngram.h"
 #include "models/qwen4_exp/config.h"
-#include "models/qwen4_exp/memory_plan.h"
+#include "models/qwen4_exp/expert_offload.h"
 #include "models/qwen4_exp/execution/fast_path_flags.h"
 #include "infernix/types.h"
 #include "runtime/contract/execution.h"
@@ -411,6 +411,9 @@ struct ProgramOptions {
     // draft head's top tokens under its sampler and verified by sparse rejection sampling, and its
     // one-row rounds verify every draft (no draft_min_p cut). Greedy rows are unchanged.
     bool sampled_mtp_drafts = false;
+    // The reproducible route (EngineOptions::fast_paths off): sampled requests draw by Gumbel-max
+    // (ops::SamplingConfig::gumbel_max), so speculation returns plain sampling's text.
+    bool gumbel_sampling = false;
     // CPU-served misses (design section 10): host expert-engine workers (0 disables), the most
     // experts one layer call hands to them, and the share kept on the PCIe stage (misses / divisor;
     // 0 derives it from the measured link and CPU rates, design §19.3.12).
@@ -676,13 +679,6 @@ struct RuntimeTypes {
 };
 
 namespace testing {
-// Fault injection for engine-level tests: the `checks`-th later check of the expert error word (one
-// per prefill call or decode round, process-wide) reports a failed expert read, as a real one would.
-// 0 disarms.
-void set_expert_fault(std::uint32_t checks) noexcept;
-// Consumes one check; true on the armed one.
-[[nodiscard]] bool take_expert_fault() noexcept;
-
 // LLM<->image VRAM coexistence: drive the live Program's one-shot yield for a coexistence test (Engine
 // holds no Program accessor). has_image_yield_program(): a Program is loaded to yield from.
 // yield_image_vram frees physical VRAM toward the image job's need (bytes, plus a margin kept below the

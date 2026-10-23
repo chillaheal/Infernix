@@ -22,9 +22,8 @@ struct PendingWeight {
 
 class Bindings {
 public:
-    // a16_activations binds every Use A16Only (LoadOptions::a16_activations).
-    Bindings(artifact::Binder& binder, bool a16_activations)
-        : binder(binder), a16_activations(a16_activations) {}
+    // The lossless route binds every Use A16Only (LoadOptions::lossless).
+    Bindings(artifact::Binder& binder, bool a16_only) : binder(binder), a16_only(a16_only) {}
 
     [[nodiscard]] WeightId parameter(std::string name, artifact::Shape shape,
                                      std::vector<std::string> inputs   = {},
@@ -39,7 +38,7 @@ public:
     [[nodiscard]] WeightUseId use(WeightId id, std::string_view input) const;
 
     artifact::Binder& binder;
-    bool a16_activations = false;
+    bool a16_only = false;
     std::vector<PendingWeight> weights;
 
 private:
@@ -51,8 +50,13 @@ private:
 [[nodiscard]] DenseWeights bind_dense(Bindings& bindings, std::uint64_t hidden,
                                       std::uint64_t intermediate, const std::string& prefix,
                                       bool draft = false);
+// `stream_experts`: an offloaded bank stays in the artifact (LoadOptions::stream_experts).
 [[nodiscard]] BlockWeights bind_block(Bindings& bindings, const TextConfig& config,
-                                      const std::string& prefix, MixerKind mixer);
+                                      const std::string& prefix, MixerKind mixer,
+                                      bool stream_experts = false);
+// Whether the block at `prefix` stores its routed experts as one bank (`moe/experts`), which binds
+// the offloaded form.
+[[nodiscard]] bool offloaded_expert_bank(const Bindings& bindings, const std::string& prefix);
 [[nodiscard]] TextWeights bind_text(Bindings& bindings, const TextConfig& config,
                                     const LoadOptions& options);
 [[nodiscard]] VisionWeights bind_vision(Bindings& bindings, const VisionConfig& config,

@@ -64,13 +64,18 @@ struct MoeParameters {
     LinearParameters shared_down;    // [H, I_shared]
     const ExpertBank* bank = nullptr;
     const ops::offloaded_moe::ExpertScales* device_scales = nullptr; // [E]
+    // The lossless route's (TextConfig::lossless): each NVFP4 matrix's weight multiplier in alpha_* (an
+    // A4 bank's alpha also folds in its input scale); [E], null without the route. The design reference
+    // (TextConfig::design_reference) adds a W4A4 bank's input scales in input_*.
+    const ops::offloaded_moe::ExpertScales* lossless_scales = nullptr;
+    ops::offloaded_moe::LosslessExpertDesign lossless_design = ops::offloaded_moe::LosslessExpertDesign::kNone;
 };
 
 struct PleParameters {
     LinearParameters projection; // [key (S*H) | value (H), embed]
     Tensor key_norm, query_norm, conv_norm; // BF16 [S*H]
     Tensor convolution;                     // BF16 [S*H, K]
-    Tensor ngram_scale;                     // BF16 [1] (FP8 tables; empty for an IQ4_NL table)
+    Tensor ngram_scale; // BF16 [1] (FP8 tables) or FP32 [1] (NVFP4); empty for IQ4_NL and BF16 tables
 };
 
 // The MTP drafter (design §11.2).
@@ -141,8 +146,9 @@ public:
     std::optional<qwen3_5::execution::VisionParameters> vision; // --vision (shared tower types)
 
 private:
-    // Device copy of every layer's ExpertScales, [layers][E].
+    // Device copy of every layer's ExpertScales, [layers][E], and the lossless route's.
     DeviceBuffer scales_;
+    DeviceBuffer lossless_scales_;
     // A GGUF import's GDN output permutation: input block j of the output projection is value head
     // gdn_value_perm_[j] (ggml's tiled order).
     DeviceBuffer gdn_value_perm_;

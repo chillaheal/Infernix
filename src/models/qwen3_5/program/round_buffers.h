@@ -24,6 +24,10 @@ inline constexpr std::uint32_t kDFlashDecodeMaximumWidth  = kDFlashDecodeMaximum
 inline constexpr std::uint32_t kDFlashVerifyMaximumDrafts = 63;
 inline constexpr std::uint32_t kDFlashVerifyMaximumWidth  = kDFlashVerifyMaximumDrafts + 1;
 
+namespace execution {
+struct OffloadedExperts;
+} // namespace execution
+
 struct RoundStateSpec {
     std::int32_t hidden          = 0;
     std::int32_t output_rows     = 0;
@@ -31,6 +35,11 @@ struct RoundStateSpec {
     std::uint32_t draft_window   = 0;
     SpeculativeBackend backend   = SpeculativeBackend::None;
     bool causal_scoring          = false;
+    // The lossless route: the step and ordinary decode logits are FP32.
+    bool fp32_logits             = false;
+    // adaptive-dflash: the drafter's whole block (its draft count K), which a round's proposal graph
+    // drafts before the round's width is chosen; 0 without it.
+    std::uint32_t block_drafts = 0;
 };
 
 struct PrefillRoundHost {
@@ -79,6 +88,9 @@ struct MtpDecodeEgress {
     // Step-major: all B rows for proposal step 0, followed by all B rows for step 1, etc.
     std::array<TokenId, kMaximumConcurrency * kMtpDecodeMaximumDrafts> next_drafts{};
     std::array<std::int32_t, kMaximumConcurrency> next_extents{};
+    // The drafter's probability of each next draft, as next_drafts (written only with
+    // ExecutionSchedule::mtp_draft_confidence).
+    std::array<float, kMaximumConcurrency * kMtpDecodeMaximumDrafts> next_probabilities{};
 };
 
 // Prefill binds the current chunk independently of the compact decode batch.
@@ -193,6 +205,13 @@ struct DFlashDecodeStateLayout {
     // [W,B] ancestor masks.
     std::optional<TensorRegion> tree_rows;
     std::optional<TensorRegion> tree_masks;
+    // adaptive-dflash: the proposal of the whole block (I32 [K,B] drafts, DFlash2 I32/FP32
+    // [16,K,B] candidates and laws) and each draft's FP32 [K,B] probability (DFlash2) or
+    // log-probability (DFlash) under the drafter, kept from the proposal graph to the verify graph.
+    std::optional<TensorRegion> block_drafts;
+    std::optional<TensorRegion> block_candidates;
+    std::optional<TensorRegion> block_q;
+    std::optional<TensorRegion> block_confidence;
 };
 
 // Constrained-generation controls (TokenConstraint): each lane's permitted sets, the per-column
@@ -299,6 +318,7 @@ struct MtpDecodeState {
     Tensor accepted_drafts;
     Tensor next_drafts;
     Tensor next_extents;
+    Tensor next_probabilities; // FP32, as next_drafts
     Tensor verify_ids;
     Tensor target_positions;
     Tensor target_argmax;
@@ -359,6 +379,12 @@ struct DFlashDecodeState {
     Tensor target_logits;
     Tensor target_hidden;
     Tensor target_continuation_hidden;
+    // adaptive-dflash's block proposal (DFlashDecodeStateLayout::block_*); empty without it. A
+    // narrowed view keeps them at the block's width.
+    Tensor block_drafts;
+    Tensor block_candidates;
+    Tensor block_q;
+    Tensor block_confidence;
 
     DFlashDecodeState() = default;
     DFlashDecodeState(DeviceSpan backing, const DFlashDecodeStateLayout& layout,
@@ -398,6 +424,9 @@ struct TokenConstraintState {
 };
 
 struct RoundState {
+    // An artifact with offloaded experts: the Program's experts (ProgramOffload::experts), which every
+    // forward's offloaded MoE layers read; null otherwise.
+    execution::OffloadedExperts* offloaded_experts = nullptr;
     std::optional<OrdinaryDecodeState> ordinary;
     std::optional<TokenConstraintState> constraint;
     Tensor token;

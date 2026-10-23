@@ -257,8 +257,9 @@ public:
         if (tree_auto_requested && !options.speculative.draft_tree_auto) {
             runtime::publish_diagnostic(
                 options.diagnostic_observer, DiagnosticLevel::Warning,
-                "automatic DFlash2 tree verification is unavailable for this artifact (its GDN "
-                "input projections are not single FP8 or NVFP4 parents); rounds verify chains");
+                "automatic DFlash2 tree verification does not run here (an artifact whose GDN input "
+                "projections are not single FP8 or NVFP4 parents, fixed speculation, or --draft-tokens "
+                "auto's adaptive-dflash widths, which verify chains faster); rounds verify chains");
         }
         sampling_defaults = active->frontend.sampling_defaults();
         StartupPhaseScope finalize_phase(options.startup_observer, StartupPhase::EngineFinalize);
@@ -274,13 +275,16 @@ public:
     // hybrid prefix cache's) need the artifact's architecture, read once here. An unreadable
     // artifact is reported by the (Qwen3.5) model construction, after option validation.
     EngineOptions normalize(EngineOptions engine_options) {
+        bool offloaded_experts = false;
         try {
             if (runtime::artifact_is_qwen4_exp(engine_options.artifact_path)) {
                 architecture = models::Architecture::Qwen4Exp;
+            } else {
+                offloaded_experts = runtime::artifact_offloads_experts(engine_options.artifact_path);
             }
         } catch (const std::exception&) {}
-        runtime::validate_engine_options(engine_options, architecture);
-        return runtime::normalize_engine_options(std::move(engine_options), architecture);
+        runtime::validate_engine_options(engine_options, architecture, offloaded_experts);
+        return runtime::normalize_engine_options(std::move(engine_options), architecture, offloaded_experts);
     }
 
     ~Impl() noexcept {

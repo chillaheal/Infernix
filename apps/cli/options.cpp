@@ -126,8 +126,10 @@ constexpr std::array kCliOptions{
     CliOption{"--use-original-int8-prefill-kernel", false},
     CliOption{"--prefill-split-workspace-mib"},
     CliOption{"--use-original-nvfp4-prefill-kernel", false},
-    CliOption{"--disable-fast-paths", false},
+    CliOption{"--reproducible", false},
+    CliOption{"--lossless", false},
     CliOption{"--fast-path", true, true},
+    CliOption{"--expert-a4-activations", false},
     CliOption{"--stop-token-id", true, true},
     CliOption{"--stop", true, true},
     CliOption{"--reasoning-stop", true, true},
@@ -177,12 +179,12 @@ std::string usage_text(const char* argv0) {
            "N|auto]\n"
            "       [--draft-model FILE]\n"
            "       [--lm-head-draft] [--spec-min-p P] [--draft-tree-nodes auto|N] [--draft-tree-paths N]\n"
-           "       [--ngram-draft-tokens 1..63] [--ngram-min-match 4..64]\n"
+           "       [--ngram-draft-tokens 1..63|auto] [--ngram-min-match 4..64]\n"
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
            "       [--chat-template FILE] [--ngram-volume FILE] [--ngram-residency auto|ram|volume]\n"
-           "       [--expert-state FILE|off] [--expert-stripe FILE]\n"
+           "       [--expert-state FILE|off] [--expert-stripe FILE] [--expert-a4-activations]\n"
            "       [--ram-headroom-mib N] [--expert-ram-mib N|auto] [--expert-pin-mib N|auto]\n"
            "       [--grammar-file FILE | --json-object | --json-schema-file FILE |\n"
            "        --regex PATTERN | --choice TEXT ...]\n"
@@ -211,18 +213,18 @@ std::string usage_text(const char* argv0) {
            "  --rope-yarn-factor F     startup-fixed YaRN, finite [1,4] (default 1);\n"
            "                           extends allowed ceiling only, not --max-context\n"
            "  --prefill-chunk N        prefill chunk size in tokens, multiple of 128\n"
-           "                           (default 16384 for Qwen3.8-Flash-Next, 1024 otherwise)\n"
+           "                           (default 16384 with offloaded experts, 1024 otherwise)\n"
            "  --max-new N              cap on generated tokens\n"
            "  --device N               CUDA device ordinal (default 0)\n"
            "  --ram-headroom-mib N     physical Host RAM in MiB that pinned weights and\n"
            "                           caches leave free for the system (default " +
            std::to_string(kDefaultRamHeadroomBytes >> 20) +
            ")\n"
-           "  --expert-ram-mib N|auto  Qwen3.8-Flash-Next: Host RAM in MiB for the routed\n"
+           "  --expert-ram-mib N|auto  Offloaded experts: Host RAM in MiB for the routed\n"
            "                           experts (auto: what --ram-headroom-mib and the other\n"
            "                           pins leave); less than all of them need reads the\n"
            "                           rest from the artifact (the SSD tier)\n"
-           "  --expert-pin-mib N|auto  Qwen3.8-Flash-Next: at most this much of the experts'\n"
+           "  --expert-pin-mib N|auto  Offloaded experts: at most this much of the experts'\n"
            "                           RAM page-locked for the GPU; the rest stays in RAM\n"
            "                           and the CPU serves it (auto: what Windows allows,\n"
            "                           the GPU's shared memory)\n"
@@ -230,17 +232,18 @@ std::string usage_text(const char* argv0) {
            "KV CACHE\n"
            "  --kv-capacity N|auto     KV-cache capacity in tokens\n"
            "                           (default = --max-context; auto sizes to free\n"
-           "                           VRAM less --vram-headroom-mib; Qwen3.8-Flash-Next:\n"
+           "                           VRAM less --vram-headroom-mib; offloaded experts:\n"
            "                           auto = --max-context)\n"
            "  --vram-past-budget       Qwen3.8-Flash-Next on Windows: also use the VRAM the\n"
            "                           OS budget withholds (~0.6 GiB more expert cache on\n"
            "                           an RTX 5090; may move to system memory if another\n"
            "                           program needs VRAM)\n"
-           "  --expert-tail-skip R     Qwen3.8-Flash-Next: trade quality for decode speed by\n"
-           "                           skipping a routed expert missing from VRAM that every\n"
-           "                           token of a decode round routes at top-10 rank R or\n"
-           "                           lower (1-9; 9 skips least). Changes the output; not\n"
-           "                           with --disable-fast-paths. Default off; Strata's\n"
+           "  --expert-tail-skip R     Offloaded experts (Qwen3.8-Flash-Next, Qwen3.5-122B):\n"
+           "                           trade quality for decode speed by skipping a routed\n"
+           "                           expert missing from VRAM that every token of a decode\n"
+           "                           round routes at top-k rank R or lower (1 to k-1; k is\n"
+           "                           10 on Flash-Next, 8 on the 122B). Changes the output; not\n"
+           "                           with --reproducible. Default off; Strata's\n"
            "                           default is 7\n"
            "  --vram-headroom-mib N|auto\n"
            "                           VRAM in MiB startup sizing leaves free: Qwen3.5,\n"
@@ -250,7 +253,9 @@ std::string usage_text(const char* argv0) {
            "                           Flash-Next, after the expert cache, for the display\n"
            "                           and other programs (auto: 1024 with a display on\n"
            "                           the GPU, else 256)\n"
-           "  --kv-dtype T             bf16 (default) | int8 | fp8 | nvfp4 | k8v4 | vq2 | k4v2\n"
+           "  --kv-dtype T             bf16 (default) | int8 | fp8 | nvfp4 | k8v4 | vq2 | k4v2;\n"
+           "                           bf16 stores K as BF16 and V as FP16 (exact for\n"
+           "                           2^-17 <= |v| < 2^16), with --lossless V as BF16\n"
            "  --use-original-int8-prefill-kernel\n"
            "                           prefill INT8 KV with the original prompt kernel\n"
            "                           (default: the fast kernel)\n"
@@ -264,14 +269,25 @@ std::string usage_text(const char* argv0) {
            "; 128-384 recommended). Less frees KV cache but\n"
            "                           slows 1-2K-token chunks over long context (64: up\n"
            "                           to 27% slower attention; 0: no splitting)\n"
-           "  --disable-fast-paths     run the exact route: bit-exact across releases and,\n"
-           "                           for NVFP4/FP8 dense models, independent of other\n"
-           "                           requests. Without it, every path qualified and\n"
-           "                           measured faster for this artifact's kernels and KV\n"
-           "                           type runs (within Infernix's numerical quality\n"
-           "                           policy; startup lists them; docs/cli.md)\n"
+           "  --reproducible           run the reproducible route: the same bits on every\n"
+           "                           run and release, whatever else is running.\n"
+           "                           Without it, every path qualified and measured\n"
+           "                           faster for this artifact's kernels and KV type\n"
+           "                           runs (within Infernix's numerical quality policy;\n"
+           "                           startup lists them; docs/cli.md)\n"
+           "  --lossless               run the lossless route: every operation of the\n"
+           "                           model correctly rounded at its own BF16 points\n"
+           "                           (FP32 logits), so the output depends on the\n"
+           "                           request and the artifact alone; text with\n"
+           "                           --kv-dtype bf16, no speculation; slower\n"
+           "                           (docs/maintainer/lossless-route.md)\n"
            "  --fast-path NAME         also run this fast path, qualified or not\n"
            "                           (qualification runs; repeatable)\n"
+           "  --expert-a4-activations  nvidia/Qwen3.8-Flash-Next-FP4-Local only: run its\n"
+           "                           routed experts with 4-bit (NVFP4) activations, using\n"
+           "                           the activation scales NVIDIA calibrated for them.\n"
+           "                           Changes the output. No other artifact supports it\n"
+           "                           (default: 16-bit activations, as NVIDIA serves it)\n"
            "\n"
            "SPECULATIVE DECODING (off by default)\n"
            "  --spec mtp|dflash|dflash2 speculative backend\n"
@@ -279,9 +295,11 @@ std::string usage_text(const char* argv0) {
            "                           dflash/dflash2 1-15 (Qwen3.8-Flash-Next dflash2 1-7)\n"
            "                             N     every round drafts and verifies N\n"
            "                             auto  mtp: each round picks 0-7 from recent\n"
-           "                                   acceptance (Qwen3.5/3.6: 1-5 where qualified,\n"
-           "                                   else the model's fastest fixed length);\n"
-           "                                   Qwen3.8-Flash-Next dflash2 likewise\n"
+           "                                   acceptance; dflash/dflash2: each round drafts\n"
+           "                                   its whole block (Qwen3.5/3.6 15, Flash-Next 7)\n"
+           "                                   and verifies as many as the drafts'\n"
+           "                                   probabilities favour (Qwen3.5/3.6: where\n"
+           "                                   qualified, else the fastest fixed length)\n"
            "  --draft-model FILE       Qwen3.8-Flash-Next dflash2: the DFlash2 drafter's\n"
            "                           companion artifact (Qwen3.5/3.6 artifacts bundle theirs)\n"
            "  --lm-head-draft          use the optimized proposal head\n"
@@ -326,7 +344,7 @@ std::string usage_text(const char* argv0) {
            "  --vision                 enable image/video input\n"
            "  --vision-offload auto|on|off  keep the vision tower in pinned system RAM\n"
            "                           instead of VRAM; on adds no steady-state VRAM (default\n"
-           "                           auto: on for Qwen3.8-Flash-Next, off for Qwen3.5)\n"
+           "                           auto: on with offloaded experts, else off)\n"
            "  --vision-max-merged N    max merged vision tokens per item (default 32768);\n"
            "                           oversized media downscales at preprocessing\n"
            "\n"
@@ -459,8 +477,7 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--spec-min-p") {
             options.speculative.draft_min_p = product::parse_draft_min_p(value(arg));
         } else if (arg == "--ngram-draft-tokens") {
-            options.speculative.ngram_draft_tokens =
-                parse_u32(value(arg), "ngram-draft-tokens", true);
+            product::apply_ngram_draft_tokens(options.speculative, value(arg));
         } else if (arg == "--ngram-min-match") {
             options.speculative.ngram_min_match = parse_u32(value(arg), "ngram-min-match");
         } else if (arg == "--draft-tree-nodes") {
@@ -527,13 +544,17 @@ Options parse_options(int argc, char** argv) {
                 parse_u32(value(arg), "prefill-split-workspace-mib", true);
         } else if (arg == "--use-original-nvfp4-prefill-kernel") {
             options.original_nvfp4_prefill_kernel = true;
-        } else if (arg == "--disable-fast-paths") {
+        } else if (arg == "--reproducible") {
             options.fast_paths = false;
+        } else if (arg == "--lossless") {
+            options.lossless = true;
         } else if (arg == "--fast-path") {
             const std::string name(value(arg));
             const std::optional<FastPath> path = parse_fast_path(name);
             if (!path) { throw std::invalid_argument("unknown fast path: " + name); }
             options.fast_path_candidates.push_back(*path);
+        } else if (arg == "--expert-a4-activations") {
+            options.expert_a4_activations = true;
         } else if (arg == "--stop-token-id") {
             const std::uint32_t token = parse_u32(value(arg), "stop-token-id", true);
             if (token > static_cast<std::uint32_t>(std::numeric_limits<TokenId>::max())) {

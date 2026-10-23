@@ -300,6 +300,23 @@ still streaming, which measured about 10 % slower on the RTX 5090 DFlash2 round.
 may stage its first weight tiles into shared memory before the wait. Attention over the KV cache
 stays an ordinary launch; it has no weights to stage and measured no faster as a dependent.
 
+#### Asynchronous-copy pipelines
+
+A producer that refills shared-memory stages with TMA or bulk copies (`cp.async.bulk.tensor`,
+`cp.async.bulk`: writes of the async proxy) while consumers read those stages through the generic
+proxy (ordinary loads, `ld.shared`, `ldmatrix`) needs every reading thread to execute
+`fence_reads_before_async_refill()` (`src/ops/common/mbarrier.cuh`,
+`fence.proxy.async.shared::cta`) after its last read of a stage and before its warp arrives on that
+stage's empty barrier. The mbarrier orders generic-proxy accesses only; without the fence a refill
+may overwrite a stage that is still being read. On the RTX 5090 this never showed in an isolated op
+test, only when another shared-memory-heavy kernel shared the SMs: Flash-Next recipe C's FP8 shared
+expert beside the offloaded routed experts' staged pass returned wrong outputs in about half of the
+overlapped calls (`tests/ops/linear/test_fp8_moe_overlap.cu`; `test_tma_moe_overlap.cu` the FP8 A8
+route, which fails there unfenced). A producer of 16-byte `cp.async` copies writes through the generic proxy, which
+the barriers order, and needs no fence. A tensor map that the host writes into device memory with
+`cudaMemcpy` is acquired with `fence.proxy.tensormap::generic.acquire.sys` before its first use
+(`src/core/tma_descriptor_staging.cuh`).
+
 ## 5. State, workspace, naming, and dependencies
 
 ### 5.1 State and execution views
@@ -468,7 +485,7 @@ of its complete affected domain; one failing implementation is not sufficient ju
 Op qualification does not show what a change does to a whole model's output. On artifacts with
 4-bit activations even reordered arithmetic moves the output distribution measurably, so a
 model-level claim follows [Model-level numerical quality](model-quality.md): several prefill chunk
-sizes, KL divergence to the 16-bit-activation reference, and the decode-quality judge for decode
+sizes, KL divergence to the lossless-route reference, and the decode-quality judge for decode
 paths.
 
 The oracle leaves private arithmetic free, but the product does not: the exact route's output is
@@ -481,7 +498,7 @@ workspace from the same field, and qualifies it in its suite against the same or
 as the exact schedule. Without the field the exact schedule is unchanged. Its model-level approval
 follows the kernels it changes, not a model: every artifact that runs the kernel on the same
 formats shares it, and each configuration needs its own measured speedup
-([kernel-based approval](model-quality.md#61-the-exact-route-and-the-fast-paths)).
+([kernel-based approval](model-quality.md#61-the-reproducible-route-and-the-fast-paths)).
 
 ## 7. Performance evidence
 

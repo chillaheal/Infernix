@@ -53,6 +53,21 @@ class AuxiliaryValue:
             raise ValueError("activation input divisor must be positive finite FP32")
         return cls("fp32", (), raw)
 
+    @classmethod
+    def activation_scale(cls, value: bytes | float) -> AuxiliaryValue:
+        """A static FP8 input's FP32 activation scale s (codes ``e4m3(x * fl32(1 / s))``), as stored."""
+        raw = value if isinstance(value, bytes) else struct.pack("<f", value)
+        if len(raw) != 4 or not valid_positive_fp32_word(struct.unpack("<I", raw)[0]):
+            raise ValueError("activation input scale must be positive finite FP32")
+        return cls("fp32", (), raw)
+
+
+# Use auxiliary roles: an NVFP4 A4 input's divisor and a static FP8 A8 input's scale.
+AUXILIARY_ROLES = {
+    "activation_input_divisor": AuxiliaryValue.activation_divisor,
+    "activation_input_scale": AuxiliaryValue.activation_scale,
+}
+
 
 @dataclass(frozen=True, slots=True)
 class PreparedMethod:
@@ -131,10 +146,11 @@ class PrepareRequest:
             raise ValueError("encoded method input range is invalid")
         first = pieces[0]
         if any(
-            (p.format, p.weight_divisor) != (first.format, first.weight_divisor)
+            (p.format, p.weight_divisor, p.weight_multiplier)
+            != (first.format, first.weight_divisor, first.weight_multiplier)
             for p in pieces
         ):
-            raise ValueError("encoded inputs cannot share one parent format/divisor")
+            raise ValueError("encoded inputs cannot share one parent format/divisor/multiplier")
         if len(pieces) == 1:
             return first
         return EncodedRows(
@@ -142,6 +158,7 @@ class PrepareRequest:
             torch.cat([p.codes for p in pieces]),
             torch.cat([p.scales for p in pieces]),
             first.weight_divisor,
+            first.weight_multiplier,
         )
 
 
@@ -167,8 +184,34 @@ def _preflight(request: PrepareRequest, *, values: bool = True) -> None:
             item.source.values(0, 1)
 
 
+def bf16_from_float64(values: torch.Tensor) -> torch.Tensor:
+    """Round binary64 values to BF16 once, to nearest even. PyTorch's conversion passes through
+    binary32, a double rounding that differs at BF16 ties (1 + 2^-8 + 2^-30 becomes 1, not
+    1 + 2^-7). Results below BF16's normal range are refused: no exact source here produces them."""
+
+    bits = values.contiguous().view(torch.int64)
+    sign = (bits >> 63) & 1
+    exponent = (bits >> 52) & 0x7FF
+    mantissa = bits & ((1 << 52) - 1)
+    zero = (exponent == 0) & (mantissa == 0)
+    if bool((exponent == 0x7FF).any()):
+        raise ValueError("BF16 conversion source holds a non-finite value")
+    biased = exponent - 1023 + 127
+    if bool(((biased < 1) & ~zero).any()):
+        raise ValueError("BF16 conversion source holds a value below BF16's normal range")
+    kept = (biased << 7) | (mantissa >> 45)
+    round_bit = (mantissa >> 44) & 1
+    sticky = (mantissa & ((1 << 44) - 1)) != 0
+    kept = kept + (round_bit & (sticky | (kept & 1)).to(torch.int64))
+    if bool((kept >= 0xFF << 7).any()):
+        raise ValueError("BF16 conversion source holds a value beyond BF16's range")
+    words = torch.where(zero, 0, kept) | (sign << 15)
+    words = torch.where(words >= 0x8000, words - 0x10000, words)  # the signed 16-bit view of each word
+    return words.to(torch.int16).view(torch.bfloat16).reshape(values.shape)
+
+
 def cast_direct(request: PrepareRequest) -> PreparedMethod:
-    """Convert values at the explicit target BF16/FP32/INT32 boundary."""
+    """Convert values at the explicit target BF16/FP32/INT32 boundary (one rounding from binary64)."""
     if not isinstance(get_format(request.target.format), DirectFormat):
         raise ValueError("cast_direct requires a direct target format")
     _preflight(request)
@@ -188,7 +231,10 @@ def cast_direct(request: PrepareRequest) -> PreparedMethod:
                 raise ValueError(
                     "int32 conversion source is outside the representable range"
                 )
-            values = values.to(dtype=dtype)
+            if values.dtype == torch.float64 and dtype == torch.bfloat16:
+                values = bf16_from_float64(values)
+            else:
+                values = values.to(dtype=dtype)
             output.write_values(begin, values)
 
     return request.job(produce=produce)
@@ -268,17 +314,29 @@ def fp8_row_maxabs(request: PrepareRequest) -> PreparedMethod:
     return request.job(produce=produce)
 
 
+_IMPORT_FORMATS = (
+    "nvfp4", "nvfp4_mul", "fp8_e4m3fn_row_bf16", "fp8_e4m3fn_row_f32", "fp8_e4m3fn_g32_e8m0", "q8_g32_fp16",
+)
+
+
 def import_encoded(request: PrepareRequest) -> PreparedMethod:
     """Preserve the current FP8/NVFP4 source codes, scales and weight divisor (or a GGUF Q8_0
-    tensor's codes and scales as q8_g32_fp16, the same words)."""
-    if (
-        request.target.format not in ("nvfp4", "fp8_e4m3fn_row_bf16", "q8_g32_fp16")
-        or len(request.target.shape) != 2
-    ):
+    tensor's codes and scales as q8_g32_fp16, the same words; or ModelOpt MXFP8 codes and UE8M0
+    group scales as fp8_e4m3fn_g32_e8m0).
+
+    ``fp8_e4m3fn_row_f32`` keeps ModelOpt's FP32 weight scales exactly; an ``AllowA8`` input records
+    the source's static FP32 ``input_scale`` as its ``activation_input_scale``, and inputs fused into
+    one parent must share it (they share one activation encoding). ``nvfp4_mul`` in
+    ``nvfp4_rg16_v1`` keeps ModelOpt's FP32 multiplier exactly."""
+    if request.target.format not in _IMPORT_FORMATS or len(request.target.shape) != 2:
         raise ValueError("import_encoded requires a known encoded matrix target")
+    if request.target.format == "nvfp4_mul" and request.target.layout != "nvfp4_rg16_v1":
+        raise ValueError("a dense nvfp4_mul matrix is stored in nvfp4_rg16_v1")
     _preflight(request, values=False)
     auxiliaries = {}
     weight_divisor = None
+    weight_multiplier = None
+    input_scale = None
     for item in request.inputs:
         source = item.source
         if source.read_encoded is None:
@@ -307,17 +365,44 @@ def import_encoded(request: PrepareRequest) -> PreparedMethod:
                     auxiliaries[key] = AuxiliaryValue.activation_divisor(
                         source.input_divisor()
                     )
+        elif first.format == "nvfp4_mul":
+            if weight_multiplier is None:
+                weight_multiplier = first.weight_multiplier
+            elif first.weight_multiplier != weight_multiplier:
+                raise ValueError("nvfp4_mul multipliers differ; choose separate parents")
+        elif first.format == "fp8_e4m3fn_row_f32":
+            for parameter, input_name in item.uses:
+                key = (parameter, input_name, "activation_input_scale")
+                if key in request.auxiliary_overrides:
+                    value = request.auxiliary_overrides[key]
+                elif request.policies[(parameter, input_name)] in ("AllowA8", "AllowA4"):
+                    if source.input_scale is None:
+                        raise ValueError(f"{parameter}: AllowA8 needs the source's static input_scale")
+                    value = AuxiliaryValue.activation_scale(source.input_scale())
+                else:
+                    continue
+                if input_scale is None:
+                    input_scale = value.data
+                elif value.data != input_scale:
+                    raise ValueError(
+                        f"{parameter}: fused FP8 inputs need one static activation scale; separate the parents"
+                    )
+                auxiliaries[key] = value
     n = request.target.shape[0]
-    chunk = (
-        max(128, request.rows_per_chunk // 128 * 128)
-        if request.target.format == "nvfp4"
-        else request.rows_per_chunk
-    )
+    if request.target.format == "nvfp4":
+        chunk = max(128, request.rows_per_chunk // 128 * 128)
+    elif request.target.format in ("fp8_e4m3fn_g32_e8m0", "nvfp4_mul"):
+        chunk = max(16, request.rows_per_chunk // 16 * 16)  # whole 16-row scale tiles / row groups
+    else:
+        chunk = request.rows_per_chunk
 
     def produce(output):
         for begin in range(0, n, chunk):
             words = request.encoded_rows(begin, min(n, begin + chunk))
-            output.write_codes(begin, words.codes, words.scales, words.weight_divisor)
+            if words.format == "nvfp4_mul":
+                output.write_codes(begin, words.codes, words.scales, weight_multiplier=words.weight_multiplier)
+            else:
+                output.write_codes(begin, words.codes, words.scales, words.weight_divisor)
 
     return request.job(produce=produce, auxiliaries=auxiliaries)
 

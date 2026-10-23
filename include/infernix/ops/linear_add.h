@@ -31,6 +31,14 @@ namespace infernix::ops {
                                                               std::int32_t max_tokens);
 
 /**
+ * Whether the registered problem has a dedicated column-invariant route (NVFP4, FP8, Q5, BF16 and
+ * Q8 [2048,4096]). Without one, LinearPolicy::A16ColumnInvariant runs the exact A16 route once
+ * per column.
+ */
+[[nodiscard]] bool linear_add_column_invariant_route(QType qtype, std::int32_t output_rows,
+                                                     std::int32_t input_rows) noexcept;
+
+/**
  * Op: linear_add
  *
  * Math / indexing:
@@ -41,7 +49,8 @@ namespace infernix::ops {
  *   [5120,6144], Q5_G64_FP16 RowSplit [5120,17408] or [5120,6144], Q8_G32_FP16 RowSplit
  *   [2048,4096], [2048,6144], [5120,6144] or [5120,17408], NVFP4
  *   BlockScaleK16M128x4 [5120,6144] or [5120,17408], row-scaled
- *   FP8_E4M3FN_ROW_BF16 [5120,6144] or [5120,17408], or BF16 Contiguous [5120,6144]. T may
+ *   FP8_E4M3FN_ROW_BF16 [5120,6144] or [5120,17408], FP8_E4M3FN_ROW_F32 [3072,8192] (static
+ *   input scale: its A8 route encodes x as e4m3_rn_satfinite(fl32(x * fl32(1 / s)))), or BF16 Contiguous [5120,6144]. T may
  *   be any positive value.
  *
  * Numeric:
@@ -56,6 +65,8 @@ namespace infernix::ops {
  * Compute policy:
  *   All policies permit the A16 implementations of Q4, Q5, Q8 and BF16. NVFP4 uses A16 for
  *   A16Only/AllowA8 and may use A4 under AllowA4. FP8 may use A8 under AllowA8/AllowA4.
+ *   A16ColumnInvariant makes a column's result independent of the call's width and other columns
+ *   (linear_add_column_invariant_route).
  *   Each registration owns its production plan. A permissive policy
  *   allows the private resolver to select either qualified
  *   arithmetic profile; it does not itself prescribe a kernel.

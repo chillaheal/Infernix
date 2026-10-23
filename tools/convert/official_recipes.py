@@ -25,6 +25,15 @@ def _assign(recipe, name, format, *, source=None, method=grouped_absmax):
     recipe.assign(name, format=format, method=method, source=source)
 
 
+_DRAFT_BF16 = (
+    "/moe/router",
+    "/moe/shared_score",
+    "/attention_conv/kernel_projection",
+    "/mlp_conv/kernel_projection",
+    "/candidate_selector/hidden_projection",
+)
+
+
 def _optional(model, recipe, *, method=grouped_absmax):
     for name, parameter in model.parameters.items():
         if not parameter.projection:
@@ -42,17 +51,25 @@ def _optional(model, recipe, *, method=grouped_absmax):
                 format = Q5
             _assign(recipe, name, format, method=method)
         elif name.startswith(("mtp/", "dflash/", "dflash2/")):
-            if name.endswith(
-                (
-                    "/moe/router",
-                    "/moe/shared_score",
-                    "/attention_conv/kernel_projection",
-                    "/mlp_conv/kernel_projection",
-                    "/candidate_selector/hidden_projection",
-                )
-            ):
+            if name.endswith(_DRAFT_BF16):
                 continue
             _assign(recipe, name, Q8, method=method)
+    _share_draft_context(model, recipe)
+
+
+def _dflash_drafters(model, recipe, *, method=grouped_absmax):
+    """DFlash/DFlash2 drafters as NInfer's official Qwen3.8-27B artifact stores its DFlash2: every
+    projection ``q8_g32_fp16`` except the dynamic-convolution kernel projections and the selector's
+    hidden projection, which stay BF16 with the norms, base kernels and codebooks; the context K/V
+    roles share the query block's K/V words. A drafter only proposes tokens the model verifies, so
+    its precision changes acceptance, never output."""
+    for name, parameter in model.parameters.items():
+        if parameter.projection and name.startswith(("dflash/", "dflash2/")) and not name.endswith(_DRAFT_BF16):
+            _assign(recipe, name, Q8, method=method)
+    _share_draft_context(model, recipe)
+
+
+def _share_draft_context(model, recipe):
     for backend in ("dflash", "dflash2"):
         if backend not in model.components:
             continue
@@ -277,6 +294,95 @@ def qwen3_8_27b_nvfp4_orcarouter(model, recipe, sources):
         )
 
 
+FP8_F32 = "fp8_e4m3fn_row_f32"
+_MODELOPT_FP8_ROLES = (
+    "/gdn/query", "/gdn/key", "/gdn/value", "/gdn/z", "/gdn/output",
+    "/attention/query", "/attention/gate", "/attention/key", "/attention/value", "/attention/output",
+)
+
+
+def _modelopt_mixed_algorithms(store) -> set[str]:
+    """The per-layer algorithms of a ModelOpt ``MIXED_PRECISION`` export's ``quantization_config``."""
+
+    config = store.config.get("quantization_config")
+    if not isinstance(config, dict) or config.get("quant_method") != "modelopt":
+        raise ValueError("this recipe converts a ModelOpt export (quantization_config.quant_method modelopt)")
+    if config.get("quant_algo") != "MIXED_PRECISION" or not isinstance(config.get("quantized_layers"), dict):
+        raise ValueError("this recipe converts a ModelOpt MIXED_PRECISION export with quantized_layers")
+    return {layer.get("quant_algo") for layer in config["quantized_layers"].values()}
+
+
+def qwen3_5_moe_nvfp4_modelopt(model, recipe, sources):
+    """A ModelOpt ``MIXED_PRECISION`` export of a Qwen3.5 MoE model (Ornith-1.5-122B-NVFP4, design
+    docs/maintainer/qwen3_5-122b-offload-design.md §6), bit-exact except for the MTP drafter:
+
+    - Routed experts (weight-only ``W4A16_NVFP4``): exact ``nvfp4_mul`` banks in
+      ``nvfp4_expert_rg16_v1`` (codes, E4M3 block scales and the FP32 ``weight_scale_2`` multipliers
+      as stored), run with the canonical W4A16 arithmetic; the engine keeps them in host memory
+      behind its VRAM expert cache.
+    - Shared experts (``W4A16_NVFP4``): one-record banks of the same layout, run as a resident job of
+      the routed-expert kernels.
+    - ``lm_head`` (``W4A16_NVFP4``): exact ``nvfp4_mul`` in ``nvfp4_rg16_v1``, FP32 logits.
+    - Attention and GDN projections (per-tensor ``FP8`` with static ``input_scale``): exact
+      ``fp8_e4m3fn_row_f32`` (every row holds its matrix's FP32 ``weight_scale``), ``AllowA8`` with the
+      checkpoint's FP32 input scale as the Use's ``activation_input_scale``: static 8-bit
+      activations in prefill, 16-bit in decode on the exact route.
+    - Every BF16 tensor (router, shared-expert gate, GDN a/b, norms, convolution, ``A_log`` and
+      ``dt_bias`` widened exactly to FP32, embedding, vision) keeps its value.
+    - The BF16 MTP layer is re-quantized as Qwen3.8-Flash-Next's drafter: ``q8_g32_fp16`` dense,
+      ``q4_g64_fp16`` (MSE group scales) routed experts, BF16 router and shared-expert gate. It only
+      proposes tokens the model verifies, so its precision changes acceptance, never output.
+    - A selected DFlash2 (or DFlash) drafter, ``--source dflash2=PATH`` (Ornith's
+      incoai/Ornith-1.5-122B-DFlash2), as the official 27B artifact's (``_dflash_drafters``).
+    """
+
+    from .expert_banks import ExpertBankSource, import_expert_bank
+
+    if "num_experts" not in model.config:
+        raise ValueError("this recipe requires Qwen3.5 MoE mathematics")
+    base = sources["base"]
+    unexpected = _modelopt_mixed_algorithms(base) - {"FP8", "W4A16_NVFP4"}
+    if unexpected:
+        raise ValueError(f"this recipe imports FP8 and W4A16_NVFP4 layers only, not {sorted(unexpected)}")
+    banks = [
+        name for name in model.parameters
+        if name.startswith("text/layers/") and name.endswith(("/moe/experts", "/moe/shared_expert"))
+    ]
+    if not any(name.endswith("/moe/experts") for name in banks):
+        raise ValueError("this recipe imports per-expert ModelOpt NVFP4 routed experts")
+    for name in banks:
+        source = model.parameters[name].source
+        if not isinstance(source, ExpertBankSource) or source.packed or not source.weight_only:
+            raise ValueError(f"{name}: expected weight-only ModelOpt NVFP4 experts (no input_scale)")
+        recipe.assign(
+            name,
+            format="nvfp4_mul",
+            layout="nvfp4_expert_rg16_v1",
+            method=import_expert_bank,
+            activation_policy="A16Only",
+        )
+        recipe.group(name, shape=model.parameters[name].shape)
+    for name in model.parameters:
+        if name.startswith("text/layers/") and name.endswith(_MODELOPT_FP8_ROLES):
+            recipe.assign(
+                name,
+                format=FP8_F32,
+                method=import_encoded,
+                source=model.source(name, base, FP8_F32),
+                activation_policy="AllowA8",
+            )
+    recipe.assign(
+        "text/output_head",
+        format="nvfp4_mul",
+        layout="nvfp4_rg16_v1",
+        method=import_encoded,
+        source=model.source("text/output_head", base, "nvfp4_mul"),
+        activation_policy="A16Only",
+    )
+    _flash_next_drafter(model, recipe)
+    _dflash_drafters(model, recipe)
+
+
 def _flash_next_drafter(model, recipe, experts=Q4):
     """The MTP drafter of both Qwen3.8-Flash-Next recipes. It only proposes tokens that the main
     model verifies, so its precision changes acceptance, never output (design §11.2). Its
@@ -301,7 +407,8 @@ def qwen3_8_flash_next_nvfp4(model, recipe, sources):
     experts become exact ``nvfp4_mul`` banks in ``nvfp4_expert_rg16_v1`` with each matrix's own
     ModelOpt input scale; the FP8 n-gram table is written to its own volume) and every BF16 or FP32
     tensor keeps its dtype. Only the MTP drafter is re-quantized (``_flash_next_drafter``)."""
-    from .qwen4_exp import Fp8ExpertBankSource, import_expert_bank, weight_only_bank
+    from .expert_banks import import_expert_bank, weight_only_bank
+    from .qwen4_exp import Fp8ExpertBankSource
 
     if model.config.get("architectures") != ["Qwen4ExpForCausalLM"]:
         raise ValueError("this official recipe requires Qwen4Exp mathematics")
@@ -390,7 +497,7 @@ def qwen3_8_flash_next_nvfp4_orcarouter(model, recipe, sources):
     The QSA query/gate/key/value projections (FP8) and the indexer (BF16) form two parents, which the
     model runs as two projections."""
 
-    from .qwen4_exp import import_expert_bank, weight_only_bank
+    from .expert_banks import import_expert_bank, weight_only_bank
 
     if model.config.get("architectures") != ["Qwen4ExpForCausalLM"]:
         raise ValueError("this official recipe requires Qwen4Exp mathematics")
@@ -437,6 +544,78 @@ def qwen3_8_flash_next_nvfp4_orcarouter(model, recipe, sources):
             p = f"text/layers/{layer}/attention/"
             recipe.group([p + "query", p + "gate", p + "key", p + "value"])
             recipe.group([p + "index_query", p + "index_key"])
+    _flash_next_drafter(model, recipe)
+
+
+MXFP8 = "fp8_e4m3fn_g32_e8m0"
+
+
+def qwen3_8_flash_next_fp4_local(model, recipe, sources):
+    """nvidia/Qwen3.8-Flash-Next-FP4-Local (design §6.1.2): NVIDIA's quantization-aware-distilled
+    checkpoint, bit-exact, run by default in the arithmetic NVIDIA serves it with: 16-bit activations
+    everywhere.
+
+    - The routed experts keep their NVFP4 codes, their block scales (stored in the checkpoint in the
+      lossless NVFP4-CSF encoding, restored exactly) and their FP32 multipliers as ``nvfp4_mul``
+      banks in ``nvfp4_expert_rg16_v1``, with their calibrated FP32 activation scales. Their Use
+      permits 4-bit activations, and the text config's ``expert_a4_activations: optional`` makes the
+      16-bit arithmetic (design §16.2.1) the default: the engine runs 4-bit expert activations
+      (§16.2) only with ``--expert-a4-activations``.
+    - The MXFP8 GDN q/k/v/z and output, QSA query/gate/key/value, indexer and output and
+      shared-expert projections keep their E4M3FN codes and UE8M0 group scales
+      (``fp8_e4m3fn_g32_e8m0``, W8A16).
+    - The GDN a/b projections (MXFP8, a parameter of their own) and the vision attention become
+      their exact BF16 values; the vision MLPs and merger (weight-only NVFP4) their BF16 rounding,
+      the conversion's only rounding of a main-model or vision weight.
+    - Every BF16 or FP32 tensor keeps its dtype; the NVFP4 n-gram table is written verbatim to its
+      own volume with its FP32 multiplier.
+    - The MTP drafter is re-quantized as recipes A-C build it (``_flash_next_drafter``) from its
+      weight-only NVFP4 experts' exact values and its BF16 dense projections.
+
+    The QSA query/gate/key/value and indexer projections form one MXFP8 parent [13952, 2560], which
+    the model runs as one projection (the builder's grouping, as recipe A's)."""
+
+    from .expert_banks import ExpertBankSource, import_expert_bank, weight_only_bank
+
+    if model.config.get("architectures") != ["Qwen4ExpForCausalLM"]:
+        raise ValueError("this official recipe requires Qwen4Exp mathematics")
+    banks = [name for name in model.parameters if name.startswith("text/layers/") and name.endswith("/moe/experts")]
+    if not banks or not all(
+        isinstance(model.parameters[name].source, ExpertBankSource) and not weight_only_bank(model.parameters[name].source)
+        for name in banks
+    ):
+        raise ValueError("the FP4-Local recipe imports ModelOpt NVFP4 experts (nvidia/Qwen3.8-Flash-Next-FP4-Local)")
+    if model.config["ngram_table"]["format"] != "nvfp4":
+        raise ValueError("the FP4-Local recipe binds the checkpoint's own NVFP4 n-gram table")
+    base = sources["base"]
+    mxfp8 = (
+        "/gdn/query", "/gdn/key", "/gdn/value", "/gdn/z", "/gdn/output",
+        "/attention/query", "/attention/gate", "/attention/key", "/attention/value",
+        "/attention/index_query", "/attention/index_key", "/attention/output",
+        "/moe/shared/gate", "/moe/shared/up", "/moe/shared/down",
+    )
+    for name, parameter in model.parameters.items():
+        if not name.startswith("text/layers/"):
+            continue
+        if name.endswith("/moe/experts"):
+            recipe.assign(
+                name,
+                format="nvfp4_mul",
+                layout="nvfp4_expert_rg16_v1",
+                method=import_expert_bank,
+                activation_policy="AllowA4",
+            )
+            recipe.group(name, shape=parameter.shape)
+        elif name.endswith(mxfp8):
+            recipe.assign(
+                name,
+                format=MXFP8,
+                method=import_encoded,
+                source=model.source(name, base, MXFP8),
+                activation_policy="A16Only",
+            )
+    # The banks keep their activation scales and permit 4-bit activations; 16-bit is the default.
+    model.config["expert_a4_activations"] = "optional"
     _flash_next_drafter(model, recipe)
 
 
@@ -505,10 +684,12 @@ RECIPES = {
     "qwen3_8_27b_nvfp4_nvidia": qwen3_8_27b_nvfp4_nvidia,
     "qwen3_8_27b_nvfp4_orcarouter": qwen3_8_27b_nvfp4_orcarouter,
     "qwen3_6_35b_a3b": qwen3_6_35b_a3b,
+    "qwen3_5_moe_nvfp4_modelopt": qwen3_5_moe_nvfp4_modelopt,
     "qwen3_8_flash_next_nvfp4": qwen3_8_flash_next_nvfp4,
     "qwen3_8_flash_next_nvfp4_dense8": qwen3_8_flash_next_nvfp4_dense8,
     "qwen3_8_flash_next_nvfp4_orcarouter": qwen3_8_flash_next_nvfp4_orcarouter,
     "qwen3_8_flash_next_fp8": qwen3_8_flash_next_fp8,
+    "qwen3_8_flash_next_fp4_local": qwen3_8_flash_next_fp4_local,
     "qwen3_8_flash_next_gsq_rco_iq3s": qwen3_8_flash_next_gsq_rco_iq3s,
     "qwen3_8_flash_next_dflash2": qwen3_8_flash_next_dflash2,
     "qwen_image_fp8": qwen_image_fp8,

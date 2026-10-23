@@ -8,7 +8,7 @@ infernix_add_test(infernix_ngram_archive_test SOURCES
 # Fast-path selection rules: where each path applies and which configurations qualify it.
 infernix_add_test(infernix_qwen3_5_fast_paths_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_fast_paths.cpp"
-  LIBRARIES infernix_engine infernix::json)
+  LIBRARIES infernix_engine infernix_model_runtime infernix::json)
 
 # idle-wide-prefill planning rules: the idle width ladder and the flexible-tap step limit.
 infernix_add_test(infernix_qwen3_5_idle_prefill_test
@@ -22,6 +22,17 @@ infernix_add_test(infernix_qwen3_5_tree_width_controller_test SOURCES
 infernix_add_test(infernix_qwen3_5_mtp_draft_policy_test SOURCES
   "${CMAKE_CURRENT_LIST_DIR}/test_mtp_draft_policy.cpp"
   "${PROJECT_SOURCE_DIR}/src/models/qwen3_5/program/speculative/mtp_draft_policy.cpp")
+
+# Confidence-gated MTP extents (host logic only).
+infernix_add_test(infernix_qwen3_5_mtp_confidence_policy_test SOURCES
+  "${CMAKE_CURRENT_LIST_DIR}/test_mtp_confidence_policy.cpp"
+  "${PROJECT_SOURCE_DIR}/src/models/qwen3_5/program/speculative/mtp_confidence_policy.cpp")
+
+# The adaptive-dflash verify-width policy: its width ladders, the rate-maximizing choice against an
+# exhaustive evaluation, row limits, probes and calibration updates.
+infernix_add_test(infernix_qwen3_5_dflash_width_policy_test SOURCES
+  "${CMAKE_CURRENT_LIST_DIR}/test_dflash_width_policy.cpp"
+  "${PROJECT_SOURCE_DIR}/src/models/qwen3_5/program/speculative/dflash_width_policy.cpp")
 
 infernix_add_test(infernix_ngram_graph_planning_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ngram_graph_planning.cpp"
@@ -77,31 +88,53 @@ infernix_add_test(infernix_qwen3_5_native_transactions_test
 
 infernix_add_test(infernix_qwen3_5_prefix_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_prefix_real.cpp"
-  LIBRARIES infernix_engine)
+  LIBRARIES infernix_engine infernix_model_runtime)
 
 infernix_add_test(infernix_qwen3_5_preemption_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_preemption_real.cpp"
-  LIBRARIES infernix_engine infernix::json)
+  LIBRARIES infernix_engine infernix_model_runtime infernix::json)
 
 infernix_add_test(infernix_qwen3_5_grammar_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_grammar_real.cpp"
-  LIBRARIES infernix_engine infernix::json)
+  LIBRARIES infernix_engine infernix_model_runtime infernix::json)
 
 infernix_add_test(infernix_qwen3_5_tools_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_tools_real.cpp"
-  LIBRARIES infernix_engine infernix::json)
+  LIBRARIES infernix_engine infernix_model_runtime infernix::json)
 
 infernix_add_test(infernix_qwen3_5_hybrid_prefix_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_hybrid_prefix_real.cpp"
   LIBRARIES infernix_engine)
 
+infernix_add_test(infernix_qwen3_5_invariance_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_invariance_real.cpp"
+  LIBRARIES infernix_engine)
+
 set_tests_properties(
-  infernix_qwen3_5_hybrid_prefix_real_test
+  infernix_qwen3_5_hybrid_prefix_real_test infernix_qwen3_5_invariance_real_test
   PROPERTIES SKIP_RETURN_CODE 77)
 
 infernix_add_test(infernix_qwen3_5_score_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_score_real.cpp"
   LIBRARIES infernix_engine)
+
+infernix_add_test(infernix_qwen3_5_lossless_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_lossless_real.cpp"
+  LIBRARIES infernix_engine)
+
+infernix_add_test(infernix_qwen3_5_lossless_generation_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_lossless_generation_real.cpp"
+  LIBRARIES infernix_engine)
+
+# Speculation invariance of the reproducible route: every drafter against one plain run (the artifact
+# must hold them).
+add_executable(infernix_qwen3_5_speculation_invariance_real_test
+  "${CMAKE_CURRENT_LIST_DIR}/test_engine_speculation_invariance_real.cpp")
+infernix_test_includes(infernix_qwen3_5_speculation_invariance_real_test)
+target_link_libraries(infernix_qwen3_5_speculation_invariance_real_test PRIVATE infernix_engine)
+add_test(NAME infernix_qwen3_5_speculation_invariance_real_test
+  COMMAND infernix_qwen3_5_speculation_invariance_real_test mtp dflash2 dflash2-ngram)
+set_tests_properties(infernix_qwen3_5_speculation_invariance_real_test PROPERTIES SKIP_RETURN_CODE 77)
 
 infernix_add_test(infernix_qwen3_5_readout_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_readout_real.cpp"
@@ -141,6 +174,19 @@ add_test(NAME infernix_qwen3_5_dflash2_tree_auto_real_test
 infernix_add_test(infernix_qwen3_5_dflash2_tree_greedy_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_dflash2_tree_greedy_real.cpp"
   LIBRARIES infernix_engine)
+# The same oracle for adaptive-dflash block rounds (--draft-tokens auto, the Engine's ceiling): a
+# DFlash2 artifact (the 27B) and a DFlash one (the 35B-A3B).
+add_test(NAME infernix_qwen3_5_dflash2_block_greedy_real_test
+  COMMAND infernix_qwen3_5_dflash2_tree_greedy_real_test int8 block 160 0 dflash2)
+add_test(NAME infernix_qwen3_5_dflash_block_greedy_real_test
+  COMMAND infernix_qwen3_5_dflash2_tree_greedy_real_test int8 block 160 0 dflash)
+# Block rounds beside n-gram copy rounds (15 drafts), as the 27B serving command runs them.
+add_test(NAME infernix_qwen3_5_dflash2_block_ngram_greedy_real_test
+  COMMAND infernix_qwen3_5_dflash2_tree_greedy_real_test int8 block 160 0 dflash2 15)
+# Two streams at once with the automatic copy window: rounds of two rows (the NVFP4 27B's plain
+# batch rounds) beside one-row block rounds.
+add_test(NAME infernix_qwen3_5_dflash2_block_batch_greedy_real_test
+  COMMAND infernix_qwen3_5_dflash2_tree_greedy_real_test int8 block 160 0 dflash2 auto 2)
 
 foreach(kv IN ITEMS k8v4 nvfp4 vq2 k4v2)
   add_test(NAME infernix_qwen3_5_dflash2_tree_greedy_${kv}_real_test
@@ -150,14 +196,18 @@ endforeach()
 set_tests_properties(${infernix_qwen3_5_tree_real_tests}
   infernix_qwen3_5_dflash2_tree_auto_real_test
   infernix_qwen3_5_dflash2_tree_greedy_real_test
+  infernix_qwen3_5_dflash2_block_greedy_real_test
+  infernix_qwen3_5_dflash_block_greedy_real_test
+  infernix_qwen3_5_dflash2_block_ngram_greedy_real_test
+  infernix_qwen3_5_dflash2_block_batch_greedy_real_test
   PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real")
 infernix_add_test(infernix_qwen3_5_dflash_prefill_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_dflash_prefill_real.cpp"
-  LIBRARIES infernix_model_runtime infernix_model_loading infernix_core)
+  LIBRARIES infernix_engine infernix_model_runtime infernix_model_loading infernix_core)
 
 infernix_add_test(infernix_qwen3_5_moe_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_moe_real.cpp"
-  LIBRARIES infernix_engine)
+  LIBRARIES infernix_engine infernix_model_runtime)
 
 infernix_add_test(infernix_qwen3_5_dflash_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_dflash_real.cpp"
@@ -165,7 +215,7 @@ infernix_add_test(infernix_qwen3_5_dflash_real_test
 
 infernix_add_test(infernix_tool_call_parser_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../../test_tool_call_parser.cpp"
-  LIBRARIES infernix_engine infernix::json)
+  LIBRARIES infernix_engine infernix_model_runtime infernix::json)
 
 infernix_add_test(infernix_qwen3_5_visual_scatter_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_visual_scatter.cpp"
