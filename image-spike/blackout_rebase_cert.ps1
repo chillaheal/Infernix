@@ -3,6 +3,7 @@ param(
     [int]$GateExpectedMinutes = 75,  # announced to whoever is waiting on the port
     [int]$GraceSec = 30,             # the cert exes are already built, so the grace can be short
     [string]$ExactOldExe = '',       # a pre-rebase route-trace exe: gives the literal bit-identical pair
+    [switch]$ForceGate,              # the user's own call: take the port despite BUSY, the sessions on it lose their turns
     [switch]$SkipDeploy              # run the certs without rebuilding/replacing the serve exe
 )
 
@@ -139,7 +140,19 @@ $env:INFERNIX_IMAGE_ORACLE          = $imageOracle
 $env:INFERNIX_IMAGE_ORACLE_PIPELINE = $imageOraclePipe
 
 # ---- PHASE 1: take the port through the gate, or stop here with nothing changed ----
-& $gate -Action StartWindow -Owner (Split-Path -Leaf $MyInvocation.MyCommand.Path) -Reason 'blackout_rebase_cert.ps1 (gpu cert + exact route + deploy)' -MaxWaitSec $GateMaxWaitSec -ExpectedMinutes $GateExpectedMinutes
+# The gate's -Action is Position=0, so an ARRAY splat binds the literal '-Action' as its VALUE and the
+# call dies on the ValidateSet: splat a hashtable (names only) and preset the exit code to 1 so a call
+# that never binds counts as a refusal instead of falling through with the port untouched.
+$LASTEXITCODE = 1
+$gateParams = @{
+    Action          = 'StartWindow'
+    Owner           = (Split-Path -Leaf $MyInvocation.MyCommand.Path)
+    Reason          = 'blackout_rebase_cert.ps1 (gpu cert + exact route + deploy)'
+    MaxWaitSec      = $GateMaxWaitSec
+    ExpectedMinutes = $GateExpectedMinutes
+}
+if ($ForceGate) { $gateParams.Force = $true }
+& $gate @gateParams
 if ($LASTEXITCODE -ne 0) { Log 'WINDOW_REFUSED_BY_GATE: nothing was stopped, :8888 left as it was'; exit 10 }
 $windowOpen = $true
 Log ('PHASE1 grace ' + $GraceSec + 's, gpu_used_mib=' + (Gpu-UsedMib))
