@@ -29,9 +29,9 @@
 //                                  [concurrency=N] [mtp [auto] [min-p=P]] [dflash [auto]] [plain] [reproducible]
 //                                  [path=NAME]...
 //                                  [draft-model=FILE [drafts=N] [auto] [full-head]] (Qwen3.8-Flash-Next DFlash2)
-//                                  [temperature=T]
+//                                  [temperature=T] [logits=fp32|bf16] (the head's logits; bf16 for comparisons)
 //                                  [ngram-volume=FILE] (Qwen3.8-Flash-Next; default <artifact>.ngram)
-//                                  [route-trace=FILE] (Qwen3.8-Flash-Next's route trace, route_trace.h)
+//                                  [route-trace=FILE] (offloaded experts' route trace, route_trace.h)
 // Output, one line per segment: <corpus token offset> <prompt_tokens> <generated ids...>
 
 #include "infernix/engine.h"
@@ -56,7 +56,7 @@ int main(int argc, char** argv) {
     if (argc < 7) {
         std::cerr << "usage: infernix_decode_quality_gen <artifact> <corpus.txt> <out.txt> <segments> "
                      "<prompt_tokens> <new_tokens> [ngram] [mtp [auto] [min-p=P]] [plain] [reproducible] [path=NAME]... "
-                     "[kv=bf16|int8|fp8|nvfp4|k8v4|vq2|k4v2]\n";
+                     "[kv=bf16|int8|fp8|nvfp4|k8v4|vq2|k4v2] [logits=fp32|bf16]\n";
         return 2;
     }
     try {
@@ -74,6 +74,7 @@ int main(int argc, char** argv) {
         float temperature    = 0.0F;
         std::optional<float> min_p;
         infernix::KvCacheStorage kv = infernix::KvCacheStorage::Int8Group64;
+        bool bf16_logits            = false;
         for (int i = 7; i < argc; ++i) {
             const std::string flag = argv[i];
             if (flag == "ngram") {
@@ -125,6 +126,8 @@ int main(int argc, char** argv) {
                 temperature = std::stof(flag.substr(12));
             } else if (flag.starts_with("path=")) {
                 paths.push_back(flag.substr(5));
+            } else if (flag == "logits=fp32" || flag == "logits=bf16") {
+                bf16_logits = flag == "logits=bf16";
             } else if (flag.starts_with("kv=")) {
                 const std::string name = flag.substr(3);
                 if (name == "bf16") {
@@ -149,7 +152,7 @@ int main(int argc, char** argv) {
                 std::cerr << "unknown option " << flag
                           << " (ngram, ngram=N, min-match=M, tree=auto|N, prompts, mtp, dflash, auto, min-p=P, "
                              "plain, reproducible, path=NAME, draft-model=FILE, drafts=N, full-head, temperature=T, "
-                             "ngram-volume=FILE, route-trace=FILE, kv=NAME)\n";
+                             "ngram-volume=FILE, route-trace=FILE, kv=NAME, logits=fp32|bf16)\n";
                 return 2;
             }
         }
@@ -172,6 +175,14 @@ int main(int argc, char** argv) {
         // Every lane's whole context: the Qwen3.5 planner refuses a capacity past it.
         options.kv_capacity   = infernix::KvCapacityPolicy::explicit_capacity(options.max_context * concurrency);
         options.kv_cache      = kv;
+#if !defined(INFERNIX_DECODE_QUALITY_NINFER)
+        options.logits_dtype  = bf16_logits ? infernix::LogitsDtype::BF16 : infernix::LogitsDtype::FP32;
+#else
+        if (bf16_logits) {
+            std::cerr << "logits=bf16 is not available in NInfer\n";
+            return 2;
+        }
+#endif
         options.max_concurrency                   = concurrency;
         options.prefill_chunk                     = 4096;
         options.speculative.backend      = dflash ? infernix::SpeculativeBackend::DFlash
@@ -233,7 +244,8 @@ int main(int argc, char** argv) {
             return 2;
         }
 #else
-        // Qwen3.8-Flash-Next: the per-round expert routes for tools/expert_cache_replay/host_tier.py.
+        // Offloaded experts (Qwen3.8-Flash-Next, Qwen3.5-122B-A10B): the per-round expert routes for
+        // tools/expert_cache_replay (host_tier.py, replay.py).
         options.route_trace_path = route_trace;
         options.fast_paths = !reproducible;
         for (const std::string& name : paths) {

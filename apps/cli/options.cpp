@@ -1,5 +1,6 @@
 #include "options.h"
 #include "product/config/config_file.h"
+#include "product/logits_options.h"
 #include "product/speculative_options.h"
 
 #include <algorithm>
@@ -103,6 +104,7 @@ constexpr std::array kCliOptions{
     CliOption{"--expert-ram-mib"},
     CliOption{"--expert-pin-mib"},
     CliOption{"--kv-dtype"},
+    CliOption{"--logits-dtype"},
     CliOption{"--spec"},
     CliOption{"--draft-tokens"},
     CliOption{"--draft-model"},
@@ -130,6 +132,7 @@ constexpr std::array kCliOptions{
     CliOption{"--lossless", false},
     CliOption{"--fast-path", true, true},
     CliOption{"--expert-a4-activations", false},
+    CliOption{"--embedding-host", false},
     CliOption{"--stop-token-id", true, true},
     CliOption{"--stop", true, true},
     CliOption{"--reasoning-stop", true, true},
@@ -175,7 +178,8 @@ std::string usage_text(const char* argv0) {
            " <model.infernix> (--prompt <text>|--messages <messages.json>)\n"
            "       [--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new N]\n"
            "       [--device N]\n"
-           "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4|vq2|k4v2] [--spec mtp|dflash|dflash2 --draft-tokens "
+           "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4|vq2|k4v2] [--logits-dtype fp32|bf16]\n"
+           "       [--spec mtp|dflash|dflash2 --draft-tokens "
            "N|auto]\n"
            "       [--draft-model FILE]\n"
            "       [--lm-head-draft] [--spec-min-p P] [--draft-tree-nodes auto|N] [--draft-tree-paths N]\n"
@@ -184,7 +188,7 @@ std::string usage_text(const char* argv0) {
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
            "       [--chat-template FILE] [--ngram-volume FILE] [--ngram-residency auto|ram|volume]\n"
-           "       [--expert-state FILE|off] [--expert-stripe FILE] [--expert-a4-activations]\n"
+           "       [--expert-state FILE|off] [--expert-stripe FILE] [--expert-a4-activations] [--embedding-host]\n"
            "       [--ram-headroom-mib N] [--expert-ram-mib N|auto] [--expert-pin-mib N|auto]\n"
            "       [--grammar-file FILE | --json-object | --json-schema-file FILE |\n"
            "        --regex PATTERN | --choice TEXT ...]\n"
@@ -256,6 +260,10 @@ std::string usage_text(const char* argv0) {
            "  --kv-dtype T             bf16 (default) | int8 | fp8 | nvfp4 | k8v4 | vq2 | k4v2;\n"
            "                           bf16 stores K as BF16 and V as FP16 (exact for\n"
            "                           2^-17 <= |v| < 2^16), with --lossless V as BF16\n"
+           "  --logits-dtype T         fp32 (default) | bf16: the head's logits the sampler,\n"
+           "                           greedy choice, draft acceptance and scoring read;\n"
+           "                           bf16 rounds each once, as Transformers returns them\n"
+           "                           (near-equal logits then tie), for comparisons\n"
            "  --use-original-int8-prefill-kernel\n"
            "                           prefill INT8 KV with the original prompt kernel\n"
            "                           (default: the fast kernel)\n"
@@ -270,14 +278,14 @@ std::string usage_text(const char* argv0) {
            "                           slows 1-2K-token chunks over long context (64: up\n"
            "                           to 27% slower attention; 0: no splitting)\n"
            "  --reproducible           run the reproducible route: the same bits on every\n"
-           "                           run and release, whatever else is running.\n"
+           "                           run of this build, whatever else is running.\n"
            "                           Without it, every path qualified and measured\n"
            "                           faster for this artifact's kernels and KV type\n"
            "                           runs (within Infernix's numerical quality policy;\n"
            "                           startup lists them; docs/cli.md)\n"
            "  --lossless               run the lossless route: every operation of the\n"
            "                           model correctly rounded at its own BF16 points\n"
-           "                           (FP32 logits), so the output depends on the\n"
+           "                           (logits as --logits-dtype), so the output depends on the\n"
            "                           request and the artifact alone; text with\n"
            "                           --kv-dtype bf16, no speculation; slower\n"
            "                           (docs/maintainer/lossless-route.md)\n"
@@ -288,6 +296,12 @@ std::string usage_text(const char* argv0) {
            "                           the activation scales NVIDIA calibrated for them.\n"
            "                           Changes the output. No other artifact supports it\n"
            "                           (default: 16-bit activations, as NVIDIA serves it)\n"
+           "  --embedding-host         Qwen3.5-family artifacts: keep the token embedding in\n"
+           "                           pinned host memory, read zero-copy, so its VRAM\n"
+           "                           (1.18 GiB on the 27B) goes to the KV and prefix\n"
+           "                           caches. Same output; prompts read their rows over\n"
+           "                           PCIe (default: in VRAM; offloaded-expert artifacts\n"
+           "                           always keep it in host memory)\n"
            "\n"
            "SPECULATIVE DECODING (off by default)\n"
            "  --spec mtp|dflash|dflash2 speculative backend\n"
@@ -303,9 +317,10 @@ std::string usage_text(const char* argv0) {
            "  --draft-model FILE       Qwen3.8-Flash-Next dflash2: the DFlash2 drafter's\n"
            "                           companion artifact (Qwen3.5/3.6 artifacts bundle theirs)\n"
            "  --lm-head-draft          use the optimized proposal head\n"
-           "  --spec-min-p P           Qwen3.8-Flash-Next mtp: verify drafts only up to the\n"
-           "                           first below probability P, 0-1 (default 0.5 with\n"
-           "                           --draft-tokens auto, else 0 = all)\n"
+           "  --spec-min-p P           mtp (and Qwen3.8-Flash-Next dflash2): one-request rounds\n"
+           "                           verify drafts only up to the first below probability P,\n"
+           "                           0-1 (Flash-Next default 0.5 with --draft-tokens auto,\n"
+           "                           else 0 = all; Qwen3.5/3.6 default 0)\n"
            "  --draft-tree-nodes auto|N\n"
            "                           dflash2: verify a small tree of alternative drafts each\n"
            "                           round instead of a single draft, so more drafted tokens\n"
@@ -468,6 +483,8 @@ Options parse_options(int argc, char** argv) {
             }
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_cache(value(arg));
+        } else if (arg == "--logits-dtype") {
+            options.logits_dtype = product::parse_logits_dtype(value(arg));
         } else if (arg == "--spec") {
             options.speculative.backend = product::parse_speculative_backend(value(arg));
         } else if (arg == "--draft-tokens") {
@@ -555,6 +572,8 @@ Options parse_options(int argc, char** argv) {
             options.fast_path_candidates.push_back(*path);
         } else if (arg == "--expert-a4-activations") {
             options.expert_a4_activations = true;
+        } else if (arg == "--embedding-host") {
+            options.embedding_host = true;
         } else if (arg == "--stop-token-id") {
             const std::uint32_t token = parse_u32(value(arg), "stop-token-id", true);
             if (token > static_cast<std::uint32_t>(std::numeric_limits<TokenId>::max())) {

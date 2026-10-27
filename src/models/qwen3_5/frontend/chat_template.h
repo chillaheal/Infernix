@@ -16,7 +16,14 @@
 
 namespace infernix::models::qwen3_5::frontend {
 
+// Qwen's reasoning close: the model's `</think>` token, then the fixed separator before the answer.
+// The canonical serialization adds the line break the model writes before the close.
+inline constexpr std::string_view kReasoningCloseMarker                 = "</think>";
+inline constexpr std::string_view kReasoningCloseSeparator              = "\n\n";
 inline constexpr std::string_view kCanonicalReasoningCloseSerialization = "\n</think>\n\n";
+static_assert(kCanonicalReasoningCloseSerialization.substr(1, kReasoningCloseMarker.size()) ==
+                  kReasoningCloseMarker &&
+              kCanonicalReasoningCloseSerialization.ends_with(kReasoningCloseSeparator));
 
 struct ToolCall {
     std::string id;

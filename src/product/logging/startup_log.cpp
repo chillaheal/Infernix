@@ -336,6 +336,10 @@ void StartupLogRenderer::engine_ready(const LoadSummary& load) {
         paths += load.request_invariant ? " | request-invariant" : " | request-coupled";
         impl_->logger->info("fast paths | {} | {}", paths, load.fast_path_configuration);
     }
+    // The temporary A/B switches, so an arm can be checked from its log.
+    if (!load.temporary_switches.empty()) {
+        impl_->logger->info("temporary switches | {}", load.temporary_switches);
+    }
     // Projections whose format and shape have no column-invariant route: decode and verification
     // stay request-invariant by running each once per column, which is much slower. Such an
     // artifact is unsupported, so say so plainly.

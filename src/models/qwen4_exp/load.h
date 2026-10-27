@@ -35,6 +35,8 @@ public:
     [[nodiscard]] const std::optional<expert_cache::SavedState>& expert_profile() const noexcept;
     // Why a shipped profile was refused; empty when none was shipped or it parsed.
     [[nodiscard]] const std::string& expert_profile_message() const noexcept;
+    // Whether the LM head's 2-bit screen is bound (LoadOptions::lm_head_screen, screened_lm_head).
+    [[nodiscard]] bool has_output_head_screen() const;
     // The Host memory the pinned block must leave free at materialization, and the pins the
     // caller makes after it (both checked before anything is read).
     void set_host_reserve(std::uint64_t reserve_bytes, std::uint64_t later_pinned_bytes);

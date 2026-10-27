@@ -51,16 +51,25 @@ struct FastPathConfiguration {
     case FastPath::GdnConvFused:
     case FastPath::QsaPrepareFused:
     case FastPath::Fp8A8Pair:
+    case FastPath::Fp8A8PairBlock32:
     case FastPath::Q4W4A8:
     case FastPath::SampledMtpDrafts:
-    case FastPath::GdnF16Accumulate: return false;
+    case FastPath::GdnF16Accumulate:
+    case FastPath::Q5KSplitMma:
+    case FastPath::Bf16PromptSplit:
+    case FastPath::Fp16GdnState:
+    case FastPath::BlockVerification:
+    case FastPath::UniverTrees:
+    case FastPath::GdnTreeClosedForm: return false;
     case FastPath::ExpertA4Residual:
     case FastPath::ExpertA4Residual3:
+    case FastPath::ExpertA4ResidualDecode:
     case FastPath::BatchedDecode:
     case FastPath::BatchedA8Decode:
     case FastPath::BatchedA4Decode:
     case FastPath::BatchedA4ResidualDecode:
     case FastPath::BatchedA8ResidualDecode:
+    case FastPath::BatchedA8SubsetDecode:
     case FastPath::SingleColumnDecode:
     case FastPath::BatchSplitAttention:
     case FastPath::AdaptiveSpeculation:
@@ -68,8 +77,12 @@ struct FastPathConfiguration {
     case FastPath::Preemption:
     case FastPath::AdaptiveMtp:
     case FastPath::AdaptiveDFlash:
+    case FastPath::DFlash2Pairs:
     case FastPath::IdleWidePrefill:
-    case FastPath::GgmlBf16Prefill: return true;
+    case FastPath::GgmlBf16Prefill:
+    case FastPath::F16AccumulatePrefill:
+    case FastPath::RouterMma:
+    case FastPath::ScreenedLmHead: return true;
     }
     return false;
 }
@@ -77,10 +90,10 @@ struct FastPathConfiguration {
 // Whether the path passed the acceptance gate in this configuration (the registry, section 6.7).
 [[nodiscard]] bool fast_path_qualified(FastPath path, const FastPathConfiguration& configuration);
 
-// Whether --draft-tokens auto decodes without a drafter: where no draft length was measured faster
-// than plain decode for either drafter. The engine then turns speculation off before it binds the
-// drafter (normalize_engine_options), so the drafter's VRAM stays with the expert cache.
-[[nodiscard]] bool auto_drafts_nothing(bool offloaded_experts) noexcept;
+// Whether --draft-tokens auto decodes without the drafter: where none of its draft lengths was measured
+// faster than plain decode. The engine then turns speculation off before it binds the drafter
+// (normalize_engine_options), so the drafter's VRAM stays with the expert cache.
+[[nodiscard]] bool auto_drafts_nothing(bool offloaded_experts, SpeculativeBackend backend) noexcept;
 
 // The fixed draft length --draft-tokens auto runs where its policy (adaptive-mtp, adaptive-dflash)
 // does not (not qualified for the configuration, or fast paths disabled): the single length

@@ -113,6 +113,12 @@ void validate_engine_options(const EngineOptions& options, models::Architecture 
     if (options.reference && (!options.lossless || options.purpose != EnginePurpose::CausalScoring)) {
         throw std::invalid_argument("the design reference (--reference) is the lossless route's causal scoring");
     }
+    if (options.lossless_noise_seed != 0 && (!options.lossless || options.purpose != EnginePurpose::CausalScoring)) {
+        throw std::invalid_argument("the noise twin (lossless_noise_seed) is the lossless route's causal scoring");
+    }
+    if (!(options.lossless_noise_scale > 0.0F && options.lossless_noise_scale <= 1.0F)) {
+        throw std::invalid_argument("lossless_noise_scale must be in (0, 1]");
+    }
 }
 
 namespace {
@@ -187,8 +193,7 @@ std::size_t current_free_device_bytes() {
 
 } // namespace
 
-bool artifact_offloads_experts(const std::filesystem::path& artifact) {
-    const artifact::Reader reader(artifact);
+bool artifact_offloads_experts(const artifact::Reader& reader) {
     return reader.directory().bindings.contains("text/layers/0/moe/experts");
 }
 
@@ -241,11 +246,11 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
     const bool forced_adaptive = forced(FastPath::AdaptiveSpeculation) &&
                                  (forced(FastPath::AdaptiveDFlash) || forced(FastPath::AdaptiveMtp));
     if (!qwen4_exp && options.speculative.draft_tokens_auto && options.speculative.backend != SpeculativeBackend::None &&
-        models::qwen3_5::auto_drafts_nothing(offloaded_experts) && !forced_adaptive) {
+        models::qwen3_5::auto_drafts_nothing(offloaded_experts, options.speculative.backend) && !forced_adaptive) {
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
-                           "--draft-tokens auto: plain decode is faster than any draft length here (each verified "
-                           "draft brings its own offloaded-expert misses), so the engine decodes without a "
-                           "drafter");
+                           "--draft-tokens auto: plain decode is faster than any of this drafter's lengths here "
+                           "(each verified draft brings its own offloaded-expert misses), so the engine decodes "
+                           "without a drafter");
         options.speculative.backend           = SpeculativeBackend::None;
         options.speculative.draft_tokens      = 0;
         options.speculative.draft_tokens_auto = false;
@@ -305,16 +310,15 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
             }
         }
     }
-    // The draft-confidence gate exists only on Qwen3.8-Flash-Next's one-row MTP rounds; another
-    // model refuses it rather than ignoring a tuning value.
+    // The draft-confidence cut exists on Qwen3.8-Flash-Next's one-row MTP and DFlash2 rounds and on
+    // Qwen3.5's one-row MTP rounds; another combination refuses it rather than ignoring a tuning value.
     if (const auto& p = options.speculative.draft_min_p) {
         if (!(*p >= 0.0F && *p <= 1.0F)) {
             throw std::invalid_argument("speculative draft_min_p (--spec-min-p) must be in [0,1]");
         }
-        if (!qwen4_exp || (options.speculative.backend != SpeculativeBackend::Mtp &&
-                           options.speculative.backend != SpeculativeBackend::DFlash2)) {
-            throw std::invalid_argument(
-                "--spec-min-p applies to Qwen3.8-Flash-Next with --spec mtp or dflash2 only");
+        const bool mtp = options.speculative.backend == SpeculativeBackend::Mtp;
+        if (qwen4_exp ? !mtp && options.speculative.backend != SpeculativeBackend::DFlash2 : !mtp) {
+            throw std::invalid_argument("--spec-min-p applies to --spec mtp (and dflash2 on Qwen3.8-Flash-Next) only");
         }
     }
     if (cache.enabled) {
@@ -429,14 +433,16 @@ ModelInstance::ModelInstance(std::unique_ptr<models::qwen3_5::Model> source,
 ModelInstance::~ModelInstance() = default;
 
 ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) {
-    bool offloaded_experts = false;
-    try {
-        offloaded_experts = artifact_offloads_experts(options.artifact_path);
-    } catch (const std::exception&) {} // an unreadable artifact is reported below, after the option checks
-    validate_engine_options(options, models::Architecture::Qwen3_5, offloaded_experts);
+    // The artifact is opened once; an unreadable one is reported after the option checks.
     const auto start = Clock::now();
     StartupPhaseScope inspect(options.startup_observer, StartupPhase::ArtifactInspect);
-    artifact::Reader reader(options.artifact_path);
+    std::optional<artifact::Reader> opened;
+    try {
+        opened.emplace(options.artifact_path);
+    } catch (const std::exception&) {}
+    validate_engine_options(options, models::Architecture::Qwen3_5, opened && artifact_offloads_experts(*opened));
+    if (!opened) opened.emplace(options.artifact_path);
+    artifact::Reader& reader = *opened;
     inspect.complete();
     StartupPhaseScope binding(options.startup_observer, StartupPhase::TargetPlan);
     auto plan = models::qwen3_5::plan_load(reader, models::load_options(options, models::Architecture::Qwen3_5));
@@ -583,6 +589,12 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
                            "disabled), so every round drafts %u, its fastest fixed length",
                            options.speculative.backend == SpeculativeBackend::Mtp ? "adaptive-mtp" : "adaptive-dflash",
                            fixed);
+    }
+    // TEMPORARY (MTP drafting package A/B): what the switches resolved to (their values are in the
+    // startup log's temporary switches line).
+    if (options.speculative.backend == SpeculativeBackend::Mtp) {
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info, "mtp drafting | %s",
+                           models::qwen3_5::mtp_draft_switch_report(instance->parameters, options).c_str());
     }
     const auto signature = models::qwen3_5::prefill_signature(*instance->model);
     auto context_cost    = resolve_context_machine_cost(

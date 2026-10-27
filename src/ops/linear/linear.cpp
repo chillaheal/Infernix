@@ -3,13 +3,17 @@
 #include "infernix/ops/rg16_linear.h"
 
 #include "ops/linear/bf16/bf16_dispatch.h"
+#include "ops/linear/f16acc/f16acc_plan.h"
 #include "ops/linear/fp8/fp8_dispatch.h"
 #include "ops/linear/mxfp8/mxfp8_dispatch.h"
+#include "ops/linear/mxfp8/mxfp8_format.h"
 #include "ops/linear/nvfp4/nvfp4_dispatch.h"
 #include "ops/linear/q4/q4_dispatch.h"
 #include "ops/linear/q5/q5_dispatch.h"
 #include "ops/linear/q6/q6_dispatch.h"
 #include "ops/linear/q8/q8_dispatch.h"
+#include "ops/linear/q8/q8_f16acc.h"
+#include "ops/linear/qsa_group.h"
 
 #include <cstdint>
 #include <limits>
@@ -53,8 +57,11 @@ void validate_linear_policy(LinearPolicy policy) {
 
 void validate_linear_semantics(const Tensor& x, const Weight& w, const Tensor& out,
                                LinearPolicy policy) {
-    if (x.dtype != DType::BF16 || out.dtype != DType::BF16) {
-        throw std::invalid_argument("linear: x/out must be BF16");
+    if (x.dtype != DType::BF16 || (out.dtype != DType::BF16 && out.dtype != DType::FP32)) {
+        throw std::invalid_argument("linear: x must be BF16 and out BF16 or FP32");
+    }
+    if (out.dtype == DType::FP32 && !linear_fp32_output(w.qtype)) {
+        throw std::invalid_argument("linear: FP32 output needs a Q6, Q8, BF16, row FP8 or nvfp4_rg16 weight");
     }
     (void)checked_numel(x, "x");
     (void)checked_numel(out, "out");
@@ -103,7 +110,7 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
         detail::q6_dispatch(x, w, out, policy, stream);
         return;
     case QType::Q8_G32_FP16:
-        detail::q8_dispatch(x, w, out, policy, routes, stream);
+        detail::q8_dispatch(x, w, out, policy, routes, workspace, stream);
         return;
     case QType::BF16:
         detail::bf16_dispatch(x, w, out, policy, stream);
@@ -112,13 +119,15 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
         detail::nvfp4_dispatch(x, w, out, policy, workspace, stream);
         return;
     case QType::FP8_E4M3FN_ROW_BF16:
+    case QType::FP8_E4M3FN_ROW_F32:
         detail::fp8_dispatch(x, w, out, policy, routes, workspace, stream);
         return;
     case QType::FP8_E4M3FN_G32_E8M0:
-        detail::mxfp8_dispatch(x, w, out, policy, stream);
+        detail::mxfp8_dispatch(x, w, out, policy, routes, workspace, stream);
         return;
     case QType::NVFP4_MUL:
-        // A dense nvfp4_rg16_v1 matrix: the canonical W4A16 projection (exact sums), every policy.
+        // A dense nvfp4_rg16_v1 matrix (the 122B head, FP4-Local's vision MLP and merger): the
+        // canonical W4A16 projection (exact sums), every policy.
         if (w.layout != QuantLayout::Rg16 || workspace == nullptr) { break; }
         rg16_linear(x, w, out, *workspace, stream);
         return;
@@ -131,17 +140,26 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
 
 } // namespace
 
+// The formats a vocabulary head is stored in.
+bool linear_fp32_output(QType qtype) noexcept {
+    return qtype == QType::Q6_G64_FP16 || qtype == QType::Q8_G32_FP16 || qtype == QType::BF16 ||
+           qtype == QType::FP8_E4M3FN_ROW_BF16 || qtype == QType::FP8_E4M3FN_ROW_F32 ||
+           qtype == QType::NVFP4_MUL;
+}
+
 bool linear_column_invariant_route(QType qtype, std::int32_t output_rows,
                                    std::int32_t input_rows) noexcept {
     if (qtype == QType::Q4_G64_FP16) { return detail::q4_column_invariant_route(output_rows, input_rows); }
     if (qtype == QType::Q6_G64_FP16) { return detail::q6_column_invariant_route(output_rows, input_rows); }
     if (qtype == QType::Q8_G32_FP16) { return detail::q8_column_invariant_route(output_rows, input_rows); }
-    if (qtype == QType::FP8_E4M3FN_ROW_BF16) {
-        return detail::fp8_linear_column_invariant_route(output_rows, input_rows);
-    }
+    if (is_fp8_row(qtype)) { return detail::fp8_linear_column_invariant_route(qtype, output_rows, input_rows); }
     // nvfp4_rg16_v1 sums exactly: every route is column-invariant.
     if (qtype == QType::NVFP4_MUL) { return true; }
     return false;
+}
+
+std::size_t linear_f16_accumulate_workspace_bytes(std::int32_t input_rows, std::int32_t tokens) {
+    return detail::f16_accumulate_workspace_capacity_bytes(tokens, input_rows);
 }
 
 std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_rows,
@@ -173,7 +191,10 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
     case QType::Q8_G32_FP16:
         (void)detail::select_q8_launch(output_rows, input_rows, min_tokens, policy, LinearRoutes::Exact);
         (void)detail::select_q8_launch(output_rows, input_rows, max_tokens, policy, LinearRoutes::Exact);
-        return 0;
+        // The query does not see the route flags: the f16-accumulate route's encoded activation wherever
+        // the interval reaches it.
+        return column_invariant(policy) ? 0
+                                        : detail::q8_f16acc_workspace_capacity_bytes(output_rows, input_rows, max_tokens);
     case QType::BF16:
         (void)detail::select_bf16_launch(output_rows, input_rows, min_tokens, policy);
         (void)detail::select_bf16_launch(output_rows, input_rows, max_tokens, policy);
@@ -182,7 +203,8 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
         return detail::nvfp4_linear_workspace_capacity_bytes(output_rows, input_rows, policy,
                                                              min_tokens, max_tokens);
     case QType::FP8_E4M3FN_ROW_BF16:
-        return detail::fp8_linear_workspace_capacity_bytes(output_rows, input_rows, policy,
+    case QType::FP8_E4M3FN_ROW_F32:
+        return detail::fp8_linear_workspace_capacity_bytes(qtype, output_rows, input_rows, policy,
                                                            min_tokens, max_tokens);
     case QType::FP8_E4M3FN_G32_E8M0:
         return detail::mxfp8_linear_workspace_capacity_bytes(output_rows, input_rows, policy, min_tokens, max_tokens);
@@ -212,6 +234,43 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
         return;
     }
     dispatch_linear(x, w, out, policy, routes, &workspace, stream);
+}
+
+bool linear_qsa_group_supported(const Weight& w, const Tensor* const* parts, LinearPolicy policy) noexcept {
+    const bool q8    = w.qtype == QType::Q8_G32_FP16;
+    const bool mxfp8 = w.qtype == QType::FP8_E4M3FN_G32_E8M0;
+    // Q8 under A16ColumnInvariant takes its own SIMT route in linear(), which has no segmented form.
+    if (w.n != 13952 || w.k != 2560 || !(q8 || mxfp8) || (q8 && column_invariant(policy)) ||
+        !valid_linear_policy(policy) || parts == nullptr) {
+        return false;
+    }
+    for (std::int32_t i = 0; i < kQsaGroupSegments; ++i) {
+        const Tensor* part = parts[i];
+        if (part == nullptr || part->dtype != DType::BF16 || part->data == nullptr || !part->is_contiguous() ||
+            part->ne[0] != detail::kQsaGroupRows[i] || part->ne[1] != parts[0]->ne[1] || part->ne[2] != 1 ||
+            part->ne[3] != 1 ||
+            reinterpret_cast<std::uintptr_t>(part->data) % 16 != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void linear_qsa_group(const Tensor& x, const Weight& w, Tensor* const* parts, LinearPolicy policy,
+                      WorkspaceArena& workspace, cudaStream_t stream, LinearRoutes routes) {
+    if (!linear_qsa_group_supported(w, parts, policy) || !valid_linear_routes(routes) || x.dtype != DType::BF16 ||
+        !x.is_contiguous() || x.ne[0] != w.k || x.ne[1] != parts[0]->ne[1] || x.ne[1] <= 0) {
+        throw std::invalid_argument("linear_qsa_group: unsupported weight, segments or input");
+    }
+    detail::QsaGroupParts out{};
+    for (std::int32_t i = 0; i < kQsaGroupSegments; ++i) { out.data[i] = static_cast<__nv_bfloat16*>(parts[i]->data); }
+    if (w.qtype == QType::Q8_G32_FP16) {
+        detail::q8_qsa_group(x, w, out, routes, &workspace, stream);
+    } else {
+        (void)detail::validate_mxfp8_weight(w, "linear_qsa_group");
+        // MXFP8's routes give a column the same bits at every T; column invariance masks the others.
+        detail::mxfp8_qsa_group(x, w, out, column_invariant(policy) ? LinearRoutes::Exact : routes, &workspace, stream);
+    }
 }
 
 void linear(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {

@@ -20,6 +20,10 @@ enum SamplePurpose : std::int32_t {
     kSamplePurposeDFlash2Proposal       = 5,
     // SamplingConfig::gumbel_max: the Gumbel noise of a token, keyed by the produced token's position.
     kSamplePurposeGumbel = 6,
+    // Block verification's prefix tests, keyed by (L + i, purpose, i) for prefix i of the round at
+    // committed length L: block verification reads every prefix's uniform, so a later round must not
+    // meet one again (the token rule reads only up to its first rejection).
+    kSamplePurposeSpeculativeBlockAccept = 7,
 };
 
 // Borrowed round operand. Positions are contiguous packed vocabulary masks; null disables it.
@@ -42,6 +46,9 @@ struct SamplingConfig {
     unsigned long long seed    = 0;
     std::int32_t* token_counts = nullptr; // device [token_domain] i32, or null
     SamplingMask mask;
+    // Optional device-addressable I32 (pinned host memory serves under UVA), or null: the Op sets
+    // it to 1 when the row's selection has no finite value, and never clears it. See sample().
+    std::int32_t* nonfinite = nullptr;
     // Positive-temperature draws by Gumbel-max (the reproducible and lossless routes): the token of
     // the truncated support maximizing log p_v + g_v, g_v a standard Gumbel variate keyed by (seed, the
     // produced token's position, v). Speculative verification then compares each draft with that
@@ -58,8 +65,8 @@ struct SamplingConfig {
                                                             std::int32_t max_lanes);
 
 /**
- * Produces one token id per independent request row. `logits` is contiguous BF16 or FP32 (the
- * lossless route's) [physical_rows,B], `out` and `logical_positions` are contiguous I32 [B], and only vocabulary
+ * Produces one token id per independent request row. `logits` is contiguous FP32 or BF16
+ * [physical_rows,B], `out` and `logical_positions` are contiguous I32 [B], and only vocabulary
  * rows v in [0,token_domain) participate. `configs` is a device-resident contiguous
  * SamplingConfig[B] array. Greedy and stochastic rows may coexist in one invocation.
  * A non-null config.mask excludes vocabulary rows before argmax/top-k and normalization. sample()
@@ -89,10 +96,18 @@ struct SamplingConfig {
  * keyed by (seed, P, v) for the produced token's position P: logical_positions[b] under
  * kSamplePurposePrefill (the prompt's next position), logical_positions[b] + 1 otherwise (the
  * input token's position). In every mode the selected token atomically increments
- * configs[b].token_counts when it is non-null. Non-null token-count arrays belonging to distinct
+ * configs[b].token_counts when it is non-null.
+ *
+ * A row has no finite selection when its greedy winner's adjusted value, or its best
+ * positive-temperature candidate, is NaN or infinite, or when no finite candidate remains (model
+ * execution failed; a nonempty mask is the caller's contract). Such a row writes 1 to
+ * *configs[b].nonfinite when it is non-null and publishes token 0 (counted as above), an id every
+ * consumer of the round can index; the caller fails the row's request instead of committing it.
+ * Rows with a finite selection are unaffected. Non-null token-count arrays belonging to distinct
  * active requests must not alias. `out` must not overlap logits, configs, logical_positions, or any
  * token-count array. The Op writes all of out, uses caller-owned transient storage reported by
- * sampling_workspace_capacity_bytes(), and has no other persistent-state side effect.
+ * sampling_workspace_capacity_bytes(), and has no other persistent-state side effect than the
+ * counts and the non-finite flags.
  */
 void sample(const Tensor& logits, Tensor& out, std::int32_t token_domain,
             const SamplingConfig* configs, const Tensor& logical_positions, std::int32_t purpose,

@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
+#include <type_traits>
 
 namespace infernix::bench {
 
@@ -105,15 +106,22 @@ static __global__ void fill_row_split_kernel(std::uint8_t* low, std::uint8_t* hi
     }
 }
 
-static __global__ void fill_fp8_weight_kernel(std::uint8_t* codes, __nv_bfloat16* scales,
+// Row words in BF16 (fp8_e4m3fn_row_bf16) or FP32 (fp8_e4m3fn_row_f32).
+template <class Scale>
+static __global__ void fill_fp8_weight_kernel(std::uint8_t* codes, Scale* scales,
                                               std::uint64_t count, int rows, std::uint64_t seed,
                                               float extent) {
     for (auto i = std::uint64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < count;
          i += std::uint64_t(gridDim.x) * blockDim.x) {
         codes[i] = __nv_fp8_e4m3(fixture::uniform(i, seed, -224.F, 224.F)).__x;
-        if (i < rows)
-            scales[i] = __float2bfloat16_rn(extent / 224.F *
-                                            fixture::uniform(i, seed ^ 0x51ca1eU, .5F, 1.5F));
+        if (i < rows) {
+            const float scale = extent / 224.F * fixture::uniform(i, seed ^ 0x51ca1eU, .5F, 1.5F);
+            if constexpr (std::is_same_v<Scale, float>) {
+                scales[i] = scale;
+            } else {
+                scales[i] = __float2bfloat16_rn(scale);
+            }
+        }
     }
 }
 
@@ -136,12 +144,67 @@ static __global__ void fill_nvfp4_weight_kernel(std::uint8_t* codes, std::uint8_
     }
 }
 
+// nvfp4_rg16_v1 units (128 code bytes, then 16 E4M3FN block scales): uniform codes, scales near 1.
+static __global__ void fill_rg16_kernel(std::uint8_t* units, std::uint64_t bytes, std::uint64_t seed) {
+    for (auto i = std::uint64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < bytes;
+         i += std::uint64_t(gridDim.x) * blockDim.x) {
+        const std::uint32_t random = fixture::bits(i, seed);
+        units[i] = static_cast<std::uint8_t>(i % 144 < 128 ? random : 0x30U + (random & 15U));
+    }
+}
+
 inline int launch_grid(std::uint64_t elements) {
     return static_cast<int>(
         std::min<std::uint64_t>(65535, std::max<std::uint64_t>(1, (elements + 255) / 256)));
 }
 
 } // namespace detail
+
+// A dense nvfp4_mul matrix in nvfp4_rg16_v1 (the 122B head; FP4-Local's vision MLP and merger):
+// 16-row groups of 144-byte units, then (256-byte aligned) its FP32 multiplier.
+inline PackedQuantizedWeight make_nvfp4_rg16_weight(std::int32_t n, std::int32_t k, std::uint64_t seed = 0x51U) {
+    if (n <= 0 || k <= 0 || n % 16 != 0 || k % 16 != 0) {
+        throw std::invalid_argument("invalid benchmark nvfp4_rg16_v1 weight shape");
+    }
+    const std::uint64_t unit_bytes = detail::checked_mul(
+        detail::checked_mul(static_cast<std::uint64_t>(n / 16), static_cast<std::uint64_t>(k / 16),
+                            "benchmark nvfp4_rg16_v1 unit count overflow"),
+        144, "benchmark nvfp4_rg16_v1 unit plane overflow");
+    const std::uint64_t multiplier_offset = detail::align_up(unit_bytes, 256);
+    const std::uint64_t payload_bytes =
+        detail::checked_add(multiplier_offset, sizeof(float), "benchmark nvfp4_rg16_v1 payload size overflow");
+    if (payload_bytes > std::numeric_limits<std::size_t>::max()) {
+        throw std::overflow_error("benchmark nvfp4_rg16_v1 payload does not fit size_t");
+    }
+    // The codes and scales are the unit plane (low_bytes); the multiplier word is not counted.
+    PackedQuantizedWeight result{DeviceBuffer(static_cast<std::size_t>(payload_bytes)), {}, unit_bytes, 0, 0, 0, 0};
+    CUDA_CHECK(cudaMemset(result.storage.p, 0, result.storage.bytes));
+    detail::fill_rg16_kernel<<<detail::launch_grid(unit_bytes), 256>>>(static_cast<std::uint8_t*>(result.storage.p),
+                                                                       unit_bytes, seed);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+    constexpr float kMultiplier = 3.0517578e-05F;
+    CUDA_CHECK(cudaMemcpy(static_cast<std::uint8_t*>(result.storage.p) + multiplier_offset, &kMultiplier,
+                          sizeof(kMultiplier), cudaMemcpyHostToDevice));
+
+    Weight& weight            = result.weight;
+    weight.payload            = result.storage.p;
+    weight.payload_bytes      = payload_bytes;
+    weight.qtype              = QType::NVFP4_MUL;
+    weight.layout             = QuantLayout::Rg16;
+    weight.group_size         = 16;
+    weight.group              = 16;
+    weight.ndim               = 2;
+    weight.shape[0]           = n;
+    weight.shape[1]           = k;
+    weight.padded_shape[0]    = n;
+    weight.padded_shape[1]    = k;
+    weight.qdata              = result.storage.p;
+    weight.n                  = n;
+    weight.k                  = k;
+    weight.weight_multiplier  = kMultiplier;
+    return result;
+}
 
 inline PackedQuantizedWeight make_row_split_weight(QType qtype, std::int32_t n, std::int32_t k,
                                                    std::int32_t padded_k,
@@ -279,15 +342,17 @@ inline PackedQuantizedWeight make_nvfp4_weight(std::int32_t n, std::int32_t k,
     return result;
 }
 
+// `f32`: fp8_e4m3fn_row_f32 (FP32 row words, a per-token parent: no static input scale).
 inline PackedQuantizedWeight make_fp8_weight(std::int32_t n, std::int32_t k,
-                                             std::uint64_t seed = 0x51U, float extent = 0.05F) {
+                                             std::uint64_t seed = 0x51U, float extent = 0.05F, bool f32 = false) {
     if (n <= 0 || k <= 0) { throw std::invalid_argument("invalid benchmark FP8 weight shape"); }
+    const std::uint64_t word = f32 ? 4 : 2;
     const std::uint64_t code_bytes =
         detail::checked_mul(static_cast<std::uint64_t>(n), static_cast<std::uint64_t>(k),
                             "benchmark FP8 code size overflow");
     const std::uint64_t scale_offset = detail::align_up(code_bytes, 256);
     const std::uint64_t scale_bytes =
-        detail::checked_mul(static_cast<std::uint64_t>(n), 2, "benchmark FP8 scale size overflow");
+        detail::checked_mul(static_cast<std::uint64_t>(n), word, "benchmark FP8 scale size overflow");
     const std::uint64_t payload_bytes =
         detail::checked_add(scale_offset, scale_bytes, "benchmark FP8 payload size overflow");
     if (payload_bytes > std::numeric_limits<std::size_t>::max()) {
@@ -304,11 +369,16 @@ inline PackedQuantizedWeight make_fp8_weight(std::int32_t n, std::int32_t k,
         scale_bytes,
     };
     CUDA_CHECK(cudaMemset(result.storage.p, 0, result.storage.bytes));
-    detail::fill_fp8_weight_kernel<<<detail::launch_grid(code_bytes), 256>>>(
-        static_cast<std::uint8_t*>(result.storage.p),
-        reinterpret_cast<__nv_bfloat16*>(static_cast<std::uint8_t*>(result.storage.p) +
-                                         scale_offset),
-        code_bytes, n, seed, extent);
+    auto* scale_plane = static_cast<std::uint8_t*>(result.storage.p) + scale_offset;
+    if (f32) {
+        detail::fill_fp8_weight_kernel<<<detail::launch_grid(code_bytes), 256>>>(
+            static_cast<std::uint8_t*>(result.storage.p), reinterpret_cast<float*>(scale_plane), code_bytes, n, seed,
+            extent);
+    } else {
+        detail::fill_fp8_weight_kernel<<<detail::launch_grid(code_bytes), 256>>>(
+            static_cast<std::uint8_t*>(result.storage.p), reinterpret_cast<__nv_bfloat16*>(scale_plane), code_bytes,
+            n, seed, extent);
+    }
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -316,9 +386,9 @@ inline PackedQuantizedWeight make_fp8_weight(std::int32_t n, std::int32_t k,
     weight.payload          = result.storage.p;
     weight.payload_bytes    = payload_bytes;
     weight.high_plane_bytes = 0;
-    weight.qtype            = QType::FP8_E4M3FN_ROW_BF16;
+    weight.qtype            = f32 ? QType::FP8_E4M3FN_ROW_F32 : QType::FP8_E4M3FN_ROW_BF16;
     weight.layout           = QuantLayout::RowScale;
-    weight.scale_dtype      = DType::BF16;
+    weight.scale_dtype      = f32 ? DType::FP32 : DType::BF16;
     weight.group_size       = static_cast<std::uint32_t>(k);
     weight.group            = k;
     weight.ndim             = 2;
@@ -332,10 +402,73 @@ inline PackedQuantizedWeight make_fp8_weight(std::int32_t n, std::int32_t k,
     weight.n                = n;
     weight.k                = k;
     weight.scale_ne[0]      = n;
-    weight.scale_nb[0]      = 2;
-    weight.scale_nb[1]      = static_cast<std::int64_t>(n) * 2;
+    weight.scale_nb[0]      = static_cast<std::int64_t>(word);
+    weight.scale_nb[1]      = static_cast<std::int64_t>(n) * static_cast<std::int64_t>(word);
     weight.scale_nb[2]      = weight.scale_nb[1];
     weight.scale_nb[3]      = weight.scale_nb[1];
+    return result;
+}
+
+namespace detail {
+// MXFP8 codes uniform over +-224 and UE8M0 group scales 2^-7..2^7 (words 120..134, the sweep's range).
+static __global__ void fill_mxfp8_weight_kernel(std::uint8_t* codes, std::uint8_t* scales, std::uint64_t count,
+                                                std::uint64_t scale_count, std::uint64_t seed) {
+    for (auto i = std::uint64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < count;
+         i += std::uint64_t(gridDim.x) * blockDim.x) {
+        codes[i] = __nv_fp8_e4m3(fixture::uniform(i, seed, -224.F, 224.F)).__x;
+        if (i < scale_count) scales[i] = static_cast<std::uint8_t>(120U + fixture::bits(i, seed ^ 0x5cU) % 15U);
+    }
+}
+} // namespace detail
+
+// fp8_e4m3fn_g32_e8m0 in g32_scale_rows16_v1 (the scale plane [N/16][K/32][16]).
+inline PackedQuantizedWeight make_mxfp8_weight(std::int32_t n, std::int32_t k, std::uint64_t seed = 0x52U) {
+    if (n <= 0 || k <= 0 || n % 16 || k % 32) { throw std::invalid_argument("invalid benchmark MXFP8 weight shape"); }
+    const std::uint64_t code_bytes =
+        detail::checked_mul(static_cast<std::uint64_t>(n), static_cast<std::uint64_t>(k),
+                            "benchmark MXFP8 code size overflow");
+    const std::uint64_t scale_offset = detail::align_up(code_bytes, 256);
+    const std::uint64_t scale_bytes  = code_bytes / 32;
+    const std::uint64_t payload_bytes =
+        detail::checked_add(scale_offset, scale_bytes, "benchmark MXFP8 payload size overflow");
+    PackedQuantizedWeight result{
+        DeviceBuffer(static_cast<std::size_t>(payload_bytes)), {}, code_bytes, 0, 0, scale_offset, scale_bytes,
+    };
+    CUDA_CHECK(cudaMemset(result.storage.p, 0, result.storage.bytes));
+    auto* base = static_cast<std::uint8_t*>(result.storage.p);
+    detail::fill_mxfp8_weight_kernel<<<detail::launch_grid(code_bytes), 256>>>(base, base + scale_offset, code_bytes,
+                                                                               scale_bytes, seed);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    const std::int32_t groups = k / 32;
+    Weight& w                 = result.weight;
+    w.payload                 = result.storage.p;
+    w.payload_bytes           = payload_bytes;
+    w.high_plane_bytes        = 0;
+    w.qtype                   = QType::FP8_E4M3FN_G32_E8M0;
+    w.layout                  = QuantLayout::G32ScaleRows16;
+    w.scale_dtype             = DType::U8;
+    w.group_size              = 32;
+    w.group                   = 32;
+    w.ndim                    = 2;
+    w.shape[0] = w.padded_shape[0] = n;
+    w.shape[1] = w.padded_shape[1] = k;
+    w.shape[2] = w.padded_shape[2] = 1;
+    w.shape[3] = w.padded_shape[3] = 1;
+    w.qdata                   = base;
+    w.qhigh                   = nullptr;
+    w.scales                  = base + scale_offset;
+    w.n                       = n;
+    w.k                       = k;
+    w.scale_ne[0]             = 16;
+    w.scale_ne[1]             = groups;
+    w.scale_ne[2]             = n / 16;
+    w.scale_ne[3]             = 1;
+    w.scale_nb[0]             = 1;
+    w.scale_nb[1]             = 16;
+    w.scale_nb[2]             = static_cast<std::int64_t>(groups) * 16;
+    w.scale_nb[3]             = w.scale_nb[2] * (n / 16);
     return result;
 }
 

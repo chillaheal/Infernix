@@ -152,6 +152,8 @@ public:
 
     void timing(infernix::GenerationTimingObservation) override {}
 
+    void tool_call(infernix::ToolCallDelta) override {}
+
     void publish(infernix::OutputDelta delta) override {
         std::ostream& output =
             delta.channel == infernix::OutputChannel::Reasoning ? std::cerr : std::cout;
@@ -389,8 +391,10 @@ int main(int argc, char** argv) {
         engine_options.vram_past_budget         = cli.vram_past_budget;
         engine_options.expert_tail_skip         = cli.expert_tail_skip;
         engine_options.expert_a4_activations    = cli.expert_a4_activations;
+        engine_options.embedding_host           = cli.embedding_host;
         engine_options.prefill_chunk            = cli.prefill_chunk;
         engine_options.kv_cache                 = cli.kv_cache;
+        engine_options.logits_dtype             = cli.logits_dtype;
         engine_options.original_int8_prefill_kernel = cli.original_int8_prefill_kernel;
         engine_options.prefill_split_workspace_mib  = cli.prefill_split_workspace_mib;
         engine_options.original_nvfp4_prefill_kernel = cli.original_nvfp4_prefill_kernel;

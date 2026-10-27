@@ -281,24 +281,26 @@ int main() {
         failures += check(accepted, "Qwen3.8-Flash-Next refused a disabled context cache");
     }
 
-    // The same normalization owns the speculative draft-confidence gate (--spec-min-p): only
-    // Qwen3.8-Flash-Next's MTP rounds have it, so every other combination is refused, not ignored.
-    for (int variant = 0; variant < 5; ++variant) {
+    // The same normalization owns the speculative draft-confidence cut (--spec-min-p): Qwen3.8-Flash-Next's
+    // MTP and DFlash2 rounds and Qwen3.5's MTP rounds have it, so every other combination is refused, not
+    // ignored.
+    for (int variant = 0; variant < 7; ++variant) {
         EngineOptions options;
         options.speculative.backend      = infernix::SpeculativeBackend::Mtp;
         options.speculative.draft_tokens = 3;
         options.speculative.draft_min_p  = variant == 3 ? 1.5F : 0.25F;
         auto architecture                = infernix::models::Architecture::Qwen4Exp;
-        if (variant == 1) { architecture = infernix::models::Architecture::Qwen3_5; }
+        if (variant == 1 || variant == 5) { architecture = infernix::models::Architecture::Qwen3_5; }
         if (variant == 2) { options.speculative.backend = infernix::SpeculativeBackend::DFlash; }
         if (variant == 4) { options.speculative.draft_min_p = 0.0F; }
+        if (variant == 5 || variant == 6) { options.speculative.backend = infernix::SpeculativeBackend::DFlash2; }
         bool rejected = false;
         try {
             const EngineOptions out = normalize_engine_options(options, architecture);
             failures += check(out.speculative.draft_min_p == options.speculative.draft_min_p,
                               "normalization changed --spec-min-p");
         } catch (const std::invalid_argument&) { rejected = true; }
-        failures += check(rejected == (variant == 1 || variant == 2 || variant == 3),
+        failures += check(rejected == (variant == 2 || variant == 3 || variant == 5),
                           "--spec-min-p was misjudged for its model, backend or range");
     }
     // --vram-headroom-mib with an explicit KV capacity: refused for Qwen3.5 (the headroom is what
@@ -319,16 +321,22 @@ int main() {
         } catch (const std::invalid_argument&) { rejected = true; }
         failures += check(!rejected, "--vram-headroom-mib was refused with offloaded experts");
     }
-    // --draft-tokens auto on a Qwen3.5 artifact with offloaded experts decodes without a drafter (no
-    // length was faster than plain decode there); a fixed length keeps its drafter.
+    // --draft-tokens auto on a Qwen3.5 artifact with offloaded experts: MTP keeps its drafter (its gated
+    // drafts beat plain decode there), DFlash2 decodes without one (no policy beat plain decode); a fixed
+    // length keeps its drafter.
     {
         EngineOptions options;
         options.speculative.backend           = infernix::SpeculativeBackend::Mtp;
         options.speculative.draft_tokens_auto = true;
-        const EngineOptions out = normalize_engine_options(options, infernix::models::Architecture::Qwen3_5, true);
-        failures += check(out.speculative.backend == infernix::SpeculativeBackend::None &&
-                              !out.speculative.draft_tokens_auto && out.speculative.draft_tokens == 0,
-                          "--draft-tokens auto kept a drafter with offloaded experts");
+        const EngineOptions mtp = normalize_engine_options(options, infernix::models::Architecture::Qwen3_5, true);
+        failures += check(mtp.speculative.backend == infernix::SpeculativeBackend::Mtp && mtp.speculative.draft_tokens_auto,
+                          "--draft-tokens auto lost the MTP drafter with offloaded experts");
+        options.speculative.backend = infernix::SpeculativeBackend::DFlash2;
+        const EngineOptions block = normalize_engine_options(options, infernix::models::Architecture::Qwen3_5, true);
+        failures += check(block.speculative.backend == infernix::SpeculativeBackend::None &&
+                              !block.speculative.draft_tokens_auto && block.speculative.draft_tokens == 0,
+                          "--draft-tokens auto kept the DFlash2 drafter with offloaded experts");
+        options.speculative.backend           = infernix::SpeculativeBackend::Mtp;
         options.speculative.draft_tokens_auto = false;
         options.speculative.draft_tokens      = 1;
         failures += check(normalize_engine_options(options, infernix::models::Architecture::Qwen3_5, true)

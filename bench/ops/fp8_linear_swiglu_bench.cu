@@ -6,6 +6,7 @@
 #include "core/device.h"
 #include "infernix_bench_common.h"
 #include "quantized_weight.cuh"
+#include "roofline.h"
 
 #include <cuda_profiler_api.h>
 #include <cuda_runtime.h>
@@ -22,6 +23,7 @@
 #include <vector>
 
 using namespace infernix;
+namespace roofline = infernix::bench::roofline;
 
 namespace {
 
@@ -29,7 +31,6 @@ constexpr std::int32_t kGateUpRows        = 34816;
 constexpr std::int32_t kOutputRows        = 17408;
 constexpr std::int32_t kHidden            = 5120;
 constexpr std::size_t kFlushBytes         = 256ULL << 20;
-constexpr double kMxFp8Fp32AccumulatePeak = 838.0;
 
 struct Options {
     ops::LinearPolicy policy = ops::LinearPolicy::AllowA8;
@@ -37,6 +38,8 @@ struct Options {
     int warmup   = 5;
     int repeat   = 30;
     bool profile = false;
+    // --shared-122b: Qwen3.5-122B-A10B's per-row FP8 shared expert, fp8_e4m3fn_row_f32 [2048,3072].
+    bool shared_122b = false;
 };
 
 std::vector<std::int32_t> parse_tokens(std::string_view raw) {
@@ -87,9 +90,11 @@ Options parse_options(int argc, char** argv) {
             options.repeat = std::stoi(std::string(next("--repeat value")));
         } else if (argument == "--profile") {
             options.profile = true;
+        } else if (argument == "--shared-122b") {
+            options.shared_122b = true;
         } else if (argument == "--help" || argument == "-h") {
             std::printf("Usage: %s [--policy a16|a8|a8r|invariant] [--t-sweep 1,2,...] [--warmup N] "
-                        "[--repeat N] [--profile]\n",
+                        "[--repeat N] [--profile] [--shared-122b]\n",
                         argv[0]);
             std::exit(0);
         } else {
@@ -120,15 +125,19 @@ int main(int argc, char** argv) {
             std::minmax_element(options.tokens.begin(), options.tokens.end());
         const std::int32_t min_t = *min_it;
         const std::int32_t max_t = *max_it;
+        const std::int32_t kGateUpRows = options.shared_122b ? 2048 : ::kGateUpRows;
+        const std::int32_t kOutputRows = options.shared_122b ? 1024 : ::kOutputRows;
+        const std::int32_t kHidden     = options.shared_122b ? 3072 : ::kHidden;
 
         cudaStream_t stream = nullptr;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
         bench::L2FlushBuffer flush(kFlushBytes);
         DeviceBuffer input = bench::make_bf16(static_cast<std::size_t>(kHidden) * max_t, 101U);
         DeviceBuffer output(static_cast<std::size_t>(kOutputRows) * max_t * sizeof(std::uint16_t));
-        bench::PackedQuantizedWeight packed  = bench::make_fp8_weight(kGateUpRows, kHidden);
+        bench::PackedQuantizedWeight packed =
+            bench::make_fp8_weight(kGateUpRows, kHidden, 0x51U, 0.05F, options.shared_122b);
         const std::size_t workspace_capacity = ops::linear_swiglu_workspace_capacity_bytes(
-            QType::FP8_E4M3FN_ROW_BF16, kGateUpRows, kHidden, options.policy, min_t, max_t);
+            packed.weight.qtype, kGateUpRows, kHidden, options.policy, min_t, max_t);
         WorkspaceArena workspace(std::max<std::size_t>(workspace_capacity, 256));
 
         const auto launch = [&](std::int32_t tokens, cudaStream_t launch_stream) {
@@ -158,7 +167,7 @@ int main(int argc, char** argv) {
         }
 
         std::printf("# mxfp8_fp32_accumulate_peak_tflops=%.1f cache=cold\n",
-                    kMxFp8Fp32AccumulatePeak);
+                    roofline::kMxfp8Fp32AccumulateTFLOPs);
         std::printf("%-4s %6s %11s %11s %11s %10s %10s %8s\n", "pol", "T", "median_us", "min_us",
                     "p95_us", "eff_GB/s", "TFLOP/s", "TC_%");
         for (const std::int32_t tokens : options.tokens) {
@@ -171,8 +180,9 @@ int main(int argc, char** argv) {
                                  2.0 * static_cast<double>(kHidden + kOutputRows) * tokens;
             const double tflops     = flops / seconds / 1.0e12;
             const bool tensor_route = options.policy == ops::LinearPolicy::AllowA8 && tokens >= 5;
-            const double tensor_percent = tensor_route ? 100.0 * tflops / kMxFp8Fp32AccumulatePeak
-                                                       : std::numeric_limits<double>::quiet_NaN();
+            const double tensor_percent =
+                tensor_route ? 100.0 * tflops / roofline::kMxfp8Fp32AccumulateTFLOPs
+                             : std::numeric_limits<double>::quiet_NaN();
             if (std::isfinite(tensor_percent)) {
                 std::printf("%-4s %6d %11.3f %11.3f %11.3f %10.1f %10.2f %8.2f\n",
                             policy_name(options.policy), tokens, timing.median_us, timing.min_us,

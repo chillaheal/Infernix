@@ -69,6 +69,9 @@ int run_tests() {
                                   .expert_a4_activations &&
                           !parse({"infernix", "model.ninfer", "--prompt", "hello"}).expert_a4_activations,
                       "--expert-a4-activations did not parse (default off)");
+    failures += check(parse({"infernix", "model.ninfer", "--prompt", "hello", "--embedding-host"}).embedding_host &&
+                          !parse({"infernix", "model.ninfer", "--prompt", "hello"}).embedding_host,
+                      "--embedding-host did not parse (default off)");
     const auto gated = parse({"infernix", "model.ninfer", "--prompt", "hello", "--spec", "mtp",
                               "--draft-tokens", "3", "--spec-min-p", "0.7"});
     failures += check(gated.speculative.draft_min_p && *gated.speculative.draft_min_p == 0.7F,
@@ -288,6 +291,16 @@ int run_tests() {
                   }),
                   "CLI accepted an unsupported DFlash2 draft count");
     }
+    failures += check(parse({"infernix-cli", "model.ninfer", "--prompt", "hello"}).logits_dtype ==
+                              infernix::LogitsDtype::FP32,
+                      "CLI logits are not FP32 by default");
+    failures += check(parse({"infernix-cli", "model.ninfer", "--prompt", "hello", "--logits-dtype", "bf16"})
+                              .logits_dtype == infernix::LogitsDtype::BF16,
+                      "--logits-dtype bf16 did not select BF16 logits");
+    failures += check(rejects([&] {
+                          (void)parse({"infernix-cli", "model.ninfer", "--prompt", "hello", "--logits-dtype", "fp16"});
+                      }),
+                      "CLI accepted --logits-dtype fp16");
     const infernix::cli::Options nvfp4 =
         parse({"infernix-cli", "model.ninfer", "--prompt", "hello", "--kv-dtype", "nvfp4"});
     failures += check(nvfp4.kv_cache == infernix::KvCacheStorage::Nvfp4Group16,

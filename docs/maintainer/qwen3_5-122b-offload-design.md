@@ -64,7 +64,7 @@ RTX 5090, i9-13900K, 96 GB DDR5-5800, PCIe link measured 27.6-27.7 GB/s; the art
 | Plain decode, short context, warm cache (tg128) | 80.4-82.6 tok/s (CLI 69.6-74.0) | ≥ 100 / ≥ 140 |
 | Prefill, fresh 32K prompt (pp32768, chunk 16,384) | 6,183-6,519 tok/s | ≥ 6,000 / ≥ 9,000 |
 | Prefill pp4096 | 1,619-1,750 tok/s | — |
-| Best speculation | none faster than plain decode (below) | ≥ 140 / ≥ 200 |
+| Best speculation | first runs: none faster than plain decode (below); 2026-10-25: gated MTP 2 drafts 67-103 tok/s on corpus prompts, +14 % over plain (§12.2) | ≥ 140 / ≥ 200 |
 
 - **Decode is bound by the misses.** Decode hit rate 73.5-78 % (layers 0-19 at 58-65 %, 20-47 at
   77-87 %), about 84-100 misses per token. The CPU serves ~80 % of them (`misses / 3` rounds to 0 on
@@ -76,8 +76,9 @@ RTX 5090, i9-13900K, 96 GB DDR5-5800, PCIe link measured 27.6-27.7 GB/s; the art
 - **Speculation does not pay here.** Each verify column brings its own experts' misses (~10 ms a
   column against 13.8 ms a plain token): MTP 1/2/3 drafts 71.6/66.8/52.9 tok/s (acceptance
   1.75/2.25/2.68), DFlash2 1/2/4/7/15 65.8/61.3/57.1/35.2/19.2 (1.67-3.19) against plain 72.5 on
-  one prompt. `--draft-tokens auto` decodes without a drafter on this configuration (fast_paths.cpp
-  auto_drafts_nothing; the drafter is then not bound).
+  one prompt. `--draft-tokens auto` with DFlash2 decodes without a drafter on this configuration
+  (fast_paths.cpp auto_drafts_nothing; the drafter is then not bound); MTP's confidence gate (§12.2)
+  later made 2 drafts pay.
 - **Prefill is compute-bound, not link-bound.** A 32K chunk (each expert streamed once instead of
   twice) gave 6,892 against 6,517 tok/s (+6 %), so §10's layer walk is worth at most a few per cent
   at 32K. The wide expert route reaches 41/89/110 TFLOP/s at 1K/4K/16K columns (bench
@@ -121,8 +122,9 @@ each arm twice in ABBA order; bf16 KV.
   Greedy (bench): gated 2 drafts 91.5 against plain 93.5 (-2 %), ungated 82.8, gated 1 draft 93.0. A
   zero-draft MTP round still runs the drafter (its MoE layer misses like a target layer), which the
   rule's baseline does not see: that is the greedy loss. `--lm-head-draft` changes nothing measurable
-  (gated 2 drafts 93.2 / 92.5 against 92.8 / 93.2). `--draft-tokens auto` still decodes without a
-  drafter with offloaded experts.
+  (gated 2 drafts 93.2 / 92.5 against 92.8 / 93.2). The greedy bench decodes after a one-token seed
+  prompt; on real prompts gated MTP wins greedy too (2026-10-25, §12.2), so `--spec mtp
+  --draft-tokens auto` drafts 2 behind the gate.
 - **Elastic text KV (§11.1)**: the first 32,768 tokens backed at startup, growth from the expert frames
   in 4,096-token steps, shrink at lane release and after 60 s idle. The MoE real test grows the pool
   512 -> 704 pages for a 40,960-token prompt and back, outputs identical.
@@ -584,7 +586,11 @@ Per token at a 32K fresh prompt, on the exact route:
   (a multiplier, unlike NVFP4's `activation_input_divisor`; fused inputs must store bit-equal values).
   The first draft read: `activation_input_divisor = input_scale` (FP32, as NVFP4 A4
   inputs already do) and the `AllowA8` permission. An A8 input with a stored divisor quantizes
-  statically, as NVFP4 A4 inputs with divisors do.
+  statically, as NVFP4 A4 inputs with divisors do. An `AllowA8` input without the role (a per-channel
+  export, ModelOpt `FP8_PER_CHANNEL_PER_TOKEN`: dealignai's Ornith-1.5-122B-UNCENSORED-NVFP4, whose rows
+  each carry their own multiplier) encodes each activation column with its own scale
+  fl32(max |x| / 448) (`Weight::input_scale` 0); a fused parent's inputs are all static (one scale) or
+  all per-token.
 - **Producers and oracle.** The only producer is `import_encoded`. The exact decode oracle is
   registered in C++ and Python, and `verify_artifact` compares codes and multipliers word for word.
 
@@ -1006,8 +1012,8 @@ draft, higher for later ones), and an MTP round averaged 0.75. Two changes targe
   combines to 0. Live columns' bits are unchanged, so the exact route's
   invariance and the committed text are unaffected.
 - **Confidence gate.** Each MTP proposal step also writes the drafter's probability of its draft
-  (`ops::argmax_probability`, one deterministic softmax pass over the proposal head's rows, into the
-  round's egress). Before the next round, each row keeps the prefix that maximizes expected committed
+  (`ops::argmax_with_probability`: the argmax's own pass over the proposal head's rows also sums the
+  softmax denominator in one deterministic order, into the round's egress). Before the next round, each row keeps the prefix that maximizes expected committed
   tokens per unit of round time, `(1 + Σ_j Π_{i≤j} a(q_i)) / (1 + c·e)` (`MtpConfidencePolicy`):
   a(q) is the acceptance learned per probability bucket (prior: the bucket's midpoint), c the cost of
   one verified draft column relative to a round without drafts, fitted from consecutive rounds'
@@ -1019,8 +1025,41 @@ draft, higher for later ones), and an MTP round averaged 0.75. Two changes targe
   -2 % greedy (91.5 against 93.5; ungated 82.8). The greedy loss is the drafter's own round cost
   (its MoE layer's misses), which a zero-draft round pays and the rule's baseline does not count;
   skipping the drafter in rounds the rule expects to leave empty would need the MTP layer's KV
-  appended without its MoE and head, a separate round kind. `auto` keeps the no-drafter choice.
+  appended without its MoE and head, a separate round kind.
+- **`auto` (2026-10-25, Ornith-1.5-122B, INT8 KV, one request, `infernix_bench -pg 1280,256` on
+  three bench-corpus prompts, ABBA, four pairs each greedy and at temperature 1.0).** Against plain
+  decode: gated 2 drafts a geometric mean 14.0 % faster over the eight pairs (greedy +11 to +26 %,
+  sampled -1.1 to +25 %), gated 1 draft 8.7 % (worst -4.3 %), adaptive-mtp forced at a ceiling of
+  2 13.9 % (worst +0.0 %, greedy worst +1.2 %) and of 3 13.3 % (worst -7.9 %); the control against
+  itself +0.2 to +1.1 %. The greedy loss above came from the one-token seed prompt, whose text
+  accepts fewer drafts. MTP's `auto` drafts 2 behind the gate (`auto_fixed_draft_tokens`; the tie
+  does not justify registering adaptive-mtp here); the drafter takes 266 expert frames (1.3 GiB).
+  On `infernix_decode_quality_gen`'s workload (16 slices of 1,280 tokens of Infernix's code, greedy,
+  and docs, sampled; 384 tokens each; decode tok/s) at one request gated MTP 2 decodes 82.5 / 72.2
+  tok/s, `adaptive-speculation` beside it -0.5 %, DFlash2's adaptive-dflash (forced) -0.3 % / -3.1 %
+  (with `--lm-head-draft` +1.0 % / -1.3 %). With two requests on docs every drafter loses to plain
+  decode (47.6 tok/s per request): gated MTP 2 about -6 %, adaptive-dflash -15.6 %, its batched
+  rounds plain at one draft -18.3 %; each row's verify columns bring their own misses, and a
+  draft-free MTP round still runs the drafter. Over one and two requests MTP's 2 drafts gain about
+  3.6 % and adaptive-dflash loses about 1.6 % (eight corpus pairs at one request: +13.5 %), so
+  DFlash2's `auto` decodes without its drafter. Skipping the drafter in batched rounds (a round kind
+  that appends the MTP layer's KV without its MoE and head) is the open item.
   DFlash2 with the forced adaptive policy and `auto`: 68.8 / 69.1 tok/s sampled, below plain.
+- **The drafter's round cost (candidates §11 OR-09, unmeasured; three output-neutral switches, read in
+  `models/qwen3_5/program/planning/startup.h`).** The drafter's MoE is resident here (`resident_moe`),
+  but each round still runs the alignment over every verify column, then each draft step's layer and
+  proposal head:
+  - `INFERNIX_TMP_QWEN35_MTP_PAD_MASK`: the alignment's padding columns (past a row's licensed tokens)
+    route no resident expert.
+  - `INFERNIX_TMP_QWEN35_MTP_STEP_GATE`: Finish is captured as a step chain (the alignment, then each draft
+    behind a device gate), whose gates stop where no later draft could be verified. The threshold
+    (`MtpConfidencePolicy::step_threshold`) is the lowest bucket edge below which every bucket's
+    acceptance times the best bucket's is at most the column cost; a row's drafts end at its first
+    one below it.
+  - `INFERNIX_TMP_QWEN35_MTP_SKIP_ROUNDS` (with the step chain): `MtpDraftRegime` runs rounds without
+    drafting (the alignment's KV only) while their measured tokens per second beat drafting rounds',
+    probing the other regime 4 rounds in 32; the release log reports "MTP draft-free rounds: X of Y".
+    The aim is greedy decode at plain speed without unloading the drafter, and the sampled gain kept.
 - **DFlash2.** The adaptive-dflash policy already chooses each round's verify width from the
   block's per-draft probabilities after a split proposal (a host wait that costs nothing next to a
   14 ms round). It is not qualified here, so the A/B forces it (`adaptive-speculation`,
@@ -1114,6 +1153,15 @@ draft, higher for later ones), and an MTP round averaged 0.75. Two changes targe
 - `prompt-pv8` at group 16;
 - `decode-split64`;
 - a BF16-MMA expert wide route (approximate, prefill only);
+- `expert-a4-residual` (and its three-term form): implemented as an unqualified candidate
+  (`--fast-path`). The routed and shared experts' wide calls run Flash-Next's grouped mxf4nvf4 GEMM
+  on two (three) NVFP4 terms per x and h row at this geometry (`wide_expert.h` A4Planes,
+  `wide_expert.cuh` ScheduleResidual: Flash-Next's 64 x 128 tile, two stages, two CTAs a SM; warps
+  skip 16-column MMA tiles past a tile's valid columns). Narrow experts (the narrow ring included)
+  and CPU-served misses stay exact, so a column's result depends on its expert's column count in the
+  call, not on where its record was read. Op oracle: `test_offloaded_moe_a4_residual_122b`;
+  speed: `infernix_offloaded_moe_wide_bench --geometry 122b --activation a16x2` against `a16`, then
+  pp4096/pp32768 with and without the path;
 - `expert-tail-skip` remains an approximate opt-in.
 
 Each needs model-quality §6's kernel-based gate on every KV format and a resolved speedup.

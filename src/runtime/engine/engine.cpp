@@ -4,6 +4,8 @@
 #include "core/nvtx.h"
 #include "core/power_throttling.h"
 #include "core/startup.h"
+#include "core/temporary_switches.h"
+#include "infernix/ops/lossless_ops.h"
 #include "runtime/contract/sampling.h"
 #include "runtime/contract/request.h"
 #include "runtime/engine/causal_score_core.h"
@@ -17,6 +19,7 @@
 #include <atomic>
 #include <cstdio>
 #include <filesystem>
+#include <functional>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -150,6 +153,10 @@ const PromptPreparationStats& PreparedPrompt::preparation_stats() const noexcept
     return impl_ != nullptr ? impl_->prepare : empty;
 }
 
+std::span<const TokenId> PreparedPrompt::token_ids() const noexcept {
+    return impl_ != nullptr ? impl_->value.token_ids() : std::span<const TokenId>{};
+}
+
 PreparedPrompt::operator bool() const noexcept { return impl_ != nullptr; }
 
 class GenerationHandle::Impl {
@@ -158,6 +165,7 @@ public:
     public:
         virtual ~Concept() = default;
         virtual GenerationResult wait(OutputSink* sink, const CancellationView& cancellation) = 0;
+        virtual void await_admission(const CancellationView& cancellation) = 0;
     };
 
     template <class Submission>
@@ -168,6 +176,10 @@ public:
 
         GenerationResult wait(OutputSink* sink, const CancellationView& cancellation) override {
             return submission_.wait(sink, cancellation);
+        }
+
+        void await_admission(const CancellationView& cancellation) override {
+            submission_.await_admission(cancellation);
         }
 
     private:
@@ -184,6 +196,8 @@ public:
     GenerationResult wait(OutputSink* sink, const CancellationView& cancellation) {
         return state_->wait(sink, cancellation);
     }
+
+    void await_admission(const CancellationView& cancellation) { state_->await_admission(cancellation); }
 
     [[nodiscard]] const ResolvedSamplingParameters& resolved_sampling() const noexcept {
         return sampling_;
@@ -214,6 +228,11 @@ GenerationResult GenerationHandle::wait(OutputSink* sink, const CancellationView
     return impl->wait(sink, cancellation);
 }
 
+void GenerationHandle::await_admission(const CancellationView& cancellation) {
+    if (impl_ == nullptr) { throw std::logic_error("GenerationHandle is empty"); }
+    impl_->await_admission(cancellation);
+}
+
 class Engine::Impl {
 public:
     using GenerationCore = runtime::EngineCore<runtime::ModelInstance>;
@@ -231,6 +250,12 @@ public:
         : options(normalize(std::move(engine_options))),
           device(initialize_device(options)) {
         nvtx::ScopedRange load_range(nvtx::Name::EngineLoad, nvtx::Category::Runtime);
+        // The lossless ops' rounding mode is process-wide device state: every lossless Engine sets it, so
+        // a noise twin never leaks into a later lossless run.
+        if (options.lossless) {
+            ops::lossless_set_noise(options.lossless_noise_seed, options.lossless_noise_units,
+                                    options.lossless_noise_scale);
+        }
         if (architecture == models::Architecture::Qwen4Exp) {
             auto constructed  = runtime::construct_qwen4_exp(options, device);
             options           = std::move(constructed.options);
@@ -238,6 +263,7 @@ public:
             load              = std::move(constructed.load);
             model_metadata    = std::move(constructed.model_metadata);
             load.cuda_sync_mode = device.sync_mode();
+            load.temporary_switches = temporary_switches::describe(temporary_switches::Scope::Qwen4Exp);
             sampling_defaults = qwen4->frontend.sampling_defaults();
             StartupPhaseScope finalize_phase(options.startup_observer, StartupPhase::EngineFinalize);
             if (options.purpose == EnginePurpose::CausalScoring) {
@@ -254,11 +280,13 @@ public:
         load                           = std::move(constructed.load);
         model_metadata                 = std::move(constructed.model_metadata);
         load.cuda_sync_mode            = device.sync_mode();
+        load.temporary_switches        = temporary_switches::describe(temporary_switches::Scope::Qwen3_5);
         if (tree_auto_requested && !options.speculative.draft_tree_auto) {
             runtime::publish_diagnostic(
                 options.diagnostic_observer, DiagnosticLevel::Warning,
-                "automatic DFlash2 tree verification does not run here (an artifact whose GDN input "
-                "projections are not single FP8 or NVFP4 parents, fixed speculation, or --draft-tokens "
+                "automatic tree verification does not run here (an artifact whose GDN input "
+                "projections are not single FP8, NVFP4 or Q8 parents, fixed speculation, MTP without "
+                "sampled-mtp-drafts or beside adaptive-mtp's draft lengths, or --draft-tokens "
                 "auto's adaptive-dflash widths, which verify chains faster); rounds verify chains");
         }
         sampling_defaults = active->frontend.sampling_defaults();
@@ -277,10 +305,11 @@ public:
     EngineOptions normalize(EngineOptions engine_options) {
         bool offloaded_experts = false;
         try {
-            if (runtime::artifact_is_qwen4_exp(engine_options.artifact_path)) {
+            const artifact::Reader reader(engine_options.artifact_path);
+            if (runtime::artifact_is_qwen4_exp(reader)) {
                 architecture = models::Architecture::Qwen4Exp;
             } else {
-                offloaded_experts = runtime::artifact_offloads_experts(engine_options.artifact_path);
+                offloaded_experts = runtime::artifact_offloads_experts(reader);
             }
         } catch (const std::exception&) {}
         runtime::validate_engine_options(engine_options, architecture, offloaded_experts);
@@ -448,6 +477,16 @@ std::vector<TokenId> Engine::tokenize_text(std::string_view text) const {
     return impl_->frontend().tokenize_text(text);
 }
 
+std::string Engine::detokenize(std::span<const TokenId> token_ids) const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return impl_->frontend().detokenize(token_ids);
+}
+
+ChatTokens Engine::tokenize_chat(PromptInput input) const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return impl_->frontend().tokenize_chat(std::move(input));
+}
+
 ScoreResult Engine::score_tokens(std::vector<TokenId> tokens, std::uint32_t first_target,
                                  ScoreOptions options) {
     nvtx::ScopedRange score_range(nvtx::Name::Score, nvtx::Category::Scoring,
@@ -466,12 +505,19 @@ ScoreResult Engine::score_tokens(std::vector<TokenId> tokens, std::uint32_t firs
     if (options.top_k > kMaximumScoreTopTokens ||
         options.candidates_per_position > kMaximumScoreTopTokens) {
         throw std::invalid_argument("score_tokens top_k and candidates_per_position must be in "
-                                    "[0,64]");
+                                    "[0,kMaximumScoreTopTokens]");
     }
     if (options.candidates.size() != positions * options.candidates_per_position) {
         throw std::invalid_argument(
             "score_tokens needs candidates_per_position candidates for every scored position");
     }
+    if (options.logits_positions.size() > kMaximumScoreLogitPositions ||
+        !std::ranges::is_sorted(options.logits_positions, std::ranges::less_equal{}) ||
+        (!options.logits_positions.empty() && options.logits_positions.back() >= positions)) {
+        throw std::invalid_argument("score_tokens logits_positions must be strictly ascending scored positions, at "
+                                    "most kMaximumScoreLogitPositions");
+    }
+    const std::size_t logit_rows       = options.logits_positions.size();
     const std::size_t top_values       = positions * options.top_k;
     const std::size_t candidate_values = options.candidates.size();
     PreparedPrompt prompt              = prepare_tokens(std::move(tokens), false);
@@ -488,7 +534,8 @@ ScoreResult Engine::score_tokens(std::vector<TokenId> tokens, std::uint32_t firs
         impl_->core);
     if (result.logprobs.size() != positions || result.top_ids.size() != top_values ||
         result.top_logprobs.size() != top_values ||
-        result.candidate_logprobs.size() != candidate_values) {
+        result.candidate_logprobs.size() != candidate_values ||
+        (logit_rows == 0 ? !result.logits.empty() : result.logits.empty() || result.logits.size() % logit_rows != 0)) {
         throw std::logic_error("target Program returned an invalid causal score count");
     }
     return result;
@@ -556,6 +603,9 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
                 if (cancellation.requested()) { result.finish_reason = FinishReason::Cancelled; }
                 return std::move(result);
             }
+
+            // Answered on submit: no queue, so no admission to wait for.
+            void await_admission(const CancellationView&) const noexcept {}
         } immediate{.consumer_mode = consumer_mode};
 
         immediate.result.prompt                     = prompt_summary;
@@ -662,6 +712,22 @@ bool Engine::is_available() const {
         impl_->core);
 }
 
+bool Engine::has_failed() const {
+    if (impl_ == nullptr) { return false; }
+    return std::visit(
+        [](const auto& core) {
+            using CoreState = std::remove_cvref_t<decltype(core)>;
+            if constexpr (std::is_same_v<CoreState, std::monostate>) {
+                return false;
+            } else if constexpr (requires { core->has_failed(); }) {
+                return core != nullptr && core->has_failed();
+            } else {
+                return false; // a causal scoring core fails its call instead
+            }
+        },
+        impl_->core);
+}
+
 void Engine::reset_memory_peaks() noexcept {
     if (impl_ == nullptr) { return; }
     std::visit(
@@ -669,6 +735,17 @@ void Engine::reset_memory_peaks() noexcept {
             using CoreState = std::remove_cvref_t<decltype(core)>;
             if constexpr (!std::is_same_v<CoreState, std::monostate>) {
                 core->reset_memory_peaks();
+            }
+        },
+        impl_->core);
+}
+
+void Engine::reset_execution_maxima() noexcept {
+    if (impl_ == nullptr) { return; }
+    std::visit(
+        [](auto& core) {
+            if constexpr (requires { core->reset_execution_maxima(); }) {
+                core->reset_execution_maxima();
             }
         },
         impl_->core);

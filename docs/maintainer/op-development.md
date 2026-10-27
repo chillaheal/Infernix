@@ -482,16 +482,29 @@ Different production routes use different criteria only when their arithmetic or
 profiles differ materially. Widening a criterion requires a numerical reason and requalification
 of its complete affected domain; one failing implementation is not sufficient justification.
 
+**Repeat and compare.** A route with a pipeline (cp.async or TMA stages), atomics, a persistent work
+counter or a second stream also checks that repeated identical calls give the same bits:
+`verify_repeatable` (`tests/ops/op_tester.h`) reruns the call with its outputs poisoned between runs
+and a copy streaming on a second stream beside it, and compares every output byte with the first
+run. A race between a stage's producer and its consumers corrupts one call in many and only under
+other traffic (the TMA proxy fence race showed in 19 of 20 cases under a side stream, never alone),
+which a single call against the oracle does not see. **A bit-identity claim needs a fixture that can
+fail it:** before two routes are declared identical, the test confirms that its inputs make
+summation order visible (`summation_order_visible`: some row's FP32 sum differs between two orders),
+or the comparison only shows that both orders agree on easy data.
+
 Op qualification does not show what a change does to a whole model's output. On artifacts with
 4-bit activations even reordered arithmetic moves the output distribution measurably, so a
 model-level claim follows [Model-level numerical quality](model-quality.md): several prefill chunk
 sizes, KL divergence to the lossless-route reference, and the decode-quality judge for decode
 paths.
 
-The oracle leaves private arithmetic free, but the product does not: the exact route's output is
-bit-exact from release to release ([acceptance policy](model-quality.md#6-numerical-acceptance-policy-and-fast-paths)).
-A schedule or route change that alters an exact-route Op's output bits for speed is a fast path
-(`infernix::FastPath`). The Op exposes it through an envelope or policy field named for the path
+The oracle leaves private arithmetic free, and a new version may change an exact-route Op's output bits,
+for speed as well as precision, while the Op still meets its criterion against its oracle and keeps its
+determinism and column invariance (the release says so;
+[acceptance policy](model-quality.md#6-numerical-acceptance-policy-and-fast-paths)). A schedule or route
+change that would fall below that criterion, or make a column's bits depend on the call's other columns or on
+scheduling, is a fast path (`infernix::FastPath`). The Op exposes it through an envelope or policy field named for the path
 (for example `CausalAttentionExecutionEnvelope::decode_split64`) that model planning sets from the
 configuration's fast-path selection (`models/qwen3_5/program/planning/fast_paths.h`), sizes its
 workspace from the same field, and qualifies it in its suite against the same oracle and criterion

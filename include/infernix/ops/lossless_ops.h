@@ -16,6 +16,33 @@ namespace infernix::ops {
 // (src/ops/lossless/cr_math.cuh). Tensors are contiguous; out may alias an input of the same shape.
 
 /**
+ * The noise twin (EngineOptions::lossless_noise_seed; IQS-2's noise floor): with a nonzero seed every
+ * correctly rounded result of the lossless ops becomes a stochastic rounding of the same exact value
+ * (src/ops/lossless/noise.cuh); 0 restores round to nearest even. Process-wide device state of every
+ * lossless unit, set before the ops run.
+ */
+void lossless_set_noise_seed(std::uint64_t seed);
+
+/**
+ * The noise twin's attribution: the lossless ops grouped by the unit that rounds them. The noise applies only
+ * to the chosen groups (a bit mask of LosslessNoiseUnit), and at `scale` (in (0, 1]) of its strength: every
+ * stochastic rounding moves to the other neighbour with `scale` times the probability the twin gives it.
+ * lossless_set_noise_seed is every group at full strength.
+ */
+enum class LosslessNoiseUnit : std::uint32_t {
+    Elementwise = 1U << 0, // norms, residual adds, activations, gates, the causal convolution, the gated norm
+    Attention   = 1U << 1, // full attention (and the design reference's codec attention)
+    Flash       = 1U << 2, // Flash-Next's own operations (hyper-connections, per-layer embeddings, QSA)
+    DeltaRule   = 1U << 3, // the gated delta rule's recurrence
+    Moe         = 1U << 4, // routing, the experts' combine
+    Rope        = 1U << 5,
+    Linear      = 1U << 6, // every projection and the head
+    Gguf        = 1U << 7, // the GGUF-format projections
+};
+inline constexpr std::uint32_t kAllLosslessNoiseUnits = 0xFFU;
+void lossless_set_noise(std::uint64_t seed, std::uint32_t units, float scale);
+
+/**
  * Qwen3_5RMSNorm over rows of x (BF16 [width, rows]) with weight w (BF16 or FP32 [width]):
  * out = bf16(fp32(y fp32(1 + w))), y = fp32(x r), r = fp32(rsqrt(fp32(m + eps))), m = fp32(mean(x^2))
  * (the sum of squares exact).
@@ -132,6 +159,46 @@ void lossless_kv_append(const Tensor& k, const Tensor& v, const Tensor& position
                         const Tensor& table_rows, const PagedKVBatchLayerView& cache, cudaStream_t stream);
 
 /**
+ * The design reference's KV storage (docs/maintainer/lossless-route.md §3b): one plane of a window's stored
+ * rows, row t Hkv + h for key t and KV head h, per row `codes` (256 bytes for INT8 and FP8, 128 for NVFP4
+ * and Q4, 64 for VQ2: 32 16-bit words) and `scales` (four FP16 group scales for INT8, one FP16 scale for FP8,
+ * Q4 and VQ2, sixteen E4M3 group scales for NVFP4). A row's value is exact: each code times its scale
+ * (src/ops/kv_cache's codecs), and for a rotated plane x = R y with y those values and R = H_256 / 16
+ * (Sylvester's order, R^T = R).
+ */
+enum class LosslessKvCodec : std::uint8_t { Int8G64, Fp8Row, Nvfp4G16, Q4Lloyd, Vq2 };
+struct LosslessKvPlane {
+    LosslessKvCodec codec      = LosslessKvCodec::Int8G64;
+    bool rotated               = false;
+    const std::uint8_t* codes  = nullptr;
+    const std::uint8_t* scales = nullptr;
+};
+/// A KV format's planes for one window: K and V, and for the VQ formats the exact window's INT8 rows of
+/// the rotated K and V (window_k.codes null: none), which serve key j of query t when j < window_sinks or
+/// j >= t - window_recent (the production read rule, kKVWindowSinkTokens and kKVWindowRecentTokens); the
+/// code planes serve every other key.
+struct LosslessKvCodes {
+    LosslessKvPlane k, v, window_k, window_v;
+    int window_sinks  = 0;
+    int window_recent = 0;
+};
+/// The bytes lossless_kv_encode writes for a window of `columns` keys of `storage` (not BFloat16).
+[[nodiscard]] std::size_t lossless_kv_encode_bytes(KvCacheStorage storage, int kv_heads, int columns);
+/// Encodes K and V (contiguous BF16 [256, Hkv, T]) with `storage`'s production encoder, bit for bit as
+/// kv_cache_append stores them, into `buffer` (and for the VQ formats every key's window rows, as the
+/// append's window copy encodes them); returns the planes.
+[[nodiscard]] LosslessKvCodes lossless_kv_encode(const Tensor& k, const Tensor& v, KvCacheStorage storage,
+                                                 void* buffer, cudaStream_t stream);
+/// lossless_attention's window form over stored KV rows: key j's k and v the exact values of its rows
+/// (the code planes, or the window's under its rule); scores, exponentials, sums and rounding as
+/// lossless_attention's, `select` and `ratio` likewise. q and out BF16 [256, Hq, T]; the workspace is
+/// lossless_codec_attention_workspace_bytes(Hq, Hkv, T).
+[[nodiscard]] std::size_t lossless_codec_attention_workspace_bytes(int query_heads, int kv_heads, int columns);
+void lossless_codec_attention(const Tensor& q, const LosslessKvCodes& kv, int kv_heads, Tensor& out, void* workspace,
+                              cudaStream_t stream, const std::uint32_t* select = nullptr, int select_words = 0,
+                              int ratio = 0);
+
+/**
  * RoPE (Hugging Face's rotary module and apply_rotary_pos_emb, rotary dims R of each head, pairs P = R/2):
  * lossless_rope_frequencies writes inv_freq_i = fp32(1 / fp32(theta^(2i / R))) (FP32 [P]);
  * lossless_rope_table writes, per column t and pair i, cos and sin of fp32(position inv_freq_i), each
@@ -156,7 +223,8 @@ void lossless_router(const Tensor& logits, int experts, int top_k, Tensor& weigh
 
 /**
  * The routed experts' columns: C = lossless_moe_columns(T, top_k, E) gathered columns, each expert's
- * (slot, column) pairs in its own run of whole 64-column tiles. lossless_moe_route fills tile_experts
+ * (slot, column) pairs in its own run of whole 64-column tiles; C = 64 floor((N + 63 min(E, N)) / 64)
+ * for N = top_k T pairs, the most the padded runs can take. lossless_moe_route fills tile_experts
  * (I32 [C / 64]: the tile's expert, -1 unused), slot_column (I32 [top_k, T]: where each pair's column
  * went) and column_token (I32 [C]: the source column, -1 padding), with counts (I32 [E]) as scratch;
  * lossless_moe_gather copies x (BF16 [H, T]) into gathered (BF16 [H, C]), padding zero, for

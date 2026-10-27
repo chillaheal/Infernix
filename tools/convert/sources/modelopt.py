@@ -133,17 +133,31 @@ def nvfp4_values(words: Nvfp4MatrixWords) -> torch.Tensor:
     return _E2M1[codes.long()] * scales * float(words.weight_scale_2)
 
 
-def nvfp4_values_source(store: SafetensorsSource, leaf: str, shape: tuple[int, int]) -> LogicalSource:
-    """The exact values (binary64) of one ModelOpt NVFP4 matrix ``leaf`` with NVIDIA's multiplier
-    semantics, for a recipe that casts or re-quantizes it (a weight-only W4A16 tensor: the vision
-    MLPs and MTP experts of Qwen3.8-Flash-Next-FP4-Local). The generic NVFP4 reader divides by the
-    multiplier's rounded reciprocal instead."""
+NVFP4_MUL_FORMAT = "nvfp4_mul"
+
+
+def nvfp4_mul_matrix_source(store: SafetensorsSource, leaf: str, shape: tuple[int, int]) -> LogicalSource:
+    """One ModelOpt NVFP4 matrix ``leaf`` with NVIDIA's multiplier semantics (a weight-only W4A16
+    tensor: the vision MLPs and merger and the MTP experts of Qwen3.8-Flash-Next-FP4-Local): its exact
+    values (binary64), for a recipe that re-quantizes it, and its stored words as ``nvfp4_mul``
+    encoded rows (packed E2M1 codes ``uint8 [rows, K / 2]``, E4M3FN block scales ``uint8
+    [rows, K / 16]``, plain or restored from NVFP4-CSF, and the FP32 ``weight_scale_2`` word as the
+    multiplier), for an exact import. The generic NVFP4 reader divides by the multiplier's rounded
+    reciprocal instead."""
 
     n, k = shape
 
+    def encoded(begin: int, end: int) -> EncodedRows:
+        # Each read decodes the whole matrix's words and keeps the rows it covers (no per-matrix
+        # cache: a conversion reads thousands of these matrices).
+        if not 0 <= begin < end <= n:
+            raise ValueError(f"{leaf}: invalid encoded rows [{begin},{end})")
+        words = nvfp4_matrix_words(store, leaf, shape)
+        multiplier = words.weight_scale_2.reshape(1).view(torch.uint8).numpy().tobytes()
+        return EncodedRows(NVFP4_MUL_FORMAT, words.codes[begin:end].contiguous(), words.scales[begin:end].contiguous(),
+                           None, multiplier)
+
     def read(begin: int, end: int) -> torch.Tensor:
-        # Each read decodes only the rows it covers (no per-matrix cache: a conversion reads
-        # thousands of these matrices).
         if begin == end:
             return torch.empty(0, dtype=torch.float64)
         first, last = begin // k, -(-end // k)
@@ -151,7 +165,7 @@ def nvfp4_values_source(store: SafetensorsSource, leaf: str, shape: tuple[int, i
         rows = Nvfp4MatrixWords(words.codes[first:last], words.scales[first:last], words.weight_scale_2, None)
         return nvfp4_values(rows).reshape(-1)[begin - first * k : end - first * k]
 
-    return LogicalSource(shape, f"{store.path}:{leaf} (NVFP4 values)", read)
+    return LogicalSource(shape, f"{store.path}:{leaf} ({NVFP4_MUL_FORMAT})", read, encoded)
 
 
 def is_mxfp8_matrix(store: SafetensorsSource, prefix: str, shape: tuple[int, int]) -> bool:
@@ -298,3 +312,37 @@ def dequantize_fp8_block128(codes: torch.Tensor, scales: torch.Tensor, block: in
     expanded = scales.to(torch.float64).repeat_interleave(block, dim=-2)[..., :n, :]
     expanded = expanded.repeat_interleave(block, dim=-1)[..., :k]
     return codes.view(torch.float8_e4m3fn).to(torch.float64) * expanded
+
+
+def is_fp8_block_matrix(store: SafetensorsSource, prefix: str) -> bool:
+    """``prefix.weight`` is E4M3FN with a ``weight_scale_inv`` tile multiplier per 128 x 128."""
+
+    return (
+        store.has(prefix + ".weight_scale_inv")
+        and store.has(prefix + ".weight")
+        and store.describe(prefix + ".weight").dtype == "F8_E4M3"
+    )
+
+
+def fp8_block_values(store: SafetensorsSource, leaf: str, shape: tuple[int, int]) -> LogicalSource:
+    """The exact values of one block-FP8 matrix ``leaf`` (code x FP32 tile multiplier, binary64).
+
+    NVIDIA stores Qwen3.8-Flash-Next's MTP routed experts this way, per expert, and so does ModelOpt's
+    ``FP8_PB_WO`` (dealignai's Ornith-1.5-122B-UNCENSORED MTP experts). Each read decodes only the rows
+    it covers, so a recipe's row-chunked quantizer never holds more than one matrix's codes.
+    """
+
+    n, k = shape
+
+    def read(begin: int, end: int) -> torch.Tensor:
+        if begin == end:
+            return torch.empty(0, dtype=torch.float64)
+        first, last = begin // k, -(-end // k)
+        codes, scales = fp8_block_matrix_words(store, leaf, shape)
+        lo, hi = first // 128 * 128, -(-last // 128) * 128
+        rows = dequantize_fp8_block128(codes[lo:min(hi, n)], scales[lo // 128 : -(-min(hi, n) // 128)])
+        flat = rows.reshape(-1)
+        start = begin - lo * k
+        return flat[start : start + end - begin]
+
+    return LogicalSource(shape, f"{store.path}:{leaf}", read)

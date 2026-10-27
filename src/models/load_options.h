@@ -3,6 +3,7 @@
 #include "models/registry.h"
 #include "infernix/types.h"
 
+#include <algorithm>
 #include <filesystem>
 #include <string_view>
 
@@ -20,8 +21,10 @@ struct LoadOptions {
     // route.
     bool lossless = false;
     // The design reference (EngineOptions::reference, with lossless): every Use keeps its declared
-    // activation permission, which the lossless route applies as the design (lossless-route.md §3b).
-    bool reference = false;
+    // activation permission, which the lossless route applies as the design (lossless-route.md §3b), and
+    // K and V cross the KV format reference_kv's codec (bf16 without the reference).
+    bool reference              = false;
+    KvCacheStorage reference_kv = KvCacheStorage::BFloat16;
     // Qwen4Exp: routed expert banks whose 4-bit activations are optional run them (W4A4).
     bool expert_a4_activations = false;
     // Offloaded routed expert banks (Qwen4Exp, Qwen3.5 with offloaded experts) stay in the artifact
@@ -30,6 +33,17 @@ struct LoadOptions {
     bool stream_experts = false;
     // Qwen4Exp DFlash2: the companion artifact of the drafter (SpeculativeOptions::draft_model).
     std::filesystem::path draft_model;
+    // Qwen4Exp: the artifact's 2-bit screens (--screen-heads), each bound when present for its consumer (an
+    // artifact without them loads as before): the MTP drafter's proposal head (Generation with --spec mtp
+    // --lm-head-draft) and the LM head (Generation with fast paths, where screened-lm-head may be selected).
+    // screened_lm_head (the fast path asked for as a candidate) needs the LM head's screen: an artifact
+    // without it is refused.
+    bool proposal_head_screen = false;
+    bool lm_head_screen       = false;
+    bool screened_lm_head     = false;
+    // Qwen3.5 (EngineOptions::embedding_host): the token embedding stays in pinned host memory, gathered
+    // zero-copy, as an artifact with offloaded experts already keeps it.
+    bool embedding_host = false;
 
     bool operator==(const LoadOptions&) const = default;
 
@@ -91,8 +105,20 @@ struct LoadOptions {
             .rope_yarn_factor         = options.rope_yarn_factor,
             .lossless                 = options.lossless,
             .reference                = options.reference,
+            .reference_kv             = options.reference ? options.kv_cache : KvCacheStorage::BFloat16,
             .expert_a4_activations    = options.expert_a4_activations,
-            .draft_model              = options.speculative.draft_model};
+            .draft_model              = options.speculative.draft_model,
+            // The screens are Qwen4Exp's (a Qwen3.5 Program compares these options with its loaded ones).
+            .proposal_head_screen     = architecture == Architecture::Qwen4Exp &&
+                                    options.purpose == EnginePurpose::Generation &&
+                                    options.speculative.backend == SpeculativeBackend::Mtp &&
+                                    options.speculative.proposal_head == ProposalHead::Optimized,
+            .lm_head_screen           = architecture == Architecture::Qwen4Exp &&
+                                    options.purpose == EnginePurpose::Generation && options.fast_paths &&
+                                    !options.lossless,
+            .screened_lm_head         = std::find(options.fast_path_candidates.begin(), options.fast_path_candidates.end(),
+                                                  FastPath::ScreenedLmHead) != options.fast_path_candidates.end(),
+            .embedding_host           = options.embedding_host};
 }
 
 } // namespace infernix::models

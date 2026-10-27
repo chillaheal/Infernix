@@ -5,6 +5,7 @@
 #include <chrono>
 #include <functional>
 #include <memory>
+#include <span>
 #include <string_view>
 #include <vector>
 
@@ -23,6 +24,9 @@ public:
 
     [[nodiscard]] const PromptSummary& summary() const noexcept;
     [[nodiscard]] const PromptPreparationStats& preparation_stats() const noexcept;
+    // The token ids the Engine will process for this prompt (chat template applied), for
+    // measurement tools that score a rendered conversation; empty for an empty prompt.
+    [[nodiscard]] std::span<const TokenId> token_ids() const noexcept;
     [[nodiscard]] explicit operator bool() const noexcept;
 
 private:
@@ -48,6 +52,14 @@ public:
     [[nodiscard]] const ResolvedSamplingParameters& resolved_sampling() const noexcept;
 
     GenerationResult wait(OutputSink* sink = nullptr, const CancellationView& cancellation = {});
+
+    // Blocks until the Engine admits this handle's request (the boundary that publishes its
+    // GenerationStart) or answers it before admission, consuming nothing: wait() still delivers every
+    // event. An error answered before admission (a queue timeout, an orderly stop) is rethrown here as
+    // wait() would rethrow it, so a streaming route can answer with a plain HTTP status before it
+    // commits a response; a request settled without admission and without an error (cancelled while
+    // queued) returns, and wait() gives its answer. Valid on a stream-consumed handle only.
+    void await_admission(const CancellationView& cancellation = {});
 
 private:
     class Impl;
@@ -77,6 +89,15 @@ public:
 
     // Artifact-tokenizer raw-text encoding. No chat template or implicit special token is added.
     [[nodiscard]] std::vector<TokenId> tokenize_text(std::string_view text) const;
+
+    // Artifact-tokenizer decoding of token ids, special tokens included. The bytes of a character
+    // that the ids cut are returned as they are (not necessarily valid UTF-8).
+    [[nodiscard]] std::string detokenize(std::span<const TokenId> token_ids) const;
+
+    // The token ids of a text chat rendered with the artifact's chat template, whatever their number: unlike
+    // prepare(), no max_context or capacity limit applies (a measurement tool cuts its windows from them).
+    // Also marks the tokens the model writes (the assistant messages) apart from the prompt text.
+    [[nodiscard]] ChatTokens tokenize_chat(PromptInput input) const;
 
     // Returns log p(tokens[i] | tokens[0..i)) for i in [first_target,tokens.size()), and the
     // distribution outputs options requests for those positions.
@@ -113,6 +134,9 @@ public:
     // instruction turn that arrived in an unsupported position to a role the template does render.
     [[nodiscard]] ChatTemplateRoleSupport chat_template_role_support() const;
     [[nodiscard]] bool is_available() const;
+    // True once an execution failure has ended every request: the Engine refuses new work until
+    // the process starts a new one. An orderly stop() is not a failure.
+    [[nodiscard]] bool has_failed() const;
 
     // LLM<->image VRAM coexistence: whether the loaded model supports an image interlude (today the
     // qwen4_exp Program). run_image_interlude suspends generation, yields physical VRAM toward the
@@ -142,6 +166,9 @@ public:
                                                    std::uint64_t margin_bytes) const;
 
     void reset_memory_peaks() noexcept;
+    // Restarts RuntimeStats::execution's maxima (counts and totals keep running), so they describe
+    // what follows: a benchmark's measured runs, or serving after the startup warm-up.
+    void reset_execution_maxima() noexcept;
 
     // Begins the orderly stop without waiting for it: new work is refused, and queued and active
     // generation requests end with an Unavailable error within one unit of work. A Generation

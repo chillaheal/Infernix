@@ -11,10 +11,11 @@ import sys
 from collections.abc import Mapping
 
 from .official_recipes import RECIPES
-from .pipeline import convert
+from .pipeline import DEFAULT_MAX_BUFFERED_BYTES, convert
 from .proposal import DEFAULT_RANKING, add_official_proposal
 from . import qwen4_exp
 from . import qwen_image
+from .screen import add_screen_heads
 from .qwen3_5 import build_model
 from .recipe import Recipe
 from .sources.safetensors import SafetensorsSource
@@ -146,6 +147,12 @@ def main(argv=None):
     )
     parser.add_argument("--proposal-rows", type=int, default=131072)
     parser.add_argument("--ranking", type=Path, default=DEFAULT_RANKING)
+    parser.add_argument(
+        "--screen-heads",
+        action="store_true",
+        help="Qwen4Exp: add 2-bit screens (q2_g64_fp16) of the LM head and, with --proposal, of the "
+        "proposal head, for the screened heads (tools/convert/screen.py); the artifact's last objects",
+    )
     parser.add_argument("--name", help="public instance name saved in metadata")
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--device", default="cuda")
@@ -154,7 +161,15 @@ def main(argv=None):
         type=int,
         default=1,
         help="parallel CPU weight conversion workers (--device cpu only); each of up to "
-        "2 x WORKERS objects in flight is held whole in RAM",
+        "2 x WORKERS objects in flight is held whole in RAM, within --max-buffered-bytes",
+    )
+    parser.add_argument(
+        "--max-buffered-bytes",
+        type=int,
+        default=DEFAULT_MAX_BUFFERED_BYTES,
+        help="with --workers > 1: at most this many bytes of in-flight objects are buffered "
+        "(one larger object still converts, alone); the workers' source reads and temporaries "
+        f"come on top (default {DEFAULT_MAX_BUFFERED_BYTES})",
     )
     parser.add_argument("--rows-per-chunk", type=int, default=512)
     parser.add_argument("--max-file-bytes", type=int, default=32_000_000_000)
@@ -175,8 +190,9 @@ def main(argv=None):
         action="append",
         default=[],
         metavar="SHARD",
-        help="Qwen4Exp: import the weights bit-exactly from these GGUF shards (all of one split model); "
-        "--model then supplies the config, frontend resources and, with the mtp component, the MTP head",
+        help="import the weights bit-exactly from these GGUF shards (all of one split model): a Qwen4Exp "
+        "GGUF, or a Qwen3.5 dense qwen35 GGUF (text only); --model then supplies the config, frontend "
+        "resources and, for Qwen4Exp with the mtp component, the MTP head",
     )
     parser.add_argument(
         "--mmproj",
@@ -209,6 +225,7 @@ def main(argv=None):
             or args.gguf
             or args.mmproj
             or args.proposal
+            or args.screen_heads
             or args.ngram_out
             or args.ngram_reuse
             or overrides
@@ -225,16 +242,13 @@ def main(argv=None):
             )
         gguf_store = None
         if args.gguf:
-            if not qwen4:
-                raise ValueError("--gguf imports Qwen4Exp GGUFs; --model must be its Qwen checkpoint")
-            from . import qwen4_exp_gguf
             from .sources.gguf_raw import GgufStore
 
             gguf_store = stack.enter_context(GgufStore(args.gguf))
         mmproj = None
         if args.mmproj is not None:
-            if gguf_store is None:
-                raise ValueError("--mmproj supplies the vision tower of a --gguf import")
+            if gguf_store is None or not qwen4:
+                raise ValueError("--mmproj supplies the vision tower of a Qwen4Exp --gguf import")
             from .sources.gguf import GGUFSource
 
             mmproj = stack.enter_context(GGUFSource(args.mmproj))
@@ -251,6 +265,8 @@ def main(argv=None):
                 if ngram_format == "bf16":
                     raise ValueError("a GGUF import binds its own IQ4_NL volume; give it a BF16 volume at run "
                                      "time with --ngram-volume")
+                from . import qwen4_exp_gguf
+
                 model = qwen4_exp_gguf.build_model(
                     base, gguf_store, components=components, resource_overrides=overrides, mmproj=mmproj
                 )
@@ -280,19 +296,31 @@ def main(argv=None):
                 raise ValueError("--ngram-out applies only to Qwen4Exp sources")
             if args.expert_profile is not None:
                 raise ValueError("--expert-profile applies only to Qwen4Exp sources")
-            companions = {
-                key: sources[key] for key in ("dflash", "dflash2") if key in components
-            }
-            model = build_model(
-                base,
-                components=components,
-                companions=companions,
-                resource_overrides=overrides,
-            )
+            if gguf_store is not None:
+                from . import qwen3_5_gguf
+
+                model = qwen3_5_gguf.build_model(
+                    base, gguf_store, components=components, resource_overrides=overrides
+                )
+            else:
+                companions = {
+                    key: sources[key] for key in ("dflash", "dflash2") if key in components
+                }
+                model = build_model(
+                    base,
+                    components=components,
+                    companions=companions,
+                    resource_overrides=overrides,
+                )
         recipe = Recipe(model)
         _function(args.recipe)(model, recipe, sources)
         if args.proposal:
             add_official_proposal(recipe, ranking=args.ranking, rows=args.proposal_rows)
+        if args.screen_heads:
+            # After every other parameter: the copies are the artifact's last objects.
+            if not qwen4 or gguf_store is not None:
+                raise ValueError("--screen-heads screens a Qwen4Exp artifact converted from its checkpoint (not --gguf)")
+            add_screen_heads(recipe)
         if args.override:
             _function(args.override)(model, recipe, sources)
 
@@ -320,6 +348,8 @@ def main(argv=None):
             provenance["ranking"] = str(args.ranking)
         if args.expert_profile is not None:
             provenance["expert_profile"] = str(args.expert_profile)
+        if args.screen_heads:
+            provenance["screen_heads"] = {"format": "q2_g64_fp16", "method": "grouped_mse_norm"}
         report = convert(
             model,
             recipe,
@@ -329,6 +359,7 @@ def main(argv=None):
             device=args.device,
             rows_per_chunk=args.rows_per_chunk,
             workers=args.workers,
+            max_buffered_bytes=args.max_buffered_bytes,
             max_file_bytes=args.max_file_bytes,
             progress=progress,
         )

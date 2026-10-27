@@ -19,6 +19,9 @@ public:
     void rejected();
     void failed(bool cancelled);
     void response_failed();
+    // A Chat Completions request's tool-call turns sent without reasoning, and those restored
+    // (--restore-tool-reasoning).
+    void reasoning(std::size_t missing, std::size_t restored);
     [[nodiscard]] std::string render(const RuntimeStats& runtime, bool ready) const;
 
     struct RequestCounts {
@@ -45,6 +48,8 @@ private:
         std::uint64_t failed            = 0;
         std::uint64_t rejected          = 0;
         std::uint64_t response_failures = 0;
+        std::uint64_t reasoning_missing  = 0;
+        std::uint64_t reasoning_restored = 0;
         std::array<std::uint64_t, 3> constraint_outcomes{};
         std::array<std::uint64_t, 3> constraint_cache{};
         double constraint_prepare_seconds     = 0;

@@ -370,6 +370,10 @@ int main(int argc, char** argv) {
             operational_log.listen_failure(options.host, options.port);
             return 1;
         }
+        if (server.engine_failed()) {
+            operational_log.engine_failure_exit(infernix::serve::kEngineFailureExitStatus);
+            return infernix::serve::kEngineFailureExitStatus;
+        }
         operational_log.server_stopped();
         return 0;
     } catch (const std::exception& exception) {

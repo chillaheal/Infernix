@@ -1,5 +1,6 @@
 #include "serve/serve_options.h"
 #include "product/config/config_file.h"
+#include "product/logits_options.h"
 #include "product/speculative_options.h"
 
 #include <algorithm>
@@ -53,6 +54,7 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--lossless", false},
     ServeOptionArity{"--fast-path", true, true},
     ServeOptionArity{"--expert-a4-activations", false},
+    ServeOptionArity{"--embedding-host", false},
     ServeOptionArity{"--context-cost-presets"},
     ServeOptionArity{"--log-stats-interval-ms"},
     ServeOptionArity{"--log-colours"},
@@ -82,6 +84,7 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--expert-ram-mib"},
     ServeOptionArity{"--expert-pin-mib"},
     ServeOptionArity{"--kv-dtype"},
+    ServeOptionArity{"--logits-dtype"},
     ServeOptionArity{"--spec"},
     ServeOptionArity{"--draft-tokens"},
     ServeOptionArity{"--draft-model"},
@@ -111,6 +114,8 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--no-thinking", false},
     ServeOptionArity{"--preserve-thinking", false},
     ServeOptionArity{"--tolerant-tool-calls", false},
+    ServeOptionArity{"--restore-tool-reasoning", false},
+    ServeOptionArity{"--any-model-name", false},
     ServeOptionArity{"--cors", false},
     ServeOptionArity{"--usage-chunk-choice", false},
     ServeOptionArity{"--temperature"},
@@ -288,14 +293,14 @@ std::string serve_usage_text(const char* argv0) {
            "                             slows 1-2K-token chunks over long context (64: up\n"
            "                             to 27% slower attention; 0: no splitting)\n"
            "  --reproducible             run the reproducible route (the same bits on every\n"
-           "                             run and release, whatever else is running):\n"
+           "                             run of this build, whatever else is running):\n"
            "                             without it, every path qualified and measured\n"
            "                             faster for this artifact's kernels and KV type\n"
            "                             runs (within Infernix's numerical quality\n"
            "                             policy; startup lists them; docs/serving.md)\n"
            "  --lossless                 run the lossless route: every operation of the\n"
            "                             model correctly rounded at its own BF16 points\n"
-           "                             (FP32 logits), so the output depends on the\n"
+           "                             (logits as --logits-dtype), so the output depends on the\n"
            "                             request and the artifact alone; text with\n"
            "                             --kv-dtype bf16, no speculation; slower\n"
            "                             (docs/maintainer/lossless-route.md)\n"
@@ -306,6 +311,10 @@ std::string serve_usage_text(const char* argv0) {
            "                             the activation scales NVIDIA calibrated for them.\n"
            "                             Changes the output. No other artifact supports it\n"
            "                             (default: 16-bit activations, as NVIDIA serves it)\n"
+           "  --embedding-host           Qwen3.5-family artifacts: keep the token embedding in\n"
+           "                             pinned host memory, read zero-copy, so its VRAM\n"
+           "                             (1.18 GiB on the 27B) goes to the KV and prefix caches.\n"
+           "                             Same output; prompts read their rows over PCIe\n"
            "  --no-cuda-graph            disable CUDA-graph decode rounds (on by default)\n"
            "  --default-max-tokens N     default max_tokens when a request omits it\n"
            "                             (default " +
@@ -314,9 +323,11 @@ std::string serve_usage_text(const char* argv0) {
            "  --default-thinking-budget N  cap model-origin thinking for enabled\n"
            "                             requests; control tokens count toward the\n"
            "                             request output limit\n"
-           "  --no-thinking-answer-room  without a budget, thinking may use all of\n"
-           "                             max_tokens (default: from max_tokens 1024, thinking\n"
-           "                             closes early enough to leave a quarter for the answer)\n"
+           "  --no-thinking-answer-room  without a budget, thinking may use all of the\n"
+           "                             output limit (default: from a limit of 1024, thinking\n"
+           "                             closes early enough to leave a quarter for the answer;\n"
+           "                             the limit is max_tokens or the context the prompt\n"
+           "                             leaves, whichever is less)\n"
            "  --thinking-budget-message S  message fed to the model when it hits its thinking\n"
            "                             budget, replacing the built-in end-of-thinking notice\n"
            "                             (wrap the message in double quotes, e.g.\n"
@@ -334,6 +345,9 @@ std::string serve_usage_text(const char* argv0) {
            "                             the thinking-budget message and lets the model answer\n"
            "  --model-id ID              override the artifact metadata.name reported by\n"
            "                             the server\n"
+           "  --any-model-name           serve OpenAI requests whatever model name they\n"
+           "                             give, reporting the served model's name (off: any\n"
+           "                             other name is 404 model_not_found)\n"
            "  --chat-template FILE       replace the artifact frontend chat template at\n"
            "                             startup; must match a template the target accepts\n"
            "  --claude-code-prompt as-sent|local\n"
@@ -405,6 +419,10 @@ std::string serve_usage_text(const char* argv0) {
            "  --kv-dtype T               KV storage: bf16 (default) | int8 | fp8 | nvfp4 | k8v4 |\n"
            "                             vq2 | k4v2; bf16 stores K as BF16 and V as FP16 (exact\n"
            "                             for 2^-17 <= |v| < 2^16), with --lossless V as BF16\n"
+           "  --logits-dtype T           fp32 (default) | bf16: the head's logits the sampler,\n"
+           "                             greedy choice, draft acceptance and constraints read;\n"
+           "                             bf16 rounds each once, as Transformers returns them\n"
+           "                             (near-equal logits then tie), for comparisons\n"
            "  --no-prefix-reuse          disable the prefix cache: every request starts from\n"
            "                             the root and a preempted request recovers by\n"
            "                             replay; cannot be combined with any option below\n"
@@ -471,9 +489,11 @@ std::string serve_usage_text(const char* argv0) {
            "                             companion artifact (Qwen3.5/3.6 artifacts bundle\n"
            "                             theirs)\n"
            "  --lm-head-draft            use the optimized proposal head\n"
-           "  --spec-min-p P             Qwen3.8-Flash-Next mtp: verify drafts only up to\n"
-           "                             the first below probability P, 0-1 (default 0.5\n"
-           "                             with --draft-tokens auto, else 0 = all)\n"
+           "  --spec-min-p P             mtp (and Qwen3.8-Flash-Next dflash2): one-request\n"
+           "                             rounds verify drafts only up to the first below\n"
+           "                             probability P, 0-1 (Flash-Next default 0.5 with\n"
+           "                             --draft-tokens auto, else 0 = all; Qwen3.5/3.6\n"
+           "                             default 0)\n"
            "  --draft-tree-nodes auto|LIST\n"
            "                             dflash2: verify a small tree of alternative drafts\n"
            "                             each round instead of a single draft, so more drafted\n"
@@ -532,6 +552,10 @@ std::string serve_usage_text(const char* argv0) {
            "                             budget and an undeclared name, and return complete\n"
            "                             calls stranded in unclosed thinking (strict\n"
            "                             all-or-nothing by default)\n"
+           "  --restore-tool-reasoning   give a Chat Completions tool-call turn sent back\n"
+           "                             without its reasoning the reasoning this server\n"
+           "                             generated for it, so a tool loop keeps its\n"
+           "                             prefix-cache match (off by default)\n"
            "\n"
            "NETWORKING & RESOURCES\n"
            "  --host H                   listen address (default 127.0.0.1)\n"
@@ -731,6 +755,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.fast_path_candidates.push_back(*path);
         } else if (arg == "--expert-a4-activations") {
             options.expert_a4_activations = true;
+        } else if (arg == "--embedding-host") {
+            options.embedding_host = true;
         } else if (arg == "--context-cost-presets") {
             options.context_cost_presets = require_value("--context-cost-presets");
             if (options.context_cost_presets.empty()) {
@@ -929,6 +955,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             }
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_dtype(require_value("--kv-dtype"));
+        } else if (arg == "--logits-dtype") {
+            options.logits_dtype = product::parse_logits_dtype(require_value("--logits-dtype"));
         } else if (arg == "--spec") {
             options.speculative.backend =
                 product::parse_speculative_backend(require_value("--spec"));
@@ -1032,6 +1060,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.preserve_thinking = true;
         } else if (arg == "--tolerant-tool-calls") {
             options.tolerant_tool_calls = true;
+        } else if (arg == "--restore-tool-reasoning") {
+            options.restore_tool_reasoning = true;
+        } else if (arg == "--any-model-name") {
+            options.any_model_name = true;
         } else if (arg == "--cors") {
             options.enable_cors = true;
         } else if (arg == "--usage-chunk-choice") {

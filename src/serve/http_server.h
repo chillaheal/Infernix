@@ -8,6 +8,7 @@
 #include "serve/openai_common.h"
 #include "serve/operational_log.h"
 #include "serve/openai_responses_store.h"
+#include "serve/reasoning_store.h"
 #include "serve/request_log.h"
 #include "serve/serve_options.h"
 
@@ -26,6 +27,11 @@
 namespace infernix::serve {
 
 class ImageGenerationService;
+// infernix-serve's exit status after an Engine-wide failure stopped it, so a launcher can restart
+// it; startup and other failures exit with 1.
+inline constexpr int kEngineFailureExitStatus = 2;
+// How often a listening server checks the Engine for such a failure.
+inline constexpr std::chrono::milliseconds kEngineWatchInterval{250};
 
 void write_openai_error(httplib::Response& response, const ApiError& error);
 void write_anthropic_error(httplib::Response& response, const ApiError& error,
@@ -71,7 +77,11 @@ public:
     // The synchronous image route serves 503 image_generation_not_configured until this is called
     // (serve started without --image-artifact, or the pipeline is still incomplete).
     void attach_images(ImageGenerationService& images);
+    // Returns once stop() or an Engine-wide failure (engine_failed()) ends the accept loop.
     bool listen();
+    // Whether listen() returned because the Engine failed: it then answers nothing but errors
+    // until the process restarts, so the server stops instead of keeping a dead endpoint up.
+    [[nodiscard]] bool engine_failed() const noexcept { return engine_failed_.load(); }
     // Closes the listening socket and stops the attached service's Engine, whose queued and
     // running requests then fail, so listen() returns within about one unit of Engine work.
     // Does not block; callable from any thread.
@@ -138,6 +148,8 @@ private:
     [[nodiscard]] std::string metrics_json_body() const;
     void run_stats_reporter();
     void stop_stats_reporter();
+    void run_engine_watch();
+    void stop_engine_watch();
 
     GenerationService* service_ = nullptr;
     ImageGenerationService* images_ = nullptr;
@@ -149,6 +161,9 @@ private:
     // /v1/decide answer labels, computed from the loaded tokenizer when the service attaches.
     std::vector<DecideLabel> decide_labels_;
     OpenAIResponsesStore openai_responses_store_;
+    // --restore-tool-reasoning: the last 4,096 tool-calling Chat Completions responses' reasoning, at most
+    // 64 MiB of it.
+    ReasoningStore reasoning_store_{4096, 64U << 20};
     OperationalLog operational_log_;
     JsonlRequestLog request_jsonl_;
     Metrics metrics_;
@@ -160,6 +175,11 @@ private:
     std::condition_variable stats_cv_;
     std::thread stats_thread_;
     bool stats_stopping_ = false;
+    std::mutex watch_mutex_;
+    std::condition_variable watch_cv_;
+    std::thread watch_thread_;
+    bool watch_stopping_ = false;
+    std::atomic<bool> engine_failed_{false};
 };
 
 } // namespace infernix::serve

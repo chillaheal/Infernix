@@ -30,8 +30,11 @@ downloaded files.
 
 Source-weight conversion requires a Python 3.11 environment with PyTorch and NumPy. It uses CUDA
 by default; `--device cpu` selects CPU conversion, and `--workers N` converts up to N weight objects
-at once on the CPU (written in order; each in-flight object, at most 2N, is held whole in RAM). The
-input paths below are placeholders for your local checkpoint directories.
+at once on the CPU (written in order; each in-flight object, at most 2N, is held whole in RAM, and
+`--max-buffered-bytes`, default 8 GiB, bounds their total; a larger object converts alone). The
+input paths below are placeholders for your local checkpoint directories. A Safetensors checkpoint
+is read through its `model.safetensors.index.json`; without one, `model.safetensors`, or else every
+`*.safetensors` file in the directory (a tensor stored in two of them is rejected).
 
 For Qwen3.6-27B floating-point source weights:
 
@@ -67,7 +70,7 @@ The built-in recipes are ordinary Python functions in
 | `qwen3_8_27b_nvfp4_orcarouter` | orcarouter GPTQ layout: imported NVFP4 MLP for layers 0–55, imported FP8 for the last eight layers' MLP and every attention/GDN projection, FP8 embedding and vocabulary weights from BF16 | `quantized` |
 | `qwen3_8_flash_next_nvfp4` | Qwen3.8-Flash-Next recipe A: every tensor as NVIDIA stores it (routed experts as exact `nvfp4_mul` banks, the FP8 n-gram table in its own volume); only the MTP drafter re-quantized (Q8 projections, Q4 experts) ([guide](qwen3_8-flash-next.md)) | None |
 | `qwen3_8_flash_next_nvfp4_dense8` | Recipe B (Dense8): recipe A plus Q8 for the dense projection classes that dominate per-token weight reads (GDN, QSA output, shared experts, hyper-connection mixers, PLE projections, `lm_head`) | None |
-| `qwen3_8_flash_next_fp4_local` | NVIDIA's QAD Qwen3.8-Flash-Next-FP4-Local, bit-exact: `nvfp4_mul` expert banks (NVFP4-CSF scales restored) with their calibrated activation scales, run W4A16 by default and W4A4 with `--expert-a4-activations`, MXFP8 GDN/QSA/shared-expert projections as `fp8_e4m3fn_g32_e8m0`, FP32 norms kept, the NVFP4 n-gram table in its own volume; drafter and vision MLPs re-quantized/rounded ([guide](qwen3_8-flash-next.md#nvidia-fp4-local-checkpoint)) | None |
+| `qwen3_8_flash_next_fp4_local` | NVIDIA's QAD Qwen3.8-Flash-Next-FP4-Local, bit-exact: `nvfp4_mul` expert banks (NVFP4-CSF scales restored) with their calibrated activation scales, run W4A16 by default and W4A4 with `--expert-a4-activations`, MXFP8 GDN/QSA/shared-expert projections as `fp8_e4m3fn_g32_e8m0`, the NVFP4 vision MLPs and merger as dense `nvfp4_mul` in `nvfp4_rg16_v1`, FP32 norms kept, the NVFP4 n-gram table in its own volume; only the drafter re-quantized ([guide](qwen3_8-flash-next.md#nvidia-fp4-local-checkpoint)) | None |
 
 These names select conversion choices. Runtime execution is selected from the architecture,
 configuration and actual bindings stored in the artifact. `--name` sets the public model name;
@@ -344,6 +347,38 @@ values. To preserve existing compatible encoded words, also provide `read_encode
 `EncodedRows`, and the format's required divisor accessors. Their definitions are in
 [`sources/logical.py`](../tools/convert/sources/logical.py).
 
+## Import a GGUF bit-exactly
+
+`--gguf` imports a llama.cpp GGUF's stored blocks as they are, with no dequantization and
+re-quantization, so the artifact runs exactly the weights llama.cpp runs from that file. Two
+architectures are supported: Qwen3.8-Flash-Next (see
+[its guide](qwen3_8-flash-next.md#gguf-import-ista-daslab-gsq-rco-iq3_s)), and Qwen3.5 dense
+(`qwen35`) GGUFs in `Q8_0`, text only. For the second, `--model` needs only the checkpoint's
+config and tokenizer files:
+
+```bash
+python -m tools.convert --model /path/to/Qwen3.8-27B-config-only \
+  --gguf /path/to/Qwen3.8-27B-Q8_0.gguf --recipe qwen3_5_gguf_q8_0 \
+  --device cpu --out out/qwen3_8_27b_gguf_q8_0.infernix
+```
+
+Each Q8_0 block becomes the identical `q8_g32_fp16` word, including the token embedding and
+the head. The F32 gating projections and every vector keep their exact values.
+[`tools/convert/qwen3_5_gguf.py`](../tools/convert/qwen3_5_gguf.py) undoes llama.cpp's export
+transforms and checks each one: the `+1` on the norms, the gated delta-net's tiled value-head
+order (rows and whole output-projection column blocks), `-exp(A_log)`, and the squeezed
+convolution. The GGUF's metadata must agree with the config. The MTP block and any mmproj are
+not imported, and the recipe refuses other ggml formats.
+
+This was checked on bartowski's Qwen3.8-27B `Q8_0` against Qwen's BF16 checkpoint:
+
+- Sampled rows of every matrix role equal llama.cpp's Q8_0 quantization of the checkpoint's
+  rows in Hugging Face order.
+- `A_log` and `dt_bias` are exact on all 48 delta-net layers.
+- The norms, convolutions and gating projections of seven layers are exact, except two gamma
+  elements below 2^-16 that llama.cpp's binary32 `1 + g` rounded. The import keeps the GGUF's
+  values there.
+
 ## Convert from a GGUF quant instead of the full checkpoint
 
 The base `--model` checkpoint only needs to supply `config.json` and the frontend
@@ -537,7 +572,9 @@ architecture's (process flags and request fields still override them). It holds 
 `presence_penalty` and `frequency_penalty` [-2,2], and optionally `repetition_penalty` (only 1: the
 sampler has none), plus an optional `source` string. The converter and the runtime refuse a missing,
 unknown or out-of-range value. [ornith-1.5-122b.json](../tools/convert/sampling/ornith-1.5-122b.json)
-is Ornith-1.5-122B's model-card set.
+is Ornith-1.5-122B's model-card set and
+[ornith-1.5-122b-uncensored.json](../tools/convert/sampling/ornith-1.5-122b-uncensored.json)
+dealignai's Ornith-1.5-122B-UNCENSORED-NVFP4's.
 
 The official conversion examples select these maintained templates:
 

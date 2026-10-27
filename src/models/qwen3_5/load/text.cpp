@@ -79,21 +79,27 @@ MoeWeights bind_moe(Bindings& b, const TextConfig& config, const std::string& pr
 
 // The offloaded form (weights.h OffloadedMoeWeights): the routed bank stays in pinned host memory, or
 // in the artifact for the SSD tier (`stream`; the experts' frames in VRAM are the Program's), the
-// shared expert's one-record bank is in device memory.
+// shared expert (a one-record bank, or dense projections) is in device memory.
 OffloadedMoeWeights bind_offloaded_moe(Bindings& b, const TextConfig& config, const std::string& prefix,
                                        bool stream) {
-    const auto& moe  = std::get<MoeConfig>(config.ffn);
-    const auto p     = prefix + "moe/";
-    const auto input = prefix + "ffn_input";
-    const auto h     = config.hidden_size;
+    const auto& moe   = std::get<MoeConfig>(config.ffn);
+    const auto p      = prefix + "moe/";
+    const auto input  = prefix + "ffn_input";
+    const auto h      = config.hidden_size;
+    const auto shared = moe.shared_expert_intermediate_size;
     OffloadedMoeWeights out;
-    out.router        = b.parameter(p + "router", {moe.num_experts, h}, {input});
-    out.shared_score  = b.parameter(p + "shared_score", {1, h}, {input});
-    out.experts       = b.parameter(p + "experts", {moe.num_experts, h, moe.moe_intermediate_size}, {input},
-                                    QType::NVFP4_MUL,
-                                    stream ? artifact::Residency::Streamed : artifact::Residency::HostPinned);
-    out.shared_expert = b.parameter(p + "shared_expert", {1, h, moe.shared_expert_intermediate_size}, {input},
-                                    QType::NVFP4_MUL);
+    out.router       = b.parameter(p + "router", {moe.num_experts, h}, {input});
+    out.shared_score = b.parameter(p + "shared_score", {1, h}, {input});
+    out.experts      = b.parameter(p + "experts", {moe.num_experts, h, moe.moe_intermediate_size}, {input},
+                                   QType::NVFP4_MUL,
+                                   stream ? artifact::Residency::Streamed : artifact::Residency::HostPinned);
+    if (b.binder.reader().directory().bindings.contains(p + "shared_expert")) {
+        out.shared_expert = b.parameter(p + "shared_expert", {1, h, shared}, {input}, QType::NVFP4_MUL);
+    } else {
+        out.shared = DenseWeights{b.parameter(p + "shared/gate", {shared, h}, {input}),
+                                  b.parameter(p + "shared/up", {shared, h}, {input}),
+                                  b.parameter(p + "shared/down", {h, shared}, {p + "shared/product"})};
+    }
     return out;
 }
 
@@ -126,11 +132,14 @@ BlockWeights bind_block(Bindings& b, const TextConfig& config, const std::string
 TextWeights bind_text(Bindings& b, const TextConfig& config, const LoadOptions& options) {
     TextWeights out;
     // With offloaded experts the embedding stays in pinned host memory too (design D8): one row per
-    // token is read zero-copy, and its 1.4 GiB become expert frames.
+    // token is read zero-copy, and its 1.4 GiB become expert frames. --embedding-host does the same for
+    // any artifact (candidates CF-17: the 27B's 1.18 GiB go to KV and prefix blocks; a prefill chunk
+    // reads its rows over the link).
     const bool offloaded = std::holds_alternative<MoeConfig>(config.ffn) && offloaded_expert_bank(b, "text/layers/0/");
     out.token_embedding  = b.parameter("text/token_embedding", {config.vocab_size, config.hidden_size}, {},
                                        std::nullopt,
-                                       offloaded ? artifact::Residency::HostPinned : artifact::Residency::Device);
+                                       offloaded || options.embedding_host ? artifact::Residency::HostPinned
+                                                                           : artifact::Residency::Device);
     std::vector<std::string> head_inputs{"text/final_hidden"};
     if (options.speculative != SpeculativeBackend::None && !options.proposal_enabled()) {
         head_inputs.push_back(std::string(options.speculative_component()) + "/final_hidden");

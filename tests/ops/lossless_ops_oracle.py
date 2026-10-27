@@ -1,6 +1,6 @@
 """Exact oracle for the lossless route's elementwise and row operations (include/infernix/ops/lossless_ops.h).
 
-Writes test cases and runs the CUDA test on them: python lossless_ops_oracle.py <test executable>.
+Writes test cases and runs the CUDA test on them: python lossless_ops_oracle.py <family executable> lossless_ops.
 Every expected value follows docs/maintainer/lossless-route.md §2 and §2a step by step: sums exact (fractions),
 transcendental functions correctly rounded (decimal at 60 digits, lossless_cr_oracle.py), every
 intermediate rounded to the dtype the specification gives it. Standard library only.
@@ -13,7 +13,6 @@ import random
 import struct
 import subprocess
 import sys
-import tempfile
 from fractions import Fraction
 from pathlib import Path
 
@@ -24,7 +23,7 @@ import lossless_cr_oracle as cr  # noqa: E402
  MOE_COMBINE, MOE_ROUTE, RMSNORM_GROUPED, RMSNORM_GATED_SIGMOID, HC_GATES, HC_MIX, HC_INJECT, PLE_GATE, PLE_CONV,
  QSA_POOL, QSA_SELECT, ATTENTION_SELECT, ROUTER_BF16, MOE_COMBINE_ENTRIES, CONV_SLOTS, DELTA_RULE_SLOTS, ATTENTION_PAGED,
  PLE_CONV_SLOTS, QSA_CACHE, QSA_SELECT_POSITIONS, ATTENTION_PAGED_SELECT, QUANTIZE_NVFP4, QUANTIZE_NVFP4_SCALED,
- QUANTIZE_FP8_TOKEN, ROUND_FP16, QUANTIZE_FP8_STATIC) = range(37)
+ QUANTIZE_FP8_TOKEN, ROUND_FP16, QUANTIZE_FP8_STATIC, CODEC_ATTENTION) = range(38)
 
 
 def bf16_value(bits: int) -> Fraction:
@@ -41,22 +40,48 @@ def f32_bits(f: float) -> int:
 
 def round_fraction(a: Fraction, prec: int) -> int:
     """Correctly rounded bits of the exact rational a (binary32: prec 24; BF16: prec 8, low 16 bits)."""
-    total = 16 if prec == 8 else 32
-    sign = 1 if a < 0 else 0
-    a = abs(a)
-    if a == 0:
-        return sign << (total - 1)
-    e = a.numerator.bit_length() - a.denominator.bit_length()
-    if Fraction(2) ** e > a:
+    num, den = a.numerator, a.denominator
+    if num == 0:
+        return 0
+    if den & (den - 1) == 0:
+        return round_scaled(num, den.bit_length() - 1, prec)
+    sign = 1 if num < 0 else 0
+    mag = -num if sign else num
+    # floor(log2 a) is e or e - 1 for this e.
+    e = mag.bit_length() - den.bit_length()
+    if (mag << max(0, -e)) < (den << max(0, e)):
         e -= 1
-    while Fraction(2) ** (e + 1) <= a:
-        e += 1
     e = max(e, -126)
-    q = a / Fraction(2) ** (e - prec + 1)
-    n = q.numerator // q.denominator
-    rem = q - n
-    if rem > Fraction(1, 2) or (rem == Fraction(1, 2) and n % 2 == 1):
+    shift = e - prec + 1
+    divisor = den << max(0, shift)
+    n, rem = divmod(mag << max(0, -shift), divisor)
+    if 2 * rem > divisor or (2 * rem == divisor and n % 2 == 1):
         n += 1
+    return pack_rounded(sign, e, n, prec)
+
+
+def round_scaled(value: int, scale: int, prec: int) -> int:
+    """round_fraction(value / 2^scale, prec), in integers."""
+    if value == 0:
+        return 0
+    sign = 1 if value < 0 else 0
+    mag = -value if sign else value
+    e = max(mag.bit_length() - 1 - scale, -126)
+    drop = scale + e - prec + 1
+    if drop <= 0:
+        n = mag << -drop
+    else:
+        n = mag >> drop
+        rem = mag & ((1 << drop) - 1)
+        half = 1 << (drop - 1)
+        if rem > half or (rem == half and n & 1):
+            n += 1
+    return pack_rounded(sign, e, n, prec)
+
+
+def pack_rounded(sign: int, e: int, n: int, prec: int) -> int:
+    """The bits of (-1)^sign n 2^(e - prec + 1), n the significand rounded to prec bits (2^prec when it carried)."""
+    total = 16 if prec == 8 else 32
     if n == 2 ** prec:
         n //= 2
         e += 1
@@ -284,6 +309,18 @@ def cases(rng: random.Random):
         ids += rng.sample(range(256) if t % 3 else range(12), 8)
     x = [random_bf16(rng, 4) for _ in range(64 * cols)]
     yield MOE_ROUTE, [256, 8, cols], [ids, x], [1]
+    # The gathered-column bound at its extremes: one decoded column (8 runs of one pair: 512 columns, all
+    # used by runs), every expert hit once (256 runs of one pair fill all 256 tiles), and runs of whole
+    # tiles (8 experts, 64 pairs each).
+    for experts, top_k, cols, pick in ((256, 8, 1, None), (256, 8, 32, "distinct"), (8, 8, 64, "all")):
+        if pick == "distinct":
+            ids = [e for e in range(256)]
+        elif pick == "all":
+            ids = [e for _ in range(cols) for e in range(8)]
+        else:
+            ids = rng.sample(range(experts), top_k)
+        x = [random_bf16(rng, 4) for _ in range(64 * cols)]
+        yield MOE_ROUTE, [experts, top_k, cols], [ids, x], [1]
     yield from flash_cases(rng)
     yield from state_cases(rng)
     yield from flash_state_cases(rng)
@@ -541,41 +578,92 @@ def conv_slots(x, w, states, src, dst, channels, width, seqs, taps):
     return out, final
 
 
+# The delta rule's oracle computes in integers: a binary32 value v is the integer v 2^149 (its smallest step is
+# 2^-149), so a product of two is exact at 2^298 and sums are exact; each rounding is round_scaled's.
+F32_SCALE = 149
+
+
+def f32_int(bits: int) -> int:
+    """The finite binary32 value of bits, times 2^149."""
+    e = (bits >> 23) & 0xFF
+    m = bits & 0x7FFFFF
+    mag = m if e == 0 else (m | 0x800000) << (e - 1)
+    return -mag if bits >> 31 else mag
+
+
+def f32_round(value: int, scale: int) -> int:
+    """value / 2^scale rounded to binary32, times 2^149."""
+    if value == 0:
+        return 0
+    mag = -value if value < 0 else value
+    e = max(mag.bit_length() - 1 - scale, -126)
+    drop = scale + e - 23
+    if drop <= 0:
+        n = mag << -drop
+    else:
+        n = mag >> drop
+        rem = mag & ((1 << drop) - 1)
+        half = 1 << (drop - 1)
+        if rem > half or (rem == half and n & 1):
+            n += 1
+    if n == 1 << 24:
+        n >>= 1
+        e += 1
+    if e > 127:
+        raise OverflowError("binary32 overflow in the delta rule oracle")
+    n <<= e + 126
+    return -n if value < 0 else n
+
+
+def delta_rule_column(S, qb, kb, vb, g_bits, beta_bits) -> list[int]:
+    """One column of the gated delta rule on the head's state S (S[i][j], f32_int values), in place, from its
+    128 BF16 bits of q, k and v, FP32 bits of g and BF16 bits of beta; returns the column's BF16 output bits."""
+    eps = f32_int(f32_bits(1e-6))
+    scale = f32_int(0x3DB504F3)
+    s2 = 2 * F32_SCALE
+    qv = [f32_int(x << 16) for x in qb]
+    kv = [f32_int(x << 16) for x in kb]
+    rq_in = round_scaled(f32_round(sum(x * x for x in qv), s2) + eps, F32_SCALE, 24)
+    rk_in = round_scaled(f32_round(sum(x * x for x in kv), s2) + eps, F32_SCALE, 24)
+    rq = f32_int(cr.evaluate(cr.RSQRT, float_of(rq_in, 24)))
+    rk = f32_int(cr.evaluate(cr.RSQRT, float_of(rk_in, 24)))
+    qn = [f32_round(f32_round(x * rq, s2) * scale, s2) for x in qv]
+    kn = [f32_round(x * rk, s2) for x in kv]
+    decay = f32_int(cr.evaluate(cr.EXP, float(f32_value(g_bits))))
+    bt = f32_int(beta_bits << 16)
+    for row in S:
+        for j in range(128):
+            row[j] = f32_round(row[j] * decay, s2)
+    out = []
+    for j in range(128):
+        u = f32_round(sum(f32_round(S[i][j] * kn[i], s2) for i in range(128)), F32_SCALE)
+        delta = f32_round(f32_round(f32_int(vb[j] << 16) - u, F32_SCALE) * bt, s2)
+        for i in range(128):
+            S[i][j] = f32_round(S[i][j] + f32_round(kn[i] * delta, s2), F32_SCALE)
+        o = sum(f32_round(S[i][j] * qn[i], s2) for i in range(128))
+        out.append(round_scaled(f32_round(o, F32_SCALE), F32_SCALE, 8))
+    return out
+
+
 def delta_rule_slots(q, k, v, g, beta, hk, hv, width, seqs, states, src, dst):
     """The rule per sequence from its source slot; states FP32 [128 (k), 128 (v), Hv, slots]."""
-    eps = f32_value(f32_bits(1e-6))
-    scale = f32_value(0x3DB504F3)
     out = [0] * (128 * hv * width * seqs)
     final = list(states)
     for b in range(seqs):
         for head in range(hv):
             kh = head // (hv // hk)
             base = (src[b] * hv + head) * 128 * 128
-            S = [[f32_value(states[base + j * 128 + i]) for j in range(128)] for i in range(128)]  # S[i][j]
+            S = [[f32_int(states[base + j * 128 + i]) for j in range(128)] for i in range(128)]  # S[i][j]
             for w_ in range(width):
                 t = b * width + w_
-                qv = [bf16_value(q[(t * hk + kh) * 128 + d]) for d in range(128)]
-                kv = [bf16_value(k[(t * hk + kh) * 128 + d]) for d in range(128)]
-                rq = cr32(cr.RSQRT, f32_of(f32_of(sum((x * x for x in qv), Fraction(0))) + eps))
-                rk = cr32(cr.RSQRT, f32_of(f32_of(sum((x * x for x in kv), Fraction(0))) + eps))
-                qn = [f32_of(f32_of(x * rq) * scale) for x in qv]
-                kn = [f32_of(x * rk) for x in kv]
-                decay = cr32(cr.EXP, f32_value(g[t * hv + head]))
-                bt = bf16_value(beta[t * hv + head])
-                for i in range(128):
-                    for j in range(128):
-                        S[i][j] = f32_of(S[i][j] * decay)
-                for j in range(128):
-                    u = f32_of(sum((f32_of(S[i][j] * kn[i]) for i in range(128)), Fraction(0)))
-                    delta = f32_of(f32_of(bf16_value(v[(t * hv + head) * 128 + j]) - u) * bt)
-                    for i in range(128):
-                        S[i][j] = f32_of(S[i][j] + f32_of(kn[i] * delta))
-                    o = f32_of(sum((f32_of(S[i][j] * qn[i]) for i in range(128)), Fraction(0)))
-                    out[(t * hv + head) * 128 + j] = round_fraction(o, 8)
+                o = (t * hv + head) * 128
+                out[o:o + 128] = delta_rule_column(S, q[(t * hk + kh) * 128:(t * hk + kh + 1) * 128],
+                                                   k[(t * hk + kh) * 128:(t * hk + kh + 1) * 128], v[o:o + 128],
+                                                   g[t * hv + head], beta[t * hv + head])
             dbase = (dst[b] * hv + head) * 128 * 128
             for i in range(128):
                 for j in range(128):
-                    final[dbase + j * 128 + i] = round_fraction(S[i][j], 24)
+                    final[dbase + j * 128 + i] = round_scaled(S[i][j], F32_SCALE, 24)
     return out, final
 
 
@@ -838,31 +926,15 @@ def moe_combine(expert_out, weights, ids, slot_column, shared_out, shared_logits
 
 
 def delta_rule(q, k, v, g, beta, hk, hv, cols):
-    eps = f32_value(f32_bits(1e-6))
-    scale = f32_value(0x3DB504F3)
     out = [0] * (128 * hv * cols)
     for head in range(hv):
         kh = head // (hv // hk)
-        S = [[Fraction(0)] * 128 for _ in range(128)]  # S[i][j]
+        S = [[0] * 128 for _ in range(128)]  # S[i][j]
         for t in range(cols):
-            qv = [bf16_value(q[(t * hk + kh) * 128 + d]) for d in range(128)]
-            kv = [bf16_value(k[(t * hk + kh) * 128 + d]) for d in range(128)]
-            rq = cr32(cr.RSQRT, f32_of(f32_of(sum((x * x for x in qv), Fraction(0))) + eps))
-            rk = cr32(cr.RSQRT, f32_of(f32_of(sum((x * x for x in kv), Fraction(0))) + eps))
-            qn = [f32_of(f32_of(x * rq) * scale) for x in qv]
-            kn = [f32_of(x * rk) for x in kv]
-            decay = cr32(cr.EXP, f32_value(g[t * hv + head]))
-            b = bf16_value(beta[t * hv + head])
-            for i in range(128):
-                for j in range(128):
-                    S[i][j] = f32_of(S[i][j] * decay)
-            for j in range(128):
-                u = f32_of(sum((f32_of(S[i][j] * kn[i]) for i in range(128)), Fraction(0)))
-                delta = f32_of(f32_of(bf16_value(v[(t * hv + head) * 128 + j]) - u) * b)
-                for i in range(128):
-                    S[i][j] = f32_of(S[i][j] + f32_of(kn[i] * delta))
-                o = f32_of(sum((f32_of(S[i][j] * qn[i]) for i in range(128)), Fraction(0)))
-                out[(t * hv + head) * 128 + j] = round_fraction(o, 8)
+            o = (t * hv + head) * 128
+            out[o:o + 128] = delta_rule_column(S, q[(t * hk + kh) * 128:(t * hk + kh + 1) * 128],
+                                               k[(t * hk + kh) * 128:(t * hk + kh + 1) * 128], v[o:o + 128],
+                                               g[t * hv + head], beta[t * hv + head])
     return out
 
 
@@ -1068,11 +1140,202 @@ def quantize_cases(rng: random.Random):
         yield QUANTIZE_FP8_STATIC, [k, cols, f32_bits(scale_f)], [xs], fp8_static_values(xs, s) + [f32_bits(scale_f)] * cols
 
 
+# ----------------------------------------------------------------- the design reference's KV codecs
+# (lossless_codec_attention, include/infernix/ops/lossless_ops.h; docs/maintainer/lossless-route.md §3b):
+# attention over each KV format's stored codes, every row decoded exactly (its codes times its scales,
+# src/ops/kv_cache/*_codec.cuh) and taken back from the rotated basis exactly (x = R y, R = H_256 / 16,
+# Sylvester order), the scores, exponentials and sums as attention()'s. The VQ formats' exact window rows
+# (rotated INT8-G64, kv_window.cuh) serve key j of query t when j < sinks or j >= t - recent.
+
+KV_INT8, KV_FP8, KV_NVFP4, KV_Q4, KV_VQ2 = range(5)
+# u32 entries per 256-element row: code bytes (VQ2: 16-bit words) and scales (FP16 bits; NVFP4: E4M3 bytes).
+CODE_UNITS = {KV_INT8: 256, KV_FP8: 256, KV_NVFP4: 128, KV_Q4: 128, KV_VQ2: 32}
+SCALE_UNITS = {KV_INT8: 4, KV_FP8: 1, KV_NVFP4: 16, KV_Q4: 1, KV_VQ2: 1}
+Q4_LEVELS = (4, 12, 21, 30, 40, 52, 66, 87)
+E2M1_VALUES = tuple(Fraction(v) for v in ("0", "1/2", "1", "3/2", "2", "3", "4", "6"))
+_VQ2_CODEBOOK: list[int] = []
+
+
+def vq2_codebook() -> list[int]:
+    if not _VQ2_CODEBOOK:
+        inc = Path(__file__).resolve().parents[2] / "src" / "ops" / "kv_cache" / "vq2_codebook.inc"
+        lines = [line for line in inc.read_text(encoding="utf-8").splitlines() if not line.lstrip().startswith("//")]
+        _VQ2_CODEBOOK.extend(int(t) for t in " ".join(lines).split(",") if t.strip())
+        assert len(_VQ2_CODEBOOK) == 512 * 8
+    return _VQ2_CODEBOOK
+
+
+def fp16_value(bits: int) -> Fraction:
+    sign = -1 if bits & 0x8000 else 1
+    e, m = (bits >> 10) & 0x1F, bits & 0x3FF
+    assert e != 31
+    return sign * (Fraction(m, 1 << 24) if e == 0 else Fraction(1024 + m) * Fraction(2) ** (e - 25))
+
+
+def e4m3_value(bits: int) -> Fraction:
+    assert bits & 0x7F != 0x7F
+    sign = -1 if bits & 0x80 else 1
+    e, m = (bits >> 3) & 0xF, bits & 7
+    return sign * (Fraction(m, 512) if e == 0 else Fraction(8 + m) * Fraction(2) ** (e - 10))
+
+
+def signed_byte(b: int) -> int:
+    return b - 256 if b >= 128 else b
+
+
+def plane_row(codec: int, codes: list[int], scales: list[int]) -> list[Fraction]:
+    """A stored row's 256 values (rotated basis where the format rotates), exactly."""
+    row = []
+    for d in range(256):
+        if codec == KV_INT8:
+            row.append(signed_byte(codes[d]) * fp16_value(scales[d // 64]))
+        elif codec == KV_FP8:
+            row.append(e4m3_value(codes[d]) * fp16_value(scales[0]))
+        elif codec in (KV_NVFP4, KV_Q4):
+            n = (codes[d // 2] >> (4 * (d % 2))) & 0xF
+            if codec == KV_NVFP4:
+                row.append((-1 if n & 8 else 1) * E2M1_VALUES[n & 7] * e4m3_value(scales[d // 16]))
+            else:
+                level = Q4_LEVELS[n ^ 8] if n >= 8 else -Q4_LEVELS[n ^ 7]
+                row.append(level * fp16_value(scales[0]))
+        else:
+            word = codes[d // 8]
+            low7 = (word >> 9) & 0x7F
+            sign = low7 | ((bin(low7).count("1") & 1) << 7)
+            mag = vq2_codebook()[8 * (word & 0x1FF) + d % 8]
+            row.append((-mag if (sign >> (d % 8)) & 1 else mag) * fp16_value(scales[0]))
+    return row
+
+
+def hadamard_exact(y: list[Fraction]) -> list[Fraction]:
+    """R y with R = H_256 / 16 (H Sylvester's, H_ij = (-1)^popcount(i & j)), exactly."""
+    x = list(y)
+    span = 1
+    while span < 256:
+        for base in range(0, 256, 2 * span):
+            for i in range(base, base + span):
+                x[i], x[i + span] = x[i] + x[i + span], x[i] - x[i + span]
+        span *= 2
+    return [v / 16 for v in x]
+
+
+CODEC_SHIFT = 40   # every decoded K/V value (after R) is an integer multiple of 2^-37
+Q_SHIFT = 140      # every BF16 value is an integer multiple of 2^-133
+P_SHIFT = 149      # every binary32 value is an integer multiple of 2^-149
+
+
+def codec_rows(codec: int, rotated: bool, codes: list[int], scales: list[int], rows: int) -> list[list[int]]:
+    """Each row's exact values times 2^CODEC_SHIFT, as integers (the sums below stay exact and fast)."""
+    cu, su = CODE_UNITS[codec], SCALE_UNITS[codec]
+    out = []
+    for r in range(rows):
+        row = plane_row(codec, codes[r * cu:(r + 1) * cu], scales[r * su:(r + 1) * su])
+        scaled = [v * (1 << CODEC_SHIFT) for v in (hadamard_exact(row) if rotated else row)]
+        assert all(v.denominator == 1 for v in scaled)
+        out.append([int(v) for v in scaled])
+    return out
+
+
+def codec_attention(q, kp, vp, window, heads, kv_heads, cols, sinks, recent, select=None, ratio=0):
+    """kp, vp: (codec, rotated, codes, scales), rows [key][kv head]; window: None or the exact rows'
+    (k codes, k scales, v codes, v scales), INT8-G64 of the rotated row."""
+    rows = cols * kv_heads
+    ks, vs = codec_rows(*kp, rows), codec_rows(*vp, rows)
+    if window is not None:
+        wk = codec_rows(KV_INT8, True, window[0], window[1], rows)
+        wv = codec_rows(KV_INT8, True, window[2], window[3], rows)
+    group = heads // kv_heads
+    out = [0] * (256 * heads * cols)
+    score_unit = Fraction(1, 1 << (Q_SHIFT + CODEC_SHIFT + 4))  # s = q k / 16
+    for t in range(cols):
+        if select is None:
+            keys = list(range(t + 1))
+        else:
+            tail = (t + 1) // ratio * ratio
+            keys = [j for j in range(t + 1) if j >= tail or (select[t] >> (j // ratio)) & 1]
+        for h in range(heads):
+            kvh = h // group
+            qr = [int(bf16_value(q[(t * heads + h) * 256 + d]) * (1 << Q_SHIFT)) for d in range(256)]
+            krs, vrs = [], []
+            for j in keys:
+                exact = window is not None and (j < sinks or j >= t - recent)
+                krs.append((wk if exact else ks)[j * kv_heads + kvh])
+                vrs.append((wv if exact else vs)[j * kv_heads + kvh])
+            scores = [sum(a * b for a, b in zip(qr, kr)) for kr in krs]
+            m = max(scores)
+            ps = [int(f32_value(cr.evaluate(cr.EXP, float(f32_of((s - m) * score_unit)))) * (1 << P_SHIFT))
+                  for s in scores]
+            den = sum(ps) << CODEC_SHIFT
+            for c in range(256):
+                num = sum(p * vr[c] for vr, p in zip(vrs, ps))
+                out[(t * heads + h) * 256 + c] = round_fraction(Fraction(num, den), 8)
+    return out
+
+
+def random_codec_plane(rng: random.Random, codec: int, rows: int, spread: int) -> tuple[list[int], list[int]]:
+    """Codes and scales as the encoders can store them (finite, E4M3 codes not NaN), scales over `spread`
+    binades."""
+    codes, scales = [], []
+    for _ in range(rows):
+        if codec in (KV_INT8,):
+            codes += [rng.randint(-127, 127) & 0xFF for _ in range(256)]
+        elif codec == KV_FP8:
+            codes += [b if b & 0x7F != 0x7F else 0x7E for b in (rng.getrandbits(8) for _ in range(256))]
+        elif codec in (KV_NVFP4, KV_Q4):
+            codes += [rng.getrandbits(8) for _ in range(128)]
+        else:
+            codes += [rng.getrandbits(16) for _ in range(32)]
+        for _ in range(SCALE_UNITS[codec]):
+            if codec == KV_NVFP4:
+                scales.append(rng.randint(0x08, 0x7E) if rng.random() > 0.05 else 0)
+            else:
+                v = abs(rng.gauss(0.0, 1.0)) * 2.0 ** rng.randint(-spread, spread // 2) * 0.01
+                scales.append(0 if rng.random() < 0.03 else struct.unpack("<H", struct.pack("<e", v))[0])
+    return codes, scales
+
+
+def codec_cases(rng: random.Random):
+    # Every KV format's K and V codecs (kv_cache/append: K rotated in all, V in NVFP4, K8V4 and the VQ formats),
+    # the VQ formats with their exact window (small bounds so both reads occur), a QSA selection, scales over a
+    # wide range of binades (the exact fallback).
+    formats = [("int8", KV_INT8, True, KV_INT8, False, False), ("fp8", KV_FP8, True, KV_FP8, False, False),
+               ("nvfp4", KV_NVFP4, True, KV_NVFP4, True, False), ("k8v4", KV_FP8, True, KV_NVFP4, True, False),
+               ("vq2", KV_VQ2, True, KV_VQ2, True, True), ("k4v2", KV_Q4, True, KV_VQ2, True, True)]
+    heads, kv_heads, cols, sinks, recent = 4, 2, 26, 3, 9
+    for name, kc, kr, vc, vr, has_window in formats:
+        for spread in (6, 40):
+            q = [random_bf16(rng, 6) for _ in range(256 * heads * cols)]
+            kcodes, kscales = random_codec_plane(rng, kc, cols * kv_heads, spread)
+            vcodes, vscales = random_codec_plane(rng, vc, cols * kv_heads, spread)
+            window = None
+            if has_window:
+                window = (*random_codec_plane(rng, KV_INT8, cols * kv_heads, spread),
+                          *random_codec_plane(rng, KV_INT8, cols * kv_heads, spread))
+            inputs = [q, kcodes, kscales, vcodes, vscales] + (list(window) if window else [])
+            expected = codec_attention(q, (kc, kr, kcodes, kscales), (vc, vr, vcodes, vscales), window, heads,
+                                       kv_heads, cols, sinks, recent)
+            yield (CODEC_ATTENTION, [kc, int(kr), vc, int(vr), int(has_window), heads, kv_heads, cols, sinks, recent, 0],
+                   inputs, expected)
+    # QSA: selected blocks of 4 and the tail, VQ2 with its window.
+    ratio, cols = 4, 26
+    q = [random_bf16(rng, 6) for _ in range(256 * heads * cols)]
+    kcodes, kscales = random_codec_plane(rng, KV_VQ2, cols * kv_heads, 6)
+    vcodes, vscales = random_codec_plane(rng, KV_VQ2, cols * kv_heads, 6)
+    window = (*random_codec_plane(rng, KV_INT8, cols * kv_heads, 6), *random_codec_plane(rng, KV_INT8, cols * kv_heads, 6))
+    # Production selects at least one block once one is complete, so no query is left without keys.
+    select = [(rng.getrandbits((t + 1) // ratio) | 1 << ((t + 1) // ratio - 1)) if t + 1 >= ratio else 0
+              for t in range(cols)]
+    expected = codec_attention(q, (KV_VQ2, True, kcodes, kscales), (KV_VQ2, True, vcodes, vscales), window, heads,
+                               kv_heads, cols, sinks, recent, select, ratio)
+    yield (CODEC_ATTENTION, [KV_VQ2, 1, KV_VQ2, 1, 1, heads, kv_heads, cols, sinks, recent, ratio],
+           [q, kcodes, kscales, vcodes, vscales, *window, select], expected)
+
+
 def write_cases(path: Path) -> None:
     rng = random.Random(20261021)
     count = 0
     with path.open("wb") as f:
-        for op, dims, inputs, expected in itertools.chain(cases(rng), quantize_cases(rng)):
+        for op, dims, inputs, expected in itertools.chain(cases(rng), quantize_cases(rng), codec_cases(rng)):
             write_u32(f, [op, len(dims)] + dims + [len(inputs)] + [len(v) for v in inputs] + [len(expected)])
             for v in inputs:
                 write_u32(f, v)
@@ -1082,18 +1345,17 @@ def write_cases(path: Path) -> None:
 
 
 def main() -> int:
-    """lossless_ops_oracle.py <test executable> [case file]: a given case file is written once and
-    reused afterwards (the cases are deterministic)."""
-    exe = sys.argv[1]
-    if len(sys.argv) > 2:
-        path = Path(sys.argv[2])
-        if not path.is_file():
-            write_cases(path)
-        return subprocess.run([exe, str(path)], check=False).returncode
-    with tempfile.TemporaryDirectory() as tmp:
-        path = Path(tmp) / "ops_cases.bin"
-        write_cases(path)
-        return subprocess.run([exe, str(path)], check=False).returncode
+    """lossless_ops_oracle.py <family executable> <test name> [cache directory]: with a directory, the cases are
+    written there once per version of this file and lossless_cr_oracle.py and reused afterwards (they are
+    deterministic)."""
+    command = sys.argv[1:3]  # the family executable and the test name (tests/ops/op_family.h)
+    sources = [Path(__file__), Path(cr.__file__)]
+    path, tmp = cr.cached_file(sys.argv[3] if len(sys.argv) > 3 else None, "ops_cases", sources, write_cases)
+    try:
+        return subprocess.run([*command, str(path)], check=False).returncode
+    finally:
+        if tmp is not None:
+            tmp.cleanup()
 
 
 if __name__ == "__main__":

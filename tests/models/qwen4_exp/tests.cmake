@@ -28,6 +28,10 @@ infernix_add_test(infernix_qwen4_exp_expert_activations_test
 infernix_add_test(infernix_qwen4_exp_ngram_volume_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ngram_volume.cpp"
   LIBRARIES infernix_model_runtime)
+# TEMPORARY with INFERNIX_TMP_NGRAM_SCATTER: the large call's scattered reading order, same oracle.
+add_test(NAME infernix_qwen4_exp_ngram_volume_scatter_test COMMAND infernix_qwen4_exp_ngram_volume_test)
+set_tests_properties(infernix_qwen4_exp_ngram_volume_scatter_test
+  PROPERTIES ENVIRONMENT "INFERNIX_TMP_NGRAM_SCATTER=1")
 
 # The forward pass on the real artifact (INFERNIX_QWEN4_ARTIFACT) against the FP64 reference.
 infernix_add_test(infernix_qwen4_exp_forward_real_test
@@ -157,6 +161,12 @@ infernix_add_test(infernix_qwen4_exp_vision_window_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_vision_window.cpp"
   LIBRARIES infernix_model_runtime)
 
+# FP4-Local's nvfp4_rg16_v1 vision MLP and merger at binding, Linear planning and offload staging
+# (host only).
+infernix_add_test(infernix_qwen4_exp_vision_rg16_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_vision_rg16.cpp"
+  LIBRARIES infernix_model_loading)
+
 # The prefix cache's prefill call planner: coverage, grids, exact-tap admission (host only).
 infernix_add_test(infernix_qwen4_exp_call_plan_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_call_plan.cpp"
@@ -185,6 +195,14 @@ infernix_add_test(infernix_qwen4_exp_prefix_cache_real_test
   LIBRARIES infernix_engine)
 set_tests_properties(infernix_qwen4_exp_prefix_cache_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
 
+# A continuation resumed after speculative decoding against a cold run, MTP and DFlash2 (INFERNIX_QWEN4_DFLASH2),
+# on the reproducible route (bit-identical) and the default route (a teacher-forced log-probability bound).
+infernix_add_test(infernix_qwen4_exp_resume_cold_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_resume_cold_real.cpp"
+  LIBRARIES infernix_engine
+  ARGS mtp dflash2)
+set_tests_properties(infernix_qwen4_exp_resume_cold_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
+
 # A long prompt's layer walk while another lane decodes, with SSD-only experts (issue #5): both
 # requests complete with their solo ids and no call reports a silent host.
 infernix_add_test(infernix_qwen4_exp_walk_interleave_real_test
@@ -198,18 +216,13 @@ infernix_add_test(infernix_qwen4_exp_preemption_real_test
   LIBRARIES infernix_engine)
 set_tests_properties(infernix_qwen4_exp_preemption_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
 
-# Sampled MTP drafts keep the sampler's output distribution and greedy tokens (sampled-mtp-drafts).
-infernix_add_test(infernix_qwen4_exp_sampled_drafts_real_test
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_sampled_drafts_real.cpp"
+# MTP drafts (one-hot and sampled-mtp-drafts) and a DFlash2 companion drafter (--draft-model) against
+# one plain-decoding reference: the sampler's output distribution, greedy tokens, concurrency and the
+# drafter's ring through a prefix resume.
+infernix_add_test(infernix_qwen4_exp_speculative_sampling_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_speculative_sampling_real.cpp"
   LIBRARIES infernix_engine)
-set_tests_properties(infernix_qwen4_exp_sampled_drafts_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
-
-# A DFlash2 companion drafter (--draft-model): greedy tokens, concurrency, the ring through a prefix
-# resume and the sampler's output distribution.
-infernix_add_test(infernix_qwen4_exp_dflash2_real_test
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_dflash2_real.cpp"
-  LIBRARIES infernix_engine)
-set_tests_properties(infernix_qwen4_exp_dflash2_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
+set_tests_properties(infernix_qwen4_exp_speculative_sampling_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
 
 infernix_add_test(infernix_qwen4_exp_decide_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_decide_real.cpp"

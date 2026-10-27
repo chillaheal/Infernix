@@ -1,5 +1,6 @@
 #include "models/qwen3_5/execution/parameters.h"
 
+#include "core/temporary_switches.h"
 #include "core/weight_view.h"
 #include "infernix/ops/gdn_input_proj.h"
 #include "infernix/ops/linear.h"
@@ -78,7 +79,11 @@ public:
             out.router       = tensor(offloaded->router);
             out.shared_score = tensor(offloaded->shared_score);
             out.bank         = &model_.expert_banks()[layer];
-            out.shared_bank  = &model_.shared_expert_banks()[layer];
+            if (offloaded->shared) {
+                out.shared = dense(*offloaded->shared);
+            } else {
+                out.shared_bank = &model_.shared_expert_banks()[layer];
+            }
             out.layer        = static_cast<std::uint32_t>(layer);
             out.experts      = config.num_experts;
             out.top_k        = config.num_experts_per_tok;
@@ -320,20 +325,23 @@ private:
 };
 
 // Every offloaded layer's scales on the device, [layers][experts + 1]: the routed bank's, then the
-// shared expert's (its bank holds one expert).
+// shared expert's (its bank holds one expert; a dense shared expert's entry is unused, zero).
 DeviceBuffer offloaded_expert_scales(const Model& model) {
     if (!model.offloaded_experts()) { return {}; }
     const auto banks  = model.expert_banks();
     const auto shared = model.shared_expert_banks();
     const auto& moe   = std::get<MoeConfig>(model.config().text.ffn);
     const std::size_t entries = static_cast<std::size_t>(moe.num_experts) + 1;
+    if (!shared.empty() && shared.size() != banks.size()) {
+        throw std::logic_error("offloaded MoE: the shared expert banks do not cover every layer");
+    }
     std::vector<ops::offloaded_moe::ExpertScales> host(banks.size() * entries);
     for (std::size_t layer = 0; layer < banks.size(); ++layer) {
-        if (banks[layer].scales.size() != moe.num_experts || shared[layer].scales.size() != 1) {
+        if (banks[layer].scales.size() != moe.num_experts || (!shared.empty() && shared[layer].scales.size() != 1)) {
             throw std::logic_error("offloaded MoE: a bank's scales differ from its experts");
         }
         std::copy(banks[layer].scales.begin(), banks[layer].scales.end(), host.begin() + layer * entries);
-        host[layer * entries + moe.num_experts] = shared[layer].scales.front();
+        if (!shared.empty()) { host[layer * entries + moe.num_experts] = shared[layer].scales.front(); }
     }
     DeviceBuffer out(host.size() * sizeof(ops::offloaded_moe::ExpertScales));
     out.copy_from_host(host.data(), host.size() * sizeof(ops::offloaded_moe::ExpertScales));
@@ -390,8 +398,11 @@ Parameters::Parameters(const Model& source) : model(source), expert_scales(offlo
     constexpr std::pair<bool, bool> kModes[] = {{false, false}, {true, false}, {false, true}};
     for (const auto [a8, a8_residual] : kModes) {
         for (const auto [a4, a4_residual] : kModes) {
-            const DecodePrecision precision{a8, a4, a8_residual, a4_residual};
-            precision_text[precision_index(precision)] = precision_decode_text(text, precision);
+            for (const bool a8_subset : {false, true}) {
+                if (a8 && a8_subset) { continue; } // one term everywhere takes precedence
+                const DecodePrecision precision{a8, a4, a8_residual, a4_residual, a8_subset};
+                precision_text[precision_index(precision)] = precision_decode_text(text, precision);
+            }
         }
     }
 }
@@ -425,6 +436,16 @@ void limit_precision(ops::ProjectionWeights& projection, DecodePrecision precisi
     }
 }
 
+// `precision` for one projection of `kind` in text layer `layer` (-1 for the head): under
+// `a8_subset` the projections temporary_switches::a8_subset() covers take one 8-bit term.
+DecodePrecision for_projection(DecodePrecision precision, temporary_switches::A8SubsetClass kind,
+                               std::int32_t layer) {
+    if (precision.a8_subset && temporary_switches::a8_subset().covers(kind, layer)) {
+        precision.a8 = true;
+    }
+    return precision;
+}
+
 void make_invariant(ops::ProjectionWeights& projection) {
     if (auto* single = std::get_if<ops::SingleProjectionWeight>(&projection)) {
         make_invariant(*single);
@@ -440,8 +461,11 @@ void make_invariant(FfnParameters& ffn) {
         make_invariant(dense->down);
     } else if (auto* moe = std::get_if<ops::SparseMoeWeights>(&ffn)) {
         moe->policy = ops::LinearPolicy::A16ColumnInvariant;
+    } else if (auto* offloaded = std::get_if<OffloadedMoeParameters>(&ffn); offloaded && offloaded->shared) {
+        // An offloaded MoE's expert routes are exact at every width; its dense shared expert is not.
+        make_invariant(offloaded->shared->gate_up);
+        make_invariant(offloaded->shared->down);
     }
-    // An offloaded MoE's expert routes are exact at every width (OffloadedMoeParameters).
 }
 
 } // namespace
@@ -479,6 +503,15 @@ column_by_column_projections(const TextParameters& text, const MtpParameters* mt
             if (!ops::linear_add_column_invariant_route(down.qtype, down.n, down.k)) {
                 note("MLP down", down);
             }
+        }
+        // A dense shared expert beside offloaded experts runs linear_swiglu and linear (offloaded_moe).
+        if (const auto* offloaded = std::get_if<OffloadedMoeParameters>(&block.ffn); offloaded && offloaded->shared) {
+            const Weight& gate_up = offloaded->shared->gate_up.weight;
+            if (!ops::linear_swiglu_column_invariant_route(gate_up.qtype, gate_up.n, gate_up.k)) {
+                note("shared expert gate/up", gate_up);
+            }
+            const Weight& down = offloaded->shared->down.weight;
+            if (!ops::linear_column_invariant_route(down.qtype, down.n, down.k)) { note("shared expert down", down); }
         }
         const auto output = [&](const char* role, const LinearParameters& p) {
             if (!ops::linear_add_column_invariant_route(p.weight.qtype, p.weight.n, p.weight.k)) {
@@ -554,22 +587,29 @@ MtpParameters column_invariant_mtp(const MtpParameters& mtp) {
 }
 
 TextParameters precision_decode_text(const TextParameters& text, DecodePrecision precision) {
+    using temporary_switches::A8SubsetClass;
     TextParameters out = text;
     // The vocabulary head keeps 16-bit activations unless its class's one-term profile is on.
-    limit_precision(out.output_head, {precision.a8, precision.a4, false, false}, false);
-    for (BlockParameters& block : out.layers) {
+    const DecodePrecision head = for_projection(precision, A8SubsetClass::Head, -1);
+    limit_precision(out.output_head, {head.a8, head.a4, false, false}, false);
+    for (std::size_t index = 0; index < out.layers.size(); ++index) {
+        BlockParameters& block       = out.layers[index];
+        const auto layer             = static_cast<std::int32_t>(index);
+        const DecodePrecision input  = for_projection(precision, A8SubsetClass::Input, layer);
+        const DecodePrecision output = for_projection(precision, A8SubsetClass::Output, layer);
         // A sparse MoE runs A16 at every policy.
         if (auto* dense = std::get_if<DenseParameters>(&block.ffn)) {
-            limit_precision(dense->gate_up, precision, true);
-            limit_precision(dense->down, precision, true);
+            limit_precision(dense->gate_up, for_projection(precision, A8SubsetClass::GateUp, layer),
+                            true);
+            limit_precision(dense->down, for_projection(precision, A8SubsetClass::Down, layer), true);
         }
         if (auto* attention = std::get_if<AttentionParameters>(&block.mixer)) {
-            limit_precision(attention->projection, precision);
-            limit_precision(attention->output, precision, false);
+            limit_precision(attention->projection, input);
+            limit_precision(attention->output, output, false);
         } else {
             auto& gdn = std::get<GdnParameters>(block.mixer);
-            limit_precision(gdn.projection, precision);
-            limit_precision(gdn.output, precision, false);
+            limit_precision(gdn.projection, input);
+            limit_precision(gdn.output, output, false);
         }
     }
     return out;

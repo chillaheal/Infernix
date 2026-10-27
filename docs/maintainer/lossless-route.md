@@ -58,7 +58,10 @@ Notation: `bf16(v)` and `fp32(v)` are the correctly rounded value of the exact r
 
 **Gated DeltaNet** (`Qwen3_5GatedDeltaNet`):
 - `mixed = bf16(h W_qkv)`, `z = bf16(h W_z)`, `b = bf16(h W_b)`, `a = bf16(h W_a)`;
-- causal conv (`causal_conv1d_fn`, one operation): `c = bf16(silu(sum_tap w x))`, the sum exact;
+- causal conv (`causal_conv1d_fn`, one operation): `c = bf16(silu(fp32(sum_tap w x)))`, the sum exact before
+  its one rounding to binary32 (the kernel accumulates in binary32 and applies SiLU to that: SiLU of the exact
+  sum rounded once to BF16 differs where the SiLU lands within a binary32 step of a BF16 midpoint, which the
+  layer-by-layer comparison with the publisher's code found at one value of the 27B's layer 28);
 - `beta = bf16(sigmoid(b))`; `g = fp32(-fp32(exp(A_log)) fp32(softplus(fp32(a + dt_bias))))`;
 - the gated delta rule (FLA's kernels, whose L2 norm runs in FP32; the recurrence is
   `torch_recurrent_gated_delta_rule`'s, each operation correctly rounded, since a recurrence has no
@@ -88,7 +91,9 @@ Notation: `bf16(v)` and `fp32(v)` are the correctly rounded value of the exact r
 **Head.** `norm(h)`, then logits `fp32(h W_head)` (each an exact sum rounded to binary32: the scoring
 and sampling inputs). Transformers returns the head's output in BF16, and training's loss upcasts
 those values; the route keeps the exact sum rounded once to FP32 instead (owner's decision,
-2026-10-21). The logits feed nothing inside the model, so no layer is calibrated to their rounding,
+2026-10-21). `--logits-dtype bf16` (every route, 2026-10-25) gives Transformers' own dtype: each exact
+sum correctly rounded to BF16 (once, not through FP32), for comparisons with references and engines
+that round the logits. The logits feed nothing inside the model, so no layer is calibrated to their rounding,
 and a BF16 rounding of logits of magnitude 8-32 (rms error 0.02-0.04) would add a KL of roughly
 1.5e-4 to 6.5e-4 per position (an estimate) to every gate measured against the route. llama.cpp's
 KL baselines also use FP32 logits.
@@ -184,7 +189,8 @@ the GPU only.
 **Sparse MoE** (`lossless_router`, `lossless_moe_route`, `lossless_moe_gather`, `lossless_moe_combine`,
 `include/infernix/ops/lossless_ops.h`): the softmax correctly rounded per element (certified in double,
 otherwise double-double); each (slot, column) placed in its expert's run of whole tiles (placement is
-free: no column's result depends on it), the grouped projections, then per column the experts in
+free: no column's result depends on it; N pairs take at most 64 floor((N + 63 min(E, N)) / 64) gathered
+columns, 512 for one decoded column), the grouped projections, then per column the experts in
 ascending id summed in BF16 as `index_add_` does, the shared expert and the residual.
 
 **RoPE** (`lossless_rope_frequencies`, `lossless_rope_table`, `lossless_rope_apply`): inv_freq and the
@@ -192,8 +198,9 @@ angles correctly rounded per operation, cos and sin correctly rounded binary32 (
 certified, otherwise a double-double reduction with pi/2 in four pieces and Taylor sums), one table per
 window shared by every attention layer.
 
-**Gated delta rule** (`lossless_gated_delta_rule`): four CTAs per value head (32 state columns each) run
-the recurrence token by token, a column's 128 state rows on 8 threads (16 each, in registers); each
+**Gated delta rule** (`lossless_gated_delta_rule`): four CTAs per value head (32 state columns each, two
+CTAs per SM, so the 27B's 192 CTAs are one wave) run the recurrence token by token, a column's 128 state
+rows on 8 threads (16 each, in registers); each
 binary32 sum is exact in a 320-bit accumulator, the 8 partial sums added exactly, and rounded once.
 
 **Flash-Next operations** (`lossless_flash.cu`): the grouped RMSNorm (`lossless_rmsnorm_grouped`), the
@@ -206,7 +213,8 @@ ties to the lower block); a sum with an Inf or NaN term takes IEEE binary32 arit
 
 **Attention** (`lossless_attention`): each 64-element block of a q or k row on a 29-bit integer grid
 below its largest exponent, so a score is exact int64 block sums placed in an int128 (a pair whose row
-has an element off its grid is scored product by product instead); the exact maximum, fp32(s - m)
+has an element off its grid is scored product by product instead); the exact maximum (pass A, its own
+kernel with only the q and k tiles in shared memory), then (pass B, scores recomputed) fp32(s - m)
 exact, p correctly rounded; sum p exact, and sum p v from p on a 2^-48 grid and v on its channel's
 grid, the dropped bits bounded; the quotient rounded to BF16 when its error interval allows, else the
 query is recomputed exactly (every score and sum exact, the rounding decided by exact comparisons). With
@@ -214,7 +222,7 @@ a selection (QSA), a query's keys are its tail and its selected blocks.
 
 ## 3a. The route
 
-`EngineOptions::lossless` (`--lossless` of `infernix-perplexity` and `infernix_decode_quality_forced`)
+`EngineOptions::lossless` (`--lossless` of `infernix-perplexity`; `infernix-certify reference`)
 selects it on Qwen3.5/3.6/3.8 (`Qwen3_5ForCausalLM`, `Qwen3_5MoeForCausalLM`;
 `src/models/qwen3_5/execution/lossless.cpp`): a CausalScoring Engine that scores each window in one pass
 (its prefill chunk covers max_context), no fast path, FP32 logits. Its attention reads the window's own
@@ -257,9 +265,9 @@ tail (`lossless_qsa_tails_store`); each query's selection from its scores agains
 pooled keys (`lossless_qsa_pooled_gather`; `lossless_qsa_select` by position, scored 64 query columns at a
 time) once it may have more complete blocks than the budget; attention over the cache with that
 selection; the PLE history and the GDN state through the lanes' slots (`lossless_ple_conv_inject_slots`,
-the Qwen3.5 slot forms). The sampler reads an FP32 copy of the logits. `tools/quality/fast_path_gate.py`
-scores every model's
-references with `--lossless` (a decode reference's cache key records the route).
+the Qwen3.5 slot forms). The sampler reads an FP32 copy of the logits. The certification's references are this route
+or the design reference (3b), one scoring pass per window (`infernix-certify reference`; model quality
+§6).
 
 **Transcendental functions** (`src/ops/lossless/cr_math.cuh`): every one takes a binary32 argument, so
 its correct rounding is decidable: the double evaluation is accepted when both ends of its error
@@ -274,10 +282,9 @@ rsqrt decides a near-midpoint case exactly instead (y > m exactly when 1 > m^2 v
 of its own: activation quantization that its artifact permits, and the KV-cache format the user
 selects. `--reference` (`EngineOptions::reference`) is `--lossless` with each declared lossy step
 applied exactly where the configuration declares it, and nothing else changed: the exact computation of
-the configuration as designed. It is the second reference of the quality gate (model quality §6.2):
-a fast path's processing cost is its distance from `--lossless` minus the design reference's distance
-from `--lossless`, so neither the declared quantization's own cost nor any route's arbitrary rounding
-enters a verdict.
+the configuration as designed: the certification's reference wherever the artifact declares activation
+quantization or the KV format is coded (model quality §6), so a path's engine error is its distance from
+this route and the declared steps' own cost (its distance from `--lossless`) is disclosed, never charged.
 
 **Activation quantization.** Every input whose artifact Use permits a lower precision takes it, at every
 width and phase (the reproducible route chooses by call width and runs Qwen3.5 decode at 16 bits; the
@@ -306,12 +313,20 @@ window and its VQ value outside it, by position alone). Flash-Next's QSA selecti
 keys, which no KV format changes.
 
 **Scope.** Every artifact and KV format of the reproducible route, in CausalScoring and in the forced
-decode tool's observed runs (`infernix_decode_quality_forced --reference --observe`, one scoring pass per
-segment); generation is not a use of the route. Status (2026-10-22): the activation steps and `bf16` KV
-(V as FP16, `lossless_round_fp16`) are built; the other codecs need an attention over the stored codes
-(their decoded values are rotated and wider than BF16) and are next, so the route refuses them until then. On a 16-bit artifact with `bf16` KV
-the design reference differs from `--lossless` only by V's FP16 storage. Its bits are a function of the
-request, the artifact and the declared steps, so a reference survives rebuilds like `--lossless`'s.
+certification tool's references (`infernix-certify reference --design`, one scoring pass per window);
+generation is not a use of the route. `bf16` KV rounds V to FP16 (`lossless_round_fp16`); every
+other format stores the window's K and V through the production `kv_cache_append` (`lossless_kv_encode`: an
+identity block table, so the planes hold production's bytes; the VQ formats' window rows for every key by the
+append's own window-copy steps) and `lossless_codec_attention` reads them: a pack kernel decodes each row
+exactly (codes times scales; for a rotated plane the exact H_256 / 16 in 128-bit integers) onto
+`lossless_attention`'s grid integers (int32, one exponent per row), and the attention's scores, exponentials,
+sums and rounding are `lossless_attention`'s own; a key row whose exact value needs more than 29 bits (a rotated FP8 row: an 18-bit
+E4M3 code times an 11-bit scale, then the exact H_256 / 16) keeps the bits the shift to the grid would drop as a
+second 29-bit limb, scored exactly beside the first, so such rows stay on the main path; a query against a row
+needing more than the two limbs, and every query the error interval leaves undecided, takes an exact fallback
+that decodes each key row once. On a 16-bit artifact with `bf16` KV the
+design reference differs from `--lossless` only by V's FP16 storage. Its bits are a function of the request,
+the artifact and the declared steps, so a reference survives rebuilds like `--lossless`'s.
 
 ## 4. Qualification
 
@@ -320,7 +335,34 @@ request, the artifact and the declared steps, so a reference survives rebuilds l
   exact fallback alike).
 - Whole blocks against an FP64 evaluation at the same rounding points, to within those points'
   roundings.
-- As the gate reference, the §6.2 acceptance checks of model quality once. Its bits depend on the request
-  and the artifact alone, so `tools/quality/fast_path_gate.py` keys a lossless reference by the
-  definition's version (`LOSSLESS_DEFINITION`) rather than the build: a reference survives rebuilds, and
-  any change to what this document defines bumps the version.
+- Reference conformance: the route's whole FP32 logits at chosen positions
+  (`infernix-certify capture`) equal, bit for bit, the publisher's transformers code evaluated in exact
+  arithmetic with each operation rounded to its dtype (`tools/quality/shadow`). A mismatch is localized
+  by `python -m tools.quality.shadow.bisect`: with `INFERNIX_LOSSLESS_DUMP_DIR` set the engine writes the
+  BF16 residual stream after the embedding, each layer's mixer and each layer, and the tool compares every
+  checkpoint with the publisher's code on the first tokens of the same sequence; the first checkpoint
+  that differs names the operation to examine.
+- Its bits depend on the request and the artifact alone, so the certification stores its references across builds
+  and releases (`tools/quality/certify.py`'s reference store) and a release run re-scores one window of
+  each to confirm that no bit changed; any change to what this document defines needs the owner's
+  approval and a full certification.
+
+## 5. The noise twin
+
+**Attribution.** `EngineOptions::lossless_noise_units` (`ops::LosslessNoiseUnit`: elementwise, attention,
+Flash-Next's own operations, the delta rule, MoE, RoPE, linear, GGUF) confines the noise to chosen groups of
+operations, and `lossless_noise_scale` thins it: every rounding moves from its nearest neighbour to the other
+with that share of the twin's probability (`infernix-certify prefill --lossless --noise-seed N --noise-units
+LIST --noise-scale S`). With the noise in one group at a time, the twin's KL splits by group; with all groups
+at falling strength, the strength at which it equals a shipped route's KL says how noisy that route is.
+
+`EngineOptions::lossless_noise_seed` (`infernix-certify prefill --lossless --noise-seed N`, CausalScoring
+only) makes every correctly rounded result of the route a stochastic rounding of the same exact value:
+up with probability equal to the discarded fraction of the result's unit in the last place
+(`src/ops/lossless/noise.cuh`; the draw is keyed by the seed and the value being rounded, so a run is
+deterministic and equal exact values round alike). It is an ideal implementation of the model at its
+dtypes, off by at most one unit in the last place at every rounding and by nothing else. Its distance
+from the route is the model's own sensitivity to rounding, the noise floor of every route measured against it.
+`infernix_lossless_linear_test` checks it against the exact oracle: every output one of its exact
+value's two neighbours, as often away from zero as the discarded fractions predict, the same bits for
+one seed.

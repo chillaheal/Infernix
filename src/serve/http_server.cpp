@@ -124,6 +124,9 @@ std::string response_request_id(const httplib::Response& response) {
 
 void write_openai_error(httplib::Response& response, const ApiError& error) {
     response.status = error.status;
+    if (error.retry_after_seconds > 0) {
+        response.set_header("Retry-After", std::to_string(error.retry_after_seconds));
+    }
     response.set_content(make_error_body(error), "application/json");
 }
 
@@ -133,6 +136,9 @@ void write_anthropic_error(httplib::Response& response, const ApiError& api_erro
     response.status      = error.status;
     response.headers.erase("request-id");
     response.set_header("request-id", request_id);
+    if (error.retry_after_seconds > 0) {
+        response.set_header("Retry-After", std::to_string(error.retry_after_seconds));
+    }
     response.set_content(make_anthropic_error_body(error, request_id), "application/json");
 }
 
@@ -293,8 +299,7 @@ void HttpServer::record_request_done(const RequestLogContext& context,
 
 void HttpServer::record_request_failure(const RequestLogContext& context,
                                         const RequestFailure& failure) {
-    const bool cancelled =
-        failure.classification == RequestFailureClass::ClientDisconnected;
+    const bool cancelled = failure.classification == RequestFailureClass::ClientDisconnected;
     metrics_.failed(cancelled);
     metrics_json_history_.failure(context, cancelled);
     request_jsonl_.write_request_error(context, failure.machine_message);
@@ -313,12 +318,11 @@ std::string HttpServer::metrics_json_body() const {
     const infernix::EngineOptions& engine = service_->engine_options();
     const Metrics::RequestCounts counts   = metrics_.counts();
 
-    snapshot.instance_id         = request_jsonl_.server_instance_id();
-    snapshot.model               = public_model_id_;
-    snapshot.architecture        = load.architecture;
-    snapshot.weights             = load.weight_formats.empty() ? std::string{}
-                                                               : load.weight_formats.front();
-    snapshot.kv                  = infernix::kv_cache_name(engine.kv_cache);
+    snapshot.instance_id  = request_jsonl_.server_instance_id();
+    snapshot.model        = public_model_id_;
+    snapshot.architecture = load.architecture;
+    snapshot.weights = load.weight_formats.empty() ? std::string{} : load.weight_formats.front();
+    snapshot.kv      = infernix::kv_cache_cli_name(engine.kv_cache);
     snapshot.speculative_backend = product::speculative_backend_name(engine.speculative.backend);
     snapshot.time_unix           = unix_time_seconds();
     snapshot.start_time_unix     = metrics_.start_time_seconds();
@@ -347,6 +351,10 @@ void HttpServer::record_throughput(const ThroughputReport& report) {
 
 void HttpServer::run_stats_reporter() {
     using Clock                     = std::chrono::steady_clock;
+    // The device's clocks, power, energy and throttle reasons beside each interval (NVML; every
+    // sample is invalid without it).
+    const infernix::GpuTelemetry telemetry(options_.device);
+    infernix::GpuTelemetrySample gpu_previous = telemetry.sample();
     infernix::RuntimeStats previous   = service_->runtime_stats();
     Clock::time_point previous_time = Clock::now();
     const auto interval             = std::chrono::milliseconds(options_.log_stats_interval_ms);
@@ -372,8 +380,11 @@ void HttpServer::run_stats_reporter() {
         try {
             const infernix::RuntimeStats current = service_->runtime_stats();
             const Clock::time_point now        = Clock::now();
-            const ThroughputReport report      = make_throughput_report(
+            ThroughputReport report            = make_throughput_report(
                 previous, current, std::chrono::duration<double>(now - previous_time).count());
+            report.gpu_previous = gpu_previous;
+            report.gpu_current  = telemetry.sample();
+            gpu_previous        = report.gpu_current;
             previous      = current;
             previous_time = now;
             if (report_has_activity(report)) { record_throughput(report); }
@@ -393,6 +404,8 @@ void HttpServer::run_stats_reporter() {
         const Clock::time_point now        = Clock::now();
         ThroughputReport tail              = make_throughput_report(
             previous, current, std::chrono::duration<double>(now - previous_time).count());
+        tail.gpu_previous = gpu_previous;
+        tail.gpu_current  = telemetry.sample();
         // The exact partial interval remains useful to measurement consumers. Pretty throughput is
         // a fixed-cadence operational record and deliberately has no irregular shutdown tail.
         tail.final_interval = true;
@@ -518,8 +531,8 @@ void HttpServer::register_routes() {
                     handle_models(req, res);
                 });
     server_.Get("/metrics", [this](const httplib::Request& req, httplib::Response& res) {
-        const MetricsFormat format = select_metrics_format(req.get_param_value("format"),
-                                                           req.get_header_value("Accept"));
+        const MetricsFormat format =
+            select_metrics_format(req.get_param_value("format"), req.get_header_value("Accept"));
         res.set_header("Cache-Control", "no-store");
         if (format == MetricsFormat::Invalid) {
             res.status = 400;
@@ -709,8 +722,10 @@ void HttpServer::attach(GenerationService& service) {
         throw std::logic_error("HTTP generation service is already attached");
     }
     const infernix::LoadSummary load = service.load_summary();
-    // memory_summary waits for the completed worker boundary, including warmup publication.
+    // memory_summary waits for the completed worker boundary, including warmup publication. The
+    // execution maxima restart here, so /metrics reports serving's, not the warm-up's.
     const infernix::MemorySummary memory  = service.memory_summary();
+    service.reset_execution_maxima();
     const infernix::RuntimeStats baseline = service.runtime_stats();
     public_model_id_                    = resolve_public_model_id(options_, load.model_name);
     model_metadata_                     = service.model_metadata();
@@ -742,14 +757,47 @@ bool HttpServer::listen() {
         stats_stopping_ = false;
         stats_thread_   = std::thread([this] { run_stats_reporter(); });
     }
+    watch_stopping_ = false;
+    watch_thread_   = std::thread([this] { run_engine_watch(); });
     try {
         const bool result = server_.listen_after_bind();
+        stop_engine_watch();
         stop_stats_reporter();
-        return result;
+        // A stop for an Engine failure is not a listen failure.
+        return result || engine_failed_.load();
     } catch (...) {
+        stop_engine_watch();
         stop_stats_reporter();
         throw;
     }
+}
+
+void HttpServer::run_engine_watch() {
+    for (;;) {
+        {
+            std::unique_lock lock(watch_mutex_);
+            if (watch_cv_.wait_for(lock, kEngineWatchInterval, [this] { return watch_stopping_; })) {
+                return;
+            }
+        }
+        // The failed Engine has already answered every request with an error; nothing more can
+        // be served, so the accept loop ends and the process exits for a launcher to restart.
+        if (service_->has_failed()) {
+            engine_failed_.store(true);
+            server_.stop();
+            return;
+        }
+    }
+}
+
+void HttpServer::stop_engine_watch() {
+    if (!watch_thread_.joinable()) { return; }
+    {
+        std::lock_guard lock(watch_mutex_);
+        watch_stopping_ = true;
+    }
+    watch_cv_.notify_one();
+    watch_thread_.join();
 }
 
 void HttpServer::stop() {

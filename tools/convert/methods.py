@@ -25,7 +25,7 @@ from tools.artifact.schema import TensorSpec
 from tools.artifact.tensor_output import TensorOutput
 
 from .quantization.fp8_row import quantize_bf16_rows
-from .quantization.groupwise import quantize_matrix, quantize_matrix_mse
+from .quantization.groupwise import quantize_matrix, quantize_matrix_mse, quantize_matrix_mse_norm
 from .quantization.nvfp4 import E2M1_MAX, quantize_nvfp4, quantize_nvfp4_mse, weight_divisor
 from .sources.logical import EncodedRows, LogicalSource
 
@@ -293,6 +293,33 @@ def grouped_mse(request: PrepareRequest) -> PreparedMethod:
     return request.job(produce=produce)
 
 
+def grouped_mse_norm(request: PrepareRequest) -> PreparedMethod:
+    """``grouped_mse``'s codes with each group's scale stretched to keep the group's norm
+    (``quantize_matrix_mse_norm``): the 2-bit screens of a vocabulary head (--screen-heads)."""
+    if (
+        not isinstance(get_format(request.target.format), QuantFormat)
+        or len(request.target.shape) != 2
+    ):
+        raise ValueError("grouped_mse_norm requires a grouped-integer matrix target")
+    _preflight(request)
+    n, k = request.target.shape
+
+    def produce(output):
+        for begin in range(0, n, request.rows_per_chunk):
+            end = min(n, begin + request.rows_per_chunk)
+            values = request.values(begin * k, end * k).reshape(end - begin, k)
+            if not values.dtype.is_floating_point:
+                raise TypeError(
+                    "grouped_mse_norm source must provide floating-point values"
+                )
+            encoded = quantize_matrix_mse_norm(
+                values, request.target.format, device=request.device
+            )
+            output.write_codes(begin, encoded.codes, encoded.scales)
+
+    return request.job(produce=produce)
+
+
 def fp8_row_maxabs(request: PrepareRequest) -> PreparedMethod:
     """Round inputs to BF16, then quantize to FP8 codes with BF16 row scales."""
     if request.target.format != "fp8_e4m3fn_row_bf16" or len(request.target.shape) != 2:
@@ -326,7 +353,9 @@ def import_encoded(request: PrepareRequest) -> PreparedMethod:
 
     ``fp8_e4m3fn_row_f32`` keeps ModelOpt's FP32 weight scales exactly; an ``AllowA8`` input records
     the source's static FP32 ``input_scale`` as its ``activation_input_scale``, and inputs fused into
-    one parent must share it (they share one activation encoding). ``nvfp4_mul`` in
+    one parent must share it (they share one activation encoding). A source without one (ModelOpt
+    ``FP8_PER_CHANNEL_PER_TOKEN``) records none: its activations take a scale per column at run time,
+    and a parent may not mix the two. ``nvfp4_mul`` in
     ``nvfp4_rg16_v1`` keeps ModelOpt's FP32 multiplier exactly."""
     if request.target.format not in _IMPORT_FORMATS or len(request.target.shape) != 2:
         raise ValueError("import_encoded requires a known encoded matrix target")
@@ -377,7 +406,12 @@ def import_encoded(request: PrepareRequest) -> PreparedMethod:
                     value = request.auxiliary_overrides[key]
                 elif request.policies[(parameter, input_name)] in ("AllowA8", "AllowA4"):
                     if source.input_scale is None:
-                        raise ValueError(f"{parameter}: AllowA8 needs the source's static input_scale")
+                        # No static scale (ModelOpt FP8_PER_CHANNEL_PER_TOKEN): the engine encodes each
+                        # activation column with its own scale. A parent's inputs share one encoding.
+                        if input_scale not in (None, b"dynamic"):
+                            raise ValueError(f"{parameter}: fused FP8 inputs mix static and per-token scales")
+                        input_scale = b"dynamic"
+                        continue
                     value = AuxiliaryValue.activation_scale(source.input_scale())
                 else:
                     continue
@@ -524,6 +558,7 @@ METHODS: dict[str, Method] = {
     "cast_direct": cast_direct,
     "grouped_absmax": grouped_absmax,
     "grouped_mse": grouped_mse,
+    "grouped_mse_norm": grouped_mse_norm,
     "fp8_row_maxabs": fp8_row_maxabs,
     "import_encoded": import_encoded,
     "import_ggml_rows": import_ggml_rows,

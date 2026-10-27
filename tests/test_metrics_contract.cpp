@@ -59,14 +59,14 @@ int main() {
     outcome.prompt_tokens                       = 1200;
     outcome.completion_tokens                   = 65;
     outcome.finish_reason                       = infernix::FinishReason::StopToken;
-    outcome.metrics.ttft_seconds                = 0.05;
-    outcome.metrics.prefill_seconds             = 0.09;
-    outcome.metrics.decode_share_seconds        = 1.60;
-    outcome.metrics.total_seconds               = 1.75;
-    outcome.metrics.computed_prefill_tokens     = 200;
-    outcome.metrics.prefix_cache_hit_tokens     = 1000;
-    outcome.metrics.speculative_draft_tokens    = 80;
-    outcome.metrics.speculative_accepted_tokens = 60;
+    outcome.timings.first_token_seconds                = 0.05;
+    outcome.timings.prefill_seconds             = 0.09;
+    outcome.timings.decode_share_seconds        = 1.60;
+    outcome.timings.total_seconds               = 1.75;
+    outcome.computed_prefill_tokens     = 200;
+    outcome.reused_prompt_tokens     = 1000;
+    outcome.speculative.drafted_tokens    = 80;
+    outcome.speculative.accepted_tokens = 60;
 
     snapshot.requests.push_back(
         make_metrics_json_request(41, context, outcome, 1000.123456));

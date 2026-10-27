@@ -61,6 +61,8 @@ public:
 
     [[nodiscard]] PromptSummary summary() const;
     [[nodiscard]] PromptPreparationStats preparation_stats() const noexcept;
+    // The prompt's target token ids, as the Engine will process them; empty for an empty prompt.
+    [[nodiscard]] std::span<const TokenId> token_ids() const noexcept;
     [[nodiscard]] explicit operator bool() const noexcept;
     [[nodiscard]] std::unique_ptr<NgramArchive::Request> bind_ngram(NgramArchive& archive,
                                                                     const NgramSessionHints& hints);
@@ -89,6 +91,8 @@ public:
     [[nodiscard]] PreparedPrompt prepare_tokens(std::vector<TokenId> token_ids,
                                                 bool allow_prefix_identity = true) const;
     [[nodiscard]] std::vector<TokenId> tokenize_text(std::string_view text) const;
+    [[nodiscard]] std::string detokenize(std::span<const TokenId> token_ids) const;
+    [[nodiscard]] ChatTokens tokenize_chat(PromptInput input) const;
     [[nodiscard]] MediaCacheSummary media_cache_summary() const;
     [[nodiscard]] OutputSession
     make_output_session(const PreparedPrompt& prompt, const StopPolicy& caller_stop,

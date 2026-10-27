@@ -89,10 +89,6 @@ void validate(const EngineOptions& options) {
             (options.kv_cache != KvCacheStorage::BFloat16 || options.expert_tail_skip != 0)) {
             throw std::invalid_argument("lossless generation takes bf16 KV and no --expert-tail-skip");
         }
-        if (options.reference && options.kv_cache != KvCacheStorage::BFloat16) {
-            throw std::invalid_argument("the Qwen3.8-Flash-Next design reference scores with bf16 KV (its other KV "
-                                        "codecs are not implemented yet)");
-        }
     }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("Engine max_concurrency must be in [1,8]");
@@ -107,10 +103,7 @@ void validate(const EngineOptions& options) {
 
 } // namespace
 
-bool artifact_is_qwen4_exp(const std::filesystem::path& artifact) {
-    const artifact::Reader reader(artifact);
-    return models::qwen4_exp::is_qwen4_exp(reader);
-}
+bool artifact_is_qwen4_exp(const artifact::Reader& reader) { return models::qwen4_exp::is_qwen4_exp(reader); }
 
 Qwen4ExpInstance::Qwen4ExpInstance(std::unique_ptr<models::qwen4_exp::Model> source, const EngineOptions& options)
     : model(std::move(source)), parameters(*model),
@@ -137,7 +130,12 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         throw std::invalid_argument("artifact is not Qwen4ExpForCausalLM");
     }
     inspect.complete();
-    auto plan = models::qwen4_exp::plan_load(reader, models::load_options(options, models::Architecture::Qwen4Exp));
+    const auto qwen4_load = [&](bool stream_experts) {
+        auto load           = models::load_options(options, models::Architecture::Qwen4Exp);
+        load.stream_experts = stream_experts;
+        return load;
+    };
+    auto plan = models::qwen4_exp::plan_load(reader, qwen4_load(false));
     // The RAM ledger (design §19.3.7): the experts take what the reserve and every other planned
     // allocation leave, before anything is pinned or read.
     auto vram   = open_vram_budget_source(device.device, options.vram_past_budget);
@@ -189,11 +187,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     // the experts the ledger leaves room for (less their lock overhead) and reads the rest on use.
     const ExpertRamPlan ram = plan_expert_ram(options, demand, snapshot);
     const bool tier         = ram.tier;
-    if (tier) {
-        auto streamed           = models::load_options(options, models::Architecture::Qwen4Exp);
-        streamed.stream_experts = true;
-        plan                    = models::qwen4_exp::plan_load(reader, streamed);
-    }
+    if (tier) { plan = models::qwen4_exp::plan_load(reader, qwen4_load(true)); }
     plan.set_host_reserve(options.ram_headroom_bytes, demand.later_pinned);
 
     models::qwen4_exp::ProgramOptions program_options;
@@ -309,6 +303,15 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         options.speculative.backend == SpeculativeBackend::Mtp &&
         (options.fast_paths || std::find(options.fast_path_candidates.begin(), options.fast_path_candidates.end(),
                                          FastPath::SampledMtpDrafts) != options.fast_path_candidates.end());
+    // screened-lm-head's graphs likewise: asked for as a candidate, or with fast paths where the loader bound the
+    // LM head's screen (the path is qualified per configuration).
+    program_options.screened_lm_head =
+        std::find(options.fast_path_candidates.begin(), options.fast_path_candidates.end(),
+                  FastPath::ScreenedLmHead) != options.fast_path_candidates.end() ||
+        (options.fast_paths && plan.has_output_head_screen());
+    // fp16-gdn-state's smaller pool likewise (it is qualified nowhere, so only a candidate selects it).
+    program_options.fp16_gdn_state = std::find(options.fast_path_candidates.begin(), options.fast_path_candidates.end(),
+                                               FastPath::Fp16GdnState) != options.fast_path_candidates.end();
     const auto device_plan =
         models::qwen4_exp::Program::plan_device(program_options, plan.config(), plan.public_token_count());
     const std::uint64_t dense = plan.device_bytes();
@@ -336,11 +339,18 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     // The fast paths qualified for this configuration (docs/maintainer/model-quality.md section 6.7).
     const models::qwen4_exp::FastPathSelection fast = models::qwen4_exp::select_fast_paths(instance->parameters, options);
     program_options.fast_paths        = fast.forward();
-    program_options.pair_speculation  = fast.selected(FastPath::AdaptiveSpeculation);
+    // Two-row speculative rounds: MTP's (adaptive-speculation) or DFlash2's (dflash2-pairs); each
+    // applies only to its drafter.
+    program_options.pair_speculation  = fast.selected(FastPath::AdaptiveSpeculation) ||
+                                        fast.selected(FastPath::DFlash2Pairs);
     program_options.free_cache_resume = fast.selected(FastPath::FreeCacheResume);
     program_options.preemption        = fast.selected(FastPath::Preemption);
     program_options.sampled_mtp_drafts = fast.selected(FastPath::SampledMtpDrafts);
+    program_options.screened_lm_head   = fast.selected(FastPath::ScreenedLmHead);
+    program_options.fp16_gdn_state     = fast.selected(FastPath::Fp16GdnState);
+    program_options.block_verification = fast.selected(FastPath::BlockVerification);
     program_options.gumbel_sampling    = !options.fast_paths;
+    program_options.bf16_logits        = options.logits_dtype == LogitsDtype::BF16;
 
     StartupPhaseScope program(options.startup_observer, StartupPhase::ProgramInitialize);
     instance->program =

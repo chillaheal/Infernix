@@ -24,9 +24,16 @@ void nvfp4_linear_add_a16_launch(const Tensor& x, const Weight& weight, Tensor& 
                                  cudaStream_t stream);
 
 // A16ColumnInvariant: one K-warp count per K for every T (8 at K=6144, 4 at K=17408), so a
-// column's arithmetic does not depend on the call's other columns.
+// column's arithmetic does not depend on the call's other columns. Calls of 17+ columns (32+ at
+// K=17408) run the slice-major ring tile of that count, narrower ones the sliced-K tiles; the two give
+// the same bits (both are exposed for that test).
 void nvfp4_linear_add_invariant_launch(const Tensor& x, const Weight& weight, Tensor& residual,
                                        cudaStream_t stream);
+void nvfp4_linear_add_invariant_sliced_launch(const Tensor& x, const Weight& weight,
+                                              Tensor& residual, cudaStream_t stream);
+// T >= 17.
+void nvfp4_linear_add_invariant_ring_launch(const Tensor& x, const Weight& weight, Tensor& residual,
+                                            cudaStream_t stream);
 void nvfp4_linear_add_decode_launch(const Tensor& x, const Weight& weight, Tensor& residual,
                                     cudaStream_t stream);
 

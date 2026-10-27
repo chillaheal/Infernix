@@ -29,6 +29,8 @@ constexpr std::int32_t kFfnColumns = 4096;
 template <class A>
 constexpr bool kRuns = std::is_same_v<A, WorkspaceArena>;
 
+ResidualTap g_residual_tap;
+
 template <class A>
 Tensor alloc(A& a, DType dtype, std::initializer_list<std::int32_t> shape) {
     return a.alloc(dtype, shape);
@@ -69,7 +71,11 @@ Step design_step(const LosslessDesign& design, const LinearParameters& p) {
     if (!design.active) { return Step::None; }
     if (p.weight.qtype == QType::NVFP4 && ops::allows_a4(p.policy)) { return Step::Nvfp4; }
     if (p.weight.qtype == QType::FP8_E4M3FN_ROW_BF16 && ops::allows_a8(p.policy)) { return Step::Fp8Token; }
-    if (p.weight.qtype == QType::FP8_E4M3FN_ROW_F32 && ops::allows_a8(p.policy)) { return Step::Fp8Static; }
+    // A per-token fp8_e4m3fn_row_f32 parent (no calibrated scale: ModelOpt FP8_PER_CHANNEL_PER_TOKEN)
+    // takes the per-token rule.
+    if (p.weight.qtype == QType::FP8_E4M3FN_ROW_F32 && ops::allows_a8(p.policy)) {
+        return p.weight.input_scale > 0.0F ? Step::Fp8Static : Step::Fp8Token;
+    }
     return Step::None;
 }
 
@@ -145,10 +151,16 @@ void attention_layer(A& a, const BlockParameters& block, const TextConfig& confi
     }
     Tensor q3 = q.view({D, heads, T}), k3 = k.view({D, kv_heads, T}), v3 = v.view({D, kv_heads, T});
     Tensor o = alloc(a, DType::BF16, {D, heads, T});
+    // The design reference with a coded KV format: K and V through its production encoder, attention over the
+    // stored rows (lossless-route.md §3b).
+    const bool codes    = design.active && design.kv != KvCacheStorage::BFloat16;
     const DeviceSpan ws = a.alloc_bytes(
         cache != nullptr ? ops::lossless_paged_attention_workspace_bytes(heads, kv_heads, T / cache->sequences,
                                                                         cache->sequences, cache->key_capacity)
+        : codes          ? ops::lossless_codec_attention_workspace_bytes(heads, kv_heads, T)
                          : ops::lossless_attention_workspace_bytes(heads, kv_heads, T));
+    const DeviceSpan stored_rows =
+        codes ? a.alloc_bytes(ops::lossless_kv_encode_bytes(design.kv, kv_heads, T)) : DeviceSpan{};
     if constexpr (kRuns<A>) {
         Tensor qr = q.view({D, heads * T}), kr = k.view({D, kv_heads * T});
         ops::lossless_rmsnorm(qr, p.query_norm, config.rms_norm_eps, qr, s);
@@ -159,6 +171,9 @@ void attention_layer(A& a, const BlockParameters& block, const TextConfig& confi
             ops::lossless_kv_append(k3, v3, *cache->positions, cache->sequences, *cache->table_rows, cache->kv, s);
             ops::lossless_paged_attention(q3, *cache->positions, cache->sequences, *cache->table_rows, cache->kv,
                                           cache->max_keys, cache->key_capacity, o, ws.data, s);
+        } else if (codes) {
+            const ops::LosslessKvCodes stored = ops::lossless_kv_encode(k3, v3, design.kv, stored_rows.data, s);
+            ops::lossless_codec_attention(q3, stored, kv_heads, o, ws.data, s);
         } else {
             // The design's bf16 KV stores V as FP16 (exact in BF16 again).
             if (design.active) { ops::lossless_round_fp16(v3, s); }
@@ -188,6 +203,11 @@ void gdn_layer(A& a, const BlockParameters& block, const TextConfig& config, Ten
         throw std::invalid_argument("the lossless gated delta rule takes head dims 128");
     }
     auto scope = a.scope();
+    const auto tap = [&](const char* tag, const Tensor& t) {
+        if constexpr (kRuns<A>) {
+            if (g_residual_tap) { g_residual_tap(tag, t, s); }
+        }
+    };
     Tensor h = alloc(a, DType::BF16, {H, T});
     if constexpr (kRuns<A>) { ops::lossless_rmsnorm(x, block.input_norm, config.rms_norm_eps, h, s); }
     Tensor mixed = alloc(a, DType::BF16, {C, T}), z = alloc(a, DType::BF16, {VW, T});
@@ -225,11 +245,17 @@ void gdn_layer(A& a, const BlockParameters& block, const TextConfig& config, Ten
         const Quantized hc = quantize(a, control_step, h, *a_w, s);
         shared(a, hc.x, {{a_w, 0, Hv, &av, 0}, {b_w, b_row, Hv, &bv, 0}}, s, hc.scale);
     }
+    tap("gdn_mixed", mixed);
+    tap("gdn_z", z);
+    tap("gdn_a", av);
+    tap("gdn_b", bv);
     Tensor g = alloc(a, DType::FP32, {Hv, T}), beta = alloc(a, DType::BF16, {Hv, T});
     Tensor c = alloc(a, DType::BF16, {C, T});
     Tensor o = alloc(a, DType::BF16, {VW, T}), on = alloc(a, DType::BF16, {VW, T});
     if constexpr (kRuns<A>) {
         ops::lossless_gdn_gates(av, bv, p.a_log, p.dt_bias, g, beta, s);
+        tap("gdn_g", g);
+        tap("gdn_beta", beta);
         const Tensor qc = c.slice(0, 0, KW), kc = c.slice(0, KW, KW), vc = c.slice(0, 2 * KW, VW);
         if (cache != nullptr) {
             Tensor conv = cache->conv_states, recurrent = cache->recurrent_states;
@@ -239,14 +265,18 @@ void gdn_layer(A& a, const BlockParameters& block, const TextConfig& config, Ten
                                                  *cache->source_slots, *cache->destination_slots, o, s);
         } else {
             ops::lossless_causal_conv(mixed, p.convolution, c, s);
+            tap("gdn_conv", c);
             ops::lossless_gated_delta_rule(qc, kc, vc, g, beta, nullptr, o, s);
+            tap("gdn_o", o);
         }
         Tensor o2 = o.view({dv, Hv * T}), z2 = z.view({dv, Hv * T}), on2 = on.view({dv, Hv * T});
         ops::lossless_rmsnorm_gated(o2, z2, p.norm, config.rms_norm_eps, on2, s);
+        tap("gdn_on", on);
     }
     Tensor y = alloc(a, DType::BF16, {H, T});
     const Quantized oq = quantize(a, design_step(design, p.output), on, p.output.weight, s);
     linear(a, oq.x, p.output.weight, 0, H, y, 0, s, oq.scale);
+    tap("gdn_y", y);
     if constexpr (kRuns<A>) { ops::lossless_add(x, y, x, s); }
 }
 
@@ -364,28 +394,46 @@ void offloaded_moe(A& a, const OffloadedMoeParameters& p, const Tensor& h, Tenso
             streaming->before_experts(p.layer, s);
         }
     }
+    // A dense shared expert (an FP8 checkpoint's) is computed here; a shared expert bank is the
+    // dispatch's last job.
+    const std::int32_t sj = p.shared ? 0 : 1;
+    const std::int32_t Is = p.shared ? p.shared->gate_up.weight.n / 2 : 0;
     for (std::int32_t c0 = 0; c0 < T; c0 += kFfnColumns) {
         const std::int32_t n = std::min(kFfnColumns, T - c0);
         auto scope = a.scope();
         const Tensor hc = h.slice(1, c0, n);
-        // Router logits and the shared expert's gate logit (row E): one encode of hc.
+        // Router logits and the shared expert's gate logit (row E), and a dense shared expert's gate and
+        // up: one encode of hc.
         Tensor logits = alloc(a, DType::BF16, {E + 1, n});
-        shared(a, hc, {{&router, 0, E, &logits, 0}, {&score, 0, 1, &logits, E}}, s);
+        Tensor sg, su, sd;
+        if (p.shared) {
+            sg = alloc(a, DType::BF16, {Is, n});
+            su = alloc(a, DType::BF16, {Is, n});
+            const Weight& gu = p.shared->gate_up.weight;
+            shared(a, hc, {{&router, 0, E, &logits, 0}, {&score, 0, 1, &logits, E}, {&gu, 0, Is, &sg, 0},
+                           {&gu, Is, Is, &su, 0}},
+                   s);
+            if constexpr (kRuns<A>) { ops::lossless_silu_mul(sg, su, sg, s); }
+            sd = alloc(a, DType::BF16, {H, n});
+            linear(a, sg, p.shared->down.weight, 0, H, sd, 0, s);
+        } else {
+            shared(a, hc, {{&router, 0, E, &logits, 0}, {&score, 0, 1, &logits, E}}, s);
+        }
         Tensor weights = alloc(a, DType::FP32, {k, n}), ids = alloc(a, DType::I32, {k, n});
         Tensor gate    = alloc(a, DType::FP32, {n});
-        const std::int32_t entries = (k + 1) * n, max_jobs = std::min(E, k * n) + 1;
-        const DeviceSpan dispatch_bytes = a.alloc_bytes(ops::moe_dispatch_bytes(E + 1, entries));
+        const std::int32_t entries = (k + sj) * n, max_jobs = std::min(E, k * n) + sj;
+        const DeviceSpan dispatch_bytes = a.alloc_bytes(ops::moe_dispatch_bytes(E + sj, entries));
         Tensor outputs = alloc(a, DType::BF16, {H, entries});
         const DeviceSpan expert_ws = a.alloc_bytes(ops::moe_experts_workspace_bytes(
             shape, max_jobs, entries, n, ops::offloaded_moe::ExpertActivation::kA16, ops::offloaded_moe::WideA16::kLossless));
         if constexpr (kRuns<A>) {
             ops::lossless_router(logits, E, k, weights, ids, s);
             ops::MoeRouting routing{ids, weights, gate};
-            ops::MoeDispatch dispatch = ops::carve_moe_dispatch(dispatch_bytes.data, E + 1, entries);
+            ops::MoeDispatch dispatch = ops::carve_moe_dispatch(dispatch_bytes.data, E + sj, entries);
             std::int32_t* route_log   = experts->route_log != nullptr && static_cast<std::size_t>(k) * n <= experts->route_stride
                                             ? experts->route_log + static_cast<std::size_t>(p.layer) * experts->route_stride
                                             : nullptr;
-            ops::moe_dispatch(routing, E, dispatch, route_log, s, /*shared_job=*/true);
+            ops::moe_dispatch(routing, E, dispatch, route_log, s, /*shared_job=*/sj == 1);
             ops::MoeExpertSource source = experts->sources.at(p.layer);
             source.cpu      = ops::MoeCpuChannel{}; // the lossless pass computes every expert on the GPU
             source.wide_a16 = ops::offloaded_moe::WideA16::kLossless;
@@ -397,7 +445,8 @@ void offloaded_moe(A& a, const OffloadedMoeParameters& p, const Tensor& h, Tenso
             ops::moe_experts(hc, dispatch, source, k, max_jobs, expert_ws.data, outputs, s, /*wait_for_cpu=*/false, false);
             // Over the experts in ascending id s = bf16(s + bf16(y_e w_e)), then the gated shared expert, then
             // the residual.
-            const Tensor routed = outputs.slice(1, 0, k * n), shared_out = outputs.slice(1, k * n, n);
+            const Tensor routed = outputs.slice(1, 0, k * n);
+            const Tensor shared_out = p.shared ? sd : outputs.slice(1, k * n, n);
             Tensor xc = x.slice(1, c0, n);
             ops::lossless_moe_combine(routed, weights, ids, Tensor{}, &shared_out, &logits, E, xc, s);
         }
@@ -410,13 +459,14 @@ template <class A>
 void layer(A& a, const BlockParameters& block, const TextConfig& config, MixerKind kind, const Tensor& rope_table,
            Tensor& x, cudaStream_t s, const LosslessCache* cache, const LosslessDesign& design,
            OffloadedExperts* experts, const OffloadedCall* call) {
-    if (design.active && (cache != nullptr || design.kv != KvCacheStorage::BFloat16)) {
-        throw std::invalid_argument("the design reference scores windows with bf16 KV");
-    }
+    if (design.active && cache != nullptr) { throw std::invalid_argument("the design reference scores whole windows"); }
     if (kind == MixerKind::FullAttention) {
         attention_layer(a, block, config, rope_table, x, s, cache, design);
     } else {
         gdn_layer(a, block, config, x, s, cache, design);
+    }
+    if constexpr (kRuns<A>) {
+        if (g_residual_tap) { g_residual_tap("mixer", x, s); }
     }
     auto scope = a.scope();
     Tensor h = alloc(a, DType::BF16, {x.ne[0], x.ne[1]});
@@ -435,6 +485,8 @@ void layer(A& a, const BlockParameters& block, const TextConfig& config, MixerKi
 std::int32_t rotary_pairs(const TextConfig& config) { return dimension(config.rope_parameters->rotary_dim) / 2; }
 
 } // namespace
+
+void set_lossless_residual_tap(ResidualTap tap) { g_residual_tap = std::move(tap); }
 
 Tensor lossless_rope_window(const TextConfig& config, const Tensor& positions, WorkspaceArena& workspace,
                             cudaStream_t stream) {

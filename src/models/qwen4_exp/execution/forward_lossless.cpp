@@ -2,7 +2,8 @@
 // §3a): every operation of Transformers' modeling_qwen4_exp.py correctly rounded: the exact projections of
 // lossless_linear over each weight's exact value, the hyper-connection mixes and injections, PLE, the gated
 // delta rule, QSA attention (the indexer's pooled-key scores selecting each query's blocks), the router with
-// BF16 weights, the offloaded experts' lossless pass, and FP32 logits. Two forms:
+// BF16 weights, the offloaded experts' lossless pass, and the logits (each exact sum correctly rounded to FP32,
+// or to BF16 with BF16 logits). Two forms:
 //  - a scored window (ForwardBatch::lossless_keys 0): one sequence in one call from zero state over its own
 //    keys, writing nothing to the KV cache or the recurrent states;
 //  - the cache form (generation): prefill chunks and decode rounds continue their sequences, K/V and pooled
@@ -300,10 +301,19 @@ Tensor Forward::lossless_attention_block(const AttentionParameters& p, const Ten
         select = static_cast<const std::uint32_t*>(bits.data);
     }
     Tensor out = work_.alloc(DType::BF16, {D, heads, T});
-    const DeviceSpan attention_ws = work_.alloc_bytes(ops::lossless_attention_workspace_bytes(heads, kv_heads, T));
-    // The design reference's bf16 KV stores V as FP16 (exact in BF16 again).
-    if (config_.design_reference) { ops::lossless_round_fp16(v, s); }
-    ops::lossless_attention(qn, kn, v, out, attention_ws.data, s, select, words, ratio);
+    if (config_.design_reference && config_.design_kv != KvCacheStorage::BFloat16) {
+        // The design reference with a coded KV format: K and V through its production encoder, attention over the
+        // stored rows (lossless-route.md §3b).
+        const DeviceSpan stored_rows  = work_.alloc_bytes(ops::lossless_kv_encode_bytes(config_.design_kv, kv_heads, T));
+        const DeviceSpan attention_ws = work_.alloc_bytes(ops::lossless_codec_attention_workspace_bytes(heads, kv_heads, T));
+        const ops::LosslessKvCodes stored = ops::lossless_kv_encode(kn, v, config_.design_kv, stored_rows.data, s);
+        ops::lossless_codec_attention(qn, stored, kv_heads, out, attention_ws.data, s, select, words, ratio);
+    } else {
+        const DeviceSpan attention_ws = work_.alloc_bytes(ops::lossless_attention_workspace_bytes(heads, kv_heads, T));
+        // The design reference's bf16 KV stores V as FP16 (exact in BF16 again).
+        if (config_.design_reference) { ops::lossless_round_fp16(v, s); }
+        ops::lossless_attention(qn, kn, v, out, attention_ws.data, s, select, words, ratio);
+    }
     Tensor gated = work_.alloc(DType::BF16, {QW, T});
     ops::lossless_sigmoid_mul(out.view({QW, T}), gate, gated, s);
     lossless_project(gated, p.output, 0, H, y, 0);
@@ -509,7 +519,12 @@ std::size_t Forward::lossless_workspace_bytes(const TextConfig& c, std::int32_t 
                              std::size_t(c.qsa.index_head_dim) * blocks * bf * 2 + blocks * 12 +
                              std::size_t(c.rope.rotary_dim) * (t + blocks) * bf + blocks * c.qsa.index_heads * t * 4 +
                              ((blocks + 31) / 32 + 1) * t * 4 + ops::lossless_qsa_select_workspace_bytes(dim(t), dim(blocks)) +
-                             ops::lossless_attention_workspace_bytes(dim(c.attention.heads), dim(c.attention.kv_heads), dim(t));
+                             (c.design_reference && c.design_kv != KvCacheStorage::BFloat16
+                                  ? ops::lossless_codec_attention_workspace_bytes(dim(c.attention.heads),
+                                                                                  dim(c.attention.kv_heads), dim(t)) +
+                                        ops::lossless_kv_encode_bytes(c.design_kv, dim(c.attention.kv_heads), dim(t)) + 512
+                                  : ops::lossless_attention_workspace_bytes(dim(c.attention.heads),
+                                                                            dim(c.attention.kv_heads), dim(t)));
     std::size_t cached = 0;
     if (key_capacity > 0) {
         // The cache form: the window's projections and rotations as above, the pooled-key steps, each

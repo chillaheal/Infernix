@@ -134,6 +134,30 @@ def qwen3_8_27b_q6(model, recipe, sources):
     _dense_groupwise(model, recipe, Q8, gate_up=Q6)
 
 
+def qwen3_5_gguf_q8_0(model, recipe, sources):
+    """A llama.cpp Q8_0 GGUF of a Qwen3.5 dense model, bit-exact (``tools.convert --gguf``,
+    ``qwen3_5_gguf``): every Q8_0 matrix, the token embedding and the head included, as the
+    identical ``q8_g32_fp16`` words, and every other tensor as its exact BF16 or FP32 value, the GDN
+    gating projections as separate BF16 parents as the official recipes keep them. llama.cpp runs
+    the same weights from the GGUF, so a comparison of the two engines compares their arithmetic."""
+
+    if "num_experts" in model.config:
+        raise ValueError("this recipe requires Qwen3.5 Dense mathematics")
+    for name, parameter in model.parameters.items():
+        if name.endswith(("/gdn/a_projection", "/gdn/b_projection")):
+            recipe.separate(name)
+            continue
+        if not (parameter.projection or name == "text/token_embedding"):
+            continue
+        try:
+            stored = parameter.source.read_encoded(0, 1).format
+        except (TypeError, ValueError):  # no encoded rows (None, or a checkpoint's BF16 matrix)
+            stored = None
+        if stored != Q8:
+            raise ValueError(f"{name}: this recipe stores the Q8_0 matrices of a GGUF import (tools.convert --gguf)")
+        recipe.assign(name, format=Q8, method=import_encoded)
+
+
 def qwen3_6_35b_a3b(model, recipe, sources):
     if "num_experts" not in model.config:
         raise ValueError("this official recipe requires Qwen3.5 MoE mathematics")
@@ -314,22 +338,29 @@ def _modelopt_mixed_algorithms(store) -> set[str]:
 
 def qwen3_5_moe_nvfp4_modelopt(model, recipe, sources):
     """A ModelOpt ``MIXED_PRECISION`` export of a Qwen3.5 MoE model (Ornith-1.5-122B-NVFP4, design
-    docs/maintainer/qwen3_5-122b-offload-design.md §6), bit-exact except for the MTP drafter:
+    docs/maintainer/qwen3_5-122b-offload-design.md §6, and dealignai's Ornith-1.5-122B-UNCENSORED-NVFP4),
+    bit-exact except for the MTP drafter:
 
     - Routed experts (weight-only ``W4A16_NVFP4``): exact ``nvfp4_mul`` banks in
       ``nvfp4_expert_rg16_v1`` (codes, E4M3 block scales and the FP32 ``weight_scale_2`` multipliers
       as stored), run with the canonical W4A16 arithmetic; the engine keeps them in host memory
       behind its VRAM expert cache.
-    - Shared experts (``W4A16_NVFP4``): one-record banks of the same layout, run as a resident job of
-      the routed-expert kernels.
-    - ``lm_head`` (``W4A16_NVFP4``): exact ``nvfp4_mul`` in ``nvfp4_rg16_v1``, FP32 logits.
-    - Attention and GDN projections (per-tensor ``FP8`` with static ``input_scale``): exact
-      ``fp8_e4m3fn_row_f32`` (every row holds its matrix's FP32 ``weight_scale``), ``AllowA8`` with the
-      checkpoint's FP32 input scale as the Use's ``activation_input_scale``: static 8-bit
-      activations in prefill, 16-bit in decode on the exact route.
+    - Shared experts: ``W4A16_NVFP4`` ones become one-record banks of the same layout, run as a resident
+      job of the routed-expert kernels; FP8 ones (``FP8_PER_CHANNEL_PER_TOKEN``) dense
+      ``fp8_e4m3fn_row_f32`` gate/up and down projections, run beside the routed experts.
+    - ``lm_head``: ``W4A16_NVFP4`` as exact ``nvfp4_mul`` in ``nvfp4_rg16_v1``, or FP8 per row as
+      ``fp8_e4m3fn_row_f32``; FP32 logits either way.
+    - Attention and GDN projections: exact ``fp8_e4m3fn_row_f32`` (per-tensor ``FP8``: every row holds
+      its matrix's FP32 ``weight_scale``; ``FP8_PER_CHANNEL_PER_TOKEN``: each row its own), ``AllowA8``:
+      8-bit activations in prefill, 16-bit in decode on the exact route. A matrix with a static
+      ``input_scale`` gives the Use that FP32 scale as its ``activation_input_scale``; a per-channel one
+      has none, and its activations take one scale per column at run time, as the checkpoint's
+      ``FP8_PER_CHANNEL_PER_TOKEN`` specifies. The FP8 shared experts and head are ``A16Only``, as the
+      NVFP4 ones are.
     - Every BF16 tensor (router, shared-expert gate, GDN a/b, norms, convolution, ``A_log`` and
       ``dt_bias`` widened exactly to FP32, embedding, vision) keeps its value.
-    - The BF16 MTP layer is re-quantized as Qwen3.8-Flash-Next's drafter: ``q8_g32_fp16`` dense,
+    - The MTP layer (BF16, or FP8 per row with block-FP8 ``FP8_PB_WO`` routed experts, read as their
+      exact values) is re-quantized as Qwen3.8-Flash-Next's drafter: ``q8_g32_fp16`` dense,
       ``q4_g64_fp16`` (MSE group scales) routed experts, BF16 router and shared-expert gate. It only
       proposes tokens the model verifies, so its precision changes acceptance, never output.
     - A selected DFlash2 (or DFlash) drafter, ``--source dflash2=PATH`` (Ornith's
@@ -341,9 +372,11 @@ def qwen3_5_moe_nvfp4_modelopt(model, recipe, sources):
     if "num_experts" not in model.config:
         raise ValueError("this recipe requires Qwen3.5 MoE mathematics")
     base = sources["base"]
-    unexpected = _modelopt_mixed_algorithms(base) - {"FP8", "W4A16_NVFP4"}
+    unexpected = _modelopt_mixed_algorithms(base) - {"FP8", "FP8_PER_CHANNEL_PER_TOKEN", "FP8_PB_WO", "W4A16_NVFP4"}
     if unexpected:
-        raise ValueError(f"this recipe imports FP8 and W4A16_NVFP4 layers only, not {sorted(unexpected)}")
+        raise ValueError(
+            f"this recipe imports FP8, FP8_PER_CHANNEL_PER_TOKEN, FP8_PB_WO and W4A16_NVFP4 layers only, "
+            f"not {sorted(unexpected)}")
     banks = [
         name for name in model.parameters
         if name.startswith("text/layers/") and name.endswith(("/moe/experts", "/moe/shared_expert"))
@@ -363,24 +396,31 @@ def qwen3_5_moe_nvfp4_modelopt(model, recipe, sources):
         )
         recipe.group(name, shape=model.parameters[name].shape)
     for name in model.parameters:
-        if name.startswith("text/layers/") and name.endswith(_MODELOPT_FP8_ROLES):
+        if name.startswith("text/layers/") and name.endswith(_MODELOPT_FP8_ROLES + _MODELOPT_FP8_SHARED):
             recipe.assign(
                 name,
                 format=FP8_F32,
                 method=import_encoded,
                 source=model.source(name, base, FP8_F32),
-                activation_policy="AllowA8",
+                activation_policy="A16Only" if name.endswith(_MODELOPT_FP8_SHARED) else "AllowA8",
             )
-    recipe.assign(
-        "text/output_head",
-        format="nvfp4_mul",
-        layout="nvfp4_rg16_v1",
-        method=import_encoded,
-        source=model.source("text/output_head", base, "nvfp4_mul"),
-        activation_policy="A16Only",
-    )
+    head = model.source("text/output_head", base, FP8_F32 if _fp8_matrix(base, "lm_head.weight") else "nvfp4_mul")
+    if _fp8_matrix(base, "lm_head.weight"):
+        recipe.assign("text/output_head", format=FP8_F32, method=import_encoded, source=head,
+                      activation_policy="A16Only")
+    else:
+        recipe.assign("text/output_head", format="nvfp4_mul", layout="nvfp4_rg16_v1", method=import_encoded,
+                      source=head, activation_policy="A16Only")
     _flash_next_drafter(model, recipe)
     _dflash_drafters(model, recipe)
+
+
+# An FP8 shared expert's dense projections (dealignai's Ornith-1.5-122B-UNCENSORED-NVFP4).
+_MODELOPT_FP8_SHARED = ("/moe/shared/gate", "/moe/shared/up", "/moe/shared/down")
+
+
+def _fp8_matrix(store, name: str) -> bool:
+    return store.has(name) and store.describe(name).dtype == "F8_E4M3"
 
 
 def _flash_next_drafter(model, recipe, experts=Q4):
@@ -565,15 +605,21 @@ def qwen3_8_flash_next_fp4_local(model, recipe, sources):
       shared-expert projections keep their E4M3FN codes and UE8M0 group scales
       (``fp8_e4m3fn_g32_e8m0``, W8A16).
     - The GDN a/b projections (MXFP8, a parameter of their own) and the vision attention become
-      their exact BF16 values; the vision MLPs and merger (weight-only NVFP4) their BF16 rounding,
-      the conversion's only rounding of a main-model or vision weight.
+      their exact BF16 values.
+    - The vision MLPs and merger (weight-only NVFP4) keep their words as dense ``nvfp4_mul``
+      matrices in ``nvfp4_rg16_v1`` (``_fp4_local_vision``), run with the canonical W4A16
+      arithmetic, so no main-model or vision weight is rounded.
     - Every BF16 or FP32 tensor keeps its dtype; the NVFP4 n-gram table is written verbatim to its
       own volume with its FP32 multiplier.
     - The MTP drafter is re-quantized as recipes A-C build it (``_flash_next_drafter``) from its
       weight-only NVFP4 experts' exact values and its BF16 dense projections.
 
     The QSA query/gate/key/value and indexer projections form one MXFP8 parent [13952, 2560], which
-    the model runs as one projection (the builder's grouping, as recipe A's)."""
+    the model runs as one projection (the builder's grouping, as recipe A's).
+
+    The published conversion also passes ``--proposal --screen-heads``: the proposal head, then the
+    2-bit screens of the LM head and the proposal head (tools/convert/screen.py, 273 MB), extra objects
+    after every other, so the tensors this recipe assigns keep their bytes."""
 
     from .expert_banks import ExpertBankSource, import_expert_bank, weight_only_bank
 
@@ -616,7 +662,31 @@ def qwen3_8_flash_next_fp4_local(model, recipe, sources):
             )
     # The banks keep their activation scales and permit 4-bit activations; 16-bit is the default.
     model.config["expert_a4_activations"] = "optional"
+    _fp4_local_vision(model, recipe, base)
     _flash_next_drafter(model, recipe)
+
+
+# FP4-Local's weight-only NVFP4 vision matrices: each layer's MLP and the merger.
+_FP4_LOCAL_VISION_NVFP4 = ("/mlp/fc1", "/mlp/fc2", "/merger/fc1", "/merger/fc2")
+
+
+def _fp4_local_vision(model, recipe, base):
+    """FP4-Local's vision MLPs ([4304, 1152], [1152, 4304]) and merger ([4608, 4608], [2560, 4608]):
+    NVIDIA's E2M1 codes, E4M3 block scales and FP32 ``weight_scale_2`` words as dense ``nvfp4_mul``
+    matrices in ``nvfp4_rg16_v1``, run with 16-bit activations by the canonical W4A16 projection
+    (rg16_linear), as the Qwen3.5-122B head. Each matrix is its own parent, so the artifact's other
+    objects keep their order and bytes. Without the vision component this assigns nothing."""
+
+    for name in model.parameters:
+        if name.startswith("vision/") and name.endswith(_FP4_LOCAL_VISION_NVFP4):
+            recipe.assign(
+                name,
+                format="nvfp4_mul",
+                layout="nvfp4_rg16_v1",
+                method=import_encoded,
+                source=model.source(name, base, "nvfp4_mul"),
+                activation_policy="A16Only",
+            )
 
 
 def qwen3_8_flash_next_gsq_rco_iq3s(model, recipe, sources):
@@ -683,6 +753,7 @@ RECIPES = {
     "qwen3_8_27b_nvfp4": qwen3_8_27b_nvfp4,
     "qwen3_8_27b_nvfp4_nvidia": qwen3_8_27b_nvfp4_nvidia,
     "qwen3_8_27b_nvfp4_orcarouter": qwen3_8_27b_nvfp4_orcarouter,
+    "qwen3_5_gguf_q8_0": qwen3_5_gguf_q8_0,
     "qwen3_6_35b_a3b": qwen3_6_35b_a3b,
     "qwen3_5_moe_nvfp4_modelopt": qwen3_5_moe_nvfp4_modelopt,
     "qwen3_8_flash_next_nvfp4": qwen3_8_flash_next_nvfp4,

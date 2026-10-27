@@ -59,7 +59,15 @@ std::string make_image_model_object(std::string_view image_model_id, std::int64_
 std::string make_error_body(const ApiError& error);
 std::int64_t unix_time_now();
 
-// 404 model_not_found unless `requested` names one of the ids this process actually serves.
+// The model an OpenAI request runs on: `available` (the public model ID) when `requested` names it,
+// or names anything non-empty and `any_name` (--any-model-name) is set; otherwise throws 404
+// model_not_found. Responses and request logs report the returned name.
+[[nodiscard]] std::string resolve_openai_model(std::string_view requested, std::string_view available,
+                                               bool any_name);
+
+// 404 model_not_found unless `requested` names one of the ids this process actually serves. The
+// image route keeps this strict form: a chat name and an image name are both servable ids there,
+// and --any-model-name never widens which artifact a picture is drawn from.
 void validate_openai_model(std::string_view requested,
                            std::initializer_list<std::string_view> available);
 

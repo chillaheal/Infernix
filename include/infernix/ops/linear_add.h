@@ -50,7 +50,8 @@ namespace infernix::ops {
  *   [2048,4096], [2048,6144], [5120,6144] or [5120,17408], NVFP4
  *   BlockScaleK16M128x4 [5120,6144] or [5120,17408], row-scaled
  *   FP8_E4M3FN_ROW_BF16 [5120,6144] or [5120,17408], FP8_E4M3FN_ROW_F32 [3072,8192] (static
- *   input scale: its A8 route encodes x as e4m3_rn_satfinite(fl32(x * fl32(1 / s)))), or BF16 Contiguous [5120,6144]. T may
+ *   input scale: its A8 route encodes x as e4m3_rn_satfinite(fl32(x * fl32(1 / s))); a per-token
+ *   parent, Weight::input_scale 0, takes each column's own s = fl32(max |x| / 448)), or BF16 Contiguous [5120,6144]. T may
  *   be any positive value.
  *
  * Numeric:
@@ -83,8 +84,9 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual, WorkspaceAre
                 cudaStream_t stream);
 
 /// `routes` admits fast-path routes (LinearRoutes): under LinearRoutes::WideDownTile the NVFP4
-/// [5120,17408] A16 calls of 5-16 columns take the 8 K-warp tiles; without a flag every profile
-/// runs its exact route.
+/// [5120,17408] A16 calls of 5-16 columns take the 8 K-warp tiles; under LinearRoutes::Q5KSplit the
+/// Q5 calls of 2-16 columns (every width under A16ColumnInvariant, still column-invariant) take
+/// the 8 K-warp K-split tiles; without a flag every profile runs its exact route.
 void linear_add(const Tensor& x, const Weight& w, Tensor& residual, LinearPolicy policy,
                 WorkspaceArena& ws, cudaStream_t stream, LinearRoutes routes = LinearRoutes::Exact);
 

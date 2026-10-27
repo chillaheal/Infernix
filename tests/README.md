@@ -67,9 +67,16 @@ The chat-template reference test uses Python Jinja2.
 Run a focused target for a localized change:
 
 ```bash
-cmake --build build --parallel --target infernix_sampling_test
+cmake --build build --parallel --target infernix_ops_sampling_test
 ctest --test-dir build -R infernix_sampling_test --output-on-failure
 ```
+
+The op tests under `tests/ops` link into one executable per family (`infernix_ops_<family>_test`:
+`elementwise`, `recurrent`, `sampling`, `attention`, `projection`, `offloaded_moe`, `lossless`,
+`linear`, `linear_fused`) instead of one each, which saves a link of the Ops library per test. Each
+test keeps its own entry point (`INFERNIX_OP_TEST(name)`, `tests/ops/op_family.h`) and its CTest
+entries and names (`infernix_<name>_test`). The executable runs one test by name with that test's own
+arguments, `infernix_ops_<family>_test <name> [arguments]`, and `--list` names the family's tests.
 
 Enable uniform floating-point error records when establishing or reviewing an Op criterion:
 
@@ -88,7 +95,18 @@ statistics still drive the normal verdict. Passing tests remain quiet without it
 `infernix_softmax_attention_test` and the causal suite as one entry per KV type
 (`infernix_softmax_attention_<type>_test`, and `infernix_softmax_attention_wide_<type>_test` for
 `--wide-only`), so `ctest -j` runs the KV types concurrently; together the entries run exactly the
-cases of one unsharded invocation.
+cases of one unsharded invocation. `--geometry d256-h24-kv4|d256-h16-kv2|d256-h32-kv2` and
+`--columns LO-HI` keep only the causal cases of that geometry and of calls of LO to HI columns per
+row; a temporary switch's entry uses them to run only the calls its switch reaches.
+
+The lossless route's exact Python oracles (`tests/ops/lossless_cr_oracle.py`, which evaluates on every
+core, and `lossless_ops_oracle.py`) keep their deterministic output in `build/tests/oracle-cache/`, keyed by
+their sources and the Python version, so a tree computes it once per oracle change.
+
+`infernix_offloaded_moe_layer_test --no-idle` runs every layer check except the idle-service latency
+bounds, which `--idle-only` runs: CTest runs the former beside other tests and the latter alone
+(`infernix_offloaded_moe_layer_idle*_test`), since a bound of a few milliseconds holds only with the
+GPU to itself.
 
 `infernix_gdn_replay_fold_test --wide-only` likewise splits into one CTest entry per width and layer
 profile (`infernix_gdn_replay_fold_wide_w<width>_l<layers>_test`, from `--width 33|48|64 --layers
@@ -143,18 +161,16 @@ positions over garbage scratch.
 Linear tests are independently runnable by weight and activation-compute profile:
 
 ```bash
-cmake --build build --parallel --target \
-  infernix_linear_q4_a16_test infernix_linear_q5_a16_test \
-  infernix_linear_q6_a16_test infernix_linear_q8_a16_test
+cmake --build build --parallel --target infernix_ops_linear_test
 ctest --test-dir build -R '^infernix_linear_(q4|q5|q6|q8)_a16_test$' --output-on-failure
 ```
 
 For a change confined to one Q8 geometry, use the same public conformance cases with
-`./build/tests/infernix_linear_q8_a16_test --shape N K`. The default CTest invocation still covers
-all registered Q8 geometries.
+`./build/tests/infernix_ops_linear_test linear_q8_a16 --shape N K`. The default CTest invocation still
+covers all registered Q8 geometries.
 
 For a change confined to a newly supported BF16 geometry, use
-`./build/tests/infernix_linear_bf16_a16_test --shape N K`. These cases use the common full-K FP64
+`./build/tests/infernix_ops_linear_test linear_bf16_a16 --shape N K`. These cases use the common full-K FP64
 oracle with exact BF16 weights, complete output checks for small N, route boundaries, changed-input
 Graph replay, both public overloads, workspace domains, and preservation/guard checks. The small
 control projections also cover terminal-K pulses and paired cancellation.
@@ -277,6 +293,9 @@ INFERNIX_TEST_ARTIFACT=$PWD/out/qwen3_8_27b_nvfp4.ninfer \
 
 INFERNIX_TEST_ARTIFACT=$PWD/out/qwen3_6_35b_a3b.infernix \
   ./build/tests/infernix_qwen3_5_invariance_real_test mtp
+
+INFERNIX_TEST_ARTIFACT=$PWD/out/qwen3_8_27b_nvfp4.ninfer \
+  ctest --test-dir build -R infernix_qwen3_5_resume_cold_real_test --output-on-failure
 ```
 
 The invariance entry checks the exact route's request invariance with sampled decoding: each
@@ -284,6 +303,14 @@ request alone against all four at once in reverse submission order, a warm off-g
 the cold request, and a KV pool for two extents serving four requests without preemption. Its
 positional speculation is `none`, `mtp`, `dflash` or `dflash2` (the artifact must hold that
 drafter).
+
+The resume entries (`infernix_qwen3_5_resume_cold_real_test` and
+`infernix_qwen4_exp_resume_cold_real_test`, arguments `mtp dflash2`) decode 256 tokens with the
+drafter, then compare the continuation resumed from the prefix cache with a cold run: on the
+reproducible route the tokens and the teacher-forced log-probabilities of the 16 tokens past the
+decoded text are bit-identical; on the default route, which resumes from the decode-computed
+endpoint, the mean log-probability difference stays within max(0.1, 4 x) that of a resume from a
+prefill-made state. The Qwen4Exp entry runs DFlash2 only with `INFERNIX_QWEN4_DFLASH2`.
 
 The agent entry checks multi-turn continuation and branching. The preemption entry exercises
 Replay recovery and cancellation while paused or replaying; `INFERNIX_PREEMPTION_REAL_SCENARIO`
@@ -441,4 +468,7 @@ or `dflash` for the 35B-A3B), n-gram copy drafts (`auto` for `--ngram-draft-toke
 streams decoded at once, and a prompt file replacing the six short prompts (whole prompts, each
 ended by a line `<<<END>>>`, such as `bench/decode_quality/copy_prompts.py`'s copy-heavy rewrites).
 CTest runs it on INT8, K8V4, NVFP4, VQ2 and K4V2, and the block rounds of both drafters, beside
-15-draft copies and at two streams with the automatic window.
+15-draft copies and at two streams with the automatic window. `infernix_qwen3_5_dflash_tree_greedy_real_test`
+and its two-stream form run DFlash trees (16 columns at K=7) on the 35B-A3B;
+`infernix_qwen3_5_mtp_tree_greedy_real_test` and its two-stream form run MTP trees (8 columns on a
+3-draft chain, with the drafter argument `mtp`) on the NVFP4 27B.

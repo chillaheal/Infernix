@@ -46,20 +46,20 @@ MetricsJsonRequest make_metrics_json_request(std::uint64_t id, const RequestLogC
     row.finish                  = finish_reason_name(outcome.finish_reason);
     row.prompt_tokens           = outcome.prompt_tokens;
     row.cached_prompt_tokens    = std::min<std::uint64_t>(
-        outcome.metrics.prefix_cache_hit_tokens, prompt_tokens);
-    row.computed_prefill_tokens = outcome.metrics.computed_prefill_tokens;
+        outcome.reused_prompt_tokens, prompt_tokens);
+    row.computed_prefill_tokens = outcome.computed_prefill_tokens;
     row.output_tokens           = outcome.completion_tokens;
-    row.ttft_seconds            = outcome.metrics.ttft_seconds;
-    row.prefill_seconds         = outcome.metrics.prefill_seconds;
-    row.decode_seconds          = outcome.metrics.decode_share_seconds;
-    row.total_seconds           = outcome.metrics.total_seconds;
-    row.speculative_draft_tokens    = outcome.metrics.speculative_draft_tokens;
-    row.speculative_accepted_tokens = outcome.metrics.speculative_accepted_tokens;
-    row.ngram_draft_tokens          = outcome.metrics.ngram_drafted_tokens;
-    row.ngram_accepted_tokens       = outcome.metrics.ngram_accepted_tokens;
-    if (outcome.metrics.expert_cache) {
-        row.expert_lookups = outcome.metrics.expert_cache->routed;
-        row.expert_hits    = outcome.metrics.expert_cache->hits;
+    row.ttft_seconds            = outcome.timings.first_token_seconds;
+    row.prefill_seconds         = outcome.timings.prefill_seconds;
+    row.decode_seconds          = outcome.timings.decode_share_seconds;
+    row.total_seconds           = outcome.timings.total_seconds;
+    row.speculative_draft_tokens    = outcome.speculative.drafted_tokens;
+    row.speculative_accepted_tokens = outcome.speculative.accepted_tokens;
+    row.ngram_draft_tokens          = outcome.speculative.ngram_drafted_tokens;
+    row.ngram_accepted_tokens       = outcome.speculative.ngram_accepted_tokens;
+    if (outcome.expert_cache) {
+        row.expert_lookups = outcome.expert_cache->routed;
+        row.expert_hits    = outcome.expert_cache->hits;
     }
     return row;
 }

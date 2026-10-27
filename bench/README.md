@@ -75,7 +75,9 @@ primes the decode graphs before warmups and measured repetitions.
 
 ```text
 infernix_bench --weights <artifact.ninfer>
-          [--corpus <ids-path>]
+          [--corpus <ids-path>] [--prompt-ids <ids-path>]
+          [--temperature <f> [--top-p <f>] [--top-k <n>] [--min-p <f>]] [--seed <n>] [--stop-at-eos]
+          [--route-trace <path>]
           [-p, --n-prompt <list>]
           [-n, --n-gen <list>]
           [-pg, --prompt-gen <P,G;P,G...>]
@@ -93,6 +95,14 @@ infernix_bench --weights <artifact.ninfer>
 ```
 
 With no `-p`, `-n`, or `-pg`, the matrix is `pp512` and `tg128`.
+
+`--prompt-ids FILE` replaces corpus slices with one exact prompt (comma- or space-separated ids, such
+as a chat-templated fixture); each `-n N` then prefills it and decodes `N` tokens (`-p` and `-pg` are
+refused). Requests are greedy unless `--temperature` is given; `--top-p`, `--top-k` and `--min-p` then
+override the model's defaults, and row `k` of measured repetition `r` samples with seed
+`--seed + r × concurrency + k`. `--stop-at-eos` lets the model's stop tokens end a request before its
+limit (the default keeps the token count exact), and `--route-trace` writes the expert route trace.
+`tools/bench/basalt_parity.py` runs Basalt's fixtures this way.
 
 `--rope-yarn-factor F` selects the startup-fixed runtime YaRN factor, finite `[1,4]`, default `1`
 (native RoPE). It extends only the allowed ceiling, not the context selected from the workload or
@@ -141,7 +151,16 @@ Schema v22 adds `draft_tokens_auto` (`--draft-tokens auto`; `draft_tokens` is th
 ceiling, or the fixed length a Qwen3.5/3.6 configuration without adaptive-mtp runs, with
 `draft_tokens_auto` false). Schema v23 adds `expert_tail_skip` (`--expert-tail-skip`; 0 off).
 Schema v24 adds `expert_a4_activations` (`--expert-a4-activations`, nvidia/Qwen3.8-Flash-Next-FP4-Local's
-optional 4-bit expert activations).
+optional 4-bit expert activations). Schema v25 adds the `machine` object, so reports from different
+machines compare: the PCIe generation and width NVML reports right after the measured runs (an idle
+GPU lowers them) and the most the device and system allow, `h2d_gbps` (64 MiB pinned copies while a
+kernel keeps the SMs busy, measured once the model has loaded; `null` under `--profile-measured`,
+which keeps the profiled launches the run's own) and `ram_read_gbps` with `ram_read_threads` (every
+hardware thread reading its share of 512 MiB before the model loads). `null` is unknown; the table
+prints the same as one `machine:` line. Each test also carries `execution`: the measured repetitions'
+Engine execution units by kind (`prefill`, `replay`, `control`, `decode`: count, `mean_ms`, and
+`max_ms`, the maxima restarted after the warm-ups) and `decode_by_batch`, the decode rounds of each
+batch size that ran.
 
 `--ngram-draft-tokens 1..63 --ngram-min-match 4..64` enables the single-request
 [ngram copy proposer](../docs/ngram.md) alongside the selected neural backend.
@@ -154,47 +173,12 @@ remains neural-only unless its cases explicitly request ngram.
 
 ## Decode quality
 
-`infernix_decode_quality_forced` measures the decode route teacher-forced: each segment prefills a
-corpus prompt and forces the following corpus tokens through the production decode path, one
-constrained step per token, recording each token's log-probability from the round's full
-distribution (`ConstrainedDraw::mass`). Positions pair exactly between builds, which makes it the
-sensitive decode measure of the [acceptance policy](../docs/maintainer/model-quality.md#6-numerical-acceptance-policy-and-fast-paths)
-(`--kv-dtype` takes every KV format: `int8`, `bf16`, `fp8`, `nvfp4`, `k8v4`, `vq2`, `k4v2`;
-`--expert-a4-activations` runs nvidia/Qwen3.8-Flash-Next-FP4-Local's experts W4A4):
-
-```bat
-infernix_decode_quality_forced model.ninfer corpus.txt exact.json --segments 256 ^
-  --prompts 512,2048,8192 --mode plain --kv-dtype int8 --reproducible
-infernix_decode_quality_forced model.ninfer corpus.txt fast.json --segments 256 ^
-  --prompts 512,2048,8192 --mode plain --kv-dtype int8
-```
-
-Segments lie back to back from the corpus's first token, so no two share text, and the tool stops
-if the corpus is too short for them. `--first-segment N` computes the set's segments N to N +
-`--segments` - 1 with their offsets and prompt lengths as in the whole set, and
-`tools/quality/fast_path_gate.py concat-forced A.json B.json --out AB.json` joins consecutive ranges
-(references or runs), which is how a 1,024-segment gate extends a 256-segment one
-([acceptance policy](../docs/maintainer/model-quality.md#61-the-reproducible-route-and-the-fast-paths)). `--forced N` sets the forced tokens per segment (at most 64,
-the constraint step limit); `--mode`
-is `plain`, `dflash2`, `ngram` or `mtp`. `--lossless` writes the reference for the same segments
-instead (the lossless route, `EngineOptions::lossless`, with BF16 KV in one pass: each forced
-token's log-probability and the 64 most probable tokens there), and `--observe REFERENCE.json` makes every
-forced step also record the log-probabilities of those tokens and its own largest one
-(`TokenConstraint::observe`), from which the gate computes decode KL and top-1 agreement. Fast paths run as in `infernix-serve` unless
-`--reproducible`; `--fast-path NAME` also runs a candidate path (qualification).
-
-The log-probabilities are printed exactly, so the same segments also measure request invariance:
-`tools/quality/fast_path_gate.py identical a.json b.json` compares two exact-route runs bit for
-bit. `--concurrency N` (1-8) keeps N segments in flight, each lane taking the next segment when
-its previous one completes (their prompt lengths differ, so prefills overlap decodes, and no lane
-idles behind a group's longest prompt), `--prefill-chunk N` sets the prompt chunk (default
-4096, rounded down to the prompt-attention wave), and `--prefix-reuse` submits groups of N instead:
-each segment's prompt runs alone first (with `--warm-tokens N`, only its first N tokens) and then
-the group's measured requests together from the prefix cache (the report's `reused_prompt_tokens`
-counts the restored tokens). The last log line sums the requests' prefill time and their share of
-the decode rounds, which shows where a run's time went. `--kv-tokens N`
-sizes the KV pool (default: every lane's whole context), so a short pool makes concurrent requests
-preempt; the report's `preemptions` and `replayed_tokens` count what happened.
+The teacher-forced decode measurement of the
+[acceptance policy](../docs/maintainer/model-quality.md#6-numerical-acceptance-policy-and-fast-paths) is
+`infernix-certify decode`: it forces each corpus window's continuation through the production
+decode path, one constrained step per token, every step observing the reference's 256 most probable
+tokens (`TokenConstraint::observe`), at one request, under concurrency, from a warm prefix, under a short
+KV pool and with speculation (usage at the top of `apps/certify/main.cpp`).
 
 `infernix_decode_quality_gen` and `infernix_decode_quality_judge` measure what a build's decode path
 does to output quality, end to end, free-running. Perplexity scoring runs prefill only, so this is the check for
@@ -216,14 +200,13 @@ are in [Model-level numerical quality](../docs/maintainer/model-quality.md).
   the lossless route (`EngineOptions::lossless`), BF16 KV, each sequence in one pass. For each build it reports how often the generated token is the reference's most
   probable token given that build's own prefix, the mean reference log-probability and the mean
   regret (top log-probability minus the generated token's); for each pair, the generated prefix
-  they share exactly. `--report FILE` also writes each build's per-segment counts as JSON, which
-  `tools/quality/fast_path_gate.py decode` pairs between a default and a fast-path build
-  ([acceptance policy](../docs/maintainer/model-quality.md#6-numerical-acceptance-policy-and-fast-paths)).
+  they share exactly. `--report FILE` also writes each build's per-segment counts as JSON.
 - `--stored-activations` judges with the artifact's recorded activations instead (BF16 KV, one
   pass): it measures what decoding changes (KV format, chunking, speculation, batching), not the
   cost of the stored activation precision. `--ngram-volume FILE` (judge) and `ngram-volume=FILE`
   (generator) name Qwen3.8-Flash-Next's n-gram volume when it is not `<artifact>.ngram`. The generator's `route-trace=FILE` writes
-  Qwen3.8-Flash-Next's per-round expert routes for `tools/expert_cache_replay/host_tier.py`.
+  the per-round expert routes of a model with offloaded experts (Qwen3.8-Flash-Next, Qwen3.5-122B-A10B) for
+  `tools/expert_cache_replay/host_tier.py` and `replay.py`.
 
 ```bat
 infernix_decode_quality_gen model.ninfer corpus.txt base.txt 32 1536 384
@@ -334,7 +317,9 @@ and is not a runtime input.
 ## Linear Op benchmark
 
 `infernix_linear_bench` measures only the public pure `linear()` contract. It supports Q4, Q5, Q6,
-Q8, registered BF16 weights, the registered NVFP4 problems, and the registered FP8 problems.
+Q8, registered BF16 weights, the registered NVFP4 problems, the registered FP8 and MXFP8 problems,
+and `--qtype rg16`: a dense `nvfp4_mul` matrix in `nvfp4_rg16_v1` at its registered shapes (the
+Qwen3.5-122B head, NVIDIA FP4-Local's vision MLP and merger), the canonical W4A16 projection.
 Existing formats use `--policy a16`; NVFP4 additionally supports `--policy a4`, and
 FP8 supports `--policy a8`. Each permission lets the production resolver select the qualified
 route for the exact geometry and T. LinearAdd, LinearSwiGLU,
@@ -361,6 +346,25 @@ cmake --build build --parallel --target infernix_linear_bench
   --qtype fp8 --policy a8 --n 14336 --k 5120 --t 1
 ./build/bench/infernix_linear_bench \
   --qtype fp8 --policy a8 --n 16384 --k 5120 --t 1024
+```
+
+`--routes fast` admits the fast-path route flags (`q8-sliced-k`, `fp8-a8-pair`, `q4-w4a8`);
+`--routes block32` the same set with `fp8-a8-pair-block32` in place of `fp8-a8-pair`. On the
+Flash-Next FP8 problems, alternating `exact`, `fast` and `block32` runs time the two pair routes
+against the exact one (their quantizers included in each sample):
+
+```bash
+./build/bench/infernix_linear_bench \
+  --qtype fp8 --policy a16 --routes block32 --n 2560 --k 6144 --t 4096 --execution graph
+```
+
+`--routes f16` admits only the `f16-accumulate-prefill` route of the FP8 and MXFP8 (`--qtype mxfp8`)
+problems that register it, so the same point with `--routes exact` is its A/B; the report then names
+the `F16_F16ACC` Tensor Core profile from that route's admission width:
+
+```bash
+./build/bench/infernix_linear_bench --qtype mxfp8 --n 16384 --k 2560 --t 4096 --routes f16
+./build/bench/infernix_linear_bench --qtype mxfp8 --n 16384 --k 2560 --t 4096 --routes exact
 ```
 
 Linear tuning measures every valid T through 128 and the two bulk anchors, 512 and 1024.
@@ -390,8 +394,12 @@ matrix:
 ```bash
 ./build/bench/infernix_linear_bench --suite qwen3_6_27b
 ./build/bench/infernix_linear_bench --suite qwen3_6_35b_a3b
+./build/bench/infernix_linear_bench --suite flash_next_vision
 ./build/bench/infernix_linear_bench --suite all
 ```
+
+`flash_next_vision` times Qwen3.8-Flash-Next's vision MLP and merger at image widths (4 to 16,384
+columns) both as BF16 (every Flash-Next artifact but FP4-Local) and as `rg16` (FP4-Local).
 
 When a point group includes `T=1`, `T1_lin_x` reports the calculated ratio
 `T * median(T=1) / median(T)`. It is a scaling reference from one public `T=1` benchmark point,
@@ -424,7 +432,8 @@ Every ordinary sample is cold-cache: a 256 MiB L2 eviction read completes before
 interval. Reported effective bandwidth uses the encoded weight planes once, one BF16 activation
 read, and one BF16 output write. Reported FLOPs are the mathematical `2*N*K*T`; neither metric
 copies route-private tile, replay, padding, split, schedule, host-launcher, or kernel-instance
-behavior. The fixed RTX 5090 memory reference is `1792 GB/s` DRAM bandwidth. Tensor Core utilization
+behavior. Every Op benchmark takes its RTX 5090 peaks from `bench/ops/roofline.h`; the memory
+reference is `1792 GB/s` DRAM bandwidth. Tensor Core utilization
 is reported only for registered shape/policy/extent combinations with a known MMA profile; the
 activation policy alone does not identify that profile. MXFP8 with FP32 accumulation uses the
 `838 TFLOP/s` dense reference. `READ_%` additionally compares the same one-read model
@@ -836,8 +845,9 @@ instruction utilization require a profiler capture of the complete public call.
 
 `infernix_kv_cache_append_bench` unifies the two public append contracts without combining them in
 one timed body. `--mode full` calls full D256 KV publication for KV4/KV2 and BF16, INT8-G64,
-FP8-E4M3FN-row256, NVFP4-G16, or K8V4 caches. Its report keeps key/value vector bytes separate for
-asymmetric storage profiles. `--mode prefix` calls device-count prefix publication for BF16
+FP8-E4M3FN-row256, NVFP4-G16, K8V4, VQ2 or K4V2 caches; the two vector-quantized formats append with
+one sequence's exact window, as the engine runs them. Its report keeps key/value vector bytes
+separate for asymmetric storage profiles. `--mode prefix` calls device-count prefix publication for BF16
 D128/KV8 paged caches or cyclic caches with `--cyclic-capacity 2048|4096`. `T` is the physical input
 width and `C` is the actual device commit count. `--max-count N` selects the host envelope upper
 bound (default T), independently of C. Each default measurement contains one public call;
@@ -970,7 +980,13 @@ cmake --build build --parallel --target infernix_fp8_linear_swiglu_bench
 
 `infernix_q5_linear_add_bench` measures the public Q5 `[5120,6144]` and `[5120,17408]`
 LinearAdd profiles. Every cold-cache sample is one production-dispatched public call, with the
-workspace capacity queried for the requested interval.
+workspace capacity queried for the requested interval. `--policy invariant` measures the
+column-invariant route (the default route's decode and verification; `a16`, the default, is
+batched-decode's), and `--routes q5-ksplit` passes `LinearRoutes::Q5KSplit` (the unqualified
+`q5-ksplit-mma` fast path: eight K warps, pairwise reduction). The header line reports the
+groupwise sliced-K shape switch (`INFERNIX_TMP_GW_SHAPE`, from `temporary_switches::describe()`); the Q4 LinearSwiGLU, GDN and
+attention input benches report them too and take `--policy invariant` (`--q4q5-policy invariant`
+for the input projections).
 
 ```bash
 cmake --build build --parallel --target infernix_q5_linear_add_bench
@@ -978,6 +994,9 @@ cmake --build build --parallel --target infernix_q5_linear_add_bench
   --k 6144 --t-sweep 1,2,4,8,16,24,32,48,49,56,64,192,193 --warmup 10 --repeat 50
 ./build/bench/infernix_q5_linear_add_bench \
   --k 17408 --t-sweep 1,2,4,8,16,24,32,48,49,56,64,192,193 --warmup 10 --repeat 50
+./build/bench/infernix_q5_linear_add_bench \
+  --k 17408 --policy invariant --routes q5-ksplit --execution graph \
+  --t-sweep 1,2,3,4,5,8,9,16,17,24,32,48 --warmup 10 --repeat 50
 ```
 
 ## BF16 LinearAdd Op benchmark

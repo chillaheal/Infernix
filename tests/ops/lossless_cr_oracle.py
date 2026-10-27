@@ -1,6 +1,6 @@
 """Exact oracle for the lossless route's correctly rounded functions (src/ops/lossless/cr_math.cuh).
 
-Writes test vectors and runs the CUDA test on them: python lossless_cr_oracle.py <test executable>.
+Writes test vectors and runs the CUDA test on them: python lossless_cr_oracle.py <family executable> lossless_cr_math.
 Each expected value is the function evaluated with Python's decimal module at 60 significant digits
 (its exp, ln and sqrt are correctly rounded at that precision) and rounded to binary32 or BF16 (round to
 nearest, ties to even, subnormals, overflow to infinity) with exact rational arithmetic. 60 digits put
@@ -10,13 +10,15 @@ Standard library only.
 """
 from __future__ import annotations
 
+import hashlib
+import multiprocessing
+import os
 import random
 import struct
 import subprocess
 import sys
 import tempfile
 from decimal import Decimal, getcontext
-from fractions import Fraction
 from pathlib import Path
 
 getcontext().prec = 60
@@ -36,20 +38,25 @@ def round_binary(value: Decimal, prec: int) -> int:
     exponent range (BF16: prec 8, returned in the low 16 bits; binary32: prec 24). The sign is the value's,
     zeros included (-0, and a negative value rounding to zero, give -0)."""
     sign = 1 if value.is_signed() else 0
-    a = Fraction(abs(value))
-    if a == 0:
+    # |value| = digits 10^exponent exactly: num / den in integers (no gcd: the rounding needs none).
+    _, digits, exponent = value.as_tuple()
+    num = int("".join(map(str, digits))) if digits else 0
+    if num == 0:
         return (sign << (15 if prec == 8 else 31))
-    e = a.numerator.bit_length() - a.denominator.bit_length()
-    if Fraction(2) ** e > a:
+    den = 1
+    if exponent >= 0:
+        num *= 10 ** exponent
+    else:
+        den = 10 ** -exponent
+    # floor(log2 |value|) is e or e - 1 for this e.
+    e = num.bit_length() - den.bit_length()
+    if (num << max(0, -e)) < (den << max(0, e)):
         e -= 1
-    while Fraction(2) ** (e + 1) <= a:
-        e += 1
     e = max(e, -126)
-    quantum = Fraction(2) ** (e - prec + 1)
-    q = a / quantum
-    n = q.numerator // q.denominator
-    rem = q - n
-    if rem > Fraction(1, 2) or (rem == Fraction(1, 2) and n % 2 == 1):
+    shift = e - prec + 1
+    divisor = den << max(0, shift)
+    n, rem = divmod(num << max(0, -shift), divisor)
+    if 2 * rem > divisor or (2 * rem == divisor and n % 2 == 1):
         n += 1
     if n == 2 ** prec:
         n //= 2
@@ -123,9 +130,44 @@ def evaluate(func: int, x: float) -> int:
     raise ValueError(func)
 
 
+def evaluate_record(task: tuple[int, int]) -> tuple[int, int, int]:
+    func, bits = task
+    return func, bits, evaluate(func, float_of_bits(bits))
+
+
+def evaluate_records(tasks: list[tuple[int, int]]) -> list[tuple[int, int, int]]:
+    """evaluate_record over the tasks, in their order, on every core (each evaluation is independent)."""
+    with multiprocessing.Pool() as pool:
+        return pool.map(evaluate_record, tasks, chunksize=max(1, len(tasks) // (64 * (os.cpu_count() or 1))))
+
+
+def cached_file(directory: str | None, name: str, sources: list[Path], write) -> tuple[Path, tempfile.TemporaryDirectory | None]:
+    """The file `write(path)` produces, kept in `directory` under a key of the generating sources and the
+    Python version (the output is deterministic given both), so later runs reuse it; without a directory, a
+    temporary file. Returns the path and the temporary directory to clean up (None for a cached file)."""
+    if directory is None:
+        tmp = tempfile.TemporaryDirectory()
+        path = Path(tmp.name) / f"{name}.bin"
+        write(path)
+        return path, tmp
+    key = hashlib.sha256(sys.version.encode())
+    for source in sources:
+        key.update(source.read_bytes())
+    folder = Path(directory)
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / f"{name}-{key.hexdigest()[:16]}.bin"
+    if not path.is_file():
+        for stale in folder.glob(f"{name}-*.bin"):
+            stale.unlink(missing_ok=True)
+        partial = folder / f"{path.name}.{os.getpid()}.partial"
+        write(partial)
+        os.replace(partial, path)
+    return path, None
+
+
 def vectors() -> list[tuple[int, int, int]]:
     rng = random.Random(20261021)
-    records = []
+    tasks = []
     bf16_inputs = []
     for bits in range(0x10000):
         field = (bits >> 7) & 0xFF
@@ -150,7 +192,7 @@ def vectors() -> list[tuple[int, int, int]]:
                 continue
             if func == EXP and x > 89.0:
                 continue
-            records.append((func, bits, evaluate(func, x)))
+            tasks.append((func, bits))
     # cos and sin over RoPE's arguments (|x| < 2^20): the BF16 values in range, random binary32 across
     # the binades, and the binary32 values nearest multiples of pi / 2 (the reduction's hard cases).
     trig_inputs = [b for b in bf16_inputs if abs(float_of_bits(b)) < 2.0 ** 20]
@@ -168,8 +210,8 @@ def vectors() -> list[tuple[int, int, int]]:
     trig_inputs = [b for b in trig_inputs if abs(float_of_bits(b)) < 2.0 ** 20]
     for func in (COS, SIN):
         for bits in trig_inputs:
-            records.append((func, bits, evaluate(func, float_of_bits(bits))))
-    return records
+            tasks.append((func, bits))
+    return evaluate_records(tasks)
 
 
 def write_vectors(path: Path) -> None:
@@ -182,18 +224,15 @@ def write_vectors(path: Path) -> None:
 
 
 def main() -> int:
-    """lossless_cr_oracle.py <test executable> [vector file]: a given vector file is written once and
-    reused afterwards (the vectors are deterministic)."""
-    exe = sys.argv[1]
-    if len(sys.argv) > 2:
-        path = Path(sys.argv[2])
-        if not path.is_file():
-            write_vectors(path)
-        return subprocess.run([exe, str(path)], check=False).returncode
-    with tempfile.TemporaryDirectory() as tmp:
-        path = Path(tmp) / "cr_vectors.bin"
-        write_vectors(path)
-        return subprocess.run([exe, str(path)], check=False).returncode
+    """lossless_cr_oracle.py <family executable> <test name> [cache directory]: with a directory, the vectors are
+    written there once per version of this file and reused afterwards (they are deterministic)."""
+    command = sys.argv[1:3]  # the family executable and the test name (tests/ops/op_family.h)
+    path, tmp = cached_file(sys.argv[3] if len(sys.argv) > 3 else None, "cr_vectors", [Path(__file__)], write_vectors)
+    try:
+        return subprocess.run([*command, str(path)], check=False).returncode
+    finally:
+        if tmp is not None:
+            tmp.cleanup()
 
 
 if __name__ == "__main__":

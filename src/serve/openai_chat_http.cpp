@@ -6,6 +6,7 @@
 #include "serve/openai_chat.h"
 #include "serve/openai_common.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -32,12 +33,23 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         const auto body                  = parse_json_body(req);
         request                          = parse_chat_completion_request(body, limits);
         request.generation.ngram_session = resolve_ngram_session(req, body, options_);
-        // The image resource is not a language model: only the chat id is legal here.
-        validate_openai_model(request.model, {public_model_id_});
+        request.model = resolve_openai_model(request.model, public_model_id_, options_.any_model_name);
     } catch (const ApiException& exception) {
         write_openai_error(res, exception.error());
         return;
     }
+    // Tool-call turns sent back without their reasoning: counted, and with --restore-tool-reasoning
+    // given the reasoning this server generated for them.
+    const ReasoningRestore reasoning =
+        options_.restore_tool_reasoning
+            ? reasoning_store_.restore(request.generation.messages)
+            : ReasoningRestore{.missing = count_missing_reasoning(request.generation.messages)};
+    metrics_.reasoning(reasoning.missing, reasoning.restored);
+    const auto remember_reasoning = [this](const GenerationOutcome& outcome, const std::vector<std::string>& ids) {
+        if (options_.restore_tool_reasoning && !outcome.tool_calls.empty()) {
+            reasoning_store_.remember(ids, outcome.reasoning);
+        }
+    };
 
     // With an image pipeline in this process the request also carries the server-executed image
     // tool, so the picture rounds below are the ones a client would otherwise have to run. The URL
@@ -57,7 +69,8 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
     RequestLogMetadata metadata{.http_request_id        = res.get_header_value("x-request-id"),
                                 .model                  = request.model,
                                 .stream                 = request.stream,
-                                .output_tokens_explicit = request.output_tokens_explicit};
+                                .output_tokens_explicit = request.output_tokens_explicit,
+                                .label                  = request_label(req)};
     // Every round of one request is one HTTP request: the same observation wiring, and the same
     // request log, so an image round is visible as part of this request rather than as a new one.
     // Captured by value because a streaming provider runs after this handler has returned.
@@ -139,9 +152,11 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         }
         lifecycle->done(outcome);
         try {
-            set_ngram_generation_header(res, outcome.metrics.ngram_archive);
-            set_owned_json_content(res, make_chat_completion_response(identity, outcome),
+            set_ngram_generation_header(res, outcome.ngram_archive);
+            std::vector<std::string> call_ids;
+            set_owned_json_content(res, make_chat_completion_response(identity, outcome, &call_ids),
                                    prepared.lifetime);
+            remember_reasoning(outcome, call_ids);
         } catch (const std::exception& exception) {
             lifecycle->response_failure(make_internal_request_failure(
                 RequestFailurePhase::ResponseRender, exception.what()));
@@ -151,6 +166,27 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
             error.message = exception.what();
             write_openai_error(res, error);
         }
+        return;
+    }
+
+    // The SSE response cannot be taken back once committed: wait for the Engine's admission first,
+    // so the queue's own answers (a queue timeout, an orderly stop) are a plain HTTP status here as
+    // on the non-streaming branch; after it only mid-generation failures remain, which belong in
+    // the stream.
+    try {
+        service_->admit(prepared, [&req] { return client_disconnected(req); });
+    } catch (const ApiException& exception) {
+        lifecycle->failure(make_generation_request_failure(exception.error()));
+        write_openai_error(res, exception.error());
+        return;
+    } catch (const std::exception& exception) {
+        lifecycle->failure(
+            make_internal_request_failure(RequestFailurePhase::Generation, exception.what()));
+        ApiError error;
+        error.status  = 500;
+        error.type    = "internal_error";
+        error.message = exception.what();
+        write_openai_error(res, error);
         return;
     }
 
@@ -169,8 +205,8 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         res.set_chunked_content_provider(
             "text/event-stream",
             [this, stream, encoder, lifecycle, generation, return_progress, timings_per_token,
-             images_configured, image_model, image_url_base, make_picture,
-             make_observation](std::size_t, httplib::DataSink& sink) -> bool {
+             images_configured, image_model, image_url_base, make_picture, make_observation,
+             remember_reasoning](std::size_t, httplib::DataSink& sink) -> bool {
                 if (stream->started.exchange(true, std::memory_order_acq_rel)) {
                     sink.done();
                     return true;
@@ -207,6 +243,9 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                     return send_error(error);
                 }
 
+                // A hidden image call stays hidden on the stream too: its first delta names it,
+                // and its index then silences the rest.
+                std::vector<std::uint32_t> hidden_calls;
                 // `live` is whether this round's events reach the client. A round that only asked
                 // for a picture carries nothing: its prose is not part of the answer, and its start,
                 // prompt-progress and per-token timing would open a second generation inside the one
@@ -240,6 +279,17 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                         output.on_reasoning = [&](const std::string& text) {
                             render_and_write(transport,
                                              [&] { return encoder->reasoning_delta(text); });
+                        };
+                        output.on_tool_call = [&](const infernix::ToolCallDelta& delta) {
+                            if (!delta.name.empty() && delta.name == kChatImageToolName) {
+                                hidden_calls.push_back(delta.index);
+                            }
+                            if (std::find(hidden_calls.begin(), hidden_calls.end(), delta.index) !=
+                                hidden_calls.end()) {
+                                return;
+                            }
+                            render_and_write(transport,
+                                             [&] { return encoder->tool_call_delta(delta); });
                         };
                     }
                     output.is_cancelled = [&] { return transport.poll(); };
@@ -310,7 +360,8 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                 std::vector<std::string> terminal;
                 try {
                     terminal = encoder->finish(outcome);
-                    if (auto comment = ngram_generation_comment(outcome.metrics.ngram_archive);
+                    remember_reasoning(outcome, encoder->tool_call_ids());
+                    if (auto comment = ngram_generation_comment(outcome.ngram_archive);
                         !comment.empty()) {
                         terminal.insert(terminal.begin(), std::move(comment));
                     }

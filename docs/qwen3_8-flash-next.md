@@ -259,9 +259,6 @@ drafter does not change).
 
 ### NVIDIA FP4-Local checkpoint
 
-> **Preliminary support:** this checkpoint runs and its quality gates passed, but optimisation is still in
-> progress, so its speeds will change.
-
 Recipe `qwen3_8_flash_next_fp4_local` imports
 [nvidia/Qwen3.8-Flash-Next-FP4-Local](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-FP4-Local),
 NVIDIA's quantization-aware distillation of the model, bit-exactly
@@ -278,15 +275,24 @@ NVIDIA's quantization-aware distillation of the model, bit-exactly
   codes, one power-of-two scale per 32 weights) and run with BF16 activations (W8A16) on one
   tensor-core route at every width, so the exact route stays request-invariant; the GDN a/b
   projections and the vision attention become their exact BF16 values.
+- The vision MLPs and merger keep their NVFP4 words (codes, block scales and multiplier: 0.17 GB
+  instead of 0.6 GB of BF16) and run with BF16 activations by the exact W4A16 projection, the
+  arithmetic of the experts' default.
 - The trained FP32 norms stay FP32; every other tensor keeps its dtype.
 - The n-gram table is the checkpoint's NVFP4 table, written to its own 29.1 GB volume (any of the
   [other tables](#n-gram-table-formats) also runs the model).
 - The MTP drafter is re-quantized as for the other imports (`q8_g32_fp16` projections, `q4_g64_fp16`
-  experts from the experts' exact values); the vision MLPs are rounded once to BF16.
+  experts from the experts' exact values), the only weights not held exactly.
+- `--screen-heads` adds 2-bit copies of `lm_head` (178.8 MB) and of the proposal head (94.4 MB),
+  after every other object; every other tensor is unchanged. Only the screened heads read them: the
+  MTP drafter's draft head with `--lm-head-draft` (decode +1.6 % at MTP 3), and the `screened-lm-head`
+  fast path for greedy rounds, on by default for this artifact with INT8 KV (decode +7.5 % plain, +3.7 %
+  at MTP 3; not yet quality-gated) and otherwise `--fast-path screened-lm-head`
+  ([design §19.3.30](maintainer/qwen3_8-flash-next-design.md#19330-screened-heads-a-2-bit-screen-of-the-draft-and-lm-heads-2026-10-23-measured-2026-10-25)).
 
 ```text
 python -m tools.convert --model <dir>/Qwen3.8-Flash-Next-FP4-Local --recipe qwen3_8_flash_next_fp4_local \
-  --components text,vision,mtp --proposal --device cpu --name Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix \
+  --components text,vision,mtp --proposal --screen-heads --device cpu --name Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix \
   --resource chat_template.jinja=tools/chat_templates/qwen3_8.jinja \
   --out <dir>/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix.infernix \
   --ngram-out <fast drive>/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix.ngram
@@ -311,7 +317,10 @@ Its qualified fast paths (2026-10-21; on by default, `--reproducible` turns them
 the request-coupling paths (two-row MTP rounds: two concurrent requests decode 84 -> 126 tok/s with
 16-bit and 125 -> 162 with 4-bit expert activations; free cache resume; preemption), sampled MTP
 drafts, and `expert-a4-residual` for long prefills with 16-bit expert activations, on every KV
-format ([model quality §6.7](maintainer/model-quality.md#67-fast-path-registry)). Its exact route is
+format ([model quality §6.7](maintainer/model-quality.md#67-fast-path-registry)).
+`--fast-path expert-a4-residual-decode` (a candidate, not yet qualified or timed) takes the same two
+NVFP4 terms in decode and verification calls with 16-bit expert activations, on the GPU and for
+CPU-served misses alike (exact sums, so where an expert runs changes no bit). Its exact route is
 deterministic and gives each request the same bits alone and with up to eight concurrent requests.
 
 ## Run
@@ -372,9 +381,16 @@ infernix-serve <artifact>.infernix --ngram-volume <volume>.ngram --kv-dtype int8
     (0.6 was the best fixed cut, still below `auto` on docs).
   - The drafter takes less VRAM than MTP's: 9,070 cached experts against 8,740 on Dense8 (IQ3_S:
     12,432 against 12,288), plus its 40 MiB context ring per lane.
+  - `--lm-head-draft` (the 178 MB proposal head) decodes faster than the full head on every
+    conversion measured (2026-10-25, the same workload, one request; two on Dense8 docs): Dense8
+    (8-bit head) 1.5 %, FP4-Local (BF16 head, as FP8's and the bit-exact conversion's) 3.0 %, IQ3_S
+    1.5 %, each better in every setting.
   - Greedy output is the same as without it when one request runs at a time; sampling keeps the
     sampler's distribution. With two or more requests decoding together, rounds decode without
-    drafts (as MTP's do without `adaptive-speculation`).
+    drafts (as MTP's do without `adaptive-speculation`), except under the default fast path
+    `dflash2-pairs`: rounds of two requests share one proposal and verify up to two drafts each (with
+    `auto`, the number both requests' calibrated drafts make fastest). It is on by the owner's decision
+    ahead of its quality gate; `--disable-fast-paths` or `--reproducible` turns it off.
 - `--spec mtp --draft-tokens auto --lm-head-draft` drafts with the model's MTP layer.
   - `auto`: each round drafts the number of tokens, 0 to 7, the request's recent acceptance makes
     worthwhile (down to none on text it predicts poorly), and verifies them up to the first the
@@ -442,7 +458,10 @@ infernix-serve <artifact>.infernix --ngram-volume <volume>.ngram --kv-dtype int8
   benchmarks need (`infernix_bench` always starts that way). Output is the same either way: where an
   expert is computed never changes a bit.
 - The `infernix-serve` statistics panel's `experts` column shows the expert cache's hit rate over
-  the session and the last ten requests.
+  the session and the last ten requests. Each Chat Completions and Anthropic response's `timings`
+  carries the request's `expert_routed_n` and `expert_hit_n`, and `/metrics` exports the cache's
+  frames and its cumulative routed, hit, promotion, landing and CPU-served counts
+  ([serving](serving.md#live-metrics)).
 - After each request the engine logs two Debug lines (`--log-level debug`): the expert cache's
   hit rate, and the request's n-gram row traffic (`n-gram rows: N requested, H% host-cache hits,
   R NVMe reads, T ms of reads`, and with speculation `; G gated rounds: R NVMe reads (T ms) behind the gate, the GPU
@@ -656,8 +675,9 @@ can cost a whole record; keeping the artifact and the `.ngram` volume on a datas
 
 The GPU reads RAM experts only from page-locked (pinned) memory, and Windows page-locks at most
 the adapter's shared system memory for it: on an RTX 5090 with 95.8 GiB of RAM page-locking stopped
-at 76.0 GiB of a reported 76.6 GiB (80 % of RAM there; many machines report half of RAM). The RAM
-ledger reads that size and its current use at startup and keeps 1 GiB below it. Every other pin
+at 76.0 GiB of a reported 76.6 GiB (80 % of RAM there; many machines report half of RAM). WSL2
+inherits the limit from the Windows driver. The RAM ledger reads that size and its current use at
+startup (through DXGI on Windows, DXCore under WSL2) and keeps 1 GiB below it. Every other pin
 comes first (the embedding, the prefix cache's Host tier, the Program's buffers); the experts pin
 what is left, and their RAM beyond it holds **unpinned records**:
 
@@ -738,6 +758,9 @@ headroom 256 (auto); expert frames 9300 (23.95 GiB); 380 free after startup
   - If Windows lowers the budget later, the cache shrinks by the same amount.
   - The cost: memory past the budget may be moved to system memory if another program needs VRAM,
     which slows decode until the cache shrinks. It is off by default.
+- With more than one CUDA device visible (Windows), free VRAM is read as the Windows budget less this
+  process's usage: there CUDA's own free figure stopped following allocations, so the cache would size
+  to almost nothing. `CUDA_VISIBLE_DEVICES` naming one device restores the single-device reading.
 - <a id="expert-tail-skip"></a>**`--expert-tail-skip R`** (approximate, off by default) trades
   quality for decode speed. Each token routes 10 experts, ranked by router weight (rank 0 the
   largest). In a decode or verification round, an expert missing from VRAM that every token of the

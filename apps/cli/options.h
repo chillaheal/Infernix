@@ -41,10 +41,12 @@ struct Options {
     bool vram_past_budget = false;
     std::uint32_t expert_tail_skip = 0; // EngineOptions::expert_tail_skip
     bool expert_a4_activations     = false; // EngineOptions::expert_a4_activations
+    bool embedding_host            = false; // EngineOptions::embedding_host
     std::uint32_t prefill_chunk  = 0; // 0: the model's default (EngineOptions)
     int device                   = 0;
 
     KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
+    LogitsDtype logits_dtype = LogitsDtype::FP32;
     // INT8 KV prefills with the fast prompt kernel unless the original kernel is selected.
     bool original_int8_prefill_kernel = false;
     std::uint32_t prefill_split_workspace_mib = kDefaultPrefillSplitWorkspaceMiB;
