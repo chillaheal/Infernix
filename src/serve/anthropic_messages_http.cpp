@@ -294,6 +294,13 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                 state->final_outcome       = std::move(pictures.answer);
                 state->final_outcome.text += missing_image_url_suffix(state->final_outcome.text,
                                                                       pictures.urls);
+                // The segment's calls follow its generation: the hidden image call of the round
+                // before is no longer part of this one, and any call the answer now carries is a
+                // client call.
+                state->final_calls   = identify_anthropic_tool_calls(state->final_outcome,
+                                                                    request.tool_searches);
+                state->final_results = std::vector<std::optional<RequestJson>>(
+                    state->final_calls.size());
             }
         } catch (const ApiException& exception) {
             const ApiError error = normalize_anthropic_error(exception.error());
@@ -458,6 +465,11 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                         state->final_outcome       = std::move(pictures.answer);
                         state->final_outcome.text += missing_image_url_suffix(state->final_outcome.text,
                                                                               pictures.urls);
+                        // The segment's calls follow its generation: the hidden image call of the
+                        // round before is no longer part of this one.
+                        state->final_calls = encoder->identify_calls(state->final_outcome);
+                        state->final_results = std::vector<std::optional<RequestJson>>(
+                            state->final_calls.size());
                     }
                 } catch (const ClientDisconnected&) {
                     lifecycle->failure(

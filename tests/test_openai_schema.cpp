@@ -1421,7 +1421,6 @@ int test_late_system_and_developer_roles_parse() {
                                     Json{{"role", "developer"}, {"content", "mid policy"}},
                                     Json{{"role", "user"}, {"content", "and now?"}}});
     const GenerationRequest request = parse(body).generation;
-    int failures                    = check(request.messages.size() == 4 &&
     int failures = check(request.messages.size() == 4 &&
                              request.messages[0].role == infernix::ChatRole::System &&
                              request.messages[1].role == infernix::ChatRole::User &&
