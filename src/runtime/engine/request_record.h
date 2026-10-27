@@ -207,6 +207,10 @@ struct RequestRecord {
     std::uint64_t paused_ns                = 0;
     std::optional<Clock::time_point> paused_at;
     std::uint32_t computed_prompt_tokens = 0;
+    // Where the current prefill binding starts: a request paused inside its prompt rebinds from the
+    // deepest state the prefix cache still holds, which can sit below the frontier the Engine had
+    // already counted. The re-walked tokens are new work that must not charge the suffix again.
+    std::uint32_t prefill_binding_reuse = 0;
     GenerationTimings generation_timings;
     RequestHostTiming host_timing;
     std::uint64_t initial_binding_ns = 0;

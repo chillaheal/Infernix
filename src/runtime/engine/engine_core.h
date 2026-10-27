@@ -691,18 +691,24 @@ private:
         }
         const BeginSummary& begin = *request->admitted_begin;
         if (begin.reused_prompt_tokens > begin.prompt_tokens ||
-            request->computed_prompt_tokens > begin.prompt_tokens - begin.reused_prompt_tokens) {
+            request->prefill_binding_reuse + request->computed_prompt_tokens > begin.prompt_tokens) {
             throw std::logic_error("prompt progress exceeds the admitted prompt frontier");
         }
-        const PromptProgress progress{
+        PromptProgress progress{
             .total_prompt_tokens     = begin.prompt_tokens,
             .reused_prompt_tokens    = begin.reused_prompt_tokens,
-            .processed_prompt_tokens = begin.reused_prompt_tokens + request->computed_prompt_tokens,
+            .processed_prompt_tokens = request->prefill_binding_reuse + request->computed_prompt_tokens,
             .elapsed_ns              = elapsed_ns(*request->admitted_at, Clock::now()),
         };
         {
             std::lock_guard lock(request->mutex);
             if (request->response_done) { return; }
+            // A prompt-paused request may re-walk below its deepest reached position: the published
+            // position is the furthest walk ever committed, never one that moves backwards.
+            if (request->stream_progress &&
+                request->stream_progress->processed_prompt_tokens > progress.processed_prompt_tokens) {
+                progress.processed_prompt_tokens = request->stream_progress->processed_prompt_tokens;
+            }
             request->stream_progress = progress;
         }
         request->cv.notify_one();
@@ -1365,7 +1371,9 @@ private:
         if (begin.reused_prompt_tokens > begin.prompt_tokens) {
             throw std::logic_error("admitted prefix exceeds its prompt");
         }
-        const std::uint32_t suffix_tokens = begin.prompt_tokens - begin.reused_prompt_tokens;
+        // The suffix is this binding's: a request paused inside its prompt rebinds from the deepest
+        // state the cache still holds, and its re-walk is counted against where that binding starts.
+        const std::uint32_t suffix_tokens = begin.prompt_tokens - request->prefill_binding_reuse;
         if (request->computed_prompt_tokens > suffix_tokens ||
             progress.processed_prompt_tokens > suffix_tokens - request->computed_prompt_tokens) {
             throw std::logic_error("prefill unit exceeded the admitted prompt suffix");
@@ -1500,6 +1508,13 @@ private:
                     ++cumulative_stats_.snapshot_restores;
                     ++request->snapshot_restores;
                 }
+                if (request->resume_phase == EngineRequestState::Prefill) {
+                    // Paused inside the prompt: the binding rewalled from the deepest state the
+                    // cache holds, which may sit below the frontier already counted. The new walk
+                    // starts its own suffix; the re-walked tokens are new work, not the old suffix.
+                    request->prefill_binding_reuse  = control.summary.reused_prompt_tokens;
+                    request->computed_prompt_tokens = 0;
+                }
                 request->suspended.reset();
                 request->recovery_pending = instance_.program->recovery_pending(*request->sequence);
                 if (request->paused_at) {
@@ -1509,6 +1524,7 @@ private:
                 observe_scheduling(request, GenerationSchedulingTransition::Restored);
             } else {
                 request->initial_binding_ns = elapsed_ns(*request->admitted_at, Clock::now());
+                request->prefill_binding_reuse = control.summary.reused_prompt_tokens;
                 if (control.summary.reused_prompt_tokens) {
                     ++cumulative_stats_.prefix_selections;
                 } else {
