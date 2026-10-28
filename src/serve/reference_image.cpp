@@ -34,7 +34,13 @@ constexpr double kReferenceTargetArea = 1024.0 * 1024.0;
     return static_cast<int>(snapped) * 32;
 }
 
-std::vector<std::uint8_t> base64_decode(std::string_view text) {
+} // namespace (the geometry helpers above stay internal)
+
+// Strict base64. The significant characters of a group carry six bits each, so the emitted bytes are
+// read at 6*chars - 8*(b+1) from the top of the group. Reading fixed 16/8/0 shifts assumes four
+// significant characters, which zeroes the LAST BYTE of every payload whose length is not a multiple
+// of 3 -- two of every three images -- and hands the codec a PNG with a corrupted tail.
+[[nodiscard]] std::vector<std::uint8_t> base64_decode(std::string_view text) {
     if (text.size() % 4 != 0) { throw std::invalid_argument("image base64 length is invalid"); }
     auto value_of = [](char c) -> int {
         if (c >= 'A' && c <= 'Z') { return c - 'A'; }
@@ -44,29 +50,32 @@ std::vector<std::uint8_t> base64_decode(std::string_view text) {
         if (c == '/') { return 63; }
         return -1;
     };
-    std::size_t pad = 0;
-    if (!text.empty() && text.back() == '=') {
-        pad = (text.size() >= 2 && text[text.size() - 2] == '=') ? 2 : 1;
-    }
     std::vector<std::uint8_t> out;
     out.reserve(text.size() / 4 * 3);
     for (std::size_t i = 0; i < text.size(); i += 4) {
         std::uint32_t group = 0;
-        const std::size_t payload = i + (4 - ((i + 4 == text.size()) ? pad : 0));
-        for (std::size_t k = i; k < i + 4; ++k) {
-            if (k >= payload) { break; } // only the final group's trailing pad is skipped
-            if (text[k] == '=') { throw std::invalid_argument("image base64 has padding in the middle"); }
+        std::size_t   chars = 0;
+        for (std::size_t k = i; k < i + 4 && text[k] != '='; ++k) {
             const int v = value_of(text[k]);
             if (v < 0) { throw std::invalid_argument("image base64 has an invalid character"); }
             group = (group << 6) | static_cast<std::uint32_t>(v);
+            ++chars;
         }
-        const std::size_t bytes = (i + 4 == text.size()) ? 3 - pad : 3;
-        for (std::size_t b = 0; b < bytes; ++b) {
-            out.push_back(static_cast<std::uint8_t>(group >> (16 - 8 * b)));
+        if (chars != 4) {  // pad only ever closes the final group, and nothing may follow it
+            if (i + 4 != text.size()) { throw std::invalid_argument("image base64 has padding in the middle"); }
+            for (std::size_t k = i + chars; k < i + 4; ++k) {
+                if (text[k] != '=') { throw std::invalid_argument("image base64 has a character after padding"); }
+            }
+            if (chars < 2) { throw std::invalid_argument("image base64 has an incomplete group"); }
+        }
+        for (std::size_t b = 0; b + 1 < chars; ++b) {
+            out.push_back(static_cast<std::uint8_t>((group >> (6 * chars - 8 * (b + 1))) & 0xFFu));
         }
     }
     return out;
 }
+
+namespace {
 
 // PIL Image.resize(resample=BILINEAR) mapping: source centers at (x+0.5)/scale - 0.5, clamped,
 // 2x2 bilinear weights, no antialiasing prefilter, result rounded to uint8.
@@ -104,7 +113,20 @@ void resize_rgba_pil_bilinear(const md::RgbaImage& src, int dst_w, int dst_h,
 
 } // namespace
 
-ReferencePixels prepare_reference_image(const std::string& payload) {
+std::vector<std::uint8_t> composite_rgba_over_white(const std::uint8_t* rgba, std::size_t pixels) {
+    std::vector<std::uint8_t> out(pixels * 3);
+    for (std::size_t i = 0; i < pixels; ++i) {
+        const std::uint32_t a = rgba[4 * i + 3];
+        for (int c = 0; c < 3; ++c) {
+            const std::uint32_t src = rgba[4 * i + c];
+            // PIL ImagingPaste blend: (src*a + 255*(255-a) + 127) / 255.
+            out[3 * i + c] = static_cast<std::uint8_t>((src * a + 255u * (255u - a) + 127u) / 255u);
+        }
+    }
+    return out;
+}
+
+ReferencePlanes prepare_reference_planes(const std::string& payload) {
     std::vector<std::uint8_t> bytes = base64_decode(payload);
     if (bytes.size() > kMaximumImageInputBytes) {
         throw std::invalid_argument("the decoded reference image exceeds the size limit");
@@ -143,17 +165,25 @@ ReferencePixels prepare_reference_image(const std::string& payload) {
 
     // VaeImageProcessor.preprocess: float32 x / 255 * 2 - 1, channel-major.
     const std::size_t pixels = static_cast<std::size_t>(target_w) * target_h;
-    ReferencePixels out;
-    out.height_px = static_cast<std::uint32_t>(target_h);
-    out.width_px  = static_cast<std::uint32_t>(target_w);
-    out.pixels.resize(4 * pixels);
+    ReferencePlanes out;
+    out.vae.height_px = static_cast<std::uint32_t>(target_h);
+    out.vae.width_px  = static_cast<std::uint32_t>(target_w);
+    out.vae.pixels.resize(4 * pixels);
     for (std::size_t c = 0; c < 4; ++c) {
-        float* plane = out.pixels.data() + c * pixels;
+        float* plane = out.vae.pixels.data() + c * pixels;
         for (std::size_t i = 0; i < pixels; ++i) {
             plane[i] = static_cast<float>(resized[4 * i + c]) / 255.0F * 2.0F - 1.0F;
         }
     }
+    // The vision tower's flattened copy (pipeline: white.paste(img, mask=img.getchannel("A"))).
+    out.vision.height_px = out.vae.height_px;
+    out.vision.width_px  = out.vae.width_px;
+    out.vision.rgb       = composite_rgba_over_white(resized.data(), pixels);
     return out;
+}
+
+ReferencePixels prepare_reference_image(const std::string& payload) {
+    return prepare_reference_planes(payload).vae;
 }
 
 } // namespace infernix::serve

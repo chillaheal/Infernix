@@ -247,6 +247,17 @@ infernix_add_op_test(infernix_image_tower_prompt_test
   LIBRARIES infernix_serve infernix_engine infernix_core infernix::json)
 set_tests_properties(infernix_image_tower_prompt_test PROPERTIES SKIP_RETURN_CODE 77)
 
+# Instruction-guided edit (M1): the raw ti2i template, the host-side reproduction of the
+# processor's <|image_pad|> expansion, the derived drop, the x4 vision/VAE geometry and the
+# PIL alpha-over-white parity, all gated against tests/models/qwen_image/oracle_edit_template.json
+# (genuine Qwen3-VL processor, synthetic plane). Also guards that the production chat-template
+# render of the t2i path has not moved. Host-only; skips (77) without INFERNIX_QWENVL_PROCESSOR.
+infernix_add_op_test(infernix_image_edit_template_test
+  NEEDS_SOURCE_DIR
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_image_edit_template.cpp"
+  LIBRARIES infernix_serve infernix_engine infernix_core infernix::json)
+set_tests_properties(infernix_image_edit_template_test PROPERTIES SKIP_RETURN_CODE 77)
+
 # Step 8 (8D): the PRODUCTION raw-prompt tower route (serve provider: compiled chat template +
 # genuine tokenizer + FP8-v2 streamed weights + one-time FP8 embed dequant) on device; its
 # pre-final-RMSNorm rows gated vs pre_norm_hidden[drop_idx,S) at the qualified tower test's a-priori

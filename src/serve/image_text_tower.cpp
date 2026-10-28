@@ -8,11 +8,14 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cstddef>
+#include <cstring>
 #include <fstream>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
+#include <string_view>
 #include <utility>
 
 namespace infernix::serve {
@@ -169,6 +172,54 @@ private:
 };
 
 } // namespace
+
+namespace {
+
+// The pipeline's raw template constants (pipeline_qwenimage21.py lines 217-226), "{}" marking the
+// prompt slot and the ti2i block being the single expandable placeholder.
+constexpr const char* kTemplateT2i =
+    "<|im_start|>system\nComprehend and analyze the provided prompt.<|im_end|>\n"
+    "<|im_start|>user\n{}<|im_end|>\n"
+    "<|im_start|>assistant\n";
+constexpr const char* kTi2iImageBlock = "<image1><|vision_start|><|image_pad|><|vision_end|>";
+constexpr const char* kTemplateTi2i =
+    "<|im_start|>system\nComprehend and analyze the provided prompt.<|im_end|>\n"
+    "<|im_start|>user\n<image1><|vision_start|><|image_pad|><|vision_end|>{}<|im_end|>\n"
+    "<|im_start|>assistant\n";
+
+std::string format_into_template(std::string_view tmpl, std::string_view prompt) {
+    const std::size_t slot = tmpl.find("{}");
+    if (slot == std::string_view::npos) { throw std::runtime_error("image template has no prompt slot"); }
+    std::string out;
+    out.reserve(tmpl.size() + prompt.size());
+    out.append(tmpl, 0, slot);
+    out.append(prompt);
+    out.append(tmpl, slot + 2, tmpl.size() - slot - 2);
+    return out;
+}
+
+} // namespace
+
+std::string render_t2i_template(std::string_view prompt) { return format_into_template(kTemplateT2i, prompt); }
+
+std::string render_ti2i_template(std::string_view prompt, std::size_t image_count) {
+    if (image_count == 0) { throw std::runtime_error("ti2i template needs at least one image"); }
+    // The pipeline replaces the single placeholder block with one block per image, numbered,
+    // space-separated (pipeline_qwenimage21.py lines 259-264).
+    std::string replace = kTi2iImageBlock;
+    for (std::size_t i = 2; i <= image_count; ++i) {
+        replace += " <image" + std::to_string(i) + "><|vision_start|><|image_pad|><|vision_end|>";
+    }
+    const std::string_view tmpl{kTemplateTi2i};
+    const std::size_t at = tmpl.find(kTi2iImageBlock);
+    if (at == std::string_view::npos) { throw std::runtime_error("ti2i template has no image block"); }
+    std::string merged;
+    merged.reserve(tmpl.size() + replace.size());
+    merged.append(tmpl, 0, at);
+    merged.append(replace);
+    merged.append(tmpl, at + std::strlen(kTi2iImageBlock), tmpl.size() - at - std::strlen(kTi2iImageBlock));
+    return format_into_template(merged, prompt);
+}
 
 PromptRendererProvider make_tower_prompt_renderer(const std::string& processor_dir) {
     auto renderer = std::make_shared<PromptRenderer>(processor_dir);
