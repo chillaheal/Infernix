@@ -306,6 +306,19 @@ infernix_add_op_test(infernix_image_rope_prod_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_image_rope_prod.cpp"
   LIBRARIES infernix_qwen_image)
 
+# Instruction-guided image edit (M5): the joint index map (infernix_qwen_image::build_joint_layout) -- the
+# host arithmetic of transformer_qwenimage21.py's forward (repeats where(mask,4,1), x4 expansion, img_in
+# scatter rows onto the image slots, target_token_mask = the LAST img_shapes block, block ids, and the
+# interleaved rope walk). Gates: text-only equality (the mask [0]*tp+[1]*(H*W/4) must reproduce
+# build_joint_rope BIT-FOR-BIT across 7 geometries -- the certified t2i assembly cannot move), the
+# portrait row (30 text / 4056-token ref / 12 trailer / 4096 target: block ids, packed scatter rows,
+# target mask on the last block only, frame advance max(h,w) after each block, centred grids), two
+# adjacent images staying TWO blocks with TWO frame advances, and the x4 invariant throwing
+# std::invalid_argument (the host-side refusal the M7 ledger relies on). Host-only, no GPU, no env.
+infernix_add_op_test(infernix_image_joint_layout_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_joint_layout.cpp"
+  LIBRARIES infernix_qwen_image)
+
 # Production joint-sequence img_mask (infernix_qwen_image::build_img_mask): the DiT joint mask is the text
 # encoder's image_pad_mask_base row-concatenated with target_slots = (Hl*Wl)//4 packed-image ones
 # (dump_pipeline.py:124). The base widens with the N condition images' image_pad slots, so one rule covers

@@ -7,7 +7,8 @@ add_library(infernix_qwen_image STATIC
   "${CMAKE_CURRENT_LIST_DIR}/embed_gather.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/rope.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/img_mask.cpp"
-  "${CMAKE_CURRENT_LIST_DIR}/image_weights.cpp")
+  "${CMAKE_CURRENT_LIST_DIR}/image_weights.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/joint_layout.cpp")
 infernix_internal_includes(infernix_qwen_image)
 # The production weight loader binds logical parameters from the .infernix Directory.
 target_link_libraries(infernix_qwen_image PUBLIC infernix_artifact)
