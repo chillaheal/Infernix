@@ -1271,17 +1271,6 @@ behave the same way:
 3. The model's next round produces the reply, which quotes that URL. A reply that described the picture
    instead of quoting it gets the URL appended, so a client always gets a usable reference.
 
-The tool takes one argument a model can actually write that the route does not: `image`, which redraws a
-picture that already exists. It names that picture in one of three forms, and this process resolves the
-name into the route's own base64 reference: the job id of a picture this server drew (`img-<created>-<sequence>`),
-the URL such a picture came back with (this server's `/v1/images/…`, absolute or as a bare path), or
-`attachment:N` — the Nth picture the user attached to *this* chat request, counted from zero. Every other
-form is refused as the tool's own error result with those three named in the text so the model can retry,
-base64 and URLs on other machines included: a model cannot type a 16 MiB payload, and fetching a
-stranger's picture is not this tool's job. A resolved reference then travels exactly as the HTTP route's
-`image` does, which means it raises what the draw needs: the same size that drew fine without a reference
-can answer `503 image_vram_insufficient` with one.
-
 The client sees none of this: no tool in its own list, no tool call, no tool result, no extra round — one
 assistant answer with a URL in it. The extra rounds are counted into the reported token usage, because they
 really ran, and the round after the first cannot put thinking behind text that is already on the wire, so

@@ -149,14 +149,6 @@ using DiTDimsProvider = std::function<infernix::models::qwen_image::DiTDims()>;
 // job-id shape resolves to an empty path, so a request can never turn a name into a path.
 [[nodiscard]] std::filesystem::path generated_image_path(std::string_view id);
 
-// Reads a finished picture back off the same path. This is how the chat tool's `image` argument turns
-// into a reference: the picture the model names is this server's own file, not something it can paste.
-// Empty when `id` is not an id the artifact route serves, when the file cannot be read, or when it is
-// larger than `kMaximumImageInputBytes` -- the caller cannot tell those apart and must not claim to:
-// the picture is simply not available to draw from (never drawn here, or retired by the retention
-// sweep), which is what the tool tells the model.
-[[nodiscard]] std::vector<std::uint8_t> load_generated_image(std::string_view id);
-
 // What one retention pass removed, for the log line the caller reports.
 struct ImageRetentionResult {
     std::size_t files = 0;
