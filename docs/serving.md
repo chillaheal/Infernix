@@ -1112,13 +1112,13 @@ server starts with both `--image-artifact` and `--image-text-processor`; without
 its working VRAM to the image lane, one DiT-plus-VAE job runs on its own CUDA stream, and the model's VRAM
 is restored afterward, so chat traffic resumes unchanged. Only one image job runs at a time: a second
 caller while one is on the device is told `429 image_interlude_in_flight` rather than queued. How much
-VRAM the model yields is computed from the request itself -- its geometry, any reference image, and
+VRAM the model yields is computed from the request itself -- its geometry and
 whether `true_cfg_scale` above 1 doubles the batch -- and a request that cannot fit is refused with
 `503 image_vram_insufficient` before the model yields anything, so the LLM keeps serving and the message
 names both the need and what the device could give.
 
 Accepted request fields are exactly `model`, `prompt`, `n`, `size`, `steps`, `response_format`, `user`,
-`seed`, `image`, `negative_prompt` and `true_cfg_scale`; any other field is rejected as
+`seed`, `negative_prompt` and `true_cfg_scale`; any other field is rejected as
 `unsupported_parameter` rather than silently ignored.
 
 | Field | Behavior |
@@ -1131,7 +1131,6 @@ Accepted request fields are exactly `model`, `prompt`, `n`, `size`, `steps`, `re
 | `response_format` | `b64_json` (the default) or `url`; any other value is rejected |
 | `seed` | optional non-negative integer; when omitted the Engine picks one |
 | `user` | opaque client tag, never echoed back |
-| `image` | optional base64 reference image (product extension, no OpenAI counterpart): PNG keeps its alpha, other formats get an opaque one; an optional `data:…;base64,` prefix is accepted, an `http(s)://` URL is not, decoded payload at most 16 MiB |
 | `negative_prompt` | optional string, at most 4096 bytes: what to steer away from. Required when `true_cfg_scale` is above 1; ignored at 1 |
 | `true_cfg_scale` | guidance scale, number in `[1, 20]`; default `1`, which is a single DiT forward per step. Above 1 every step runs a second forward over the negative prompt, so the step cost roughly doubles |
 
@@ -1187,10 +1186,9 @@ Every failure names its code in the standard OpenAI error envelope:
 |---|---|---|
 | 400 | `unsupported_parameter`, `image_size_invalid`, `image_steps_invalid`, `image_n_not_supported`, `response_format_not_supported`, `string_above_max_length` | the request asks for behavior outside the accepted subset |
 | 400 | `image_cfg_scale_invalid`, `image_negative_prompt_required` | `true_cfg_scale` is outside `[1, 20]`, or it is above 1 with no `negative_prompt` |
-| 400 | `image_invalid`, `image_too_large`, `image_url_not_supported`, `image_data_uri_not_base64` | the `image` payload is not a decodable image inside the byte budget, is sent as a URL, or is a non-base64 `data:` URI |
 | 503 | `image_generation_not_configured` | the server started without the image options |
 | 503 | `image_interlude_unsupported` | the loaded model has no image interlude (only Qwen3.8-Flash-Next does) |
-| 503 | `image_vram_insufficient` | the request's size, reference image or CFG pass needs more VRAM than the model can yield right now; refused before anything is yielded, so the message can name the need and what the device could give. Retry a smaller `size`, without `image`, or with `true_cfg_scale` 1 |
+| 503 | `image_vram_insufficient` | the request's size or CFG pass needs more VRAM than the model can yield right now; refused before anything is yielded, so the message can name the need and what the device could give. Retry a smaller `size` or with `true_cfg_scale` 1 |
 | 503 | `engine_unavailable` | the Engine cannot accept work |
 | 429 | `image_interlude_in_flight` | another image generation is running |
 | 503 | `image_engine_degraded` | the interlude could not confirm the model's VRAM was restored |
@@ -1233,7 +1231,6 @@ it:
     "dimensions": {"min": 32, "max": 2048},
     "steps": {"min": 2, "max": 100},
     "true_cfg_scale": {"min": 1, "max": 20},
-    "reference_image": true,
     "automatic_from_chat": true,
     "chat_tool": "generate_image",
     "chat_max_images_per_request": 4
@@ -1250,9 +1247,8 @@ it:
 Every value is read from the running process, never from a model card: `chat_model` is the public alias,
 `image_generation.model` is the id the configured image artifact is served under, and
 `image_generation` is `null` when the server started without `--image-artifact` and
-`--image-text-processor`. `vision_input` follows `--vision`, and it is a separate surface from
-`reference_image`: the first feeds a picture into the language model, the second conditions a generation on
-a picture through the diffusion pipeline's own vision tower. `automatic_from_chat` says whether the chat
+`--image-text-processor`. `vision_input` follows `--vision`: it feeds a picture into the language model.
+`automatic_from_chat` says whether the chat
 routes may generate an image on their own initiative, `chat_tool` names the tool they are given for it, and
 `chat_max_images_per_request` is how many pictures one chat request may draw. See
 [Images from a chat request](#images-from-a-chat-request).

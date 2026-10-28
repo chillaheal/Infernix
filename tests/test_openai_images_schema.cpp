@@ -213,56 +213,17 @@ int test_steps() {
 
 int test_reference_image_field() {
     int failures = 0;
+    // The served route draws from text only: a reference image is not conditioning the production
+    // path can follow (its vision-tower context is unbuilt), so the field is an unknown parameter
+    // -- rejected, never silently dropped -- until the edit route lands on its own branch.
     const OpenAIImagesRequest absent = parse(base_request());
-    failures += check(absent.image.empty(), "image absent by default");
+    (void)absent;
 
-    const OpenAIImagesRequest bare =
+    const ApiError present = api_error([&] {
         parse(Json{{"model", "qwen-image"}, {"prompt", "x"}, {"image", "aGVsbG8="}});
-    failures += check(bare.image == "aGVsbG8=", "bare base64 captured");
-
-    const OpenAIImagesRequest uri = parse(Json{{"model", "qwen-image"},
-                                               {"prompt", "x"},
-                                               {"image", "data:image/png;base64,aGVsbG8="}});
-    failures += check(uri.image == "aGVsbG8=", "data: URI prefix stripped");
-
-    Json null_image = base_request();
-    null_image["image"] = nullptr;
-    failures += check(parse(null_image).image.empty(), "null image falls back to text-to-image");
-
-    const ApiError not_string =
-        api_error([&] { parse(Json{{"model", "qwen-image"}, {"prompt", "x"}, {"image", 7}}); });
-    failures += check(not_string.status == 400 && not_string.param == "image",
-                      "non-string image rejected");
-
-    const ApiError url = api_error([&] {
-        parse(Json{{"model", "qwen-image"}, {"prompt", "x"}, {"image", "https://example.com/a.png"}});
     });
-    failures += check(url.code == "image_url_not_supported" && url.param == "image",
-                      "image URL rejected, never fetched");
-
-    const ApiError url_http = api_error([&] {
-        parse(Json{{"model", "qwen-image"}, {"prompt", "x"}, {"image", "http://example.com/a.png"}});
-    });
-    failures += check(url_http.code == "image_url_not_supported", "plain-http image URL rejected");
-
-    const ApiError not_b64 = api_error([&] {
-        parse(Json{{"model", "qwen-image"},
-                   {"prompt", "x"},
-                   {"image", "data:image/png,%89PNG"}});
-    });
-    failures += check(not_b64.code == "image_data_uri_not_base64" && not_b64.param == "image",
-                      "non-base64 data: URI rejected");
-
-    const std::size_t limit   = (kMaximumImageInputBytes / 3) * 4 + 4;
-    const ApiError oversized = api_error([&] {
-        parse(Json{{"model", "qwen-image"}, {"prompt", "x"}, {"image", std::string(limit + 1, 'A')}});
-    });
-    failures += check(oversized.code == "image_too_large" && oversized.param == "image",
-                      "over-long base64 rejected before decode");
-
-    const OpenAIImagesRequest edge = parse(
-        Json{{"model", "qwen-image"}, {"prompt", "x"}, {"image", std::string(limit, 'A')}});
-    failures += check(edge.image.size() == limit, "base64 at the pre-gate boundary accepted");
+    failures += check(present.status == 400 && present.param == "image",
+                      "reference `image` field rejected as unsupported");
     return failures;
 }
 

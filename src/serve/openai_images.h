@@ -36,8 +36,6 @@ struct OpenAIImagesRequest {
     std::string negative_prompt;       // required non-empty when true_cfg_scale > 1
     std::optional<std::uint64_t> seed; // product extension; absent => engine-chosen
     std::string user;                  // opaque client tag; never echoed back
-    std::string image;                 // #75 product extension: base64 reference image (PNG/JPEG),
-                                       // optional data: URI prefix; empty => plain text-to-image
     ImageResponseFormat response_format = ImageResponseFormat::Base64;
 };
 
@@ -49,9 +47,6 @@ inline constexpr std::string_view kImageArtifactRoutePrefix = "/v1/images/";
 // becomes neg + scale * (cond - neg), so the wall clock of a step roughly doubles.
 inline constexpr double kMinimumImageCFGScale = 1.0;
 inline constexpr double kMaximumImageCFGScale = 20.0;
-
-// Upper bound on the decoded reference-image payload accepted in the `image` field (bytes).
-inline constexpr std::size_t kMaximumImageInputBytes = 16ULL * 1024 * 1024;
 
 // Upper bound on prompt length accepted at the images boundary (bytes).
 inline constexpr std::size_t kMaximumImagePromptBytes = 4096;

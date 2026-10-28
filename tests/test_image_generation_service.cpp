@@ -134,7 +134,7 @@ DiTDimsProvider fixed_dims() {
 
 ImageJobExecutor fixed_executor() {
     return [](const OpenAIImagesRequest&, std::uint64_t, std::span<const std::uint16_t>,
-              std::span<const std::uint16_t>, const ReferencePixels*, void*,
+              std::span<const std::uint16_t>, void*,
               const std::shared_ptr<ImageJobProgress>&) {
         return fake_picture(0x01U);
     };
@@ -142,7 +142,7 @@ ImageJobExecutor fixed_executor() {
 
 ImageJobExecutor throwing_executor() {
     return [](const OpenAIImagesRequest&, std::uint64_t, std::span<const std::uint16_t>,
-              std::span<const std::uint16_t>, const ReferencePixels*,
+              std::span<const std::uint16_t>,
               void*, const std::shared_ptr<ImageJobProgress>&) -> FinishedPicture {
         throw std::runtime_error("image job exploded");
     };
@@ -307,7 +307,7 @@ int main() {
         bool executor_ran    = false;
         ImageJobExecutor watch =
             [&executor_ran](const OpenAIImagesRequest&, std::uint64_t, std::span<const std::uint16_t>,
-                            std::span<const std::uint16_t>, const ReferencePixels*, void*,
+                            std::span<const std::uint16_t>, void*,
                             const std::shared_ptr<ImageJobProgress>&) {
                 executor_ran = true;
                 return fake_picture(0x01U);
@@ -346,65 +346,6 @@ int main() {
               "restoration fault stores FailedEngineDegraded with both errors");
     }
 
-    // #75 reference image: a valid base64 PNG reaches the executor as the prepared plane with the
-    // reference geometry (PIL calculate_dimensions at 1024^2 area, 64x48 -> 1184x896), and the PNG's
-    // alpha survives as the real fourth channel. An undecodable payload is a pre-interlude 400.
-    {
-        std::vector<std::uint8_t> rgba(64U * 48U * 4);
-        for (unsigned i = 0; i < 64U * 48U; ++i) {
-            rgba[4 * i + 0] = static_cast<std::uint8_t>(i);
-            rgba[4 * i + 1] = static_cast<std::uint8_t>(i / 7U);
-            rgba[4 * i + 2] = static_cast<std::uint8_t>(i / 13U);
-            rgba[4 * i + 3] = static_cast<std::uint8_t>(i % 256U);
-        }
-        const std::vector<std::uint8_t> png = infernix::media::encode::encode_png_rgba8(64, 48, rgba);
-        const std::string       payload     = base64_encode_bytes(png);
-
-        bool        saw_reference  = false;
-        std::size_t plane_floats   = 0;
-        std::uint32_t plane_w      = 0, plane_h = 0;
-        float       alpha_min = 0.F, alpha_max = 0.F;
-        ImageJobExecutor capture = [&](const OpenAIImagesRequest&, std::uint64_t,
-                                       std::span<const std::uint16_t>, std::span<const std::uint16_t>,
-                                       const ReferencePixels* ref, void*,
-                                       const std::shared_ptr<ImageJobProgress>&)
-            -> FinishedPicture {
-            saw_reference = ref != nullptr;
-            if (ref != nullptr) {
-                plane_floats = ref->pixels.size();
-                plane_w      = ref->width_px;
-                plane_h      = ref->height_px;
-                const std::size_t pixels = static_cast<std::size_t>(ref->width_px) * ref->height_px;
-                const float* alpha       = ref->pixels.data() + 3 * pixels;
-                const auto [lo, hi]      = std::minmax_element(alpha, alpha + pixels);
-                alpha_min                = *lo;
-                alpha_max                = *hi;
-            }
-            return fake_picture(0x01U);
-        };
-
-        ImageJobStore store(8, 1 << 20);
-        ImageGenerationService service(std::make_unique<FakeRunner>(), store, fixed_renderer(), fixed_provider(), fixed_dims(),
-                                       capture);
-        OpenAIImagesRequest request = sample_request();
-        request.image               = payload;
-        service.generate(request, 1000);
-        check(saw_reference && plane_w == 1184U && plane_h == 896U &&
-                  plane_floats == 4ULL * 1184ULL * 896ULL,
-              "valid PNG image -> 1184x896 RGBA plane at the executor");
-        check(alpha_min < -0.5F && alpha_max > 0.5F, "reference alpha carried raw, not composited");
-
-        ImageJobStore bad_store(8, 1 << 20);
-        ImageGenerationService bad_service(std::make_unique<FakeRunner>(), bad_store,
-                                           fixed_renderer(), fixed_provider(), fixed_dims(), capture);
-        OpenAIImagesRequest bad = sample_request();
-        bad.image               = "not base64 at all!!";
-        const auto outcome      = attempt([&] { return bad_service.generate(bad, 1000); });
-        check(outcome.threw && outcome.status == 400 && outcome.code == "image_invalid",
-              "undecodable image -> 400 image_invalid");
-        check(bad_store.size() == 0U, "invalid image stores no job (fails before the interlude)");
-    }
-
     // True CFG: with true_cfg_scale above 1 the negative prompt goes through the same embeds provider
     // and arrives at the executor; without it the executor gets no negative embeds and the (empty)
     // negative prompt never reaches the text tower.
@@ -419,7 +360,7 @@ int main() {
         ImageJobExecutor capture = [&](const OpenAIImagesRequest& request, std::uint64_t,
                                        std::span<const std::uint16_t>,
                                        std::span<const std::uint16_t> negative,
-                                       const ReferencePixels*, void*, const std::shared_ptr<ImageJobProgress>&)
+                                       void*, const std::shared_ptr<ImageJobProgress>&)
             -> FinishedPicture {
             neg_size   = negative.size();
             seen_scale = request.true_cfg_scale;
@@ -455,7 +396,7 @@ int main() {
         const FinishedPicture picture = fake_picture(0x89U);
         ImageJobExecutor writer = [&](const OpenAIImagesRequest&, std::uint64_t,
                                       std::span<const std::uint16_t>, std::span<const std::uint16_t>,
-                                      const ReferencePixels*, void*, const std::shared_ptr<ImageJobProgress>&)
+                                      void*, const std::shared_ptr<ImageJobProgress>&)
             -> FinishedPicture {
             return picture;
         };
@@ -483,7 +424,7 @@ int main() {
         const FinishedPicture picture = fake_picture(0x0DU);
         ImageJobExecutor writer = [&](const OpenAIImagesRequest&, std::uint64_t,
                                       std::span<const std::uint16_t>, std::span<const std::uint16_t>,
-                                      const ReferencePixels*, void*, const std::shared_ptr<ImageJobProgress>&)
+                                      void*, const std::shared_ptr<ImageJobProgress>&)
             -> FinishedPicture {
             return picture;
         };
@@ -526,7 +467,7 @@ int main() {
     {
         ImageJobExecutor stepping = [](const OpenAIImagesRequest&, std::uint64_t,
                                        std::span<const std::uint16_t>, std::span<const std::uint16_t>,
-                                       const ReferencePixels*, void*,
+                                       void*,
                                        const std::shared_ptr<ImageJobProgress>& progress)
             -> FinishedPicture {
             progress->advance(24);
@@ -546,7 +487,7 @@ int main() {
 
         ImageJobExecutor stalled = [](const OpenAIImagesRequest&, std::uint64_t,
                                       std::span<const std::uint16_t>, std::span<const std::uint16_t>,
-                                      const ReferencePixels*, void*,
+                                      void*,
                                       const std::shared_ptr<ImageJobProgress>& progress)
             -> FinishedPicture {
             progress->stalled = true;

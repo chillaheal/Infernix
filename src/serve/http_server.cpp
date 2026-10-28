@@ -645,9 +645,6 @@ std::string make_capabilities_json(const ServeOptions& options, std::string_view
                      {"steps", Json{{"min", kMinimumImageSteps}, {"max", kMaximumImageSteps}}},
                      {"true_cfg_scale",
                       Json{{"min", kMinimumImageCFGScale}, {"max", kMaximumImageCFGScale}}},
-                     // Reference-image conditioning runs on the diffusion pipeline's own vision tower,
-                     // which sees only the picture being edited; --vision is a separate surface.
-                     {"reference_image", true},
                      // A chat request to this process is given the tool below and the picture is
                      // drawn inside that same request, so a client needs no tool call of its own.
                      {"automatic_from_chat", true},

@@ -19,7 +19,6 @@ add_library(infernix_serve STATIC
   openai_responses_store.cpp
   image_job_store.cpp
   openai_images.cpp
-  reference_image.cpp
   openai_images_http.cpp
   chat_image_tool.cpp
   image_generation_service.cpp

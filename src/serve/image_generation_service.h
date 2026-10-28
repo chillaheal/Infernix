@@ -23,7 +23,6 @@
 
 #include "serve/image_job_store.h"
 #include "serve/openai_images.h"
-#include "serve/reference_image.h"
 #include "serve/request_json.h"
 
 #include <chrono>
@@ -105,8 +104,7 @@ public:
 // the interlude's dedicated stream (`image_stream`, a cudaStream_t). It stops at the last byte the
 // device touched: the encode, the base64 and the file are the service's work after the interlude.
 // `prompt_embeds` is the token-major BF16 bit payload.
-// `reference` carries the host-prepared reference-image plane (#75) whenever the request had an
-// `image` field; nullptr is plain text-to-image. `negative_embeds` carries the negative prompt's
+// `negative_embeds` carries the negative prompt's
 // BF16 bits when `request.true_cfg_scale` is above 1 (true CFG); empty means the single-forward route.
 // `progress` is the stored job's live progress state: the executor's pipeline reports each step
 // through it and honors its stall flag; a fake executor may ignore it.
@@ -114,7 +112,7 @@ using ImageJobExecutor =
     std::function<FinishedPicture(const OpenAIImagesRequest& request, std::uint64_t seed,
                                    std::span<const std::uint16_t> prompt_embeds,
                                    std::span<const std::uint16_t> negative_embeds,
-                                   const ReferencePixels* reference, void* image_stream,
+                                   void* image_stream,
                                    const std::shared_ptr<ImageJobProgress>& progress)>;
 
 // prompt -> prompt_embeds, split in the two halves the VRAM handoff needs: rendering is host work the

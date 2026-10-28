@@ -15,7 +15,7 @@ namespace {
 // style or input_fidelity for honored behavior.
 constexpr std::string_view kAllowedKeys[] = {"model", "prompt",   "n",
                                              "size",  "response_format", "user", "seed", "steps",
-                                             "image", "negative_prompt", "true_cfg_scale"};
+                                             "negative_prompt", "true_cfg_scale"};
 
 [[nodiscard]] bool is_allowed_key(std::string_view key) {
     for (std::string_view allowed : kAllowedKeys) {
@@ -184,30 +184,6 @@ OpenAIImagesRequest parse_openai_images_request(const RequestJson& body) {
     if (output.true_cfg_scale > kMinimumImageCFGScale && output.negative_prompt.empty()) {
         bad_request("negative_prompt is required when true_cfg_scale is above 1", "negative_prompt",
                     "image_negative_prompt_required");
-    }
-
-    if (body.contains("image") && !body.at("image").is_null()) {
-        if (!body.at("image").is_string()) { bad_request("image must be a string", "image"); }
-        std::string value = body.at("image").get<std::string>();
-        if (value.starts_with("http://") || value.starts_with("https://")) {
-            bad_request("image must be a base64-encoded image, not a URL", "image",
-                        "image_url_not_supported");
-        }
-        if (value.starts_with("data:")) {
-            const std::size_t comma = value.find(',');
-            const std::string_view prefix(value.data(),
-                                          comma == std::string_view::npos ? value.size() : comma);
-            if (comma == std::string_view::npos || prefix.find("base64") == std::string_view::npos) {
-                bad_request("image data: URIs must be base64", "image", "image_data_uri_not_base64");
-            }
-            value.erase(0, comma + 1);
-        }
-        // Cheap pre-gate on the base64 length (raw grows 4 bytes per 3); the exact decoded
-        // byte and pixel budgets are enforced where the image is decoded.
-        if (value.size() > (kMaximumImageInputBytes / 3) * 4 + 4) {
-            bad_request("image exceeds the maximum size", "image", "image_too_large");
-        }
-        output.image = std::move(value);
     }
 
     return output;

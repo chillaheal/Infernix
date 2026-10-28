@@ -42,8 +42,8 @@ constexpr std::uint64_t kMiB = 1024ULL * 1024ULL;
 constexpr std::uint64_t kInterludeMarginBytes = 512ULL * kMiB;
 
 // The job's device-memory need, from the pipeline's own buffer inventory (models/qwen_image). The
-// serving layer asks for it before it probes the yield, so the reference block and the longer of the
-// two CFG passes are already inside the number.
+// serving layer asks for it before it probes the yield, so the longer of the
+// two CFG passes is already inside the number.
 std::uint64_t image_need_bytes(std::int64_t width, std::int64_t height, std::size_t text_tokens,
                               std::size_t negative_tokens, std::size_t ref_tokens,
                               const qi::DiTDims& dims) {
@@ -143,7 +143,7 @@ public:
     FinishedPicture operator()(const OpenAIImagesRequest& request, std::uint64_t seed,
                                std::span<const std::uint16_t> prompt_embeds,
                                std::span<const std::uint16_t> negative_embeds,
-                               const ReferencePixels* reference, void* image_stream,
+                               void* image_stream,
                                const std::shared_ptr<ImageJobProgress>& progress) {
         std::lock_guard lock(mutex_);
         ensure_locked();
@@ -183,22 +183,6 @@ public:
         if (!negative_embeds.empty()) {
             inputs.negative_prompt_embeds.assign(negative_embeds.begin(), negative_embeds.end());
             inputs.true_cfg_scale = static_cast<float>(request.true_cfg_scale);
-        }
-
-        // #75: the host-prepared reference plane becomes the constant reference block of the
-        // joint sequence, encoded with the same VAE the job decodes with (inside the yielded VRAM).
-        if (reference != nullptr) {
-            qi::ReferenceEncodeInputs encode_in;
-            encode_in.pixels       = reference->pixels;
-            encode_in.latents_mean = denorm_.mean;
-            encode_in.latents_std  = denorm_.std;
-            encode_in.height_px    = reference->height_px;
-            encode_in.width_px     = reference->width_px;
-            const qi::EncodedReference encoded =
-                qi::encode_reference_image(*reader_, vae_, encode_in,
-                                           static_cast<cudaStream_t>(image_stream));
-            inputs.ref_latents = std::move(encoded.latents);
-            inputs.ref_grids.emplace_back(encoded.height_lat, encoded.width_lat);
         }
 
         const qi::GeneratedImage out = qi::run_image_job(
@@ -300,9 +284,9 @@ ImageJobExecutor make_artifact_image_job_executor(const std::string& image_artif
         std::make_shared<ArtifactImageJobExecutor>(image_artifact_path, std::move(logger));
     return [executor](const OpenAIImagesRequest& request, std::uint64_t seed,
                       std::span<const std::uint16_t> prompt_embeds,
-                      std::span<const std::uint16_t> negative_embeds, const ReferencePixels* reference,
+                      std::span<const std::uint16_t> negative_embeds,
                       void* image_stream, const std::shared_ptr<ImageJobProgress>& progress) {
-        return (*executor)(request, seed, prompt_embeds, negative_embeds, reference, image_stream,
+        return (*executor)(request, seed, prompt_embeds, negative_embeds, image_stream,
                            progress);
     };
 
@@ -515,23 +499,6 @@ RequestJson ImageGenerationService::generate(const OpenAIImagesRequest& request,
                                     "engine_unavailable"}};
     }
 
-    // #75 reference image: base64/decode/resize is host work and fails fast as a 400 before any
-    // VRAM is yielded. The device encode of the prepared plane runs inside the job.
-    std::optional<ReferencePixels> reference;
-    if (!request.image.empty()) {
-        try {
-            reference = prepare_reference_image(request.image);
-        } catch (const md::Error& error) {
-            throw ApiException{ApiError{400, "invalid_request_error", error.what(), "image",
-                                        error.kind() == md::ErrorKind::BudgetExceeded
-                                            ? "image_too_large"
-                                            : "image_invalid"}};
-        } catch (const std::invalid_argument& error) {
-            throw ApiException{ApiError{400, "invalid_request_error", error.what(), "image",
-                                        "image_invalid"}};
-        }
-    }
-
     // Admission, entirely before the LLM is touched. Rendering is host work, so the token counts the
     // need is built from are the counts the job will run with; the probe then answers from the live
     // pools without quiescing anything. A request that cannot fit gets its 503 here -- no stored job,
@@ -540,16 +507,9 @@ RequestJson ImageGenerationService::generate(const OpenAIImagesRequest& request,
     const TowerPrompt negative_prompt =
         request.true_cfg_scale > kMinimumImageCFGScale ? prompt_renderer_(request.negative_prompt)
                                                       : TowerPrompt{};
-    // The reference's latent tokens follow from the snapped plane prepare_reference_image produced:
-    // (height/16) * (width/16), the same count its VAE encode will return inside the job.
-    const std::size_t ref_tokens =
-        reference.has_value()
-            ? static_cast<std::size_t>(reference->height_px / qi::ImageGeometry::downscale()) *
-                  (static_cast<std::size_t>(reference->width_px) / qi::ImageGeometry::downscale())
-            : 0ULL;
     const std::uint64_t need =
         image_need_bytes(request.width, request.height, prompt.tokens(), negative_prompt.tokens(),
-                         ref_tokens, dit_dims_());
+                         /*ref_tokens=*/0ULL, dit_dims_());
     const auto fit = runner_->probe(need, kInterludeMarginBytes);
     if (!fit.fits) { throw_vram_insufficient(need, fit); }
 
@@ -606,7 +566,7 @@ RequestJson ImageGenerationService::generate(const OpenAIImagesRequest& request,
                                  : std::vector<std::uint16_t>{};
                          finished = job_executor_(
                              request, seed, prompt_embeds_(prompt), negative,
-                             reference.has_value() ? &*reference : nullptr, context.image_stream,
+                             context.image_stream,
                              record.progress);
                          store_.advance(record.id, JobUpdate{.to = ImageJobState::Restoring, .now = now});
                          return true;
