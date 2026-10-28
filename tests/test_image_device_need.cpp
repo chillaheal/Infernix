@@ -40,7 +40,7 @@ std::uint64_t need_of(std::uint32_t side, std::uint32_t text, std::uint32_t neg,
     req.text_tokens     = text;
     req.negative_tokens = neg;
     req.ref_tokens      = ref;
-    req.blocks_resident = 1;
+    // The shipped route's resident-slot count is the header's single constant (bundle B fas 2).
     return qi::image_device_need(req).total();
 }
 
@@ -56,9 +56,13 @@ int main() {
     // Area dominates: 2048^2 is far past 768^2, and past the same size plus one reference.
     check(need_of(768, 200, 0, 0) < need_of(2048, 200, 0, 0), "area raises the need");
     check(need_of(1024, 200, 0, 4096) < need_of(2048, 200, 0, 0), "area beats one reference");
-    // The certified 512x512 route's one measured peak (6183 MiB) is the floor the model may never
-    // predict below; the ledger test tightens the allowance, this check keeps it from ever under-shooting.
-    check(need_of(512, 200, 0, 0) >= 6183ULL * 1024ULL * 1024ULL, "covers the certified 512 peak");
+    // The 8dc9c63 calibration's floor for the shipped (two-resident-block, bundle B fas 2) route:
+    // the allowance plus the 512 MiB interlude floor. The old 6183 MiB floor measured the serialized
+    // one-block route's high-water peak and retired with that route; the live guarantee-0 ledger
+    // cert (f77e16b) is the oracle for the current route's peak. This check keeps the shipped route
+    // from ever predicting below the calibrated floor.
+    check(need_of(512, 200, 0, 0) >= qi::kImageWeightResidentBytes + 512ULL * qi::kImageMiB,
+          "covers the calibrated 512 floor");
     // The allowance is the conservative part; the sequence terms must still be the ones that grow.
     check(need_of(2048, 200, 0, 0) > 3ULL * 6183ULL * 1024ULL * 1024ULL,
           "the growing terms carry the large sizes");
