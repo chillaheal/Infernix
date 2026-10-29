@@ -172,6 +172,12 @@ public:
         qi::ConditionedVision out;
         out.merger_rows    = std::move(rows.merger_rows);
         out.deepstack_rows = std::move(rows.deepstack_rows);
+        // The same grid the ViT just consumed travels with the rows: the text tower's M-RoPE places
+        // the picture's rows in three axes from it, and an out-of-band copy could silently disagree
+        // with the pixels that produced them.
+        out.grids = {std::array<int, 3>{static_cast<int>(grid.temporal), static_cast<int>(grid.height),
+                                        static_cast<int>(grid.width)}};
+        out.merge = vision_.dims.merge;
         return out;
     }
 

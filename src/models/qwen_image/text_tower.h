@@ -21,6 +21,7 @@
 
 #include "models/qwen_image/image_weights.h"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -52,7 +53,27 @@ inline constexpr std::uint32_t kImagePadTokenId = 151655;
 struct ConditionedVision {
     std::vector<std::uint16_t> merger_rows;                  // [pad_count * hidden] BF16 bits
     std::vector<std::vector<std::uint16_t>> deepstack_rows;  // each [pad_count * hidden] BF16 bits
+    // M-RoPE needs the picture's geometry: each maximal run of pad tokens is ONE image, whose PRE-merge
+    // patch grid (t, h, w) -- the same numbers as VisionItemGeometry, in patch units -- fixes the three
+    // rotary axes of those rows. Grids are in pad order; a run with no grid behind it throws.
+    std::vector<std::array<int, 3>> grids;
+    std::uint32_t merge = 2U; // vision_config.spatial_merge_size
 };
+
+// The Qwen3-VL text tower's M-RoPE positions for one templated prompt: [3*S] axis-major int32
+// (axis*S + s), exactly the [3,S] the reference feeds its rotary embedding (get_rope_index,
+// modeling_qwen3_vl.py:939-1030, with get_vision_position_ids 887-937). A maximal run of
+// kImagePadTokenId rows is one image and consumes t*(h/merge)*(w/merge) rows while advancing the
+// running position by ONLY max(h/merge, w/merge) -- every row after a picture therefore sits below
+// its own index (the reference's mrope_position_delta). Text rows, <|vision_start|> and
+// <|vision_end|> included, advance all three axes by 1 per token. Positions are computed on the FULL
+// ids -- the caller must NOT renumber after dropping the system prefix, which is why this takes the
+// whole sequence and the tower slices its own output rows. `grids` covers the runs in order and
+// `merge` must divide every h and w; anything else (a run without a grid, a non-divisible grid, a
+// grid whose row count disagrees with the run) throws before any allocation.
+[[nodiscard]] std::vector<int> build_mrope_positions(const std::vector<int>& token_ids,
+                                                     const std::vector<std::array<int, 3>>& grids,
+                                                     std::uint32_t merge);
 
 struct ConditionedTextTowerOutput {
     std::vector<std::uint16_t> prompt_embeds;  // [(S - drop_rows) * hidden] BF16 bits, pre-final-norm
@@ -63,9 +84,16 @@ struct ConditionedTextTowerOutput {
 // drop_rows) are computed and dropped from BOTH fields (the mask is sliced exactly like the hidden
 // rows -- vision_start/vision_end sit outside the dropped prefix). Every pad token must be covered by
 // merger_rows and the deepstack rows, in pad order; a mismatch throws before any allocation.
+//
+// `layer_snapshots`, when given, receives the FULL [S, hidden] BF16 rows (the dropped prefix
+// included, exactly as the anchor's hooks see them) after decoder layers 0..deepstack-1 -- the layers
+// the deepstack adds have already landed on. It is the M4 test's per-layer gate; production passes
+// nothing, and the forward itself is unchanged by the request. One entry per deepstack add or this
+// throws.
 [[nodiscard]] ConditionedTextTowerOutput
 run_conditioned_text_tower(artifact::Reader& reader, const TextTowerWeights& tower,
                            const std::vector<std::byte>& embed_table, const std::vector<int>& token_ids,
-                           std::size_t drop_rows, const ConditionedVision& vision);
+                           std::size_t drop_rows, const ConditionedVision& vision,
+                           std::vector<std::vector<std::uint16_t>>* layer_snapshots = nullptr);
 
 } // namespace infernix::models::qwen_image

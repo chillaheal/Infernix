@@ -15,6 +15,8 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <memory>
 #include <stdexcept>
@@ -60,6 +62,56 @@ __global__ void deepstack_add_rows_kernel(const std::uint16_t* __restrict__ add,
     }
 }
 
+// vision_config.rope_scaling.mrope_section of this checkpoint (image-spike/artifact/text_encoder/
+// config.json, read through AutoConfig): 24 T, 20 H and 20 W over the 64 pairs of a 128-wide head.
+constexpr int kMropeSection[3] = {24, 20, 20};
+
+// The Qwen3-VL text tower's M-RoPE rotation. The FORMULA is the one ops::rope already implements for
+// its D128/R128 Text domain (include/infernix/ops/rope.h:10-19): pair i rotates the two elements
+// (i, i + HD/2) of every head by one angle, and dims beyond rotary_dim stay untouched. What the
+// registered op cannot express is where the position comes from: the reference rotates pair i with
+// the axis recomposition_frequencies assigns it (modeling_qwen3_vl.py:420-429) -- T everywhere, then
+// H over slice(1, 3*section[1], 3) and W over slice(2, 3*section[2], 3), i.e. i % 3 for i < 60 and T
+// for the four leftover pairs -- while the registered Text MRoPE geometry is D256/R64 with pair i on
+// axis i % 3 (rope.h:20-21), which is a different model's rotary width. It lives beside the tower's
+// other local kernels (replicate_kv_kernel, deepstack_add_rows_kernel) so the certified text-only
+// route keeps running the very ops kernel it was qualified with.
+//
+// pos is the [3,S] axis-major table from build_mrope_positions (pos[axis*S + s]); inverse is the
+// prepared frequency table (same values ops::rope uses). One thread per PAIR, not per element: the
+// two elements of a pair are read before either is written, so a per-element kernel would race.
+// h_span/w_span are 3*mrope_section[1] and 3*mrope_section[2], computed on the host: the namespace
+// constant cannot be named from device code.
+__global__ void mrope_kernel(std::uint16_t* __restrict__ x, const int* __restrict__ pos,
+                             const double* __restrict__ inverse, float scale, int S, int HD, int H, int h_span,
+                             int w_span) {
+    auto* xd = reinterpret_cast<__nv_bfloat16*>(x);
+    const int half = HD / 2;
+    const int total = half * H * S;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < total; i += gridDim.x * blockDim.x) {
+        const int d = i % half;              // the pair index, and the low element's dimension
+        const int t = i / half;              // [HD, H, S] dim0 fastest: t == h + H * s
+        const int s = t / H;
+        int axis = 0;
+        if (d % 3 == 1 && d < h_span) axis = 1;
+        if (d % 3 == 2 && d < w_span) axis = 2;
+        // The reference multiplies the int position by the fp32 inv_freq and takes cos/sin in fp32,
+        // rounding only the RESULT to the activation dtype (modeling_qwen3_vl.py:407-418), so the
+        // product stays fp32 here and the BF16 round happens once, on the rotated value.
+        const float angle = static_cast<float>(pos[static_cast<std::size_t>(axis) * S + s]) *
+                            static_cast<float>(inverse[d]);
+        float c = 0.0F, sn = 0.0F;
+        sincosf(angle, &sn, &c);
+        c *= scale;
+        sn *= scale;
+        const int base = HD * t;
+        const float a = __bfloat162float(xd[base + d]);
+        const float b = __bfloat162float(xd[base + d + half]);
+        xd[base + d]        = __float2bfloat16_rn(a * c - b * sn);
+        xd[base + d + half] = __float2bfloat16_rn(b * c + a * sn);
+    }
+}
+
 const TextTowerDims& checked_dims(const TextTowerWeights& tower) {
     const TextTowerDims& dims = tower.dims;
     if (dims.hidden == 0 || dims.intermediate == 0 || dims.heads == 0 || dims.kv_heads == 0 ||
@@ -100,7 +152,9 @@ std::vector<std::uint16_t> gather_inputs(const TextTowerWeights& tower, const st
 // (modeling_qwen3_vl.py:847-852). Returns the full [S*D] pre-final-RMSNorm hidden bits.
 std::vector<std::uint16_t> tower_forward(artifact::Reader& reader, const TextTowerWeights& tower,
                                          const std::vector<std::uint16_t>& xbits, const std::vector<int>* pad_rows,
-                                         const std::vector<std::vector<std::uint16_t>>* deepstack) {
+                                         const std::vector<std::vector<std::uint16_t>>* deepstack,
+                                         const std::vector<int>* mrope3,
+                                         std::vector<std::vector<std::uint16_t>>* snapshots = nullptr) {
     ImageStreamScope legacy_scope(nullptr); // the tower's consumers run on the default stream
     const TextTowerDims& dims = checked_dims(tower);
     const int D     = static_cast<int>(dims.hidden);
@@ -122,17 +176,34 @@ std::vector<std::uint16_t> tower_forward(artifact::Reader& reader, const TextTow
     const std::size_t sI  = S * static_cast<std::size_t>(I);
 
     // ---- all tower device memory lives in Bufs; RAII frees it before every return ----
-    Buf x, dpos, drows;
+    // The text-only entry rotates with the 1-D positions it was qualified with; the conditioned entry
+    // rotates with the M-RoPE table its caller built from the prompt and the reference grid. The two
+    // never mix: an arange is exactly what the reference degenerates to when no image is present.
+    const bool mrope = mrope3 != nullptr;
+    if (mrope && mrope3->size() != 3ULL * S) {
+        throw std::runtime_error("text tower: the mrope positions do not cover the prompt");
+    }
+    Buf x, dpos, dinv, drows;
     x.alloc(sD * 2);
     h2d(x.d, xbits.data(), sD * 2);
     {
-        std::vector<int> pos(S);
-        for (std::size_t s = 0; s < S; ++s) pos[s] = static_cast<int>(s);
-        dpos.alloc(S * sizeof(int));
-        h2d(dpos.d, pos.data(), S * sizeof(int));
+        std::vector<int> pos(mrope ? 3ULL * S : S);
+        if (mrope) {
+            pos = *mrope3;
+        } else {
+            for (std::size_t s = 0; s < S; ++s) pos[s] = static_cast<int>(s);
+        }
+        dpos.alloc(pos.size() * sizeof(int));
+        h2d(dpos.d, pos.data(), pos.size() * sizeof(int));
     }
     const Tensor posv(dpos.d, DType::I32, {static_cast<int>(S)});
     const ops::PreparedRope prepared = ops::prepare_rope(HD, theta);
+    if (mrope) {
+        // The kernel reads the same frequency table the registered op was prepared with -- on the
+        // device, so the host array has to be uploaded like every other input.
+        dinv.alloc(sizeof(prepared.inverse));
+        h2d(dinv.d, prepared.inverse, sizeof(prepared.inverse));
+    }
     DeviceContext device;
     const auto execution = device.execution_view().on_stream(nullptr);
 
@@ -191,7 +262,18 @@ std::vector<std::uint16_t> tower_forward(artifact::Reader& reader, const TextTow
         ops::rmsnorm(qh, qnw, eps, /*unit_offset=*/false, qhn, 0);
         ops::rmsnorm(kh, knw, eps, /*unit_offset=*/false, khn, 0);
         Tensor q3 = view(dqn.d, HD, HQ, Si), k3 = view(dkn.d, HD, HKV, Si);
-        ops::rope(posv, prepared, q3, k3, execution);
+        if (mrope) {
+            const auto* p = static_cast<const int*>(dpos.d);
+            const int h_span = 3 * kMropeSection[1], w_span = 3 * kMropeSection[2];
+            mrope_kernel<<<grid, block, 0, 0>>>(static_cast<std::uint16_t*>(dqn.d), p,
+                                                static_cast<const double*>(dinv.d), prepared.attention_scale, Si, HD,
+                                                HQ, h_span, w_span);
+            mrope_kernel<<<grid, block, 0, 0>>>(static_cast<std::uint16_t*>(dkn.d), p,
+                                                static_cast<const double*>(dinv.d), prepared.attention_scale, Si, HD,
+                                                HKV, h_span, w_span);
+        } else {
+            ops::rope(posv, prepared, q3, k3, execution);
+        }
         replicate_kv_kernel<<<grid, block, 0, 0>>>(static_cast<const std::uint16_t*>(dkn.d),
                                                    static_cast<std::uint16_t*>(dk32.d), Si, HD, HQ, HKV, GROUP);
         replicate_kv_kernel<<<grid, block, 0, 0>>>(static_cast<const std::uint16_t*>(dv.d),
@@ -218,6 +300,14 @@ std::vector<std::uint16_t> tower_forward(artifact::Reader& reader, const TextTow
                                                              static_cast<int>(pad_rows->size()));
         }
         cuda_ok(cudaGetLastError(), "text tower layer launch");
+        if (snapshots != nullptr && layer_index < snapshots->size()) {
+            // AFTER this layer's deepstack add, on the FULL sequence -- the anchor's hooks fire at the
+            // same point and before its own drop, so [D, S] here is exactly the dumped [S, hidden].
+            (*snapshots)[layer_index].resize(sD);
+            cuda_ok(cudaMemcpy((*snapshots)[layer_index].data(), x.d, sD * sizeof(std::uint16_t),
+                               cudaMemcpyDeviceToHost),
+                    "text tower layer snapshot");
+        }
     }
 
     // The rolling residual now holds the pre-final-RMSNorm hidden [D, S] (dim0 fastest == token-major
@@ -230,6 +320,67 @@ std::vector<std::uint16_t> tower_forward(artifact::Reader& reader, const TextTow
 
 } // namespace
 
+std::vector<int> build_mrope_positions(const std::vector<int>& token_ids,
+                                       const std::vector<std::array<int, 3>>& grids, std::uint32_t merge) {
+    const std::size_t S = token_ids.size();
+    if (S == 0 || merge == 0U) {
+        throw std::runtime_error("mrope: no tokens, or spatial_merge_size is not positive");
+    }
+    std::vector<int> pos(3ULL * S, 0);
+    std::size_t next = 0; // the reference's running position, shared by all three axes
+    std::size_t g    = 0; // the next grid, consumed in pad order
+    std::size_t s    = 0;
+    while (s < S) {
+        const bool is_pad = static_cast<std::uint32_t>(token_ids[s]) == kImagePadTokenId;
+        std::size_t run = 1;
+        while (s + run < S && (static_cast<std::uint32_t>(token_ids[s + run]) == kImagePadTokenId) == is_pad) ++run;
+        if (!is_pad) {
+            // Text rows, vision_start/vision_end included: every axis follows the running position.
+            for (std::size_t k = 0; k < run; ++k) {
+                const std::size_t row = s + k;
+                pos[row] = static_cast<int>(next + k);
+                pos[S + row]         = static_cast<int>(next + k);
+                pos[2ULL * S + row]  = static_cast<int>(next + k);
+            }
+            next += run;
+        } else {
+            if (g >= grids.size()) {
+                throw std::runtime_error("mrope: an image pad run has no grid behind it");
+            }
+            const std::array<int, 3> grid = grids[g++];
+            const int t = grid[0], h = grid[1], w = grid[2];
+            if (t <= 0 || h <= 0 || w <= 0 || h % int(merge) != 0 || w % int(merge) != 0) {
+                throw std::runtime_error("mrope: the image grid is not a positive multiple of the merge size");
+            }
+            // The temporal merge is 1 for this family (get_rope_index passes it positionally), so the
+            // merged grid is (t, h/merge, w/merge) and the run must hold exactly t*(h/merge)*(w/merge).
+            const std::size_t lt = std::size_t(t), lh = std::size_t(h) / merge, lw = std::size_t(w) / merge;
+            if (lt * lh * lw != run) {
+                throw std::runtime_error("mrope: the image grid does not cover the pad run");
+            }
+            for (std::size_t f = 0; f < lt; ++f) {
+                for (std::size_t dh = 0; dh < lh; ++dh) {
+                    for (std::size_t dw = 0; dw < lw; ++dw) {
+                        // meshgrid(indexing="ij"): frame-major, then the merged row, then the column.
+                        const std::size_t row = s + f * lh * lw + dh * lw + dw;
+                        pos[row]             = static_cast<int>(next + f); // t = frame*interval + start
+                        pos[S + row]         = static_cast<int>(next + dh);
+                        pos[2ULL * S + row]  = static_cast<int>(next + dw);
+                    }
+                }
+            }
+            // The picture advances the running position by its longest merged side ONLY -- never by the
+            // pad count -- which is the whole reason the rows after it sit below their own index.
+            next += std::max(lh, lw);
+        }
+        s += run;
+    }
+    if (g != grids.size()) {
+        throw std::runtime_error("mrope: more image grids than image pad runs");
+    }
+    return pos;
+}
+
 std::vector<std::uint16_t> run_text_tower(artifact::Reader& reader, const TextTowerWeights& tower,
                                           const std::vector<std::byte>& embed_table,
                                           const std::vector<int>& token_ids, std::size_t drop_rows) {
@@ -238,7 +389,7 @@ std::vector<std::uint16_t> run_text_tower(artifact::Reader& reader, const TextTo
         throw std::runtime_error("text tower: ids or embed table do not match the model dims");
     }
     std::vector<std::uint16_t> xbits = gather_inputs(tower, embed_table, token_ids);
-    std::vector<std::uint16_t> hidden = tower_forward(reader, tower, xbits, nullptr, nullptr);
+    std::vector<std::uint16_t> hidden = tower_forward(reader, tower, xbits, nullptr, nullptr, nullptr);
     // Rows [drop_rows, S) are the kept prompt conditioning (single all-valid entry:
     // build_prompt_embeds would return exactly these rows).
     return std::vector<std::uint16_t>(hidden.begin() + static_cast<std::ptrdiff_t>(drop_rows) * dims.hidden,
@@ -248,7 +399,12 @@ std::vector<std::uint16_t> run_text_tower(artifact::Reader& reader, const TextTo
 ConditionedTextTowerOutput
 run_conditioned_text_tower(artifact::Reader& reader, const TextTowerWeights& tower,
                            const std::vector<std::byte>& embed_table, const std::vector<int>& token_ids,
-                           std::size_t drop_rows, const ConditionedVision& vision) {
+                           std::size_t drop_rows, const ConditionedVision& vision,
+                           std::vector<std::vector<std::uint16_t>>* layer_snapshots) {
+    if (layer_snapshots != nullptr &&
+        (vision.deepstack_rows.empty() || layer_snapshots->size() != vision.deepstack_rows.size())) {
+        throw std::runtime_error("conditioned text tower: layer snapshots need one entry per deepstack add");
+    }
     const TextTowerDims& dims = checked_dims(tower);
     const std::size_t D = dims.hidden;
     const std::size_t S = token_ids.size();
@@ -264,23 +420,41 @@ run_conditioned_text_tower(artifact::Reader& reader, const TextTowerWeights& tow
     // Both sides carry BF16 BITS -- one uint16 per element, see VisionTowerOutput -- so the sizes to
     // compare are ELEMENT counts (rows * hidden), not byte counts: a byte-sized expectation here
     // rejects every correct vision output at exactly half the length it names.
-    const std::size_t rows_elements = pad_rows.size() * D;
-    if (pad_rows.empty() || vision.merger_rows.size() != rows_elements ||
-        vision.deepstack_rows.size() > tower.layers.size()) {
-        throw std::runtime_error("text tower: vision rows do not cover the image pad tokens");
-    }
-    for (const auto& add : vision.deepstack_rows) {
-        if (add.size() != rows_elements) {
+    const bool has_image = !pad_rows.empty();
+    if (has_image) {
+        const std::size_t rows_elements = pad_rows.size() * D;
+        if (vision.merger_rows.size() != rows_elements || vision.deepstack_rows.size() > tower.layers.size()) {
             throw std::runtime_error("text tower: vision rows do not cover the image pad tokens");
         }
+        for (const auto& add : vision.deepstack_rows) {
+            if (add.size() != rows_elements) {
+                throw std::runtime_error("text tower: vision rows do not cover the image pad tokens");
+            }
+        }
+    } else if (!vision.merger_rows.empty() || !vision.deepstack_rows.empty() || !vision.grids.empty()) {
+        throw std::runtime_error("text tower: vision rows without any image pad token");
     }
 
     std::vector<std::uint16_t> xbits = gather_inputs(tower, embed_table, token_ids);
-    for (std::size_t r = 0; r < pad_rows.size(); ++r) {
-        std::memcpy(xbits.data() + static_cast<std::size_t>(pad_rows[r]) * D,
-                    vision.merger_rows.data() + r * D, sizeof(std::uint16_t) * D);
+    std::vector<std::uint16_t> hidden;
+    if (!has_image) {
+        // A prompt with no picture takes the CERTIFIED entry verbatim -- arange rope, no scatter, no
+        // adds -- because M-RoPE degenerates to the 1-D positions when nothing is in the sequence.
+        // That is what keeps /v1/images/generations bit-identical.
+        hidden = tower_forward(reader, tower, xbits, nullptr, nullptr, nullptr, layer_snapshots);
+    } else {
+        for (std::size_t r = 0; r < pad_rows.size(); ++r) {
+            std::memcpy(xbits.data() + static_cast<std::size_t>(pad_rows[r]) * D,
+                        vision.merger_rows.data() + r * D, sizeof(std::uint16_t) * D);
+        }
+        // The reference positions the picture in THREE axes, so the conditioned forward cannot reuse
+        // the 1-D arange: it rotates with the M-RoPE table of the FULL prompt, computed before the
+        // system prefix is dropped (the reference never renumbers after the drop -- get_rope_index
+        // runs on the whole sequence and only the OUTPUT rows are sliced afterwards).
+        const std::vector<int> mrope3 = build_mrope_positions(token_ids, vision.grids, vision.merge);
+        hidden = tower_forward(reader, tower, xbits, &pad_rows, &vision.deepstack_rows, &mrope3,
+                               layer_snapshots);
     }
-    std::vector<std::uint16_t> hidden = tower_forward(reader, tower, xbits, &pad_rows, &vision.deepstack_rows);
 
     ConditionedTextTowerOutput out;
     out.prompt_embeds.assign(hidden.begin() + static_cast<std::ptrdiff_t>(drop_rows) * D, hidden.end());

@@ -17,14 +17,19 @@
 //   (D) INVARIANTS: slots x4 != block tokens, empty img_shapes, frames != 1, and a mask with no target
 //       slots all throw std::invalid_argument (the M7 ledger's host-side refusal).
 //
-// Host-only, no GPU, no env.
+// Host-only, no GPU. (E) reads the CPU oracle directory from INFERNIX_EDIT_ROPE_ORACLE and reports SKIP
+// when it is unset -- the four structural gates above need no environment at all.
 
 #include "models/qwen_image/joint_layout.h"
 #include "models/qwen_image/rope.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <format>
+#include <fstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -268,6 +273,114 @@ void gate_invariants() {
     });
 }
 
+// ---- (E) the reference's own rope and token metadata, called on CPU ----
+//
+// (A)-(D) check the layout against closed forms this test also derives, which is how the walk's own
+// misreading of QwenImage21Rope.forward could have stayed invisible: a shared misreading agrees with
+// itself. This gate compares the numbers the model itself produces. image-edit/dump_edit_rope_oracle.py
+// calls QwenImage21Rope.forward and QwenImage21Transformer2DModel.build_token_metadata on the CPU (no
+// weights, no GPU, no blackout) for THIS route's geometry -- the M6 small fixture's 77 image slots +
+// 77 target slots and img_shapes [(1,14,22),(1,14,22)] -- and writes whitespace text files (this host
+// test has no npy reader: qo::read_npy lives with the CUDA tests). Blackout #21's velocity error is
+// uniform over all 308 target rows, which is the signature of a SHARED input every target row reads:
+// the rope of the two image blocks and the block ids that drive same_image_block. Both are pure
+// functions of the mask, so they are settled here instead of in another GPU window.
+//
+// Env INFERNIX_EDIT_ROPE_ORACLE names the directory; unset means the oracle was never produced, and
+// the gate says so rather than silently passing.
+void gate_against_reference() {
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable : 4996)
+#endif
+    const char* env = std::getenv("INFERNIX_EDIT_ROPE_ORACLE");
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
+    if (env == nullptr || *env == '\0') {
+        std::printf("  %-34s SKIP  INFERNIX_EDIT_ROPE_ORACLE is unset (run "
+                    "image-edit/dump_edit_rope_oracle.py)\n", "reference rope/metadata");
+        return;
+    }
+    const std::string dir(env);
+    auto load = [&](const std::string& name, std::vector<double>& out) {
+        std::ifstream in(dir + "/" + name);
+        if (!in) { return false; }
+        out.clear();
+        double v;
+        while (in >> v) { out.push_back(v); }
+        return !out.empty();
+    };
+    std::vector<double> base, want_cos, want_sin, want_ids, want_tgt, want_exp;
+    bool read_ok = load("mask_base.txt", base) && load("rope_cos.txt", want_cos) &&
+                   load("rope_sin.txt", want_sin) && load("image_ids.txt", want_ids) &&
+                   load("target_token_mask.txt", want_tgt) && load("mask_expanded.txt", want_exp);
+    if (!read_ok || base.size() != 175 || want_cos.size() != 637 * 64 || want_sin.size() != 637 * 64 ||
+        want_ids.size() != 637 || want_tgt.size() != 637 || want_exp.size() != 637) {
+        check("reference oracle readable", false, "expected 175 mask rows and 637x64 rope in " + dir);
+        return;
+    }
+    std::vector<std::uint8_t> mask(base.size());
+    for (std::size_t i = 0; i < base.size(); ++i) { mask[i] = base[i] != 0.0 ? 1U : 0U; }
+    const std::vector<ImageShape> shapes{ImageShape{1, 14, 22}, ImageShape{1, 14, 22}};
+    const JointLayout L = build_joint_layout(mask, shapes);
+    check("reference layout shape", L.expanded_len == 637 && L.text_tokens == 21 &&
+                                          L.ref_tokens == 308 && L.target_tokens == 308,
+          "expanded=" + std::to_string(L.expanded_len) + " text=" + std::to_string(L.text_tokens) +
+          " ref=" + std::to_string(L.ref_tokens) + " target=" + std::to_string(L.target_tokens));
+
+    bool exp_ok = true;
+    for (std::size_t i = 0; i < want_exp.size() && exp_ok; ++i) {
+        const bool w = want_exp[i] != 0.0, e = L.expanded_image_pad_mask[i] != 0U;
+        if (w != e) { exp_ok = false; std::printf("    expanded mask differs at %zu\n", i); }
+    }
+    check("reference expanded mask", exp_ok, "the x4 expansion lands on the model's own image positions");
+
+    bool ids_ok = true, tgt_ok = true;
+    long long first_id_bad = -1, first_tgt_bad = -1;
+    for (std::size_t i = 0; i < want_ids.size(); ++i) {
+        if (L.image_block_ids[i] != static_cast<long long>(want_ids[i])) {
+            if (first_id_bad < 0) { first_id_bad = static_cast<long long>(i); }
+            ids_ok = false;
+        }
+        const std::uint8_t w = want_tgt[i] != 0.0 ? 1U : 0U;
+        if (L.target_token_mask[i] != w) {
+            if (first_tgt_bad < 0) { first_tgt_bad = static_cast<long long>(i); }
+            tgt_ok = false;
+        }
+    }
+    check("reference image_block_ids", ids_ok,
+          ids_ok ? "same_image_block grouping equals build_token_metadata (-1/0/1)"
+                 : "differs first at position " + std::to_string(first_id_bad) + " (engine " +
+                       std::to_string(first_id_bad >= 0 ? L.image_block_ids[static_cast<std::size_t>(first_id_bad)]
+                                                        : 0) +
+                       ", model " + std::to_string(static_cast<long long>(want_ids[first_id_bad])) + ")");
+    check("reference target_token_mask", tgt_ok,
+          tgt_ok ? "the modulation split marks exactly the model's target block"
+                 : "differs first at position " + std::to_string(first_tgt_bad));
+
+    double worst = 0.0;
+    std::size_t worst_at = 0;
+    for (std::size_t row = 0; row < 637; ++row) {
+        for (int col = 0; col < 64; ++col) {
+            const std::size_t e = row * 128;
+            const double dc = std::fabs(static_cast<double>(L.rope[e + 2 * col]) -
+                                         want_cos[row * 64 + static_cast<std::size_t>(col)]);
+            const double ds = std::fabs(static_cast<double>(L.rope[e + 2 * col + 1]) -
+                                        want_sin[row * 64 + static_cast<std::size_t>(col)]);
+            const double d  = std::max(dc, ds);
+            if (d > worst) { worst = d; worst_at = row * 64 + static_cast<std::size_t>(col); }
+        }
+    }
+    const long long worst_row = static_cast<long long>(worst_at / 64), worst_col = worst_at % 64;
+    check("reference rope table", worst <= 1.0e-5,
+          "max |cos/sin| deviation " + std::format("{:.3e}", worst) + " at joint row " +
+          std::to_string(worst_row) + " angle " + std::to_string(worst_col) +
+          " (row is " + std::string(worst_row < 8 ? "lead-in text" :
+                                     worst_row < 316 ? "reference block" :
+                                     worst_row < 329 ? "trailer text" : "target block") + ")");
+}
+
 } // namespace
 
 int main() {
@@ -275,6 +388,7 @@ int main() {
     gate_portrait();
     gate_adjacent_images();
     gate_invariants();
+    gate_against_reference();
     if (!g_ok) { std::printf("IMAGE_JOINT_LAYOUT_TEST: FAIL\n"); return 1; }
     std::printf("IMAGE_JOINT_LAYOUT_TEST: PASS (joint index map: text-only rope bit-identical to "
                 "build_joint_rope, interleaved portrait blocks/scatter/target mask/frame advance, "

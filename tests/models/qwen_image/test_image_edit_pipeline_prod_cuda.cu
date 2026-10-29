@@ -20,7 +20,12 @@
 //      test_image_edit_prompt_cuda.cu: floor = rel_fro(bf16_oracle, f32) is the reference's OWN BF16
 //      error, and a boundary passes at rel_fro(engine, f32) <= max(2 * floor, 1e-2), whole tensor and
 //      row by row. Two independent BF16 chains of a 32-block chain sit at the reference's own error
-//      apart; any band below it would measure torch, not the engine. The M4 test's text/image CLASS
+//      apart; any band below it would measure torch, not the engine. INSIDE the DiT the floor has a
+//      second, larger term: the artifact's DiT linears are fp8_e4m3fn_row_bf16, so the engine cannot sit
+//      at BF16 distance from this reference at all. floor there is MEASURED (fp8_floor: the same walk
+//      replayed with the artifact's FP8 weights decoded by the repo's own codec), never chosen, and the
+//      band stays 2 * floor at the house 1e-2 -- which is what blackout #27's nine reds asked for and
+//      what a garbage joint (rel_fro 1.414) still fails by an order of magnitude. The M4 test's text/image CLASS
 //      split has no counterpart in a target-only slice (the reference's rows are discarded by the
 //      pipeline's noise_pred[:, -latents.size(1):]), so the class split is applied where it IS
 //      meaningful: the reference half and the target half of the packed img_in input are gated apart,
@@ -69,6 +74,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -152,11 +158,34 @@ double norm_sq(const std::vector<float>& a, std::size_t offset, std::size_t coun
     return sum;
 }
 
+// The measured floor of the DiT taps. The artifact's DiT linears are fp8_e4m3fn_row_bf16, so the engine
+// cannot sit at BF16 distance from a BF16 reference: the representation alone moves every [637, 4096]
+// tap. The floor is therefore MEASURED, not retuned -- it is the distance the same reference walk covers
+// when its DiT weights are replaced by the artifact's FP8 ones decoded through the repo's own codec
+// (image-edit/dump_edit_step_fp8_shadow.py into tensors_edit_step_fp8, replayed by the same oracle
+// script). Returns the FP8 twin's rel_fro to the f32 reference, or -1.0 when the twin is absent, so a
+// BF16-only dump keeps the old band and the skip semantics.
+double fp8_floor(const std::string& shadow_dir, const std::string& name,
+                 const std::vector<float>& f32) {
+    std::vector<float> twin;
+    try {
+        const qo::NpyArray a = qo::read_npy(qo::join(shadow_dir, name));
+        if (a.shape.size() != 2) { return -1.0; }
+        twin = a.floats();
+    } catch (const std::exception&) { return -1.0; }
+    if (twin.size() != f32.size()) { return -1.0; }
+    const double base = std::sqrt(norm_sq(f32, 0, f32.size()));
+    return base > 0.0 ? std::sqrt(diff_sq(twin, f32, 0, f32.size())) / base : 0.0;
+}
+
 // One contiguous class of rows of `engine` against the f32 reference, with the reference's own BF16
 // error as the floor -- test_image_edit_prompt_cuda.cu's gate_class, on a row range instead of a mask.
-void gate_class(const std::string& tag, const std::string& what, const std::vector<float>& engine,
+// `fatal` gates decide; a non-fatal call only prints and returns the verdict, so a red whole-tensor
+// gate no longer hides the per-row evidence behind its own throw (blackout #20 learned this).
+bool gate_class(const std::string& tag, const std::string& what, const std::vector<float>& engine,
                 const std::vector<float>& f32, const std::vector<float>& bf16, std::size_t D,
-                std::size_t first_row, std::size_t rows, double base) {
+                std::size_t first_row, std::size_t rows, double base, bool fatal = true,
+                double measured_floor = 0.0) {
     require(rows > 0, tag + ": the " + what + " row class is empty");
     require(first_row * D + rows * D <= engine.size() && first_row * D + rows * D <= f32.size() &&
                 first_row * D + rows * D <= bf16.size(),
@@ -164,11 +193,16 @@ void gate_class(const std::string& tag, const std::string& what, const std::vect
     const std::size_t off = first_row * D;
     const double engine_err = std::sqrt(diff_sq(engine, f32, off, rows * D)) / base;
     const double floor_err  = std::sqrt(diff_sq(bf16, f32, off, rows * D)) / base;
-    const double band       = std::max(kFloorFactor * floor_err, kGlobalFloor);
+    const double band = std::max(std::max(kFloorFactor * floor_err, kFloorFactor * measured_floor),
+                                 kGlobalFloor);
     std::cout << "  " << tag << " " << what << " rows=" << rows << " eng=" << engine_err
-              << " floor=" << floor_err << " band=" << band << "\n";
-    require(engine_err <= band, tag + ": the " + what +
-                                    " drift further than twice the reference's own BF16 error");
+              << " floor=" << floor_err << " fp8floor=" << measured_floor
+              << " band=" << band << "\n";
+    if (fatal) {
+        require(engine_err <= band, tag + ": the " + what +
+                                        " drift further than twice the reference's own BF16 error");
+    }
+    return engine_err <= band;
 }
 
 // Read a dumped [rows, cols] float32 array and check its shape before it is trusted.
@@ -203,6 +237,9 @@ int main() {
         return 2;
     }
     const std::string step_dir   = qo::join(oracle_path, "tensors_edit_step");
+    // The FP8 twin of the same walk (see fp8_floor). Optional: its absence leaves every measured floor
+    // at 0 and the gates fall back to the house 1e-2 band.
+    const std::string fp8_dir    = qo::join(oracle_path, "tensors_edit_step_fp8");
     const std::string text_dir   = qo::join(oracle_path, "tensors_edit_text_tower");
     const std::string vision_dir = qo::join(oracle_path, "tensors_edit_vision");
 
@@ -434,7 +471,10 @@ int main() {
         const double imgin_base = std::sqrt(norm_sq(imgin_f32, 0, imgin_f32.size()));
         require(imgin_base > 0.0, "the dumped img_in reference rows are all zeros");
         // The whole-tensor floor is what a single row is allowed to add on top of its own error -- the
-        // M4 test's per-row rule, restated for this tensor.
+        // M4 test's per-row rule, restated for this tensor. Both floors are 0 here: the reference ran
+        // BF16, so the dumped "f32" rows are BF16-exact and carry no floor; the band then rests on
+        // kGlobalFloor alone. A scattered wrong row is ~1/sqrt(308) = 0.057 of the whole tensor,
+        // 5.7x outside that floor.
         const double imgin_global_floor =
             std::sqrt(diff_sq(imgin_bf16, imgin_f32, 0, imgin_f32.size())) / imgin_base;
         gate_class("img_in", "reference half", imgin_got, imgin_f32, imgin_bf16, D, 0, kRefTokens,
@@ -442,8 +482,9 @@ int main() {
         for (std::size_t row = 0; row < kRefTokens; ++row) {
             const double row_engine = std::sqrt(diff_sq(imgin_got, imgin_f32, row * D, D)) / imgin_base;
             const double row_floor  = std::sqrt(diff_sq(imgin_bf16, imgin_f32, row * D, D)) / imgin_base;
-            require(row_engine <= std::max(kFloorFactor * row_floor,
-                                           kSliceFloorShare * imgin_global_floor),
+            require(row_engine <= std::max(std::max(kFloorFactor * row_floor,
+                                                    kSliceFloorShare * imgin_global_floor),
+                                           kGlobalFloor),
                     "img_in reference row " + std::to_string(row) + " drifts beyond twice the "
                     "reference's own plus one whole tensor's floor");
         }
@@ -527,6 +568,24 @@ int main() {
 
         cudaStream_t stream = nullptr;
         if (cudaStreamCreate(&stream) != cudaSuccess) { throw std::runtime_error("no image stream"); }
+        // Ask the pipeline for its one-off trace of the SHARED inputs (image_pipeline.cu,
+        // INFERNIX_IMAGE_TRACE_DIR). #21's velocity error was uniform over all 308 target rows, which is
+        // the signature of modulation, of the assembled joint, or of the block chain -- and the blackout
+        // window is too expensive to spend guessing which. The trace costs the pipeline nothing when the
+        // variable is unset, which is how it always runs in serving.
+        const std::filesystem::path trace_dir =
+            std::filesystem::temp_directory_path() / "infernix_edit_trace";
+        std::error_code tec;
+        std::filesystem::remove_all(trace_dir, tec);
+        std::filesystem::create_directories(trace_dir, tec);
+        require(!tec, "cannot create the trace directory: " + tec.message());
+#ifdef _MSC_VER
+        require(_putenv_s("INFERNIX_IMAGE_TRACE_DIR", trace_dir.string().c_str()) == 0,
+                "cannot publish the trace directory");
+#else
+        require(setenv("INFERNIX_IMAGE_TRACE_DIR", trace_dir.string().c_str(), 1) == 0,
+                "cannot publish the trace directory");
+#endif
         GeneratedImage out;
         reset_image_device_peak();
         out = run_image_job(reader, dit, vae, inputs, stream);
@@ -565,21 +624,266 @@ int main() {
             std::sqrt(diff_sq(vel_bf16, vel_f32, 0, vel_f32.size())) / vel_base;
         std::cout << "  edit velocity whole-tensor floor (the reference's own BF16 error) = "
                   << vel_global_floor << "\n";
-        gate_class("edit", "velocity (target slice)", velocity, vel_f32, vel_bf16, kCin, 0,
-                   kTargetTokens, vel_base);
+        // The velocity and the post-step latent are the DiT's output under the ARTIFACT's FP8 weights, so
+        // their floor is the FP8 twin's own distance to the reference (0.018 and 0.021 at this fixture),
+        // not the reference's BF16 error, which is 0 because the reference DiT ran BF16.
+        const double vel_fp8_floor = std::max(0.0, fp8_floor(fp8_dir, "noise_pred_f32.npy", vel_f32));
+        const bool vel_ok = gate_class("edit", "velocity (target slice)", velocity, vel_f32, vel_bf16,
+                                       kCin, 0, kTargetTokens, vel_base, false, vel_fp8_floor);
+        // Same degeneracy as img_in: the reference DiT ran BF16, so vel_global_floor is 0 and the band
+        // rests on the FP8 twin's measured floor. A wrong target row is ~1/sqrt(308) = 0.057 of the
+        // tensor -- far outside that band, so the row gate keeps its power.
+        // Every red row is PRINTED, not thrown on: uniform drift (wrong attention/mask/modulation --
+        // a global mechanism) and a wrong row subset (a layout/scatter defect) demand different
+        // fixes, and blackout #20's throw showed only the whole-tensor number.
+        bool rows_ok = true;
+        std::size_t worst_row = 0;
+        double worst = 0.0;
         for (std::size_t row = 0; row < kTargetTokens; ++row) {
             const double row_engine =
                 std::sqrt(diff_sq(velocity, vel_f32, row * kCin, kCin)) / vel_base;
             const double row_floor =
                 std::sqrt(diff_sq(vel_bf16, vel_f32, row * kCin, kCin)) / vel_base;
-            require(row_engine <= std::max(kFloorFactor * row_floor,
-                                           kSliceFloorShare * vel_global_floor),
-                    "target row " + std::to_string(row) +
-                        " drifts beyond twice the reference's own plus one whole tensor's floor");
+            const double row_band =
+                std::max(std::max(kFloorFactor * row_floor,
+                                  std::max(kSliceFloorShare * vel_global_floor,
+                                           kSliceFloorShare * vel_fp8_floor)),
+                         kGlobalFloor);
+            if (row_engine > row_band) {
+                rows_ok = false;
+                std::cout << "  edit red velocity row " << row << " eng=" << row_engine
+                          << " floor=" << row_floor << " band=" << row_band << "\n";
+            }
+            if (row_engine > worst) { worst = row_engine; worst_row = row; }
+        }
+        std::cout << "  edit velocity rows: worst " << worst_row << " eng=" << worst
+                  << (rows_ok ? ", all inside" : ", RED rows above") << "\n";
+        // Is the whole error a multiplicative factor? An output-head scale, a modulation gain or a
+        // normalization constant all leave v_cuda = a * v_ref, which this fit exposes: a* moves off 1 and
+        // the residual collapses to the noise floor. A direction-changing bug keeps a big residual at
+        // any a, and that distinction decides whether to look at the heads or inside the blocks.
+        {
+            double num = 0.0, den = 0.0;
+            for (std::size_t i = 0; i < velocity.size(); ++i) {
+                num += static_cast<double>(velocity[i]) * vel_f32[i];
+                den += static_cast<double>(vel_f32[i]) * vel_f32[i];
+            }
+            const double a = den > 0.0 ? num / den : 0.0;
+            double rs = 0.0;
+            for (std::size_t i = 0; i < velocity.size(); ++i) {
+                const double d = static_cast<double>(velocity[i]) - a * vel_f32[i];
+                rs += d * d;
+            }
+            std::cout << "  edit velocity scalar fit a*=" << a << " residual="
+                      << (vel_base > 0.0 ? std::sqrt(rs) / vel_base : 0.0) << "\n";
         }
         const double lat_base = std::sqrt(norm_sq(lat_f32, 0, lat_f32.size()));
         require(lat_base > 0.0, "the dumped post-step latent is all zeros");
-        gate_class("edit", "final latent", new_lat, lat_f32, lat_bf16, kCin, 0, kTargetTokens, lat_base);
+        const double lat_fp8_floor =
+            std::max(0.0, fp8_floor(fp8_dir, "latents_after_step_f32.npy", lat_f32));
+        const bool lat_ok = gate_class("edit", "final latent", new_lat, lat_f32, lat_bf16, kCin, 0,
+                                       kTargetTokens, lat_base, false, lat_fp8_floor);
+
+        // ---- the shared inputs, from the trace the job just wrote ----
+        // temb carries BOTH modulation rows in the order the engine built them: the sampled t first, then
+        // the t=0 row causal_condition appends. Matching it clears the modulation path end to end (nlin
+        // and mod are ops::linear of it, and the row SELECTION is the host gate above), including the row
+        // ORDER, which no mask gate can see. joint_in is the sequence as block 0 received it -- txt_in's
+        // rows and the scattered img_in rows before any block touched them. The taps say where the chain
+        // starts to diverge if both of those match. temb and the assembled joint are built from BF16 chains the
+// engine shares with the reference, so they keep the house 1e-2 band; every tap INSIDE the DiT is gated
+// on the FP8 twin's measured drift instead, because the artifact's weights -- not the engine -- are what
+// separates those from a BF16 reference.
+        auto read_trace = [&](const std::string& name, std::size_t n) {
+            std::vector<float> v;
+            std::FILE* h = std::fopen((trace_dir.string() + "\\" + name).c_str(), "rb");
+            if (h == nullptr) { return v; }
+            v.resize(n);
+            const std::size_t got = std::fread(v.data(), sizeof(float), n, h);
+            std::fclose(h);
+            if (got != n) { v.clear(); }
+            return v;
+        };
+        auto gate_trace = [&](const std::string& what, const std::vector<float>& got,
+                              const std::vector<float>& want, double band) {
+            if (got.size() != want.size()) {
+                std::cout << "  edit " << what << ": NO TRACE (" << got.size() << " of "
+                          << want.size() << " floats)\n";
+                return false;
+            }
+            const double base = std::sqrt(norm_sq(want, 0, want.size()));
+            const double err  = base > 0.0
+                ? std::sqrt(diff_sq(got, want, 0, want.size())) / base : 0.0;
+            std::cout << "  edit " << what << " eng=" << err << " band=" << band
+                      << (err <= band ? " OK" : " RED") << "\n";
+            return err <= band;
+        };
+        auto rel_rows = [](const std::vector<float>& got, const std::vector<float>& want,
+                           std::size_t off, std::size_t n) {
+            const double base = std::sqrt(norm_sq(want, off, n));
+            return base > 0.0 ? std::sqrt(diff_sq(got, want, off, n)) / base : 0.0;
+        };
+        // Every [637, 4096] surface is asked twice: whole tensor, and the 308 target rows alone. A wrong
+        // SHARED input (the modulation source, rope, txt_in, the assembly) moves both classes together;
+        // a causal_condition mechanism -- which modulation row a token reads -- moves only the target
+        // rows, and only the target rows can be wrong while the velocity is uniformly wrong.
+        auto gate_trace_split = [&](const std::string& what, const std::vector<float>& got,
+                                    const std::vector<float>& want, double band) {
+            const bool ok = gate_trace(what, got, want, band);
+            const std::size_t first = static_cast<std::size_t>(kExpanded - kTargetTokens) * 4096;
+            const std::size_t count = static_cast<std::size_t>(kTargetTokens) * 4096;
+            if (got.size() != want.size() || want.size() != kExpanded * 4096) { return ok; }
+            std::cout << "  edit " << what << " by class: target rows eng="
+                      << rel_rows(got, want, first, count)
+                      << ", text+reference rows eng=" << rel_rows(got, want, 0, first) << "\n";
+            return ok;
+        };
+        bool trace_ok = true;
+        {
+            const std::vector<float> temb_want =
+                qo::read_npy(qo::join(step_dir, "temb_f32.npy")).floats();
+            require(temb_want.size() == 2ULL * 4096, "the dumped temb is not [2, 4096]");
+            const std::vector<float> temb_got = read_trace("temb.f32", temb_want.size());
+            trace_ok &= gate_trace("temb (sampled row + t=0 row)", temb_got, temb_want, 1.0e-2);
+            // The aggregate cannot see a SWAP: two rows of similar norm exchanged sit at a diluted
+            // distance, and the row ORDER is exactly what causal_condition asks of the engine -- row 0
+            // must be the sampled t (the target reads it), row 1 the t=0 row every non-target reads. So
+            // each engine row is matched against its own row AND against the other one: two mirrored
+            // reds name a swapped build, one lone red names the timestep chain itself.
+            if (temb_got.size() == temb_want.size()) {
+                const std::size_t C = 4096;
+                for (std::size_t r = 0; r < 2; ++r) {
+                    const std::size_t o = 1 - r;
+                    const std::vector<float> g(temb_got.begin() + r * C, temb_got.begin() + (r + 1) * C);
+                    const std::vector<float> same(temb_want.begin() + r * C, temb_want.begin() + (r + 1) * C);
+                    const std::vector<float> other(temb_want.begin() + o * C, temb_want.begin() + (o + 1) * C);
+                    std::cout << "  edit temb row " << (r == 0 ? "0 (sampled t)" : "1 (t = 0)")
+                              << " eng=" << rel_rows(g, same, 0, C)
+                              << " against the other row eng=" << rel_rows(g, other, 0, C) << "\n";
+                }
+            }
+            const std::vector<float> jin_want =
+                qo::read_npy(qo::join(step_dir, "joint_in_f32.npy")).floats();
+            require(jin_want.size() == kExpanded * 4096, "the dumped joint_in is not [637, 4096]");
+            trace_ok &= gate_trace_split("joint as block 0 received it",
+                                         read_trace("joint_in.f32", jin_want.size()), jin_want, 1.0e-2);
+            // Blackout #23 left the joint's TARGET block unexplained: 1.42 from the dump (the distance
+            // two independent tensors sit at) while the reference half was bit-exact. The target half of
+            // the packed img_in input had never been gated on EITHER side -- the dump saved only its
+            // reference half, and the "img_in reference half" gate above is the TEST's own GEMM of the
+            // bytes it packed, not the job's buffer. These three close the gap and separate the three
+            // remaining hypotheses: the upload of init_latent into d_lat, the GEMM's rows, the scatter's
+            // indices. The job was handed the packed bytes, so its latent trace must be bit-exact; if it
+            // is and the joint still differs, the scatter is what lost the rows.
+            {
+                std::vector<float> tgt_want;
+                try {
+                    tgt_want = qo::read_npy(qo::join(step_dir, "img_in_target_f32.npy")).floats();
+                } catch (const std::exception&) {
+                    tgt_want.clear();
+                }
+                if (tgt_want.size() != kTargetTokens * 4096ULL) {
+                    std::cout << "  edit img_in target half: THE DUMP CARRIES NO img_in_target_f32.npy\n";
+                    trace_ok = false;
+                } else {
+                    // rel_rows takes ONE offset for both tensors, and tgt_want holds only the target
+                    // half, so the halves are compared with the two-offset form.
+                    const double tgt_base = std::sqrt(norm_sq(tgt_want, 0, kTargetTokens * 4096ULL));
+                    const double probe_tgt =
+                        tgt_base > 0.0
+                            ? std::sqrt(diff_sq_rows(imgin_got, kRefTokens * 4096ULL, tgt_want, 0,
+                                                     kTargetTokens * 4096ULL)) / tgt_base
+                            : 0.0;
+                    std::cout << "  edit img_in target half (the test's own GEMM of the packed rows) eng="
+                              << probe_tgt << " band=" << kGlobalFloor
+                              << (probe_tgt <= kGlobalFloor ? " OK" : " RED") << "\n";
+                    trace_ok &= probe_tgt <= kGlobalFloor;
+                }
+
+                std::vector<float> packed_want;
+                packed_want.reserve((kRefTokens + kTargetTokens) * kCin);
+                packed_want.insert(packed_want.end(), ref_bf16.begin(), ref_bf16.end());
+                packed_want.insert(packed_want.end(), init_bf16.begin(), init_bf16.end());
+                const std::size_t pn = (kRefTokens + kTargetTokens) * kCin;
+                const std::vector<float> packed_got = read_trace("latent_packed.f32", pn);
+                if (packed_got.size() != pn) {
+                    std::cout << "  edit the job's packed latent: NO TRACE\n";
+                    trace_ok = false;
+                } else {
+                    const double pr = rel_rows(packed_got, packed_want, kRefTokens * kCin,
+                                               kTargetTokens * kCin);
+                    std::cout << "  edit the job's packed latent by class: reference half eng="
+                              << rel_rows(packed_got, packed_want, 0, kRefTokens * kCin)
+                              << ", target half eng=" << pr << " (both must be 0: the job was handed "
+                              << "these bytes)\n";
+                    trace_ok &= pr <= 0.0;
+                }
+
+                std::vector<float> hs_want = imgin_f32;
+                hs_want.insert(hs_want.end(), tgt_want.begin(), tgt_want.end());
+                const std::size_t hn = (kRefTokens + kTargetTokens) * 4096ULL;
+                const std::vector<float> hs_got = read_trace("hs_img.f32", hn);
+                if (hs_got.size() != hn) {
+                    std::cout << "  edit the job's img_in output: NO TRACE\n";
+                    trace_ok = false;
+                } else {
+                    const double hr = rel_rows(hs_got, hs_want, kRefTokens * 4096ULL,
+                                               kTargetTokens * 4096ULL);
+                    std::cout << "  edit the job's img_in output by class: reference half eng="
+                              << rel_rows(hs_got, hs_want, 0, kRefTokens * 4096ULL)
+                              << ", target half eng=" << hr << " band=" << kGlobalFloor << "\n";
+                    trace_ok &= hr <= kGlobalFloor;
+                }
+            }
+            // The other end of the chain: everything above the velocity head can be right and the head
+            // (layer_norm + masked adaln_scale, before proj_out) still wrong.
+            {
+                std::vector<float> nout_want;
+                try {
+                    nout_want = qo::read_npy(qo::join(step_dir, "norm_out_f32.npy")).floats();
+                } catch (const std::exception&) {
+                    nout_want.clear();
+                }
+                if (nout_want.empty()) {
+                    std::cout << "  edit velocity head input: the dump carries no norm_out file\n";
+                } else {
+                    // The engine's DiT runs the artifact's FP8 weights, so the head input's floor is the
+                    // FP8 twin's own drift (6.0e-2 here), not the reference's BF16 error.
+                    const double twin = fp8_floor(fp8_dir, "norm_out_f32.npy", nout_want);
+                    const double band = twin >= 0.0 ? std::max(kFloorFactor * twin, kGlobalFloor) : 1.0e-2;
+                    trace_ok &= gate_trace_split("velocity head input (norm_out)",
+                                                 read_trace("norm_out.f32", nout_want.size()),
+                                                 nout_want, band);
+                }
+            }
+            for (const int tap : {0, 1, 2, 4, 8, 16, 24, 31}) {
+                const std::string nm = "block_" + std::to_string(tap) + "_joint_f32.npy";
+                std::vector<float> want;
+                try {
+                    want = qo::read_npy(qo::join(step_dir, nm)).floats();
+                } catch (const std::exception&) {
+                    want.clear();
+                }
+                if (want.empty()) {
+                    std::cout << "  edit block " << tap << " tap: the dump carries no tap file\n";
+                    continue;
+                }
+                // The drift grows monotonically with depth (4.7e-3 at block 0 to 2.8e-2 at block 31) and
+                // the FP8 twin reproduces it tap for tap, so each tap is gated on ITS OWN measured FP8
+                // floor. A mechanism defect moves the engine further than the representation does.
+                const double twin = fp8_floor(fp8_dir, nm, want);
+                const double band = twin >= 0.0 ? std::max(kFloorFactor * twin, kGlobalFloor) : 1.0e-2;
+                trace_ok &= gate_trace_split("block " + std::to_string(tap) + " output",
+                                             read_trace("block_" + std::to_string(tap) + ".f32",
+                                                        want.size()),
+                                             want, band);
+            }
+        }
+
+        require(vel_ok && rows_ok && lat_ok && trace_ok,
+                "the velocity (target slice), the final latent or a SHARED INPUT of the DiT step (temb, "
+                "the assembled joint, a block output) drifts further than the band allows -- the red rows "
+                "and the first diverging shared input are printed above");
 
         // ---- (d) the ledger's throw path, on the edit route's own host-side refusals ----
         {
@@ -609,8 +913,11 @@ int main() {
 
             ImageJobInputs few_slots = inputs;
             few_slots.prompt_image_pad_mask.assign(kKept, 0U);
-            for (std::size_t s = 0; s < kRefTokens / 4; ++s) few_slots.prompt_image_pad_mask[s] = 1U;
-            refused = false;   // 77 slots -> 60: 4 * 60 cannot cover 308 + 308 tokens
+            // 60 slots, not the fixture's own 77: a mask of exactly kRefTokens/4 ones IS the correct
+            // input (the engine appends the target slots itself), so the negative case has to disagree
+            // with the reference token count -- 4 * 60 = 240 cannot cover 308 reference tokens.
+            for (std::size_t s = 0; s < kRefTokens / 4 - 17; ++s) few_slots.prompt_image_pad_mask[s] = 1U;
+            refused = false;
             try {
                 cudaStream_t s3 = nullptr;
                 if (cudaStreamCreate(&s3) != cudaSuccess) { throw std::runtime_error("no image stream"); }
