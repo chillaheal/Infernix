@@ -59,7 +59,37 @@ void attn_dit_joint(const Tensor& q, const Tensor& k, const Tensor& v, std::int3
     if (overlaps(out, q) || overlaps(out, k) || overlaps(out, v)) {
         throw std::invalid_argument("attn_dit_joint: out overlaps an input");
     }
-    detail::attn_dit_joint_launch(q, k, v, text_prefix, &out, heads, tokens, stream);
+    detail::attn_dit_joint_launch(q, k, v, text_prefix, nullptr, &out, heads, tokens, stream);
+}
+
+void attn_dit_joint_block_causal(const Tensor& q, const Tensor& k, const Tensor& v,
+                                 const Tensor& image_ids, Tensor& out, cudaStream_t stream) {
+    const std::int32_t heads  = q.ne[1];
+    const std::int32_t tokens = q.ne[2];
+    if (heads < 1 || heads > kMaxHeads) {
+        throw std::invalid_argument("attn_dit_joint: heads must be 1..40");
+    }
+    if (tokens < 1 || tokens > kMaxTokens) {
+        throw std::invalid_argument("attn_dit_joint: S must be 1..20480");
+    }
+    // One id per token and nothing else: the kernel indexes it with the key token alone, so a mask
+    // of any other shape would read past its end at the last tile.
+    if (image_ids.dtype != DType::I32 || image_ids.ne[0] != tokens || image_ids.ne[1] != 1 ||
+        image_ids.ne[2] != 1 || image_ids.ne[3] != 1 || !image_ids.is_contiguous() ||
+        image_ids.data == nullptr) {
+        throw std::invalid_argument("attn_dit_joint: invalid image_ids [S,1,1,1] I32");
+    }
+    if (!head_shape(q, heads, tokens)) {
+        throw std::invalid_argument("attn_dit_joint: invalid q");
+    }
+    if (!head_shape(k, heads, tokens) || !head_shape(v, heads, tokens) ||
+        !head_shape(out, heads, tokens)) {
+        throw std::invalid_argument("attn_dit_joint: k, v and out must match q's shape and dtype");
+    }
+    if (overlaps(out, q) || overlaps(out, k) || overlaps(out, v) || overlaps(out, image_ids)) {
+        throw std::invalid_argument("attn_dit_joint: out overlaps an input");
+    }
+    detail::attn_dit_joint_launch(q, k, v, 0, &image_ids, &out, heads, tokens, stream);
 }
 
 } // namespace infernix::ops

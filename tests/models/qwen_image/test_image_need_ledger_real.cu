@@ -103,6 +103,13 @@ int main() {
                 const ImageGeometry ref = ImageGeometry::derive(c.ref_side, c.ref_side);
                 inputs.ref_grids.emplace_back(ref.hl, ref.wl);
                 inputs.ref_latents = zero_bits(static_cast<std::size_t>(ref.tokens) * dit.dims.image_in);
+                // A reference makes this the edit route, whose joint sequence is built from the prompt's
+                // image-pad mask: one set bit per 2x2 group of reference latents, in the kept prompt rows
+                // (the job appends the target's own slots itself). Zeroes elsewhere keep the row count --
+                // and so the ledger's sequence length -- at what the request declares.
+                inputs.prompt_image_pad_mask.assign(static_cast<std::size_t>(kTextTokens), 0U);
+                inputs.prompt_image_pad_mask.assign(
+                    static_cast<std::size_t>(ref.tokens / 4), 1U);
             }
             if (c.neg_tokens != 0) {
                 inputs.negative_prompt_embeds = zero_bits(static_cast<std::size_t>(c.neg_tokens) *

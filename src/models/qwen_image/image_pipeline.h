@@ -53,6 +53,17 @@ struct ImageJobInputs {
     // default (1.0 with empty negatives) is the single-forward route, byte for byte.
     std::vector<std::uint16_t> negative_prompt_embeds;    // [neg_tokens, hidden] token-major BF16 bits
     float true_cfg_scale = 1.0F;
+    // M6 instruction-guided edit: the VLM's image pad mask, one byte per KEPT prompt row (1 on an
+    // <|image_pad|> slot, 0 elsewhere) -- exactly run_conditioned_text_tower's image_pad_mask / the
+    // text encoder's image_pad_mask_base BEFORE the pipeline's append_target_slots adds the target's
+    // quarter-count slots. Only this and ref_grids define the route: with ref_grids EMPTY the job stays
+    // the certified text-to-image assembly and both fields are ignored; with ref_grids set, the mask's
+    // image slots x4 plus the appended (Hl*Wl)/4 target slots must cover ref_grids' grids and the
+    // target grid (build_joint_layout's invariant), so a prompt whose vision plane and VAE plane
+    // disagree fails host-side before any device work. The negative route is the SAME references and
+    // its own prompt rows, so it carries its own mask: empty = no negative pass.
+    std::vector<std::uint8_t> prompt_image_pad_mask;      // [tp] 0/1, one byte per kept prompt row
+    std::vector<std::uint8_t> negative_prompt_image_pad_mask; // [tp_neg] 0/1, one byte per negative row
 };
 
 // The job's output. channels is the decoded image ([4, height, width] channel-major float, the
@@ -100,7 +111,9 @@ void reset_image_device_peak() noexcept;
 
 // Runs one complete image job on `stream` inside the yielded VRAM. Every device allocation is
 // owned here and freed before the return, on success and on failure alike (the caller's interlude
-// restore then returns the LLM's pools). Bad inputs or a CUDA failure throw std::runtime_error.
+// restore then returns the LLM's pools). Bad inputs or a CUDA failure throw std::runtime_error; an
+// edit route whose mask, grids or target geometry disagree throws std::invalid_argument, host-side and
+// before any device allocation.
 // The 32 blocks' weights are read from the artifact once per job into a host cache (peak ~ one
 // block's roles x layers) and streamed H2D per block per step, so the 40-step loop never re-reads
 // them from disk and the device working set peaks at ~one block.

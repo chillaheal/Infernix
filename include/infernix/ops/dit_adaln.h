@@ -71,4 +71,28 @@ void adaln_gate_add(const Tensor& residual, const Tensor& branch, const Tensor& 
                     std::int32_t col_off, std::int32_t text_prefix, Tensor& out,
                     cudaStream_t stream);
 
+/**
+ * The same two modulations with the row selected by a per-token mask instead of one boundary.
+ *
+ * Math / indexing:
+ *   row(s)  = target_mask[s] ? 0 : 1        // 0 = the sampled timestep, 1 = the t = 0 embedding
+ * and otherwise the identical formulas. The edit route needs this because its non-target set is not
+ * a prefix: the REFERENCE image rows sit after the text and still read the t = 0 row
+ * (causal_condition), while only the target block reads the sampled t. Passing a mask that is set
+ * exactly on a suffix is the prefix rule, so the two forms agree bit-for-bit on every sequence the
+ * prefix form can express -- which is what lets the certified text-to-image path keep its own calls.
+ *
+ * Logical shapes:
+ *   as above, with target_mask a contiguous device U8 [S,1,1,1] (one byte per token, the same S as
+ *   the activations). Non-zero bytes select row 0; the Op never reads outside those S bytes.
+ *
+ * Effects / Workspace:
+ *   Same as the prefix forms; target_mask is read only and must not overlap out.
+ */
+void adaln_scale_masked(const Tensor& x, const Tensor& mod, std::int32_t col_off,
+                        const Tensor& target_mask, Tensor& out, cudaStream_t stream);
+void adaln_gate_add_masked(const Tensor& residual, const Tensor& branch, const Tensor& mod,
+                           std::int32_t col_off, const Tensor& target_mask, Tensor& out,
+                           cudaStream_t stream);
+
 }  // namespace infernix::ops

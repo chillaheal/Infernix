@@ -176,6 +176,21 @@ infernix_add_op_test(infernix_image_edit_prompt_cuda_test
   LIBRARIES infernix_ops infernix_qwen_image infernix_qwen_image_runtime)
 set_tests_properties(infernix_image_edit_prompt_cuda_test PROPERTIES SKIP_RETURN_CODE 77)
 
+# Instruction-guided edit (M6): ONE denoising step of the EDIT route's DiT -- run_image_job with ref_grids
+# set, so the joint sequence is the interleaved [expanded VLM rows][target] that joint_scatter_u16_kernel
+# assembles, modulated by target_token_mask and masked block-causally by image_block_ids. The step's target
+# velocity and the returned latent are gated against torch's own one-step dump (seed 7, use_kv_cache off,
+# no CFG) with the M4 gate: rel_fro(engine, f32) <= max(2 * floor, 1e-2), floor = the reference's own BF16
+# error, with the text and image classes gated separately. Two asserts the old certification never had: the
+# reference slot carries img_in(reference latents) and measurably NOT the VLM merger row, and the #17 ledger
+# returns to zero on the success path AND under each refused/inconsistent input. The certified
+# text-to-image step test stays the guard for the empty-ref branch. Skips (77) without
+# INFERNIX_TEST_ARTIFACT / INFERNIX_IMAGE_ORACLE; returns 2 with no CUDA device.
+infernix_add_op_test(infernix_image_edit_pipeline_prod_cuda_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_image_edit_pipeline_prod_cuda.cu"
+  LIBRARIES infernix_ops infernix_qwen_image infernix_qwen_image_runtime)
+set_tests_properties(infernix_image_edit_pipeline_prod_cuda_test PROPERTIES SKIP_RETURN_CODE 77)
+
 # GPU production-route qualification, VAE DECODER: the full Qwen-Image-2.1 single-frame VAE decoder
 # (AutoencoderKLQwenImage21, T=1 first-chunk) composed from production ops (ops::conv2d, ops::silu,
 # ops::add, ops::upsample_nearest_2x, ops::dupup3d, ops::spatial_attn, plus reused ops::linear +
