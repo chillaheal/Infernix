@@ -160,6 +160,22 @@ infernix_add_op_test(infernix_image_vision_prod_cuda_test
   LIBRARIES infernix_ops infernix_qwen_image infernix_qwen_image_runtime)
 set_tests_properties(infernix_image_vision_prod_cuda_test PROPERTIES SKIP_RETURN_CODE 77)
 
+# Instruction-guided edit (M4): the EDIT route's CONDITIONED text tower (src/models/qwen_image/
+# text_tower.cu run_conditioned_text_tower) -- the streamed 36-layer forward over an inputs_embeds whose
+# <|image_pad|> rows are the M3 tower's merger rows, with the deepstack rows added to those rows after
+# decoder layers 0/1/2. Gated on the artifact's own streamed text/* + vision/* weights (production
+# shapes, real FP8 embed dequantization) against torch's conditioned forward on the same artifact:
+# rel_fro(engine, f32) <= max(2 * floor, 1e-2) with floor = the reference's own BF16 error, per row, and
+# with the text and image row CLASSES gated separately. Plus three tolerance-free asserts: the
+# image_pad_mask equals the model's own byte for byte, the deepstack add measurably moves the image rows,
+# and a plain prompt (identity scatter, no adds) is BIT-identical to run_text_tower -- the certified t2i
+# route's regression. Also asserts the #17 ledger returns to zero on success and under a refused
+# allocation. Skips (77) without INFERNIX_TEST_ARTIFACT / INFERNIX_IMAGE_ORACLE; returns 2 with no CUDA.
+infernix_add_op_test(infernix_image_edit_prompt_cuda_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_image_edit_prompt_cuda.cu"
+  LIBRARIES infernix_ops infernix_qwen_image infernix_qwen_image_runtime)
+set_tests_properties(infernix_image_edit_prompt_cuda_test PROPERTIES SKIP_RETURN_CODE 77)
+
 # GPU production-route qualification, VAE DECODER: the full Qwen-Image-2.1 single-frame VAE decoder
 # (AutoencoderKLQwenImage21, T=1 first-chunk) composed from production ops (ops::conv2d, ops::silu,
 # ops::add, ops::upsample_nearest_2x, ops::dupup3d, ops::spatial_attn, plus reused ops::linear +

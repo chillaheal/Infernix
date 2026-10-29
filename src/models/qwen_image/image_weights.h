@@ -155,6 +155,14 @@ struct VaeDenorm {
 [[nodiscard]] DiTWeights bind_dit(artifact::Binder& binder);
 [[nodiscard]] TextTowerWeights bind_text_encoder(artifact::Binder& binder);
 [[nodiscard]] VaeWeights bind_image_vae(artifact::Binder& binder);
+
+// The FP8 RowScale text/embed_tokens plane decoded ONCE into [vocab, hidden] row-major BF16 bits --
+// value = e4m3 code * the row's BF16 scale, rounded to BF16 (the production route's quantization
+// error, disclosed with the tower's device gate). run_text_tower and run_conditioned_text_tower gather
+// from exactly this, so the dequantization the serve route caches is the same code the tower tests gate.
+// A plane that is not [codes][scales] FP8 RowScale, or one shorter than its geometry, throws
+// std::runtime_error.
+[[nodiscard]] std::vector<std::byte> dequantize_embed_table(artifact::Reader& reader, const TextTowerWeights& tower);
 // The vision tower an edit conditions the text tower on: every vision/* parameter of the recipe
 // (patch embedding, position table, the depth blocks, the main merger and one merger per
 // deepstack_visual_indexes entry), all direct BF16 -- the FP8 recipe never names a vision role. A

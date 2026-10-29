@@ -53,6 +53,19 @@ struct NpyArray {
         require(bytes.size() == numel, "bool array byte count mismatch");
         return bytes;
     }
+    // A torch token-id dump is int64 ('<i8'); the towers take int, so the values are narrowed here.
+    std::vector<int> ints() const {
+        require(descr == "<i8", "ints() on non-int64 array");
+        require(bytes.size() == numel * 8, "int array byte count mismatch");
+        std::vector<std::int64_t> wide(numel);
+        std::memcpy(wide.data(), bytes.data(), bytes.size());
+        std::vector<int> out(numel);
+        for (std::size_t i = 0; i < numel; ++i) {
+            require(wide[i] >= 0 && wide[i] <= 0x7fffffffLL, "token id outside the int range");
+            out[i] = static_cast<int>(wide[i]);
+        }
+        return out;
+    }
     std::vector<double> doubles() const {
         require(descr == "<f8" || descr == "<f4", "doubles() on non-float array");
         if (descr == "<f8") {
@@ -115,7 +128,8 @@ inline NpyArray read_npy(const std::string& path) {
         while (j < dims.size() && dims[j] >= '0' && dims[j] <= '9') ++j;
         if (j > i) { a.shape.push_back(std::stoull(dims.substr(i, j - i))); i = j; } else { ++i; }
     }
-    const std::size_t elem = (a.descr == "<f4") ? 4u : ((a.descr == "<c8" || a.descr == "<f8") ? 8u : 1u);
+    const std::size_t elem =
+        (a.descr == "<f4") ? 4u : ((a.descr == "<c8" || a.descr == "<f8" || a.descr == "<i8") ? 8u : 1u);
     a.numel = 1;
     for (std::size_t s : a.shape) a.numel *= s;
     require(raw.size() == data_off + a.numel * elem, "npy payload size mismatch");

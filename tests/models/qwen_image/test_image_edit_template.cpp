@@ -20,8 +20,11 @@
 // the source tree (NEEDS_SOURCE_DIR).
 
 #include "models/qwen3_5/frontend/tokenizer.h"
+#include "ops/common/canonical_math.h"
 #include "serve/image_text_tower.h"
 #include "serve/reference_image.h"
+
+#include "qwen_image_oracle_ref.h"
 
 #include <nlohmann/json.hpp>
 
@@ -38,6 +41,7 @@
 namespace {
 
 using json = nlohmann::json;
+namespace qo = qioracle;
 using Tokenizer = infernix::models::qwen3_5::frontend::Tokenizer;
 using TokenizerResources = infernix::models::qwen3_5::frontend::TokenizerResources;
 
@@ -286,6 +290,103 @@ int main() {
     check("processor emitted tensors", o.at("has_pixel_values").get<bool>() &&
                                            o.at("has_mm_token_type_ids").get<bool>(),
           "pixel_values " + o.at("pixel_values_shape").dump() + " + mm_token_type_ids present");
+
+    // 11) The host conditioning the edit route builds itself -- the plane's patch rows and the pad
+    // expansion -- graded against the processor's OWN tensors. No device test ever looked at these:
+    // the vision blackout is handed torch's pixel_values directly, so a wrong patch order or a wrong
+    // normalisation would have reached the tower unnoticed. Requires the vision/text oracle root
+    // (INFERNIX_IMAGE_ORACLE, image-spike/oracle; the gradient plane comes from
+    // image-edit/dump_vision_oracle.py --pack-only). Without it these gates report that they did NOT
+    // run -- never OK.
+    {
+        const char* oracle_root = std::getenv("INFERNIX_IMAGE_ORACLE");
+        if (oracle_root == nullptr || std::string(oracle_root).empty()) {
+            std::printf("  %-34s SKIPPED  INFERNIX_IMAGE_ORACLE unset: the vision pack and the pad "
+                        "expansion did NOT run\n",
+                        "vision pack / pad expansion");
+        } else {
+            const std::string vision_dir = qo::join(oracle_root, "tensors_edit_vision");
+            const std::string text_dir   = qo::join(oracle_root, "tensors_edit_text_tower");
+
+            // ---- the pack: gradient plane -> the processor's pixel_values, BF16 bit-for-bit ----
+            const qo::NpyArray grid_array = qo::read_npy(qo::join(vision_dir, "gradient_grid.npy"));
+            const std::vector<float> grid = grid_array.floats(); // [t, h, w] in patches
+            if (grid.size() != 3 || grid[0] != 1.0F) { die("the gradient grid is not a single frame"); }
+            const qo::NpyArray want_array = qo::read_npy(qo::join(vision_dir, "gradient_patches.npy"));
+            if (want_array.shape.size() != 2) { die("gradient_patches is not [patches, width]"); }
+            const std::vector<float> want = want_array.floats();
+            const qo::NpyArray plane_array = qo::read_npy(qo::join(vision_dir, "gradient_vision_rgb_u8.npy"));
+            if (plane_array.shape.size() != 3 || plane_array.shape[2] != 3 || plane_array.descr != "|u1") {
+                die("the stored plane is not a uint8 [height, width, 3] array");
+            }
+            infernix::serve::ReferenceVisionPlane plane;
+            plane.height_px = static_cast<std::uint32_t>(plane_array.shape[0]);
+            plane.width_px  = static_cast<std::uint32_t>(plane_array.shape[1]);
+            plane.rgb       = plane_array.bytes;
+            if (static_cast<std::size_t>(plane.height_px) * plane.width_px * 3ULL != plane.rgb.size()) {
+                die("the stored plane's byte count is not h*w*3");
+            }
+            infernix::serve::VisionPatchGeometry geometry;
+            geometry.patch    = 16U; // preprocessor_config.json / vision_config.patch_size
+            geometry.temporal = 2U;  // vision_config.temporal_patch_size
+            geometry.merge    = 2U;  // vision_config.spatial_merge_size
+            const std::vector<std::uint16_t> got = infernix::serve::pack_vision_patches(plane, geometry);
+            std::string pack_bad;
+            if (got.size() != want.size()) {
+                pack_bad = "length: got " + std::to_string(got.size()) + ", want " + std::to_string(want.size());
+            } else if (want_array.shape[0] != static_cast<std::size_t>(grid[1]) * static_cast<std::size_t>(grid[2])) {
+                pack_bad = "the dump's row count does not match its own grid";
+            } else {
+                for (std::size_t i = 0; i < got.size(); ++i) {
+                    const std::uint16_t w = infernix::ops::canon::f32_to_bf16_rn(want[i]);
+                    if (got[i] != w) {
+                        const std::size_t row = i / want_array.shape[1], col = i % want_array.shape[1];
+                        pack_bad = "row " + std::to_string(row) + " col " + std::to_string(col) + ": got " +
+                                   std::to_string(got[i]) + ", want " + std::to_string(w) + " (f32 " +
+                                   std::to_string(want[i]) + ")";
+                        break;
+                    }
+                }
+            }
+            check("vision pack == processor", pack_bad.empty(),
+                  pack_bad.empty()
+                      ? std::to_string(got.size() / want_array.shape[1]) + " rows x " +
+                            std::to_string(want_array.shape[1]) + " of the gradient plane, bit-for-bit"
+                      : pack_bad);
+
+            // ---- the expansion: raw ti2i + the reference's vision tokens == the model's input_ids ----
+            const json text_meta = json::parse(read_file(qo::join(text_dir, "meta.json")));
+            const std::string edit_prompt = text_meta.at("cases").at("portrait").at("prompt")
+                                                .template get<std::string>();
+            const auto& grid_thw = text_meta.at("cases").at("portrait").at("grid_thw");
+            const std::uint64_t vision_tokens =
+                grid_thw[0].get<std::uint64_t>() * grid_thw[1].get<std::uint64_t>() *
+                grid_thw[2].get<std::uint64_t>() / 4ULL; // spatial_merge_size^2
+            const qo::NpyArray ids_array = qo::read_npy(qo::join(text_dir, "portrait_input_ids.npy"));
+            const std::vector<int> want_ids = ids_array.ints();
+            std::string expand_bad;
+            try {
+                const std::vector<int> got_ids = infernix::serve::expand_image_pads(
+                    tokz->encode(infernix::serve::render_ti2i_template(edit_prompt, 1)), {vision_tokens});
+                if (got_ids.size() != want_ids.size()) {
+                    expand_bad = "length: got " + std::to_string(got_ids.size()) + ", want " +
+                                 std::to_string(want_ids.size());
+                } else {
+                    for (std::size_t i = 0; i < got_ids.size(); ++i) {
+                        if (got_ids[i] != want_ids[i]) {
+                            expand_bad = "id " + std::to_string(i) + ": got " + std::to_string(got_ids[i]) +
+                                         ", want " + std::to_string(want_ids[i]);
+                            break;
+                        }
+                    }
+                }
+            } catch (const std::exception& e) { expand_bad = e.what(); }
+            check("pad expansion == processor", expand_bad.empty(),
+                  expand_bad.empty() ? "engine ti2i + expand_image_pads(" + std::to_string(vision_tokens) +
+                                           ") reproduces the processor's portrait input_ids"
+                                     : expand_bad);
+        }
+    }
 
     if (!g_ok) { std::printf("IMAGE_EDIT_TEMPLATE_TEST: FAIL\n"); return 1; }
     std::printf("IMAGE_EDIT_TEMPLATE_TEST: PASS (raw ti2i/t2i templates, processor expansion, "

@@ -1,8 +1,10 @@
 #include "models/qwen_image/image_weights.h"
 
 #include "artifact/schema.h"
+#include "ops/common/canonical_math.h"
 
 #include <cmath>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -436,6 +438,38 @@ VaeWeights bind_image_vae(Binder& binder) {
     add("vae/encoder.conv_out.weight", {128, 768, 3, 3});
     add("vae/encoder.conv_out.bias", {128});
     return out;
+}
+
+std::vector<std::byte> dequantize_embed_table(artifact::Reader& reader, const TextTowerWeights& tower) {
+    const ParameterReference& ref = tower.embed_tokens;
+    if (ref.binding.parts.size() != 1) {
+        throw std::runtime_error("image text tower: embed_tokens binds more than one object");
+    }
+    const auto object = ref.binding.parts.front().object;
+    const WeightGeometry& g  = reader.geometry(object);
+    const std::size_t vocab  = static_cast<std::size_t>(tower.dims.vocab);
+    const std::size_t hidden = static_cast<std::size_t>(tower.dims.hidden);
+    if (g.format != QType::FP8_E4M3FN_ROW_BF16 || g.layout != QuantLayout::RowScale ||
+        g.code_bytes != vocab * hidden || g.scale_bytes != vocab * 2 || g.scale_offset < g.code_bytes) {
+        throw std::runtime_error("image text tower: embed_tokens is not a plain [codes][scales] FP8 plane");
+    }
+    const std::vector<std::byte> obj = reader.read_object(object);
+    if (obj.size() < g.scale_offset + g.scale_bytes) {
+        throw std::runtime_error("image text tower: embed_tokens object is shorter than its geometry");
+    }
+    const auto* codes  = reinterpret_cast<const std::uint8_t*>(obj.data());
+    const auto* scales = reinterpret_cast<const std::uint16_t*>(obj.data() + g.scale_offset);
+    std::vector<std::byte> table(vocab * hidden * 2);
+    auto* rows = reinterpret_cast<std::uint16_t*>(table.data());
+    for (std::size_t row = 0; row < vocab; ++row) {
+        const float scale = ops::canon::bf16_to_f32(scales[row]);
+        for (std::size_t col = 0; col < hidden; ++col) {
+            const std::uint8_t byte = codes[row * hidden + col];
+            const float value       = ops::canon::e4m3_value(byte & 0x7FU) * ((byte & 0x80U) ? -scale : scale);
+            rows[row * hidden + col] = ops::canon::f32_to_bf16_rn(value);
+        }
+    }
+    return table;
 }
 
 } // namespace infernix::models::qwen_image

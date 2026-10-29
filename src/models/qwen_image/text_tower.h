@@ -40,4 +40,32 @@ namespace infernix::models::qwen_image {
                                                         const std::vector<int>& token_ids,
                                                         std::size_t drop_rows);
 
+// The <|image_pad|> token id of the Qwen3-VL vocabulary (the slot every vision row is written to).
+inline constexpr std::uint32_t kImagePadTokenId = 151655;
+
+// The image side of one conditioned prompt, normally filled straight from a VisionTowerOutput:
+// `merger_rows` replaces the embedding rows at the pad tokens (in pad order), and `deepstack_rows[i]`
+// is ADDED to the hidden rows at those same tokens after decoder layer i -- the reference adds the
+// deepstack embeds to text decoder layers 0..len-1 by list position, not by the vision tap index
+// (diffusers-reference modeling_qwen3_vl.py:847-852). An empty `deepstack_rows` is the ablated
+// forward (the M2 comparison's zeroed-adds variant), not an error.
+struct ConditionedVision {
+    std::vector<std::uint16_t> merger_rows;                  // [pad_count * hidden] BF16 bits
+    std::vector<std::vector<std::uint16_t>> deepstack_rows;  // each [pad_count * hidden] BF16 bits
+};
+
+struct ConditionedTextTowerOutput {
+    std::vector<std::uint16_t> prompt_embeds;  // [(S - drop_rows) * hidden] BF16 bits, pre-final-norm
+    std::vector<std::uint8_t> image_pad_mask;  // [S - drop_rows], 1 where the kept id == kImagePadTokenId
+};
+
+// The same tower, run over an inputs_embeds whose pad rows are the vision merger rows. Rows [0,
+// drop_rows) are computed and dropped from BOTH fields (the mask is sliced exactly like the hidden
+// rows -- vision_start/vision_end sit outside the dropped prefix). Every pad token must be covered by
+// merger_rows and the deepstack rows, in pad order; a mismatch throws before any allocation.
+[[nodiscard]] ConditionedTextTowerOutput
+run_conditioned_text_tower(artifact::Reader& reader, const TextTowerWeights& tower,
+                           const std::vector<std::byte>& embed_table, const std::vector<int>& token_ids,
+                           std::size_t drop_rows, const ConditionedVision& vision);
+
 } // namespace infernix::models::qwen_image
