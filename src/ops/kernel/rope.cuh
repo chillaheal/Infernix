@@ -37,11 +37,15 @@ static __device__ __constant__ float kTextRopeInvFrequency[32] = {
     2.738419634e-07F, 1.654817100e-07F,
 };
 
+// Qwen3VLVisionRotaryEmbedding holds inv_freq as an nn.Buffer, so Module.to(bfloat16) quantises the
+// 18 frequencies before forward() takes cos/sin. The deployed tower therefore angles with
+// bf16(10000^(-j/18)), not with the fp32 value, and the engine has to match the deployed numerics.
+// Measured against the oracle's own table: 3.5e-08 with these literals, 1.4e-01 with fp32 ones.
 static __device__ __constant__ float kVisionRopeInvFrequency[18] = {
-    1.000000000e+00F, 5.994842503e-01F, 3.593813664e-01F, 2.154434690e-01F, 1.291549665e-01F,
-    7.742636827e-02F, 4.641588834e-02F, 2.782559402e-02F, 1.668100537e-02F, 1.000000000e-02F,
-    5.994842503e-03F, 3.593813664e-03F, 2.154434690e-03F, 1.291549665e-03F, 7.742636827e-04F,
-    4.641588834e-04F, 2.782559402e-04F, 1.668100537e-04F,
+    1.000000000e+00F, 5.976562500e-01F, 3.593750000e-01F, 2.158203125e-01F, 1.289062500e-01F,
+    7.763671875e-02F, 4.638671875e-02F, 2.783203125e-02F, 1.672363281e-02F, 1.000976562e-02F,
+    5.981445312e-03F, 3.601074219e-03F, 2.151489258e-03F, 1.289367676e-03F, 7.743835449e-04F,
+    4.634857178e-04F, 2.784729004e-04F, 1.668930054e-04F,
 };
 
 template <RopeKernelMode Mode>
@@ -242,7 +246,12 @@ __global__ void rope_generic_kernel(const std::int32_t* positions, std::int32_t 
             int axis       = 0;
             float exponent = 0.0F;
             generic_axis_frequency(axes, head_dim, rotary_dim, pair, &axis, &exponent);
-            const float frequency = powf(theta, exponent);
+            float frequency = powf(theta, exponent);
+            // Same reasoning as kVisionRopeInvFrequency: the Qwen3-VL vision tower keeps inv_freq in
+            // BF16, so the deployed angles come from the quantised table.
+            if (axes == 2 && head_dim == 72 && rotary_dim == 72) {
+                frequency = __bfloat162float(__float2bfloat16(frequency));
+            }
             const float angle =
                 static_cast<float>(positions[static_cast<std::int64_t>(axis) * tokens + token]) *
                 frequency;

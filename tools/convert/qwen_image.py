@@ -171,14 +171,22 @@ def _build_vision(model, store, cfg):
     those hidden states and `image_pad_mask` marks the image positions. Role and activation names are
     exactly models/qwen3_5/load/vision.cpp, the shared tower the LLM route already runs.
 
-    The checkpoint's `deepstack_merger_list` mergers are not converted: nothing binds them yet, and
-    the image text tower has no deepstack injection. Disclosed as a fidelity gap for edit conditioning.
+    The `deepstack_merger_list` mergers ARE converted (one per `deepstack_visual_indexes` entry): the
+    image text tower cannot reproduce the pipeline's conditioning without them. Measured on the
+    pipeline's own `_get_qwen_prompt_embeds` (stock forward vs `deepstack_features=[]`), dropping the
+    adds moves the post-drop hidden states the DiT reads by relative Frobenius 0.19 at text positions
+    and 1.03 at the image-pad positions, against the 2e-2 BF16 tolerance the text tower is qualified
+    with. Their features are tapped after the vision blocks named in `deepstack_visual_indexes` and
+    each merger is a `Qwen3VLVisionPatchMerger(use_postshuffle_norm=True)`: its LayerNorm runs on the
+    merged `spatial_merge_size**2 * hidden_size` row (not on `hidden_size` like the main merger), so
+    the norm here is `merger`-wide while fc1/fc2 keep the main merger's geometry.
     """
     vision = cfg["vision_config"]
     h, intermediate = vision["hidden_size"], vision["intermediate_size"]
     patch, temporal = vision["patch_size"], vision["temporal_patch_size"]
     merger = vision["spatial_merge_size"] ** 2 * h
     out_width = vision["out_hidden_size"]
+    deepstack = vision.get("deepstack_visual_indexes", ())
 
     _add(model, "vision/patch_embedding", store, "model.visual.patch_embed.proj.weight",
          (h, 3 * temporal * patch * patch), source_shape=(h, 3, temporal, patch, patch),
@@ -215,6 +223,17 @@ def _build_vision(model, store, cfg):
     ):
         _add(model, "vision/merger/" + role, store, "model.visual.merger." + field, dims,
              inputs=inputs)
+    for i in range(len(deepstack)):
+        p, sp = f"vision/deepstack/{i}/", f"model.visual.deepstack_merger_list.{i}."
+        for role, field, dims, act_inputs in (
+            ("norm_weight", "norm.weight", (merger,), ()),
+            ("norm_bias", "norm.bias", (merger,), ()),
+            ("fc1", "linear_fc1.weight", (merger, merger), (p + "input",)),
+            ("fc1_bias", "linear_fc1.bias", (merger,), ()),
+            ("fc2", "linear_fc2.weight", (out_width, merger), (p + "activation",)),
+            ("fc2_bias", "linear_fc2.bias", (out_width,), ()),
+        ):
+            _add(model, p + role, store, sp + field, dims, inputs=act_inputs)
 
 
 def _build_vae(model, store):

@@ -2,6 +2,7 @@
 
 #include "artifact/schema.h"
 
+#include <cmath>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -59,6 +60,24 @@ ParameterReference take(Binder& binder, std::uint64_t& high_water, std::string_v
     Bound bound = bind_streamed(binder, name, std::move(shape), exact_format);
     if (bound.max_bytes > high_water) { high_water = bound.max_bytes; }
     return std::move(bound.ref);
+}
+
+// One integer array of a component config. A key the config does not carry yields NO entries (that
+// is what "this architecture has no deepstack taps" means); a present key must be an array of
+// integers. The caller decides whether an empty result is legal for the route it serves.
+std::vector<std::uint64_t> cfg_integer_array(const Json& config, const char* key, std::string_view component) {
+    if (!config.contains(key)) { return {}; }
+    if (!config.at(key).is_array()) {
+        throw ArtifactError(std::string(component) + " config " + key + " is not an array");
+    }
+    std::vector<std::uint64_t> out;
+    for (const Json& value : config.at(key)) {
+        if (!value.is_number_integer()) {
+            throw ArtifactError(std::string(component) + " config array " + key + " holds a non-integer");
+        }
+        out.push_back(value.get<std::uint64_t>());
+    }
+    return out;
 }
 
 std::vector<float> cfg_float_array(const Json& config, const char* key, std::string_view component) {
@@ -201,6 +220,102 @@ TextTowerWeights bind_text_encoder(Binder& binder) {
         row_take(row.mlp_gate, "mlp/gate", {inter, hidden}, fp8);
         row_take(row.mlp_up, "mlp/up", {inter, hidden}, fp8);
         row_take(row.mlp_down, "mlp/down", {hidden, inter}, fp8);
+    }
+    return out;
+}
+
+VisionWeights bind_image_vision(Binder& binder) {
+    // The vision tower lives in the text encoder's shards, so its geometry comes from that
+    // component's own "vision_config" -- the same object the converter read to declare the names
+    // bound here. Every role is direct BF16 (the FP8 recipe assigns only dit/* and text/*), so a
+    // quantized vision object in the artifact is a recipe drift and throws in bind_streamed.
+    const Directory& directory   = binder.reader().directory();
+    const Json& root             = directory.component("text").config;
+    const std::string_view component = "text";
+    if (!root.contains("vision_config")) { throw ArtifactError("text config lacks vision_config"); }
+    const Json& config = root.at("vision_config");
+
+    VisionWeights out;
+    out.dims.depth         = static_cast<std::uint32_t>(cfg_integer(config, "depth", component));
+    out.dims.hidden        = static_cast<std::uint32_t>(cfg_integer(config, "hidden_size", component));
+    out.dims.intermediate  = static_cast<std::uint32_t>(cfg_integer(config, "intermediate_size", component));
+    out.dims.heads         = static_cast<std::uint32_t>(cfg_integer(config, "num_heads", component));
+    out.dims.patch         = static_cast<std::uint32_t>(cfg_integer(config, "patch_size", component));
+    out.dims.temporal      = static_cast<std::uint32_t>(cfg_integer(config, "temporal_patch_size", component));
+    out.dims.merge         = static_cast<std::uint32_t>(cfg_integer(config, "spatial_merge_size", component));
+    out.dims.position_rows = static_cast<std::uint32_t>(cfg_integer(config, "num_position_embeddings", component));
+    out.dims.out_hidden    = static_cast<std::uint32_t>(cfg_integer(config, "out_hidden_size", component));
+    for (const std::uint64_t index : cfg_integer_array(config, "deepstack_visual_indexes", component)) {
+        if (index >= out.dims.depth) {
+            throw ArtifactError("vision config deepstack index is outside the block count");
+        }
+        out.dims.deepstack_indexes.push_back(static_cast<std::uint32_t>(index));
+    }
+
+    const std::uint64_t hidden      = out.dims.hidden;
+    const std::uint64_t inter       = out.dims.intermediate;
+    const std::uint64_t patch_width = 3ULL * out.dims.temporal * out.dims.patch * out.dims.patch;
+    const std::uint64_t merger      = static_cast<std::uint64_t>(out.dims.merge) * out.dims.merge * hidden;
+    const auto side                 = static_cast<std::uint32_t>(std::sqrt(double(out.dims.position_rows)));
+    out.dims.patch_width      = static_cast<std::uint32_t>(patch_width);
+    out.dims.merger_width     = static_cast<std::uint32_t>(merger);
+    out.dims.position_grid_side = side;
+    if (hidden == 0 || inter == 0 || patch_width == 0 || merger == 0 || out.dims.depth == 0 ||
+        out.dims.out_hidden == 0 || out.dims.heads == 0 || hidden % out.dims.heads != 0 ||
+        std::uint64_t(side) * side != out.dims.position_rows) {
+        throw ArtifactError("vision config derives an unusable dimension");
+    }
+    out.dims.head_dim = static_cast<std::uint32_t>(hidden / out.dims.heads);
+
+    const QType bf16 = QType::BF16;
+    out.patch_embedding =
+        take(binder, out.max_object_bytes, "vision/patch_embedding", {hidden, patch_width}, bf16);
+    out.patch_embedding_bias =
+        take(binder, out.max_object_bytes, "vision/patch_embedding_bias", {hidden}, bf16);
+    out.position_embedding =
+        take(binder, out.max_object_bytes, "vision/position_embedding", {out.dims.position_rows, hidden},
+             bf16);
+
+    out.blocks.resize(static_cast<std::size_t>(out.dims.depth));
+    for (std::uint32_t layer = 0; layer < out.dims.depth; ++layer) {
+        const std::string p  = "vision/layers/" + std::to_string(layer) + "/";
+        auto& row            = out.blocks[static_cast<std::size_t>(layer)];
+        auto row_take = [&](ParameterReference& slot, std::string_view suffix, Shape shape) {
+            slot = take(binder, out.max_object_bytes, p + std::string(suffix), std::move(shape), bf16);
+        };
+        row_take(row.norm1_weight, "norm1_weight", {hidden});
+        row_take(row.norm1_bias, "norm1_bias", {hidden});
+        row_take(row.norm2_weight, "norm2_weight", {hidden});
+        row_take(row.norm2_bias, "norm2_bias", {hidden});
+        row_take(row.q, "attention/query", {hidden, hidden});
+        row_take(row.q_bias, "attention/query_bias", {hidden});
+        row_take(row.k, "attention/key", {hidden, hidden});
+        row_take(row.k_bias, "attention/key_bias", {hidden});
+        row_take(row.v, "attention/value", {hidden, hidden});
+        row_take(row.v_bias, "attention/value_bias", {hidden});
+        row_take(row.attention_output, "attention/output", {hidden, hidden});
+        row_take(row.attention_output_bias, "attention/output_bias", {hidden});
+        row_take(row.fc1, "mlp/fc1", {inter, hidden});
+        row_take(row.fc1_bias, "mlp/fc1_bias", {inter});
+        row_take(row.fc2, "mlp/fc2", {hidden, inter});
+        row_take(row.fc2_bias, "mlp/fc2_bias", {hidden});
+    }
+
+    // One patch merger at the geometry the recipe declares: fc1 is merger-wide on both variants,
+    // fc2 lands on the text tower's width, and only the LayerNorm differs (hidden for the main
+    // merger, the merged row for a deepstack one) -- see Qwen3VLVisionPatchMerger.forward.
+    const auto bind_merger = [&](VisionMergerWeights& m, const std::string& p, std::uint64_t norm_width) {
+        m.norm_weight = take(binder, out.max_object_bytes, p + "norm_weight", {norm_width}, bf16);
+        m.norm_bias   = take(binder, out.max_object_bytes, p + "norm_bias", {norm_width}, bf16);
+        m.fc1         = take(binder, out.max_object_bytes, p + "fc1", {merger, merger}, bf16);
+        m.fc1_bias    = take(binder, out.max_object_bytes, p + "fc1_bias", {merger}, bf16);
+        m.fc2         = take(binder, out.max_object_bytes, p + "fc2", {out.dims.out_hidden, merger}, bf16);
+        m.fc2_bias    = take(binder, out.max_object_bytes, p + "fc2_bias", {out.dims.out_hidden}, bf16);
+    };
+    bind_merger(out.merger, "vision/merger/", hidden);
+    out.deepstack.resize(out.dims.deepstack_indexes.size());
+    for (std::size_t i = 0; i < out.deepstack.size(); ++i) {
+        bind_merger(out.deepstack[i], "vision/deepstack/" + std::to_string(i) + "/", merger);
     }
     return out;
 }

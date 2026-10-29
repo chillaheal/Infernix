@@ -68,6 +68,13 @@ inline void cuda_ok(cudaError_t error, const char* what) {
 inline std::atomic<std::uint64_t> g_image_device_live{0};
 inline std::atomic<std::uint64_t> g_image_device_peak{0};
 
+// Test seam for the OOM throw path. Free-bytes starvation cannot provoke it here: the Windows driver
+// answers a cudaMalloc from sysmem instead of refusing (a 117 MiB vision tower completed twice on a
+// 58 MiB "budget"). Count the lane's allocations instead and fail the (limit+1)-th one as if the
+// device were full; 0 = off, and production never sets it.
+inline std::atomic<std::uint64_t> g_image_device_alloc_calls{0};
+inline std::atomic<std::uint64_t> g_image_device_alloc_fail_after{0};
+
 // The stream of the image region executing now (its Bufs' consumers enqueue on it), or null for a
 // legacy region (the text tower on the default stream). Alloc inside a region goes to the
 // stream-ordered pool on this stream so a retired buffer's bytes are REUSABLE by the lane's next
@@ -94,8 +101,12 @@ struct Buf {
     void alloc(std::size_t b) {
         bytes  = b;
         stream = g_image_stream.load();
+        const std::uint64_t call       = g_image_device_alloc_calls.fetch_add(1) + 1;
+        const std::uint64_t fail_after = g_image_device_alloc_fail_after.load();
+        const bool inject_oom          = fail_after != 0 && call > fail_after;
         const cudaError_t err =
-            (stream != nullptr) ? cudaMallocAsync(&d, b, stream) : cudaMalloc(&d, b);
+            inject_oom  ? cudaErrorMemoryAllocation
+            : (stream != nullptr) ? cudaMallocAsync(&d, b, stream) : cudaMalloc(&d, b);
         if (err != cudaSuccess) {
             // The bare OOM told nothing; the ledger + driver view say which size died against what.
             cudaGetLastError();

@@ -146,6 +146,20 @@ infernix_add_op_test(infernix_image_texttower_prod_cuda_test
   LIBRARIES infernix_ops infernix_qwen_image)
 set_tests_properties(infernix_image_texttower_prod_cuda_test PROPERTIES SKIP_RETURN_CODE 77)
 
+# Instruction-guided edit (M3): the EDIT route's Qwen3-VL vision tower (src/models/qwen_image/
+# vision_tower.cu) on the production artifact's streamed vision/* weights, gated against torch's own
+# Qwen3VLVisionModel output on the same processor pixels -- both the merger rows the text tower
+# scatters onto the <|image_pad|> slots and one deepstack tensor per vision_config
+# deepstack_visual_indexes entry (blocks 8/16/24), so a wrong tap index cannot survive to M4.
+# A-priori tol 5e-2 rel Frobenius per gated tensor (the deep-BF16-chain precedent of the VAE gate);
+# never narrowed to pass. Also asserts the #17 ledger returns to zero on the success path and under a
+# device budget the tower cannot fit. Skips (77) without INFERNIX_TEST_ARTIFACT / INFERNIX_IMAGE_ORACLE;
+# returns 2 (runnable) with no CUDA device.
+infernix_add_op_test(infernix_image_vision_prod_cuda_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_image_vision_prod_cuda.cu"
+  LIBRARIES infernix_ops infernix_qwen_image infernix_qwen_image_runtime)
+set_tests_properties(infernix_image_vision_prod_cuda_test PROPERTIES SKIP_RETURN_CODE 77)
+
 # GPU production-route qualification, VAE DECODER: the full Qwen-Image-2.1 single-frame VAE decoder
 # (AutoencoderKLQwenImage21, T=1 first-chunk) composed from production ops (ops::conv2d, ops::silu,
 # ops::add, ops::upsample_nearest_2x, ops::dupup3d, ops::spatial_attn, plus reused ops::linear +
