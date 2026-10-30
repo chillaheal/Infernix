@@ -17,6 +17,7 @@
 // restarts (the recovery unit the C5 state machine defines).
 
 #include "infernix/engine.h"
+#include "models/qwen_image/image_device_need.h" // VisionLaneDims: the ledger's ViT lane
 #include "models/qwen_image/image_weights.h"
 
 #include <nlohmann/json.hpp>
@@ -127,6 +128,14 @@ using PromptEmbedsProvider   = std::function<std::vector<std::uint16_t>(const To
 // from the device-side weight binding.
 using DiTDimsProvider = std::function<infernix::models::qwen_image::DiTDims()>;
 
+// The bound ViT's dimensions for the ledger's vision term, read the same host-side way (the artifact's
+// component config, never the device-side binding). Optional: with no reference in the request the
+// term is zero and the provider is never called, so the certified text-to-image route does not need
+// one. A request WITH a reference and no provider is refused as unconfigured (503): an admission that
+// cannot name the ViT lane's shape cannot claim it fits, and under-reserving OOMs the resident LLM.
+using VisionLaneDimsProvider =
+    std::function<infernix::models::qwen_image::VisionLaneDims()>;
+
 // The production executor: lazy-binds the DiT + VAE weights and the VAE denormalization constants
 // from one .infernix image artifact (one streamed-only plan) and runs the merged pipeline entry
 // on the caller's stream. A bad artifact throws std::runtime_error on first use. `logger` receives
@@ -139,6 +148,13 @@ using DiTDimsProvider = std::function<infernix::models::qwen_image::DiTDims()>;
 // the same binding the job uses. Called OUTSIDE any interlude (it is host work the admission needs
 // before the yield) and cached by the service, so the artifact opens once per process.
 [[nodiscard]] DiTDimsProvider make_artifact_dit_dims_provider(const std::string& image_artifact_path);
+
+// The host-side ViT dimensions of the same artifact, for the ledger's vision term. Same lazy, cached,
+// outside-any-interlude contract as make_artifact_dit_dims_provider; only the edit route asks for it.
+// Throws std::runtime_error when the artifact carries no vision component -- the caller must then
+// refuse an `image` request rather than admit one it cannot size.
+[[nodiscard]] VisionLaneDimsProvider
+make_artifact_vision_dims_provider(const std::string& image_artifact_path);
 
 // Standard-alphabet base64 (no line breaks), shared by the image route and its tests.
 [[nodiscard]] std::string base64_encode_bytes(std::span<const std::uint8_t> bytes);
@@ -205,9 +221,12 @@ private:
 
 class ImageGenerationService {
 public:
+    // `vision_dims` is only needed by the edit route (a request that carries an `image`); it defaults
+    // to null so every text-to-image caller and test keeps the exact same admission as before.
     ImageGenerationService(std::unique_ptr<ImageInterludeRunner> runner, ImageJobStore& store,
                            PromptRendererProvider prompt_renderer, PromptEmbedsProvider prompt_embeds,
-                           DiTDimsProvider dit_dims, ImageJobExecutor job_executor);
+                           DiTDimsProvider dit_dims, ImageJobExecutor job_executor,
+                           VisionLaneDimsProvider vision_dims = {});
 
     // False when serve started without the image pipeline: the route answers a documented 503.
     [[nodiscard]] bool is_configured() const noexcept;
@@ -223,7 +242,8 @@ public:
     //   503 image_engine_degraded              (Degraded: process restart is the recovery unit)
     //   503 image_interlude_failed             (the job never ran, e.g. a drain-deadline miss)
     //   500 image_generation_failed            (the job itself failed; restoration confirmed)
-    //   400 image_invalid                      (the `image` field could not be prepared)
+    //   400 image_too_large / image_decode_failed (the `image` payload exceeded its budget, or is not
+    //       a base64 PNG/JPEG the decoders accept; the codec's own words are never echoed)
     RequestJson generate(const OpenAIImagesRequest& request, std::int64_t now,
                          std::string_view artifact_url_base = {});
 
@@ -249,6 +269,7 @@ private:
     PromptRendererProvider prompt_renderer_;
     PromptEmbedsProvider prompt_embeds_;
     DiTDimsProvider dit_dims_;
+    VisionLaneDimsProvider vision_dims_;
     ImageJobExecutor job_executor_;
     std::mutex dims_mutex_;
     infernix::models::qwen_image::DiTDims dims_cache_;

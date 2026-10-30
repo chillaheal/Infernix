@@ -187,8 +187,32 @@ OpenAIImagesRequest parse_openai_images_request(const RequestJson& body) {
     }
 
     if (body.contains("image") && !body.at("image").is_null()) {
-        if (!body.at("image").is_string()) { bad_request("image must be a string", "image"); }
-        std::string value = body.at("image").get<std::string>();
+        // The family takes a LIST of references; this build renders exactly one (kMaximumImageReferences
+        // says why: the ledger sizes one reference). The list FORM is still accepted at that cap, so a
+        // client written against the family -- "image": ["..."] -- parses here instead of getting a 400
+        // for a shape that is legal upstream. Anything the request asks for that the route cannot draw
+        // is a count error, not a type error: the payload is a picture however it is wrapped.
+        const RequestJson& field = body.at("image");
+        std::string value;
+        if (field.is_string()) {
+            value = field.get<std::string>();
+        } else if (field.is_array()) {
+            if (field.empty() || field.size() > kMaximumImageReferences) {
+                bad_request("image must carry exactly one reference image", "image",
+                            "image_count_invalid");
+            }
+            if (!field.at(0).is_string()) {
+                bad_request("image must be a base64 string, or an array of one", "image",
+                            "image_count_invalid");
+            }
+            value = field.at(0).get<std::string>();
+        } else {
+            bad_request("image must be a base64 string, or an array of one", "image",
+                        "image_count_invalid");
+        }
+        if (value.empty()) {
+            bad_request("image must carry exactly one reference image", "image", "image_count_invalid");
+        }
         if (value.starts_with("http://") || value.starts_with("https://")) {
             bad_request("image must be a base64-encoded image, not a URL", "image",
                         "image_url_not_supported");

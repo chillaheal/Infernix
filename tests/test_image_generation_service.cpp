@@ -116,6 +116,21 @@ DiTDimsProvider fixed_dims() {
     };
 }
 
+// The ViT lane's shape for the ledger's vision term -- the shipped vision_config, without an artifact.
+VisionLaneDimsProvider fixed_vision() {
+    return [] {
+        infernix::models::qwen_image::VisionLaneDims v;
+        v.hidden       = 1152;
+        v.intermediate = 4304;
+        v.head_dim     = 72;
+        v.patch        = 16;
+        v.temporal     = 2;
+        v.merge        = 2;
+        v.out_hidden   = 4096;
+        return v;
+    };
+}
+
 // The picture a fake device job finishes with: RGBA8 pixels and their size, one solid shade. The
 // encode, the base64 and the file are the SERVICE's work after the interlude, so a fake stops here
 // and what belongs on disk is this encoder's output for these pixels.
@@ -385,7 +400,7 @@ int main() {
 
         ImageJobStore store(8, 1 << 20);
         ImageGenerationService service(std::make_unique<FakeRunner>(), store, fixed_renderer(), fixed_provider(), fixed_dims(),
-                                       capture);
+                                       capture, fixed_vision());
         OpenAIImagesRequest request = sample_request();
         request.image               = payload;
         service.generate(request, 1000);
@@ -400,9 +415,85 @@ int main() {
         OpenAIImagesRequest bad = sample_request();
         bad.image               = "not base64 at all!!";
         const auto outcome      = attempt([&] { return bad_service.generate(bad, 1000); });
-        check(outcome.threw && outcome.status == 400 && outcome.code == "image_invalid",
-              "undecodable image -> 400 image_invalid");
+        // The codec's own words are never echoed to the client, so the CODE is the contract here: a
+        // payload that is not base64 PNG/JPEG is image_decode_failed, not the generic image_invalid and
+        // not a 500 (nothing about this request is the server's fault).
+        check(outcome.threw && outcome.status == 400 && outcome.code == "image_decode_failed",
+              "undecodable image -> 400 image_decode_failed");
         check(bad_store.size() == 0U, "invalid image stores no job (fails before the interlude)");
+    }
+
+    // M7 admission with a reference. The ledger is what protects the resident LLM, so every case here
+    // asserts the same thing twice: the refusal code AND that nothing was yielded (probes<=1, runs==0)
+    // and nothing was stored.
+    {
+        std::vector<std::uint8_t> rgba(64U * 48U * 4, 90U);
+        for (unsigned i = 0; i < 64U * 48U; ++i) rgba[4 * i + 3] = 255U;
+        const std::vector<std::uint8_t> png = infernix::media::encode::encode_png_rgba8(64, 48, rgba);
+        const std::string payload = base64_encode_bytes(png);
+
+        // A request that carries a picture but no way to size the ViT encode is refused as
+        // unconfigured BEFORE the probe: guessing the vision term is how the resident LLM gets OOMed.
+        {
+            ImageJobStore store(8, 8ULL << 20);
+            auto runner = std::make_unique<FakeRunner>();
+            FakeRunner* eyes = runner.get();
+            ImageGenerationService service(std::move(runner), store, fixed_renderer(), fixed_provider(),
+                                           fixed_dims(), fixed_executor());
+            OpenAIImagesRequest request = sample_request();
+            request.image = payload;
+            const auto outcome = attempt([&] { return service.generate(request, 1900); });
+            check(outcome.threw && outcome.status == 503 &&
+                      outcome.code == "image_generation_not_configured",
+                  "a reference with no vision component -> 503 image_generation_not_configured");
+            check(eyes->probes == 0 && eyes->runs == 0 && store.size() == 0U,
+                  "the unsizable reference never reaches the probe or the yield");
+        }
+
+        // The same request WITH the lane: the probe is asked for more than the picture-less request
+        // asked for (the vision lane plus the structural sequence terms), and a "no" still stops it
+        // before a byte is yielded and before any job is stored.
+        std::uint64_t asked_without = 0, asked_with = 0;
+        {
+            ImageJobStore store(8, 8ULL << 20);
+            auto runner = std::make_unique<FakeRunner>();
+            FakeRunner* eyes = runner.get();
+            ImageGenerationService service(std::move(runner), store, fixed_renderer(), fixed_provider(),
+                                           fixed_dims(), fixed_executor(), fixed_vision());
+            (void)attempt([&] { return service.generate(sample_request(), 1910); });
+            asked_without = eyes->probed_target;
+            OpenAIImagesRequest request = sample_request();
+            request.image = payload;
+            const auto outcome = attempt([&] { return service.generate(request, 1920); });
+            asked_with = eyes->probed_target;
+            check(!outcome.threw, "the sized reference request is admitted");
+            check(asked_with > asked_without + 100ULL * 1024ULL * 1024ULL,
+                  "a reference raises what the probe is asked for (the vision lane is in the number)");
+        }
+        {
+            ImageJobStore store(8, 8ULL << 20);
+            auto runner = std::make_unique<FakeRunner>();
+            FakeRunner* eyes = runner.get();
+            eyes->probe_answer = FakeRunner::Fit{.fits = false, .freed_bytes_expected = 1ULL << 30};
+            bool executor_ran = false;
+            ImageJobExecutor watch =
+                [&executor_ran](const OpenAIImagesRequest&, std::uint64_t, std::span<const std::uint16_t>,
+                                std::span<const std::uint16_t>, const ReferencePixels*, void*,
+                                const std::shared_ptr<ImageJobProgress>&) {
+                    executor_ran = true;
+                    return fake_picture(0x01U);
+                };
+            ImageGenerationService service(std::move(runner), store, fixed_renderer(), fixed_provider(),
+                                           fixed_dims(), watch, fixed_vision());
+            OpenAIImagesRequest request = sample_request();
+            request.image = payload;
+            const auto outcome = attempt([&] { return service.generate(request, 1930); });
+            check(outcome.threw && outcome.status == 503 &&
+                      outcome.code == "image_vram_insufficient",
+                  "a reference whose ledger row does not fit -> 503 image_vram_insufficient");
+            check(eyes->probes == 1 && eyes->runs == 0 && !executor_ran && store.size() == 0U,
+                  "the refused reference yields nothing, runs nothing and stores nothing");
+        }
     }
 
     // True CFG: with true_cfg_scale above 1 the negative prompt goes through the same embeds provider

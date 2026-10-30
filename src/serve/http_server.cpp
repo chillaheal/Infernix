@@ -647,7 +647,12 @@ std::string make_capabilities_json(const ServeOptions& options, std::string_view
                       Json{{"min", kMinimumImageCFGScale}, {"max", kMaximumImageCFGScale}}},
                      // Reference-image conditioning runs on the diffusion pipeline's own vision tower,
                      // which sees only the picture being edited; --vision is a separate surface.
-                     {"reference_image", true},
+                     // FALSE until the behavioural gate (tests/models/qwen_image/
+                     // test_image_edit_behavior.cu) is green: the field is PARSED and the route
+                     // admits the job, but nothing yet certifies that the edit instruction changed
+                     // the picture rather than the reference being copied. Advertising true here is
+                     // what let the last "certification" pass while every edit came back a copy.
+                     {"reference_image", false},
                      // A chat request to this process is given the tool below and the picture is
                      // drawn inside that same request, so a client needs no tool call of its own.
                      {"automatic_from_chat", true},

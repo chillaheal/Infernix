@@ -13,6 +13,7 @@
 #include "models/qwen_image/image_job.h"
 #include "models/qwen_image/image_pipeline.h"
 #include "models/qwen_image/image_weights.h"
+#include "models/qwen_image/vision_tower.h"
 
 #include <cuda_runtime.h>
 
@@ -39,6 +40,10 @@ struct Case {
     std::uint32_t ref_side; // 0 = no reference image
     std::uint32_t neg_tokens; // 0 = single forward (no true CFG)
     const char*   what;
+    // Run the ViT encode inside the SAME peak window as the DiT loop and reserve for it. The interlude
+    // holds both at once -- the encode that produces the conditioning runs on the yielded VRAM -- so
+    // the edit route's ledger row has to predict the ViT's live set and this row has to measure it.
+    bool          vit = false;
 };
 
 void require(bool condition, const std::string& message) {
@@ -72,7 +77,23 @@ int main() {
         DiTWeights    dit = bind_dit(binder);
         VaeWeights    vae = bind_image_vae(binder);
         const VaeDenorm denorm = read_vae_denorm(binder);
+        // Bound for the edit row below: the same artifact, the same streamed-only plan. Its dims are
+        // what the ledger's vision term is derived from, so the row reserves for the ViT the artifact
+        // actually ships rather than for a number written into the header.
+        VisionWeights vision = bind_image_vision(binder);
         (void)std::move(binder).finish();
+
+        const auto lane_of = [](const VisionDims& v) {
+            VisionLaneDims out;
+            out.hidden       = v.hidden;
+            out.intermediate = v.intermediate;
+            out.head_dim     = v.head_dim;
+            out.patch        = v.patch;
+            out.temporal     = v.temporal;
+            out.merge        = v.merge;
+            out.out_hidden   = v.out_hidden;
+            return out;
+        };
 
         const std::vector<Case> cases = {
             {512, 0, 0, "the certified route"},
@@ -80,6 +101,10 @@ int main() {
             {768, 128, 0, "the review's case: same target plus a reference"},
             {768, 0, 24, "true CFG (a second, differently sized pass)"},
             {1024, 0, 0, "one megapixel"},
+            // M7's own row: a reference on the 1024^2 area cap (4096 latent tokens == 4 * 1024 vision
+            // tokens) whose pad rows are the whole prompt, with the ViT encode measured in the same
+            // window. This is the edit route the serving layer admits on this number.
+            {768, 1024, 0, "the edit route: a 1024^2 reference, the ViT lane and the joint sequence", true},
         };
 
         cudaStream_t stream = nullptr;
@@ -125,15 +150,37 @@ int main() {
             req.ref_tokens      = static_cast<std::uint32_t>(inputs.ref_latents.size() / dit.dims.image_in);
             req.blocks_resident = kImageResidentBlocks; // same symbol the serving layer and the
                              // pipeline's CopyLane assert; the allowance was calibrated at this value
+            if (c.vit) {
+                // The reference's vision tokens are the prompt here: 4096 patches merge to 1024 rows,
+                // all of them <|image_pad|>, so the joint sequence is 0 text + 4096 reference + target.
+                // Declaring them is the point -- the same 1024 rows must not also be counted as text.
+                const std::size_t merged = 64ULL * 64ULL /
+                                           (static_cast<std::size_t>(vision.dims.merge) * vision.dims.merge);
+                inputs.prompt_embeds         = zero_bits(merged * dit.dims.hidden);
+                inputs.prompt_image_pad_mask.assign(merged, 1U);
+                req.text_tokens              = static_cast<std::uint32_t>(merged);
+                req.vision_tokens            = static_cast<std::uint32_t>(merged);
+                req.vision                   = lane_of(vision.dims);
+            }
             const std::uint64_t predicted = image_device_need(req).total();
 
             reset_image_device_peak();
+            if (c.vit) {
+                // The encode runs on the yielded VRAM, inside the same window as the loop below, so the
+                // high-water mark this row compares against the ledger includes the ViT's live set.
+                const VisionItemGeometry grid{1U, 64U, 64U};
+                const std::size_t patches = 64ULL * 64ULL;
+                (void)run_vision_tower(reader, vision,
+                                       zero_bits(patches * vision.dims.patch_width), grid);
+            }
             (void)run_image_job(reader, dit, vae, inputs, stream);
             const std::uint64_t measured = image_device_bytes_peak();
             const std::uint64_t mib      = 1024ULL * 1024ULL;
             std::cout << c.what << ": " << c.side << "x" << c.side << " ref=" << c.ref_side
-                      << " neg=" << c.neg_tokens << " predicted " << predicted / mib
-                      << " MiB, measured peak " << measured / mib << " MiB\n";
+                      << " neg=" << c.neg_tokens << (c.vit ? " vit=yes" : "")
+                      << " predicted " << predicted / mib
+                      << " MiB (vision lane " << image_device_need(req).vision_peak / mib
+                      << " MiB), measured peak " << measured / mib << " MiB\n";
             if (measured > predicted) {
                 std::cout << "FAIL: the measured peak exceeds the predicted need by "
                           << (measured - predicted) / mib << " MiB\n";

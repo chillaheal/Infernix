@@ -225,6 +225,51 @@ int test_reference_image_field() {
                                                {"image", "data:image/png;base64,aGVsbG8="}});
     failures += check(uri.image == "aGVsbG8=", "data: URI prefix stripped");
 
+    // The family's LIST form, accepted at this build's cap of one (openai_images.h
+    // kMaximumImageReferences): the shape is legal upstream, so it parses here; what the route can
+    // actually draw is the ledger's decision, and asking for more than that is a count error rather
+    // than a silently dropped picture. Every content rule below the shape is the string's own.
+    const OpenAIImagesRequest one =
+        parse(Json{{"model", "qwen-image"}, {"prompt", "x"}, {"image", Json::array({"aGVsbG8="})}});
+    failures += check(one.image == "aGVsbG8=", "array of one captured like the string form");
+
+    const OpenAIImagesRequest one_uri =
+        parse(Json{{"model", "qwen-image"},
+                   {"prompt", "x"},
+                   {"image", Json::array({"data:image/png;base64,aGVsbG8="})}});
+    failures += check(one_uri.image == "aGVsbG8=", "array of one strips the data: URI prefix");
+
+    Json too_many = Json::array();
+    for (std::size_t i = 0; i <= kMaximumImageReferences; ++i) too_many.push_back("aGVsbG8=");
+    const ApiError over = api_error([&] {
+        parse(Json{{"model", "qwen-image"}, {"prompt", "x"}, {"image", too_many}});
+    });
+    failures += check(over.status == 400 && over.code == "image_count_invalid" && over.param == "image",
+                      "a reference past the cap is refused, never silently dropped");
+
+    const ApiError none = api_error([&] {
+        parse(Json{{"model", "qwen-image"}, {"prompt", "x"}, {"image", Json::array()}});
+    });
+    failures += check(none.code == "image_count_invalid", "an empty array is a count error, not a 500");
+
+    const ApiError blank = api_error([&] {
+        parse(Json{{"model", "qwen-image"}, {"prompt", "x"}, {"image", ""}});
+    });
+    failures += check(blank.code == "image_count_invalid", "an empty image payload is a count error");
+
+    const ApiError array_item = api_error([&] {
+        parse(Json{{"model", "qwen-image"}, {"prompt", "x"}, {"image", Json::array({7})}});
+    });
+    failures += check(array_item.code == "image_count_invalid", "a non-string array item is a count error");
+
+    const ApiError url_in_array = api_error([&] {
+        parse(Json{{"model", "qwen-image"},
+                   {"prompt", "x"},
+                   {"image", Json::array({"https://example.com/a.png"})}});
+    });
+    failures += check(url_in_array.code == "image_url_not_supported",
+                      "the URL rule applies inside the array form too (no server-side fetch)");
+
     Json null_image = base_request();
     null_image["image"] = nullptr;
     failures += check(parse(null_image).image.empty(), "null image falls back to text-to-image");

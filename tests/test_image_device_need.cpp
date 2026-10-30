@@ -33,16 +33,45 @@ qi::DiTDims test_dims() {
     return d;
 }
 
-std::uint64_t need_of(std::uint32_t side, std::uint32_t text, std::uint32_t neg, std::uint32_t ref) {
+qi::VisionLaneDims test_vision() {
+    // The shipped vision_config (image-edit/NOTES-M0.md, read off the artifact's component config):
+    // depth 27, hidden 1152, out_hidden 4096 == the text tower's hidden, patch 16, temporal 2,
+    // spatial_merge 2. The intermediate width is the ViT MLP's; the ledger only ever multiplies it by
+    // the patch count, so any plausible width exercises the same code path here.
+    qi::VisionLaneDims v;
+    v.hidden       = 1152;
+    v.intermediate = 4304;
+    v.head_dim     = 72;
+    v.patch        = 16;
+    v.temporal     = 2;
+    v.merge        = 2;
+    v.out_hidden   = 4096;
+    return v;
+}
+
+qi::ImageDeviceNeed need_struct(std::uint32_t side, std::uint32_t text, std::uint32_t neg,
+                                std::uint32_t ref, std::uint32_t vision_tokens, bool with_vision) {
     qi::ImageDeviceNeedRequest req;
     req.geometry        = qi::ImageGeometry::derive(side, side);
     req.dims            = test_dims();
     req.text_tokens     = text;
     req.negative_tokens = neg;
     req.ref_tokens      = ref;
+    req.vision_tokens   = vision_tokens;
+    if (with_vision) { req.vision = test_vision(); }
     // The shipped route's resident-slot count is the header's single constant (bundle B fas 2).
-    return qi::image_device_need(req).total();
+    return qi::image_device_need(req);
 }
+
+std::uint64_t need_of(std::uint32_t side, std::uint32_t text, std::uint32_t neg, std::uint32_t ref) {
+    return need_struct(side, text, neg, ref, 0, false).total();
+}
+
+// The certified text-to-image admission in BYTES -- this test's own report line prints the number on
+// the tree where the edit route's fields were added (both zero for this route). The lock is the
+// point: adding a vision lane must not move one byte of the route that is already certified. If this
+// number ever changes, the text-to-image admission regressed; explain the diff, do not edit this.
+constexpr std::uint64_t kGoldenT2I768Bytes = 6214898688ULL; // 5926 MiB, this test's own report line
 
 } // namespace
 
@@ -74,9 +103,66 @@ int main() {
     req.blocks_resident = 1;
     const auto need     = qi::image_device_need(req);
     check(need.total() == need.dit_activations + need.latent_and_velocity + need.resident_weights +
-                              need.vae_peak + need.rope_and_tables,
+                              need.vae_peak + need.rope_and_tables + need.vision_peak,
           "total is the sum of its terms");
     check(need.vae_peak > 0 && need.dit_activations > 0 && need.resident_weights > 0, "every term is set");
+
+    // ---- the edit route's ledger (M7) ----
+    // The certified text-to-image route must not move a byte when the edit fields are absent.
+    check(kGoldenT2I768Bytes != 0ULL && need_of(768, 32, 0, 0) == kGoldenT2I768Bytes,
+          "the certified 768x768 text-to-image admission is byte-identical");
+    {
+        // A 768^2 target with a reference on the 1024^2 area cap: ref_tokens 4096 == 4 * 1024 vision
+        // tokens (reference_image.h vision_token_count), and the rendered prompt carries those 1024
+        // rows inside its kept length -- so the joint sequence is 32 + 4096 + 2304, NOT 1056 + 4096.
+        constexpr std::uint32_t kRef = 4096U, kVis = 1024U, kNonPad = 32U;
+        const auto declared = need_struct(768, kNonPad + kVis, 0, kRef, kVis, true);
+        const auto undecl = need_struct(768, kNonPad + kVis, 0, kRef, 0, true);
+        const auto honest = need_struct(768, kNonPad, 0, kRef, 0, true);
+        check(declared.dit_activations < undecl.dit_activations &&
+                  declared.rope_and_tables < undecl.rope_and_tables,
+              "declaring the pad rows takes them out of the joint sequence");
+        check(declared.dit_activations == honest.dit_activations &&
+                  declared.rope_and_tables == honest.rope_and_tables,
+              "the image pad rows are counted once, in ref_tokens");
+        // The tower's output really does carry the pad rows, so the text-side stages must still be
+        // sized by the full kept length. Only the JOINT sequence deduplicates them.
+        check(declared.latent_and_velocity == undecl.latent_and_velocity,
+              "the text stages keep the full kept length");
+        check(need_struct(768, kNonPad, 0, 0, 0, false).vision_peak == 0,
+              "no vision lane, no vision bytes");
+        check(declared.vision_peak > 100ULL * qi::kImageMiB &&
+                  declared.vision_peak < 256ULL * qi::kImageMiB,
+              "the ViT lane reserves its live set (172 MiB at the shipped config: eleven "
+              "[hidden,patches] planes 104 MiB, d_up 33 MiB, d_patches 12 MiB, the merger rows 8 MiB, "
+              "the three index planes 0.1 MiB, one block's roles 19 MiB -- vision_tower.cu:197-219 plus "
+              "the streamed block, over the worst legal reference of 4096 patches)");
+        // The vision term is purely additive: the same request with NO lane, with the two joint-shaped
+        // terms shrunk by exactly what declaring the pad rows saved, plus the vision term, reproduces
+        // total() byte for byte. Nothing else in the ledger moved.
+        const auto nolid = need_struct(768, kNonPad + kVis, 0, kRef, 0, false);
+        check(declared.total() ==
+                  nolid.total() - (nolid.dit_activations - declared.dit_activations) -
+                      (nolid.rope_and_tables - declared.rope_and_tables) + declared.vision_peak,
+              "the vision term is summed like vae_peak, never maxed");
+        // The row the plan asks for in MiB: the same 768^2 target as the certified route plus a
+        // reference and the ViT lane. Expected ~1.0-1.2 GiB above the text-only need (the 4096 extra
+        // latent tokens at ~0.2 MiB per joint row plus the ~130 MiB vision lane).
+        const auto plain = need_struct(768, kNonPad, 0, 0, 0, false);
+        const std::uint64_t delta = declared.total() > plain.total()
+                                        ? declared.total() - plain.total()
+                                        : 0ULL;
+        check(delta > declared.vision_peak && delta > 512ULL * qi::kImageMiB,
+              "a reference plus the ViT lane raises the need by its structural terms");
+        std::printf("edit row 768x768 text32 ref4096: %llu MiB (vision lane %llu MiB, delta %llu MiB)\n",
+                    static_cast<unsigned long long>(declared.total() / qi::kImageMiB),
+                    static_cast<unsigned long long>(declared.vision_peak / qi::kImageMiB),
+                    static_cast<unsigned long long>(delta / qi::kImageMiB));
+    }
+
+    // Printed before the verdict so a broken golden constant can be read off a failing run.
+    std::printf("golden 768x768 text32 ref0: %llu bytes\n",
+                static_cast<unsigned long long>(need_of(768, 32, 0, 0)));
 
     if (failures != 0) {
         std::printf("%d check(s) failed\n", failures);

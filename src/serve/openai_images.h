@@ -37,7 +37,9 @@ struct OpenAIImagesRequest {
     std::optional<std::uint64_t> seed; // product extension; absent => engine-chosen
     std::string user;                  // opaque client tag; never echoed back
     std::string image;                 // #75 product extension: base64 reference image (PNG/JPEG),
-                                       // optional data: URI prefix; empty => plain text-to-image
+                                       // optional data: URI prefix, given as the string or as an array
+                                       // of exactly one such string (kMaximumImageReferences); an
+                                       // empty string means plain text-to-image
     ImageResponseFormat response_format = ImageResponseFormat::Base64;
 };
 
@@ -52,6 +54,13 @@ inline constexpr double kMaximumImageCFGScale = 20.0;
 
 // Upper bound on the decoded reference-image payload accepted in the `image` field (bytes).
 inline constexpr std::size_t kMaximumImageInputBytes = 16ULL * 1024 * 1024;
+
+// How many references one request may carry. The Qwen-Image family allows up to 10; this build renders
+// exactly one, because M7's admission ledger sizes the joint sequence for a single reference on the
+// 1024^2-area cap (4 * vision tokens == the reference's latent tokens) and nothing has measured what a
+// second one costs. The WIRE accepts the list form at this cap so a client written against the family
+// does not special-case us; raising the cap is a ledger change first (M7), never a parse change alone.
+inline constexpr std::size_t kMaximumImageReferences = 1;
 
 // Upper bound on prompt length accepted at the images boundary (bytes).
 inline constexpr std::size_t kMaximumImagePromptBytes = 4096;

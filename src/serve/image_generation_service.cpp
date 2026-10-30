@@ -44,10 +44,17 @@ constexpr std::uint64_t kInterludeMarginBytes = 512ULL * kMiB;
 // The job's device-memory need, from the pipeline's own buffer inventory (models/qwen_image). The
 // serving layer asks for it before it probes the yield, so the reference block and the longer of the
 // two CFG passes are already inside the number.
+// `vision_tokens` / `vision` are the edit route's: the reference's vision token count (the
+// <|image_pad|> rows already inside text_tokens, which the joint sequence carries four times each) and
+// the bound ViT's shape. Both stay 0/zero for the certified text-to-image route, which keeps every
+// term -- and total() -- bit-identical to what it was before the edit route existed.
 std::uint64_t image_need_bytes(std::int64_t width, std::int64_t height, std::size_t text_tokens,
                               std::size_t negative_tokens, std::size_t ref_tokens,
-                              const qi::DiTDims& dims) {
+                              const qi::DiTDims& dims, std::size_t vision_tokens = 0,
+                              const qi::VisionLaneDims& vision = {}) {
     qi::ImageDeviceNeedRequest req;
+    req.vision_tokens   = static_cast<std::uint32_t>(vision_tokens);
+    req.vision          = vision;
     req.geometry        = qi::ImageGeometry::derive(static_cast<std::uint32_t>(height),
                                                    static_cast<std::uint32_t>(width));
     req.dims            = dims;
@@ -465,12 +472,14 @@ ImageGenerationService::ImageGenerationService(std::unique_ptr<ImageInterludeRun
                                                PromptRendererProvider prompt_renderer,
                                                PromptEmbedsProvider prompt_embeds,
                                                DiTDimsProvider dit_dims,
-                                               ImageJobExecutor job_executor)
+                                               ImageJobExecutor job_executor,
+                                               VisionLaneDimsProvider vision_dims)
     : runner_(std::move(runner)),
       store_(store),
       prompt_renderer_(std::move(prompt_renderer)),
       prompt_embeds_(std::move(prompt_embeds)),
       dit_dims_(std::move(dit_dims)),
+      vision_dims_(std::move(vision_dims)),
       job_executor_(std::move(job_executor)) {}
 
 bool ImageGenerationService::is_configured() const noexcept {
@@ -492,6 +501,32 @@ DiTDimsProvider make_artifact_dit_dims_provider(const std::string& image_artifac
         (void)std::move(binder).finish();
         *cached = dims;
         return dims;
+    };
+}
+
+// The same host-side read for the ViT lane: the ledger needs the vision block's and activation's
+// shapes to reserve for the encode that runs inside the interlude, and it must get them from the
+// artifact's component config, not from a constant that can drift from the shipped checkpoint.
+VisionLaneDimsProvider make_artifact_vision_dims_provider(const std::string& image_artifact_path) {
+    auto cached = std::make_shared<std::optional<qi::VisionLaneDims>>();
+    auto guard  = std::make_shared<std::mutex>();
+    return [path = image_artifact_path, cached, guard]() -> qi::VisionLaneDims {
+        const std::lock_guard lock(*guard);
+        if (cached->has_value()) { return **cached; }
+        artifact::Reader reader(path);
+        artifact::Binder binder(reader);
+        const qi::VisionDims v = qi::bind_image_vision(binder).dims;
+        (void)std::move(binder).finish();
+        qi::VisionLaneDims out;
+        out.hidden      = v.hidden;
+        out.intermediate = v.intermediate;
+        out.head_dim    = v.head_dim;
+        out.patch       = v.patch;
+        out.temporal    = v.temporal;
+        out.merge       = v.merge;
+        out.out_hidden  = v.out_hidden;
+        *cached = out;
+        return out;
     };
 }
 
@@ -535,16 +570,25 @@ RequestJson ImageGenerationService::generate(const OpenAIImagesRequest& request,
     // VRAM is yielded. The device encode of the prepared plane runs inside the job.
     std::optional<ReferencePixels> reference;
     if (!request.image.empty()) {
+        // The codec's own words never reach the wire: they name decoders, byte offsets and internal
+        // limits, which is both a leak and noise to a client that only wants to know its picture was
+        // bad. The CODE distinguishes the cases a caller can act on.
         try {
             reference = prepare_reference_image(request.image);
         } catch (const md::Error& error) {
-            throw ApiException{ApiError{400, "invalid_request_error", error.what(), "image",
+            throw ApiException{ApiError{400, "invalid_request_error",
+                                        error.kind() == md::ErrorKind::BudgetExceeded
+                                            ? "the decoded reference image exceeds the accepted budget"
+                                            : "the image is not a decodable PNG or JPEG",
+                                        "image",
                                         error.kind() == md::ErrorKind::BudgetExceeded
                                             ? "image_too_large"
-                                            : "image_invalid"}};
+                                            : "image_decode_failed"}};
         } catch (const std::invalid_argument& error) {
-            throw ApiException{ApiError{400, "invalid_request_error", error.what(), "image",
-                                        "image_invalid"}};
+            // Strict base64 rejected the payload, or the decoded bytes were not an image at all.
+            throw ApiException{ApiError{400, "invalid_request_error",
+                                        "the image is not a base64-encoded PNG or JPEG", "image",
+                                        "image_decode_failed"}};
         }
     }
 
@@ -563,9 +607,37 @@ RequestJson ImageGenerationService::generate(const OpenAIImagesRequest& request,
             ? static_cast<std::size_t>(reference->height_px / qi::ImageGeometry::downscale()) *
                   (static_cast<std::size_t>(reference->width_px) / qi::ImageGeometry::downscale())
             : 0ULL;
+    // The reference's vision tokens are the <|image_pad|> rows the rendered prompt already carries, and
+    // each of them becomes four joint rows -- which ref_tokens is. Both numbers come from the same
+    // plane OUR prepare_reference_image snapped, so 4 * vision != ref means our own resize broke the
+    // x4 invariant the joint assembly asserts (models/qwen_image/joint_layout.cpp:41-47). That is our
+    // bug, not the client's: a 500 of our own making, raised host-side, before a single byte is yielded.
+    std::size_t vision_tokens = 0;
+    qi::VisionLaneDims vision{};
+    if (reference.has_value()) {
+        vision_tokens = static_cast<std::size_t>(
+            vision_token_count(reference->height_px, reference->width_px));
+        if (4ULL * vision_tokens != ref_tokens) {
+            throw ApiException{ApiError{500, "server_error",
+                                        "the prepared reference disagrees with itself: 4 * " +
+                                            std::to_string(vision_tokens) + " vision tokens != " +
+                                            std::to_string(ref_tokens) + " latent tokens",
+                                        "image", "image_conditioning_inconsistent"}};
+        }
+        // No readable vision component == no way to size the encode the job will run. Refusing here
+        // is the whole point of the ledger: an admission that guesses under-reserves and OOMs the
+        // resident LLM, which outranks serving this request at all.
+        if (!vision_dims_) {
+            throw ApiException{ApiError{503, "server_error",
+                                        "the image artifact carries no readable vision component, so a "
+                                        "request with a reference cannot be sized",
+                                        "image_artifact", "image_generation_not_configured"}};
+        }
+        vision = vision_dims_();
+    }
     const std::uint64_t need =
         image_need_bytes(request.width, request.height, prompt.tokens(), negative_prompt.tokens(),
-                         ref_tokens, dit_dims_());
+                         ref_tokens, dit_dims_(), vision_tokens, vision);
     const auto fit = runner_->probe(need, kInterludeMarginBytes);
     if (!fit.fits) { throw_vram_insufficient(need, fit); }
 
