@@ -401,9 +401,15 @@ run_conditioned_text_tower(artifact::Reader& reader, const TextTowerWeights& tow
                            const std::vector<std::byte>& embed_table, const std::vector<int>& token_ids,
                            std::size_t drop_rows, const ConditionedVision& vision,
                            std::vector<std::vector<std::uint16_t>>* layer_snapshots) {
-    if (layer_snapshots != nullptr &&
-        (vision.deepstack_rows.empty() || layer_snapshots->size() != vision.deepstack_rows.size())) {
-        throw std::runtime_error("conditioned text tower: layer snapshots need one entry per deepstack add");
+    // The M4 test asks for the layers the adds land on (one per add) to separate a feed defect from
+    // tower drift. It now also asks for EVERY layer, which is the same mechanism -- tower_forward fills
+    // while layer_index < size -- and the growth curve per row class is what says whether an image-row
+    // error is born at layer 0 (scatter/add) or accumulates (BF16 depth). Both sizes are accepted; any
+    // other size is a caller bug and throws before any allocation, as the shorter form always did.
+    if (layer_snapshots != nullptr && layer_snapshots->size() != vision.deepstack_rows.size() &&
+        layer_snapshots->size() != tower.layers.size()) {
+        throw std::runtime_error("conditioned text tower: layer snapshots need one entry per deepstack "
+                                 "add or one per decoder layer");
     }
     const TextTowerDims& dims = checked_dims(tower);
     const std::size_t D = dims.hidden;

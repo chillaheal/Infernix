@@ -86,10 +86,10 @@ struct ConditionedTextTowerOutput {
 // merger_rows and the deepstack rows, in pad order; a mismatch throws before any allocation.
 //
 // `layer_snapshots`, when given, receives the FULL [S, hidden] BF16 rows (the dropped prefix
-// included, exactly as the anchor's hooks see them) after decoder layers 0..deepstack-1 -- the layers
-// the deepstack adds have already landed on. It is the M4 test's per-layer gate; production passes
-// nothing, and the forward itself is unchanged by the request. One entry per deepstack add or this
-// throws.
+// included, exactly as the anchor's hooks see them) after decoder layers 0..size-1 -- so sizing it to
+// the deepstack adds gives the layers the adds land on, and sizing it to the tower gives every layer.
+// It is the M4 test's per-layer gate; production passes nothing, and the forward itself is unchanged
+// by the request. Any other size throws.
 [[nodiscard]] ConditionedTextTowerOutput
 run_conditioned_text_tower(artifact::Reader& reader, const TextTowerWeights& tower,
                            const std::vector<std::byte>& embed_table, const std::vector<int>& token_ids,
