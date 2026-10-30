@@ -130,11 +130,14 @@ int main() {
                 inputs.ref_latents = zero_bits(static_cast<std::size_t>(ref.tokens) * dit.dims.image_in);
                 // A reference makes this the edit route, whose joint sequence is built from the prompt's
                 // image-pad mask: one set bit per 2x2 group of reference latents, in the kept prompt rows
-                // (the job appends the target's own slots itself). Zeroes elsewhere keep the row count --
-                // and so the ledger's sequence length -- at what the request declares.
+                // (the job appends the target's own slots itself). The mask carries exactly one byte per
+                // kept row (run_image_job throws otherwise), so the prompt grows by the pad rows rather
+                // than the mask shrinking to them: kTextTokens text rows, then one set bit per 2x2 group.
+                const std::size_t pads = static_cast<std::size_t>(ref.tokens) / 4ULL;
+                inputs.prompt_embeds = zero_bits((static_cast<std::size_t>(kTextTokens) + pads) *
+                                                 dit.dims.hidden);
                 inputs.prompt_image_pad_mask.assign(static_cast<std::size_t>(kTextTokens), 0U);
-                inputs.prompt_image_pad_mask.assign(
-                    static_cast<std::size_t>(ref.tokens / 4), 1U);
+                inputs.prompt_image_pad_mask.insert(inputs.prompt_image_pad_mask.end(), pads, 1U);
             }
             if (c.neg_tokens != 0) {
                 inputs.negative_prompt_embeds = zero_bits(static_cast<std::size_t>(c.neg_tokens) *
@@ -145,7 +148,10 @@ int main() {
             ImageDeviceNeedRequest req;
             req.geometry        = geom;
             req.dims            = dit.dims;
-            req.text_tokens     = kTextTokens;
+            // The prompt's kept rows, read back from what the job is actually handed: a reference grew
+            // the prompt by its pad rows above, and the ledger must size the same sequence the job builds.
+            req.text_tokens     = static_cast<std::uint32_t>(inputs.prompt_embeds.size() /
+                                                             static_cast<std::size_t>(dit.dims.hidden));
             req.negative_tokens = c.neg_tokens;
             req.ref_tokens      = static_cast<std::uint32_t>(inputs.ref_latents.size() / dit.dims.image_in);
             req.blocks_resident = kImageResidentBlocks; // same symbol the serving layer and the
