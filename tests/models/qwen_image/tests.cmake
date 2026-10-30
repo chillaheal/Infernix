@@ -408,3 +408,18 @@ set_tests_properties(infernix_image_pipeline_gate_test PROPERTIES SKIP_RETURN_CO
 infernix_add_op_test(infernix_image_job_assembly_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_image_job_assembly.cpp"
   LIBRARIES infernix_qwen_image)
+
+# M9, THE SHIP GATE for the reference_image capability: the edit instruction graded on the picture
+# instead of on a row. The synthetic fixture (a blue field, a centred red square) goes through the
+# production route end to end -- the raw ti2i render, the genuine tokenizer and its pad expansion,
+# the vision tower, the conditioned 36-layer forward, the VAE encode and the DiT loop -- twice, with
+# two mutually exclusive instructions, and the assertions are pixel statistics only: not-a-copy (MAE
+# and a test-local SSIM), the subject held inside the round-trip tolerance, and the effect the
+# sentence names (a red field outside the square / a green band across the top). No VLM, no judge.
+# Links infernix_serve for the host halves the serving layer itself uses. Skips (77) without
+# INFERNIX_TEST_ARTIFACT / INFERNIX_QWENVL_PROCESSOR; returns 2 with no CUDA device. It runs the real
+# pipeline on the real GPU, so it never runs beside a live serve.
+infernix_add_op_test(infernix_image_edit_behavior_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_image_edit_behavior.cu"
+  LIBRARIES infernix_ops infernix_qwen_image infernix_qwen_image_runtime infernix_serve)
+set_tests_properties(infernix_image_edit_behavior_test PROPERTIES SKIP_RETURN_CODE 77)
