@@ -13,8 +13,19 @@
 //
 // The gate is the M3 one, and for the same measured reason: two independent BF16 chains of a 36-layer
 // tower sit ~0.12-0.18 apart on this tensor, so any a-priori band below the reference's own error would
-// measure the reference, not the engine. Floor = rel_fro(bf16_oracle, f32), computed here from the two
-// dumped files:
+// measure the reference, not the engine. Floor = the distance from the exact forward to the FARTHEST
+// certified correct forward over the same rows, computed here from the dumped files:
+//
+//   {case}_prompt_embeds_bf16.npy   and, when INFERNIX_IMAGE_ORACLE_F32FED points at it,
+//   {case}_prompt_embeds_f32fed.npy -- the same BF16 tower fed the FP32 ViT's merger rows and taps
+//   (image-edit/dump_text_fp32fed_probe.py, whose BF16-fed pass was verified bit-identical to the file
+//   above). Both dumped passes are fed IDENTICAL BF16 picture rows -- dump_edit_text_oracle.py:494-496
+//   asserts the difference is 0.0 for each of them -- so their two-pass spread carries the TOWER's dtype
+//   error and nothing of the ViT's, while the engine's image rows arrive carrying the ViT (its own merger
+//   rows sit 0.1396 from the oracle's, against a checkpoint BF16-vs-FP32 merger scatter of 0.1580).
+//   Measured on the image rows, that third view sits 0.429 from the BF16-fed pass and 0.079 is what the
+//   gate was dividing by: a floor no forward whose picture came from a different ViT arithmetic could
+//   meet. Absent the file, the certified two-view gate is exactly as it was.
 //
 //   whole tensor: rel_fro(engine, f32) <= max(2 * floor, 1e-2)
 //   per row:      ||engine_r - f32_r|| / ||f32|| <= max(2 * that row's own floor share, floor)
@@ -108,14 +119,20 @@ double norm_sq(const std::vector<float>& a, std::size_t offset, std::size_t coun
 bool gate_class(const std::string& tag, const std::string& what, const std::vector<float>& engine,
                 const std::vector<float>& f32, const std::vector<float>& floor_ref, std::size_t D,
                 const std::vector<std::uint8_t>& selected, double base,
-                double global_floor = kGlobalFloor, bool fatal = true) {
-    double engine_sq = 0.0, floor_sq = 0.0, class_sq = 0.0, dev_dot = 0.0;
+                double global_floor = kGlobalFloor, bool fatal = true,
+                const std::vector<float>* fed_ref = nullptr) {
+    double engine_sq = 0.0, floor_sq = 0.0, fed_sq = 0.0, class_sq = 0.0, dev_dot = 0.0;
     std::size_t rows = 0;
     for (std::size_t row = 0; row < selected.size(); ++row) {
         if (!selected[row]) continue;
         ++rows;
         engine_sq += diff_sq(engine, f32, row * D, D);
         floor_sq  += diff_sq(floor_ref, f32, row * D, D);
+        // The third certified view's distance to the SAME anchor, by the SAME formula. A floor built
+        // from the distance to one correct forward cannot be the floor for a class whose input the
+        // reference family itself varies -- so the floor is how far the EXACT forward is from the
+        // farthest correct one, not from the convenient one.
+        if (fed_ref != nullptr) { fed_sq += diff_sq(*fed_ref, f32, row * D, D); }
         class_sq  += norm_sq(f32, row * D, D);
         for (std::size_t i = 0; i < D; ++i) {
             const std::size_t o = row * D + i;
@@ -125,9 +142,11 @@ bool gate_class(const std::string& tag, const std::string& what, const std::vect
         }
     }
     require(rows > 0, tag + ": the " + what + " row class is empty");
-    const double engine_err = std::sqrt(engine_sq) / base;
-    const double floor_err  = std::sqrt(floor_sq) / base;
-    const double band       = std::max(kFloorFactor * floor_err, global_floor);
+    const double engine_err  = std::sqrt(engine_sq) / base;
+    const double floor_tower = std::sqrt(floor_sq) / base;
+    const double floor_fed   = (fed_ref != nullptr) ? std::sqrt(fed_sq) / base : 0.0;
+    const double floor_err   = std::max(floor_tower, floor_fed);
+    const double band        = std::max(kFloorFactor * floor_err, global_floor);
     // The same numbers over THIS class's own norm. `base` is a shared denominator, so a class whose
     // rows carry a larger magnitude (the merger rows do) reads bigger here than it is; the classrel
     // ratio is what is comparable between text and image rows. Diagnostics only -- the band below is
@@ -141,11 +160,13 @@ bool gate_class(const std::string& tag, const std::string& what, const std::vect
     const double cos  = (engine_sq > 0.0 && floor_sq > 0.0)
                             ? dev_dot / (std::sqrt(engine_sq) * std::sqrt(floor_sq)) : 0.0;
     const double gain = floor_sq > 0.0 ? dev_dot / floor_sq : 0.0;
+    const double class_floor = std::max(std::sqrt(floor_sq), std::sqrt(fed_sq)) / class_nrm;
     std::cout << "  " << tag << " " << what << " rows=" << rows << " eng=" << engine_err
               << " floor=" << floor_err << " band=" << band
+              << " floor_tower=" << floor_tower << " floor_fedview=" << floor_fed
               << " classrel eng=" << std::sqrt(engine_sq) / class_nrm
-              << " floor=" << std::sqrt(floor_sq) / class_nrm
-              << " ratio=" << (floor_sq > 0.0 ? std::sqrt(engine_sq / floor_sq) : 0.0)
+              << " floor=" << class_floor
+              << " ratio=" << (floor_err > 0.0 ? engine_err / floor_err : 0.0)
               << " cos=" << cos << " gain=" << gain << "\n";
     if (fatal) {
         require(engine_err <= band,
@@ -211,6 +232,25 @@ int main() {
             const std::vector<float> f32  = want_embeds.floats();
             const std::vector<float> bf16 = want_bf16.floats();
             require(bf16.size() == f32.size(), "the two references differ in size");
+
+            // The third certified view, probed by file (see the header). Empty keeps every gate below
+            // byte-for-byte the two-view gate it has always been.
+            std::vector<float> fed_view;
+            {
+                const std::string fed_dir = env_or("INFERNIX_IMAGE_ORACLE_F32FED", "");
+                if (!fed_dir.empty()) {
+                    const std::string fed_file = qo::join(fed_dir, tag + "_prompt_embeds_f32fed.npy");
+                    if (std::filesystem::exists(fed_file, ec)) {
+                        const qo::NpyArray fed_array = qo::read_npy(fed_file);
+                        require(fed_array.shape.size() == 2 && fed_array.shape[0] == kept &&
+                                    fed_array.shape[1] == D,
+                                tag + ": the dumped f32fed conditioning is not [kept, D]");
+                        fed_view = fed_array.floats();
+                        std::cout << "  " << tag << " floor views: bf16 + f32fed (" << fed_file << ")\n";
+                    }
+                }
+            }
+            const std::vector<float>* const fed_ptr = fed_view.empty() ? nullptr : &fed_view;
 
             const qo::NpyArray mask_array = qo::read_npy(qo::join(dir, std::string(tag) + "_image_pad_mask.npy"));
             // The dump carries the mask at the FULL prompt length -- the model is handed the mask before
@@ -334,7 +374,8 @@ int main() {
             // reference's own error at this boundary, measured by M3 on the same plane.
             {
                 auto gate_fed_rows = [&](const std::vector<std::uint16_t>& have, const std::vector<float>& want,
-                                         const std::string& what, double band_rows) {
+                                         const std::string& what, double band_rows,
+                                         const std::vector<float>* twin = nullptr) {
                     require(have.size() == want.size(),
                             tag + ": the engine's " + what + " is not the size the reference dumped");
                     std::vector<std::uint16_t> rounded_bits(want.size());
@@ -344,11 +385,21 @@ int main() {
                     const double base_rows  = std::sqrt(norm_sq(want, 0, want.size()));
                     const double floor_rows = std::sqrt(diff_sq(rounded, want, 0, want.size())) / base_rows;
                     const double err        = std::sqrt(diff_sq(got, want, 0, want.size())) / base_rows;
+                    // These four fixtures are BF16-exact, so rounding them measures nothing and
+                    // floor_rows comes out 0. Where the oracle carries the FP32 ViT's own rows for this
+                    // set (INFERNIX_IMAGE_ORACLE_VISION_F32), THAT is the checkpoint's error at this
+                    // boundary and the only floor that exists here. Printed either way; the a-priori
+                    // band still wins wherever it is larger, so no gate is relaxed by the measurement.
+                    double twin_floor = 0.0;
+                    if (twin != nullptr && twin->size() == want.size()) {
+                        twin_floor = std::sqrt(diff_sq(*twin, want, 0, want.size())) / base_rows;
+                    }
+                    const double floor_used = std::max(floor_rows, twin_floor);
                     // The handoff band is the floor for a BF16-exact fixture; where the fixture does
                     // carry a floor, the house band applies too -- take the larger, never the smaller.
-                    band_rows = std::max(band_rows, std::max(kFloorFactor * floor_rows, kGlobalFloor));
+                    band_rows = std::max(band_rows, std::max(kFloorFactor * floor_used, kGlobalFloor));
                     std::cout << "  " << tag << " " << what << " rel_fro=" << err << " floor=" << floor_rows
-                              << " band=" << band_rows << "\n";
+                              << " model_scatter=" << twin_floor << " band=" << band_rows << "\n";
                     // WHICH row, not only how much: one wrong fed row contaminates every row downstream
                     // through attention, and it shows up in the aggregate as a class error of about
                     // 1/sqrt(rows) -- which is what blackout #21 measured for the merger feed (0.14 of 77
@@ -375,14 +426,25 @@ int main() {
                     for (std::size_t i = 0; i < v.size(); ++i) { b[i] = to_bf16(v[i]); }
                     return b;
                 };
+                // The FP32 ViT's own rows for the same sets, probed by file: empty keeps the gate as it
+                // was (print-only floor 0), present gives the handoff a measured model scatter.
+                auto fed_twin = [&](const std::string& fname) {
+                    const std::string d = env_or("INFERNIX_IMAGE_ORACLE_VISION_F32", "");
+                    if (d.empty()) { return std::vector<float>{}; }
+                    const std::string f = qo::join(d, fname);
+                    if (!std::filesystem::exists(f, ec)) { return std::vector<float>{}; }
+                    return qo::read_npy(f).floats();
+                };
                 for (std::size_t i = 0; i < vision.deepstack.size(); ++i) {
                     const std::string name = tag + "_deepstack_" + std::to_string(i) + "_f32.npy";
                     const qo::NpyArray want_ds = qo::read_npy(qo::join(dir, name));
                     require(want_ds.shape.size() == 2 && want_ds.shape[0] == merged && want_ds.shape[1] == D,
                             tag + ": the dumped " + name + " is not [pads, hidden]");
                     const std::vector<float> ds = want_ds.floats();
+                    const std::vector<float> ds_twin =
+                        fed_twin(tag + "_deepstack_" + std::to_string(i) + "_f32.npy");
                     gate_fed_rows(rows.deepstack_rows[i], ds, "deepstack rows " + std::to_string(i),
-                                  kHandoffDeepstack[i]);
+                                  kHandoffDeepstack[i], ds_twin.empty() ? nullptr : &ds_twin);
                     // The tower is fed the reference's own rows: BF16-exact, so this conversion is exact.
                     conditioned.deepstack_rows.push_back(bits_of(ds));
                 }
@@ -404,7 +466,9 @@ int main() {
                         want_merger.insert(want_merger.end(), ie.begin() + s * D, ie.begin() + (s + 1) * D);
                     }
                 }
-                gate_fed_rows(rows.merger_rows, want_merger, "merger rows", kHandoffMergerBand);
+                const std::vector<float> merger_twin = fed_twin(tag + "_merger_f32.npy");
+                gate_fed_rows(rows.merger_rows, want_merger, "merger rows", kHandoffMergerBand,
+                              merger_twin.empty() ? nullptr : &merger_twin);
                 conditioned.merger_rows = bits_of(want_merger);
                 require(conditioned.deepstack_rows.size() == vision.deepstack.size(),
                         "the fed deepstack rows are not one per deepstack add");
@@ -540,7 +604,13 @@ int main() {
                 require(std::isfinite(engine[i]), "the conditioned tower produced a non-finite value");
             }
             const double base        = std::sqrt(norm_sq(f32, 0, f32.size()));
-            const double global_floor = std::sqrt(diff_sq(bf16, f32, 0, f32.size())) / base;
+            const double floor_tower = std::sqrt(diff_sq(bf16, f32, 0, f32.size())) / base;
+            const double floor_fed   = fed_ptr == nullptr
+                                          ? 0.0
+                                          : std::sqrt(diff_sq(*fed_ptr, f32, 0, f32.size())) / base;
+            const double global_floor = std::max(floor_tower, floor_fed);
+            std::cout << "  " << tag << " floor: tower=" << floor_tower << " fedview=" << floor_fed
+                      << " decided=" << global_floor << "\n";
             require(base > 0.0, "the reference conditioning is all zeros");
             // Every gate below prints before the run decides. Blackout #20's throw on the global gate
             // hid the per-row evidence: uniform drift across all rows with the deepstack layers green is
@@ -560,7 +630,11 @@ int main() {
                 text_rows[s]  = want_mask[s] ? 0U : 1U;
                 image_rows[s] = want_mask[s];
                 const double row_engine = std::sqrt(diff_sq(engine, f32, s * D, D)) / base;
-                const double row_floor  = std::sqrt(diff_sq(bf16, f32, s * D, D)) / base;
+                const double row_tower  = std::sqrt(diff_sq(bf16, f32, s * D, D)) / base;
+                const double row_fed    = fed_ptr == nullptr
+                                             ? 0.0
+                                             : std::sqrt(diff_sq(*fed_ptr, f32, s * D, D)) / base;
+                const double row_floor  = std::max(row_tower, row_fed);
                 const double row_band   = std::max(kFloorFactor * row_floor,
                                                    kSliceFloorShare * global_floor);
                 if (row_engine > row_band) {
@@ -574,9 +648,9 @@ int main() {
             std::cout << "  " << tag << " kept rows: worst " << worst_row << " eng=" << worst
                       << (rows_ok ? ", all inside" : ", RED rows above") << "\n";
             const bool text_ok  = gate_class(tag, "text", engine, f32, bf16, D, text_rows, base,
-                                             kGlobalFloor, false);
+                                             kGlobalFloor, false, fed_ptr);
             const bool image_ok = gate_class(tag, "image", engine, f32, bf16, D, image_rows, base,
-                                             kGlobalFloor, false);
+                                             kGlobalFloor, false, fed_ptr);
 
             // ---- the text class, split by whether the picture MOVED the row ----
             // build_mrope_positions advances the running position by max(h/merge, w/merge) per image
