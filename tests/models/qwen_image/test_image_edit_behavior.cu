@@ -49,11 +49,14 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <iterator>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -444,6 +447,128 @@ int main() {
             return 1;
         }
         std::cout << "EDIT_BEHAVIOR_OK\n";
+
+        // ---- the manual look (plan Task 10 step 5): opt-in, outside the gate ----------------------
+        // Nothing below is a CTest assertion. It renders ONE REFERENCE THE CALLER NAMES through the
+        // identical route -- the same prepare_reference_planes the HTTP route runs, so the decode, the
+        // aspect snap to the 32-grid and the bilinear resize are the shipped ones, not a fixture -- so
+        // a person can look at the picture a real edit produced. It runs only when INFERNIX_EDIT_PORTRAIT
+        // is a readable file AND INFERNIX_EDIT_OUTDIR is set, so the gate that ships the capability is
+        // byte-for-byte the run above; the photograph never enters the repository.
+        const std::string portrait = env_or("INFERNIX_EDIT_PORTRAIT", "");
+        const std::string out_dir  = env_or("INFERNIX_EDIT_OUTDIR", "");
+        if (!portrait.empty() && !out_dir.empty()) {
+            std::ifstream in(portrait, std::ios::binary);
+            const std::vector<std::uint8_t> bytes{(std::istreambuf_iterator<char>(in)),
+                                                  std::istreambuf_iterator<char>()};
+            require(in.good() || !bytes.empty(), "portrait: the named file is empty or unreadable");
+            static constexpr char kB64[] =
+                "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            std::string b64;
+            b64.reserve((bytes.size() + 2ULL) / 3ULL * 4ULL);
+            for (std::size_t i = 0; i < bytes.size(); i += 3ULL) {
+                const auto at = [&](std::size_t k) {
+                    return i + k < bytes.size() ? static_cast<std::uint32_t>(bytes[i + k]) : 0U;
+                };
+                const std::uint32_t v = (at(0) << 16U) | (at(1) << 8U) | at(2);
+                b64.push_back(kB64[(v >> 18U) & 63U]);
+                b64.push_back(kB64[(v >> 12U) & 63U]);
+                b64.push_back(i + 1ULL < bytes.size() ? kB64[(v >> 6U) & 63U] : '=');
+                b64.push_back(i + 2ULL < bytes.size() ? kB64[v & 63U] : '=');
+            }
+
+            const srv::ReferencePlanes real = srv::prepare_reference_planes(b64);
+            const std::uint64_t ref_vision =
+                srv::vision_token_count(real.vision.height_px, real.vision.width_px);
+            const std::string prompt = env_or("INFERNIX_EDIT_PROMPT",
+                                              "Change the background to solid green. Keep the person "
+                                              "standing in the center unchanged.");
+            std::cout << "PORTRAIT source=" << portrait << " plane=" << real.vae.width_px << "x"
+                      << real.vae.height_px << " vision=" << ref_vision << " prompt=" << prompt << "\n";
+
+            const auto rendered = render(prompt, {ref_vision});
+            const auto vision   = vision_rows(real.vision);
+            const auto embeds   = conditioned(rendered, vision);
+            std::size_t pads = 0;
+            for (const std::uint8_t m : embeds.image_pad_mask) { pads += m; }
+            require(pads == ref_vision,
+                    "portrait: only " + std::to_string(pads) + " of " + std::to_string(ref_vision) +
+                        " kept rows carry the picture");
+
+            EncodedReference reference;
+            {
+                ReferenceEncodeInputs enc_in;
+                enc_in.pixels       = real.vae.pixels;
+                enc_in.latents_mean = denorm.mean;
+                enc_in.latents_std  = denorm.std;
+                enc_in.height_px    = real.vae.height_px;
+                enc_in.width_px     = real.vae.width_px;
+                cudaStream_t encode_stream = nullptr;
+                if (cudaStreamCreate(&encode_stream) != cudaSuccess) {
+                    throw std::runtime_error("portrait: no encode stream");
+                }
+                reference = encode_reference_image(reader, vae, enc_in, encode_stream);
+                cudaStreamDestroy(encode_stream);
+            }
+            require(image_device_bytes_live() == 0,
+                    "portrait: the VAE encode left image device bytes live");
+
+            const ImageGeometry pgeom = ImageGeometry::derive(real.vae.height_px, real.vae.width_px);
+            const Schedule psched =
+                ImageJob{pgeom.height, pgeom.width, kSteps}.schedule(SchedulerConfig{});
+            ImageJobInputs inputs;
+            inputs.prompt_embeds         = embeds.prompt_embeds;
+            inputs.prompt_image_pad_mask = embeds.image_pad_mask;
+            inputs.ref_latents           = reference.latents;
+            inputs.ref_grids.emplace_back(reference.height_lat, reference.width_lat);
+            inputs.timesteps    = psched.timesteps;
+            inputs.sigmas       = psched.sigmas;
+            inputs.latents_mean = denorm.mean;
+            inputs.latents_std  = denorm.std;
+            inputs.height_px    = pgeom.height;
+            inputs.width_px     = pgeom.width;
+            inputs.true_cfg_scale = kCfgScale;
+            {
+                std::vector<float> noise(static_cast<std::size_t>(pgeom.tokens) * dit.dims.image_in);
+                fill_normal(kSeed, noise);
+                inputs.init_latent = bits_of(noise);
+            }
+            cudaStream_t stream = nullptr;
+            if (cudaStreamCreate(&stream) != cudaSuccess) {
+                throw std::runtime_error("portrait: no image stream");
+            }
+            GeneratedImage out;
+            try {
+                out = run_image_job(reader, dit, vae, inputs, stream);
+            } catch (...) {
+                cudaStreamDestroy(stream);
+                require(image_device_bytes_live() == 0,
+                        "portrait: the refused job left image device bytes live");
+                throw;
+            }
+            cudaStreamDestroy(stream);
+            require(image_device_bytes_live() == 0,
+                    "portrait: the job left image device bytes live");
+
+            const std::string ppm = out_dir + "\\portrait_edit.ppm";
+            std::ofstream file(ppm, std::ios::binary);
+            require(static_cast<bool>(file), "portrait: cannot open " + ppm);
+            file << "P6\n" << out.width << ' ' << out.height << "\n255\n";
+            std::array<char, 3> rgb{};
+            for (std::uint32_t y = 0; y < out.height; ++y) {
+                for (std::uint32_t x = 0; x < out.width; ++x) {
+                    for (int c = 0; c < 3; ++c) {
+                        rgb[static_cast<std::size_t>(c)] =
+                            static_cast<char>(std::lround(channel_byte(out, c, x, y)));
+                    }
+                    file.write(rgb.data(), 3);
+                }
+            }
+            file.close();
+            require(static_cast<bool>(file), "portrait: the write of " + ppm + " failed");
+            std::cout << "PORTRAIT_EDIT_WRITTEN " << ppm << " " << out.width << "x" << out.height
+                      << " steps=" << kSteps << " seed=" << kSeed << " cfg=" << kCfgScale << "\n";
+        }
         return 0;
     } catch (const std::exception& error) {
         std::cout << "EDIT_BEHAVIOR_FAIL " << error.what() << "\n";
