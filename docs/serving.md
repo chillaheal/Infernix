@@ -1131,7 +1131,7 @@ Accepted request fields are exactly `model`, `prompt`, `n`, `size`, `steps`, `re
 | `response_format` | `b64_json` (the default) or `url`; any other value is rejected |
 | `seed` | optional non-negative integer; when omitted the Engine picks one |
 | `user` | opaque client tag, never echoed back |
-| `image` | optional reference image (product extension, no OpenAI counterpart): a base64 string, or an array of EXACTLY one such string, with an optional `data:…;base64,` prefix. PNG keeps its alpha, other formats get an opaque one; an `http(s)://` URL is never fetched; decoded payload at most 16 MiB. A second reference, an empty string, an empty array or a non-string item is `image_count_invalid` |
+| `image` | optional reference image (product extension, no OpenAI counterpart): a base64 string, or an array of EXACTLY one such string, with an optional `data:…;base64,` prefix. PNG keeps its alpha, other formats get an opaque one; an `http(s)://` URL is never fetched; decoded payload at most 16 MiB. A second reference, an empty string, an empty array or a non-string item is `image_count_invalid`. The reference conditions the generation through the Qwen3-VL vision tower and the VAE encoder — its merger rows are scattered onto the image slots of the 36-layer text tower, including the three deepstack adds, and its latent tokens overwrite those slots in the joint sequence. N=1, no mask, no inpainting region; the KV cache stays off on this route |
 | `negative_prompt` | optional string, at most 4096 bytes: what to steer away from. Required when `true_cfg_scale` is above 1; ignored at 1 |
 | `true_cfg_scale` | guidance scale, number in `[1, 20]`; default `1`, which is a single DiT forward per step. Above 1 every step runs a second forward over the negative prompt, so the step cost roughly doubles |
 
@@ -1233,7 +1233,7 @@ it:
     "dimensions": {"min": 32, "max": 2048},
     "steps": {"min": 2, "max": 100},
     "true_cfg_scale": {"min": 1, "max": 20},
-    "reference_image": false,
+    "reference_image": true,
     "automatic_from_chat": true,
     "chat_tool": "generate_image",
     "chat_max_images_per_request": 4
@@ -1252,11 +1252,13 @@ Every value is read from the running process, never from a model card: `chat_mod
 `image_generation` is `null` when the server started without `--image-artifact` and
 `--image-text-processor`. `vision_input` follows `--vision`, and it is a separate surface from
 `reference_image`: the first feeds a picture into the language model, the second conditions a generation on
-a picture through the diffusion pipeline's own vision tower. `reference_image` is **false** here until the
-behavioral gate (`tests/models/qwen_image/test_image_edit_behavior.cu`) is green: the `image` field is still
-parsed and such a request is still admitted and executed — a client gets the documented `400`/`503` codes
-above rather than an unknown-parameter error — but the server does not claim that an edit instruction is
-followed. That claim is what the gate exists to earn. `automatic_from_chat` says whether the chat
+a picture through the diffusion pipeline's own vision tower. `reference_image` is **true**, and it is that claim rather than
+a parsed field: it says the server follows an edit instruction instead of reproducing the reference. It is
+earned from the behavioral gate (`tests/models/qwen_image/test_image_edit_behavior.cu`), which renders the
+same fixture once per instruction and grades the PICTURES — not a copy of the reference (MAE and SSIM), the
+subject held inside the frame, and the named change actually present. A build that has not passed that CTest
+must keep the flag false; the field is parsed and the job admitted either way, so the flag is the difference
+between a documented capability and an unproven one. `automatic_from_chat` says whether the chat
 routes may generate an image on their own initiative, `chat_tool` names the tool they are given for it, and
 `chat_max_images_per_request` is how many pictures one chat request may draw. See
 [Images from a chat request](#images-from-a-chat-request).
