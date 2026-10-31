@@ -19,6 +19,7 @@
 #include "infernix/engine.h"
 #include "models/qwen_image/image_device_need.h" // VisionLaneDims: the ledger's ViT lane
 #include "models/qwen_image/image_weights.h"
+#include "models/qwen_image/text_tower.h"        // ConditionedVision: the edit route's vision rows
 
 #include <nlohmann/json.hpp>
 
@@ -59,6 +60,24 @@ struct TowerPrompt {
     // The rows the joint sequence actually carries.
     [[nodiscard]] std::size_t tokens() const noexcept { return ids.size() - drop_rows; }
 };
+
+// ---- the edit route's conditioning seams (declared here, like TowerPrompt above) -----------------
+// The serving layer owns WHEN each half runs -- the render before the probe, the two forwards inside
+// the yield -- so the types the route passes around belong to the route's header, not to
+// serve/image_text_tower.h, which only builds them.
+using ReferencePromptRendererProvider =
+    std::function<TowerPrompt(const std::string& prompt,
+                              const std::vector<std::uint64_t>& tokens_per_image)>;
+
+struct ConditionedPromptEmbeds {
+    std::vector<std::uint16_t> prompt_embeds; // [(S - drop_rows) * hidden] BF16 bits, pre-final-norm
+    std::vector<std::uint8_t> image_pad_mask; // [S - drop_rows], 1 on the rows that carry the picture
+};
+using VisionRowsProvider =
+    std::function<models::qwen_image::ConditionedVision(const ReferenceVisionPlane& plane)>;
+using ConditionedEmbedsProvider =
+    std::function<ConditionedPromptEmbeds(const TowerPrompt& rendered,
+                                          const models::qwen_image::ConditionedVision& vision)>;
 
 // Thrown when another interlude already owns the VRAM yield. A type, not a message match: the HTTP
 // surface (429 image_interlude_in_flight) must not depend on the words a Program happens to use.
@@ -111,12 +130,25 @@ public:
 // BF16 bits when `request.true_cfg_scale` is above 1 (true CFG); empty means the single-forward route.
 // `progress` is the stored job's live progress state: the executor's pipeline reports each step
 // through it and honors its stall flag; a fake executor may ignore it.
+//
+// `edit` is the edit route's half of the conditioning and is null for text-to-image, where every
+// byte of the certified path stays as it is. With a reference the prompt embeds are NOT pre-computed
+// (a plain text-tower forward would produce rows that have never seen the picture, which is the
+// 2026-10-28 near-copy): the service hands over the two rendered ti2i prompts and both planes of the
+// reference, and the executor runs the vision tower and the conditioned text tower inside the yield
+// and reads `prompt_image_pad_mask` off the result. `prompt_embeds`/`negative_embeds` are then empty.
+struct EditConditioning {
+    const ReferencePlanes* planes           = nullptr; // both copies of the snapped reference
+    const TowerPrompt*     prompt           = nullptr; // the raw ti2i render, pads expanded
+    const TowerPrompt*     negative_prompt  = nullptr; // same images, own text; null without true CFG
+};
 using ImageJobExecutor =
     std::function<FinishedPicture(const OpenAIImagesRequest& request, std::uint64_t seed,
                                    std::span<const std::uint16_t> prompt_embeds,
                                    std::span<const std::uint16_t> negative_embeds,
                                    const ReferencePixels* reference, void* image_stream,
-                                   const std::shared_ptr<ImageJobProgress>& progress)>;
+                                   const std::shared_ptr<ImageJobProgress>& progress,
+                                   const EditConditioning* edit)>;
 
 // prompt -> prompt_embeds, split in the two halves the VRAM handoff needs: rendering is host work the
 // service does BEFORE it probes the yield, the tower forward needs device memory and runs inside it.
@@ -221,12 +253,16 @@ private:
 
 class ImageGenerationService {
 public:
-    // `vision_dims` is only needed by the edit route (a request that carries an `image`); it defaults
-    // to null so every text-to-image caller and test keeps the exact same admission as before.
+    // `vision_dims` and `reference_prompt_renderer` are only needed by the edit route (a request that
+    // carries an `image`); both default to null so every text-to-image caller and test keeps the exact
+    // same admission as before. A request WITH a reference and either one missing is refused as
+    // unconfigured: the renderer is what the admission sizes the ti2i prompt with, and guessing there
+    // under-reserves the yield the resident LLM is resting in.
     ImageGenerationService(std::unique_ptr<ImageInterludeRunner> runner, ImageJobStore& store,
                            PromptRendererProvider prompt_renderer, PromptEmbedsProvider prompt_embeds,
                            DiTDimsProvider dit_dims, ImageJobExecutor job_executor,
-                           VisionLaneDimsProvider vision_dims = {});
+                           VisionLaneDimsProvider vision_dims = {},
+                           ReferencePromptRendererProvider reference_prompt_renderer = {});
 
     // False when serve started without the image pipeline: the route answers a documented 503.
     [[nodiscard]] bool is_configured() const noexcept;
@@ -270,6 +306,7 @@ private:
     PromptEmbedsProvider prompt_embeds_;
     DiTDimsProvider dit_dims_;
     VisionLaneDimsProvider vision_dims_;
+    ReferencePromptRendererProvider reference_prompt_renderer_;
     ImageJobExecutor job_executor_;
     std::mutex dims_mutex_;
     infernix::models::qwen_image::DiTDims dims_cache_;

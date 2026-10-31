@@ -131,6 +131,21 @@ VisionLaneDimsProvider fixed_vision() {
     };
 }
 
+// The edit route's host half: the ti2i render, counted the way the genuine renderer counts -- the
+// text rows plus one run of tokens_per_image[0] <|image_pad|> rows. The admission sizes the joint
+// sequence on THESE ids (the ledger subtracts the pad rows itself, image_device_need.h:120-125), so a
+// fake that ignored the pads would hide a route that under-reserves the yield.
+ReferencePromptRendererProvider fixed_reference_renderer() {
+    return [](const std::string& prompt, const std::vector<std::uint64_t>& tokens_per_image) {
+        TowerPrompt rendered;
+        rendered.rendered      = prompt;
+        const std::size_t pads = tokens_per_image.empty() ? 0ULL : tokens_per_image[0];
+        rendered.ids.assign(8ULL + pads, 7);
+        rendered.drop_rows = 2U;
+        return rendered;
+    };
+}
+
 // The picture a fake device job finishes with: RGBA8 pixels and their size, one solid shade. The
 // encode, the base64 and the file are the SERVICE's work after the interlude, so a fake stops here
 // and what belongs on disk is this encoder's output for these pixels.
@@ -150,7 +165,7 @@ VisionLaneDimsProvider fixed_vision() {
 ImageJobExecutor fixed_executor() {
     return [](const OpenAIImagesRequest&, std::uint64_t, std::span<const std::uint16_t>,
               std::span<const std::uint16_t>, const ReferencePixels*, void*,
-              const std::shared_ptr<ImageJobProgress>&) {
+              const std::shared_ptr<ImageJobProgress>&, const EditConditioning*) {
         return fake_picture(0x01U);
     };
 }
@@ -158,7 +173,7 @@ ImageJobExecutor fixed_executor() {
 ImageJobExecutor throwing_executor() {
     return [](const OpenAIImagesRequest&, std::uint64_t, std::span<const std::uint16_t>,
               std::span<const std::uint16_t>, const ReferencePixels*,
-              void*, const std::shared_ptr<ImageJobProgress>&) -> FinishedPicture {
+              void*, const std::shared_ptr<ImageJobProgress>&, const EditConditioning*) -> FinishedPicture {
         throw std::runtime_error("image job exploded");
     };
 }
@@ -323,7 +338,7 @@ int main() {
         ImageJobExecutor watch =
             [&executor_ran](const OpenAIImagesRequest&, std::uint64_t, std::span<const std::uint16_t>,
                             std::span<const std::uint16_t>, const ReferencePixels*, void*,
-                            const std::shared_ptr<ImageJobProgress>&) {
+                            const std::shared_ptr<ImageJobProgress>&, const EditConditioning*) {
                 executor_ran = true;
                 return fake_picture(0x01U);
             };
@@ -379,12 +394,27 @@ int main() {
         std::size_t plane_floats   = 0;
         std::uint32_t plane_w      = 0, plane_h = 0;
         float       alpha_min = 0.F, alpha_max = 0.F;
+        // The edit route's handoff: both planes, and the ti2i render whose pad rows ARE the reference.
+        bool        saw_edit_planes = false, saw_edit_prompt = false;
+        std::size_t edit_rows = 0, vision_rgb_bytes = 0;
+        std::uint32_t vision_w = 0, vision_h = 0;
         ImageJobExecutor capture = [&](const OpenAIImagesRequest&, std::uint64_t,
                                        std::span<const std::uint16_t>, std::span<const std::uint16_t>,
                                        const ReferencePixels* ref, void*,
-                                       const std::shared_ptr<ImageJobProgress>&)
+                                       const std::shared_ptr<ImageJobProgress>&,
+                                       const EditConditioning* edit)
             -> FinishedPicture {
             saw_reference = ref != nullptr;
+            if (edit != nullptr) {
+                saw_edit_planes = edit->planes != nullptr && edit->prompt != nullptr &&
+                                  edit->negative_prompt == nullptr; // true_cfg_scale is 1 here
+                if (edit->planes != nullptr) {
+                    vision_rgb_bytes = edit->planes->vision.rgb.size();
+                    vision_w         = edit->planes->vision.width_px;
+                    vision_h         = edit->planes->vision.height_px;
+                }
+                if (edit->prompt != nullptr) { edit_rows = edit->prompt->tokens(); }
+            }
             if (ref != nullptr) {
                 plane_floats = ref->pixels.size();
                 plane_w      = ref->width_px;
@@ -400,7 +430,7 @@ int main() {
 
         ImageJobStore store(8, 1 << 20);
         ImageGenerationService service(std::make_unique<FakeRunner>(), store, fixed_renderer(), fixed_provider(), fixed_dims(),
-                                       capture, fixed_vision());
+                                       capture, fixed_vision(), fixed_reference_renderer());
         OpenAIImagesRequest request = sample_request();
         request.image               = payload;
         service.generate(request, 1000);
@@ -408,6 +438,16 @@ int main() {
                   plane_floats == 4ULL * 1184ULL * 896ULL,
               "valid PNG image -> 1184x896 RGBA plane at the executor");
         check(alpha_min < -0.5F && alpha_max > 0.5F, "reference alpha carried raw, not composited");
+        // The edit route's handoff: the executor gets BOTH planes of the one snapped picture, and the
+        // prompt it renders the conditioning from is the ti2i render -- its kept rows are the text plus
+        // one vision row per pad, 4 * 1036 == the 4144 latent rows the VAE encode will return.
+        check(saw_edit_planes && vision_w == 1184U && vision_h == 896U &&
+                  vision_rgb_bytes == 3ULL * 1184ULL * 896ULL,
+              "a reference hands the executor both planes of the same snapped picture");
+        // 8 text rows + the 1036 pad rows, minus the 2 dropped system rows the t2i route drops too
+        // (the pads sit after that line, so the prefix length does not move).
+        check(edit_rows == 8ULL + 1036ULL - 2ULL,
+              "a reference renders the ti2i prompt: 1036 vision pad rows on top of the text rows");
 
         ImageJobStore bad_store(8, 1 << 20);
         ImageGenerationService bad_service(std::make_unique<FakeRunner>(), bad_store,
@@ -459,7 +499,8 @@ int main() {
             auto runner = std::make_unique<FakeRunner>();
             FakeRunner* eyes = runner.get();
             ImageGenerationService service(std::move(runner), store, fixed_renderer(), fixed_provider(),
-                                           fixed_dims(), fixed_executor(), fixed_vision());
+                                           fixed_dims(), fixed_executor(), fixed_vision(),
+                                           fixed_reference_renderer());
             (void)attempt([&] { return service.generate(sample_request(), 1910); });
             asked_without = eyes->probed_target;
             OpenAIImagesRequest request = sample_request();
@@ -479,12 +520,13 @@ int main() {
             ImageJobExecutor watch =
                 [&executor_ran](const OpenAIImagesRequest&, std::uint64_t, std::span<const std::uint16_t>,
                                 std::span<const std::uint16_t>, const ReferencePixels*, void*,
-                                const std::shared_ptr<ImageJobProgress>&) {
+                                const std::shared_ptr<ImageJobProgress>&, const EditConditioning*) {
                     executor_ran = true;
                     return fake_picture(0x01U);
                 };
             ImageGenerationService service(std::move(runner), store, fixed_renderer(), fixed_provider(),
-                                           fixed_dims(), watch, fixed_vision());
+                                           fixed_dims(), watch, fixed_vision(),
+                                           fixed_reference_renderer());
             OpenAIImagesRequest request = sample_request();
             request.image = payload;
             const auto outcome = attempt([&] { return service.generate(request, 1930); });
@@ -510,7 +552,7 @@ int main() {
         ImageJobExecutor capture = [&](const OpenAIImagesRequest& request, std::uint64_t,
                                        std::span<const std::uint16_t>,
                                        std::span<const std::uint16_t> negative,
-                                       const ReferencePixels*, void*, const std::shared_ptr<ImageJobProgress>&)
+                                       const ReferencePixels*, void*, const std::shared_ptr<ImageJobProgress>&, const EditConditioning*)
             -> FinishedPicture {
             neg_size   = negative.size();
             seen_scale = request.true_cfg_scale;
@@ -546,7 +588,7 @@ int main() {
         const FinishedPicture picture = fake_picture(0x89U);
         ImageJobExecutor writer = [&](const OpenAIImagesRequest&, std::uint64_t,
                                       std::span<const std::uint16_t>, std::span<const std::uint16_t>,
-                                      const ReferencePixels*, void*, const std::shared_ptr<ImageJobProgress>&)
+                                      const ReferencePixels*, void*, const std::shared_ptr<ImageJobProgress>&, const EditConditioning*)
             -> FinishedPicture {
             return picture;
         };
@@ -574,7 +616,7 @@ int main() {
         const FinishedPicture picture = fake_picture(0x0DU);
         ImageJobExecutor writer = [&](const OpenAIImagesRequest&, std::uint64_t,
                                       std::span<const std::uint16_t>, std::span<const std::uint16_t>,
-                                      const ReferencePixels*, void*, const std::shared_ptr<ImageJobProgress>&)
+                                      const ReferencePixels*, void*, const std::shared_ptr<ImageJobProgress>&, const EditConditioning*)
             -> FinishedPicture {
             return picture;
         };
@@ -618,7 +660,7 @@ int main() {
         ImageJobExecutor stepping = [](const OpenAIImagesRequest&, std::uint64_t,
                                        std::span<const std::uint16_t>, std::span<const std::uint16_t>,
                                        const ReferencePixels*, void*,
-                                       const std::shared_ptr<ImageJobProgress>& progress)
+                                       const std::shared_ptr<ImageJobProgress>& progress, const EditConditioning*)
             -> FinishedPicture {
             progress->advance(24);
             progress->advance(97);
@@ -638,7 +680,7 @@ int main() {
         ImageJobExecutor stalled = [](const OpenAIImagesRequest&, std::uint64_t,
                                       std::span<const std::uint16_t>, std::span<const std::uint16_t>,
                                       const ReferencePixels*, void*,
-                                      const std::shared_ptr<ImageJobProgress>& progress)
+                                      const std::shared_ptr<ImageJobProgress>& progress, const EditConditioning*)
             -> FinishedPicture {
             progress->stalled = true;
             if (!progress->advance(50)) {

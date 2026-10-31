@@ -110,10 +110,11 @@ public:
                                                std::span<const std::uint16_t> negative_embeds,
                                                const infernix::serve::ReferencePixels* reference,
                                                void* image_stream,
-                                               const std::shared_ptr<infernix::serve::ImageJobProgress>& progress) {
+                                               const std::shared_ptr<infernix::serve::ImageJobProgress>& progress,
+                                               const infernix::serve::EditConditioning* edit) {
         const auto t0 = std::chrono::steady_clock::now();
         auto picture  = inner_(request, seed, prompt_embeds, negative_embeds, reference, image_stream,
-                               progress);
+                               progress, edit);
         last_device_ms = ms_since(t0);
         return picture;
     }

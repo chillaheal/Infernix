@@ -1,5 +1,9 @@
 #include "serve/image_generation_service.h"
 
+// The edit route's device halves (the vision tower and the conditioned text tower forwards) are built
+// here and run inside the interlude, which is the only place the device may be touched.
+#include "serve/image_text_tower.h"
+
 #include "artifact/reader.h"
 #include "media/decode/decode.h"
 #include "media/encode/png_encode.h"
@@ -151,7 +155,8 @@ public:
                                std::span<const std::uint16_t> prompt_embeds,
                                std::span<const std::uint16_t> negative_embeds,
                                const ReferencePixels* reference, void* image_stream,
-                               const std::shared_ptr<ImageJobProgress>& progress) {
+                               const std::shared_ptr<ImageJobProgress>& progress,
+                               const EditConditioning* edit) {
         std::lock_guard lock(mutex_);
         ensure_locked();
 
@@ -206,6 +211,32 @@ public:
                                            static_cast<cudaStream_t>(image_stream));
             inputs.ref_latents = std::move(encoded.latents);
             inputs.ref_grids.emplace_back(encoded.height_lat, encoded.width_lat);
+        }
+
+        // The edit route: the reference must ALSO reach the DiT as text rows that have seen the picture.
+        // The vision tower and the conditioned 36-layer forward are the halves that need the yielded
+        // VRAM, so they run here -- inside the interlude, after the probe said the lane fits -- on the
+        // same artifact the job opened (shared_tower caches the tower, embedding table and vision bind
+        // by path). The VAE block above is what the route had before this existed, and on its own it
+        // returns the near pixel copy the M9 behavioral gate was written to catch: a reference the text
+        // conditioning never saw cannot be edited by an instruction.
+        if (edit != nullptr && edit->planes != nullptr && edit->prompt != nullptr) {
+            if (!vision_rows_ || !conditioned_) {
+                vision_rows_ = make_tower_vision_rows_provider(path_);
+                conditioned_ = make_tower_conditioned_embeds_provider(path_);
+            }
+            const qi::ConditionedVision vision = vision_rows_(edit->planes->vision);
+            const ConditionedPromptEmbeds embeds = conditioned_(*edit->prompt, vision);
+            inputs.prompt_embeds          = embeds.prompt_embeds;
+            inputs.prompt_image_pad_mask  = embeds.image_pad_mask;
+            if (edit->negative_prompt != nullptr) {
+                // Same reference, own text: the CFG joint differs only in the instruction rows, which is
+                // what the reference family trains.
+                const ConditionedPromptEmbeds negative = conditioned_(*edit->negative_prompt, vision);
+                inputs.negative_prompt_embeds         = negative.prompt_embeds;
+                inputs.negative_prompt_image_pad_mask = negative.image_pad_mask;
+                inputs.true_cfg_scale = static_cast<float>(request.true_cfg_scale);
+            }
         }
 
         const qi::GeneratedImage out = qi::run_image_job(
@@ -274,6 +305,11 @@ private:
     qi::DiTWeights dit_;
     qi::VaeWeights vae_;
     qi::VaeDenorm denorm_;
+    // The edit route's device halves, lazy-bound on the first job that carries a reference (they are
+    // only ever called inside an interlude). Both share one tower and one vision bind with the prompt
+    // providers of the same artifact path.
+    VisionRowsProvider vision_rows_;
+    ConditionedEmbedsProvider conditioned_;
     std::vector<ScheduleCache> schedules_;
 };
 
@@ -308,9 +344,10 @@ ImageJobExecutor make_artifact_image_job_executor(const std::string& image_artif
     return [executor](const OpenAIImagesRequest& request, std::uint64_t seed,
                       std::span<const std::uint16_t> prompt_embeds,
                       std::span<const std::uint16_t> negative_embeds, const ReferencePixels* reference,
-                      void* image_stream, const std::shared_ptr<ImageJobProgress>& progress) {
+                      void* image_stream, const std::shared_ptr<ImageJobProgress>& progress,
+                      const EditConditioning* edit) {
         return (*executor)(request, seed, prompt_embeds, negative_embeds, reference, image_stream,
-                           progress);
+                           progress, edit);
     };
 
 }
@@ -473,13 +510,15 @@ ImageGenerationService::ImageGenerationService(std::unique_ptr<ImageInterludeRun
                                                PromptEmbedsProvider prompt_embeds,
                                                DiTDimsProvider dit_dims,
                                                ImageJobExecutor job_executor,
-                                               VisionLaneDimsProvider vision_dims)
+                                               VisionLaneDimsProvider vision_dims,
+                                               ReferencePromptRendererProvider reference_prompt_renderer)
     : runner_(std::move(runner)),
       store_(store),
       prompt_renderer_(std::move(prompt_renderer)),
       prompt_embeds_(std::move(prompt_embeds)),
       dit_dims_(std::move(dit_dims)),
       vision_dims_(std::move(vision_dims)),
+      reference_prompt_renderer_(std::move(reference_prompt_renderer)),
       job_executor_(std::move(job_executor)) {}
 
 bool ImageGenerationService::is_configured() const noexcept {
@@ -568,13 +607,16 @@ RequestJson ImageGenerationService::generate(const OpenAIImagesRequest& request,
 
     // #75 reference image: base64/decode/resize is host work and fails fast as a 400 before any
     // VRAM is yielded. The device encode of the prepared plane runs inside the job.
-    std::optional<ReferencePixels> reference;
+    // Both planes of one decode and one resize: the raw-alpha VAE plane the encoder consumes and the
+    // white-composited copy the Qwen3-VL tower was trained on. They come from the same call so the two
+    // can never disagree about what picture is being edited.
+    std::optional<ReferencePlanes> planes;
     if (!request.image.empty()) {
         // The codec's own words never reach the wire: they name decoders, byte offsets and internal
         // limits, which is both a leak and noise to a client that only wants to know its picture was
         // bad. The CODE distinguishes the cases a caller can act on.
         try {
-            reference = prepare_reference_image(request.image);
+            planes = prepare_reference_planes(request.image);
         } catch (const md::Error& error) {
             throw ApiException{ApiError{400, "invalid_request_error",
                                         error.kind() == md::ErrorKind::BudgetExceeded
@@ -592,31 +634,28 @@ RequestJson ImageGenerationService::generate(const OpenAIImagesRequest& request,
         }
     }
 
-    // Admission, entirely before the LLM is touched. Rendering is host work, so the token counts the
-    // need is built from are the counts the job will run with; the probe then answers from the live
-    // pools without quiescing anything. A request that cannot fit gets its 503 here -- no stored job,
-    // no closed submit door, no other request waiting behind a job that could never run.
-    const TowerPrompt prompt = prompt_renderer_(request.prompt);
-    const TowerPrompt negative_prompt =
-        request.true_cfg_scale > kMinimumImageCFGScale ? prompt_renderer_(request.negative_prompt)
-                                                      : TowerPrompt{};
-    // The reference's latent tokens follow from the snapped plane prepare_reference_image produced:
-    // (height/16) * (width/16), the same count its VAE encode will return inside the job.
-    const std::size_t ref_tokens =
-        reference.has_value()
-            ? static_cast<std::size_t>(reference->height_px / qi::ImageGeometry::downscale()) *
-                  (static_cast<std::size_t>(reference->width_px) / qi::ImageGeometry::downscale())
-            : 0ULL;
-    // The reference's vision tokens are the <|image_pad|> rows the rendered prompt already carries, and
-    // each of them becomes four joint rows -- which ref_tokens is. Both numbers come from the same
-    // plane OUR prepare_reference_image snapped, so 4 * vision != ref means our own resize broke the
-    // x4 invariant the joint assembly asserts (models/qwen_image/joint_layout.cpp:41-47). That is our
-    // bug, not the client's: a 500 of our own making, raised host-side, before a single byte is yielded.
+    // Admission, entirely before the LLM is touched. The reference's geometry comes first because the
+    // prompt the admission sizes on is the one that carries the reference: the ti2i template with every
+    // <|image_pad|> expanded into the vision rows, which is host work (tokenizer only) and therefore
+    // runs here too. The probe then answers from the live pools without quiescing anything. A request
+    // that cannot fit gets its 503 here -- no stored job, no closed submit door, no other request
+    // waiting behind a job that could never run.
+    //
+    // The reference's latent tokens follow from the snapped plane prepare_reference_planes produced:
+    // (height/16) * (width/16), the same count its VAE encode will return inside the job. Its vision
+    // tokens are the <|image_pad|> rows the rendered prompt carries, and each of them becomes four of
+    // those latent rows -- so 4 * vision != ref means OUR resize broke the x4 invariant the joint
+    // assembly asserts (models/qwen_image/joint_layout.cpp:41-47). That is our bug, not the client's:
+    // a 500 of our own making, raised host-side, before a single byte is yielded.
+    std::size_t ref_tokens    = 0;
     std::size_t vision_tokens = 0;
     qi::VisionLaneDims vision{};
-    if (reference.has_value()) {
+    if (planes.has_value()) {
+        ref_tokens =
+            static_cast<std::size_t>(planes->vae.height_px / qi::ImageGeometry::downscale()) *
+            (static_cast<std::size_t>(planes->vae.width_px) / qi::ImageGeometry::downscale());
         vision_tokens = static_cast<std::size_t>(
-            vision_token_count(reference->height_px, reference->width_px));
+            vision_token_count(planes->vae.height_px, planes->vae.width_px));
         if (4ULL * vision_tokens != ref_tokens) {
             throw ApiException{ApiError{500, "server_error",
                                         "the prepared reference disagrees with itself: 4 * " +
@@ -624,17 +663,32 @@ RequestJson ImageGenerationService::generate(const OpenAIImagesRequest& request,
                                             std::to_string(ref_tokens) + " latent tokens",
                                         "image", "image_conditioning_inconsistent"}};
         }
-        // No readable vision component == no way to size the encode the job will run. Refusing here
-        // is the whole point of the ledger: an admission that guesses under-reserves and OOMs the
-        // resident LLM, which outranks serving this request at all.
+        // Two things an edit cannot be served without, both refused for the same reason the ledger
+        // refuses a guess: the render is the only prompt whose token count is the one the job will run,
+        // and a lane whose shape the artifact cannot name is a lane that cannot be reserved -- an
+        // under-reserved yield OOMs the resident LLM, which outranks serving this request at all.
         if (!vision_dims_) {
             throw ApiException{ApiError{503, "server_error",
                                         "the image artifact carries no readable vision component, so a "
                                         "request with a reference cannot be sized",
                                         "image_artifact", "image_generation_not_configured"}};
         }
+        if (!reference_prompt_renderer_) {
+            throw ApiException{ApiError{503, "server_error",
+                                        "no image text processor is configured, so the reference "
+                                        "prompt cannot be rendered",
+                                        "image_text_processor", "image_generation_not_configured"}};
+        }
         vision = vision_dims_();
     }
+    const auto render = [&](const std::string& text) {
+        return planes.has_value() ? reference_prompt_renderer_(text, {vision_tokens})
+                                  : prompt_renderer_(text);
+    };
+    const TowerPrompt prompt = render(request.prompt);
+    const TowerPrompt negative_prompt =
+        request.true_cfg_scale > kMinimumImageCFGScale ? render(request.negative_prompt)
+                                                      : TowerPrompt{};
     const std::uint64_t need =
         image_need_bytes(request.width, request.height, prompt.tokens(), negative_prompt.tokens(),
                          ref_tokens, dit_dims_(), vision_tokens, vision);
@@ -687,15 +741,26 @@ RequestJson ImageGenerationService::generate(const OpenAIImagesRequest& request,
                              seed = (static_cast<std::uint64_t>(random()) << 32U) | random();
                          }
                          // Both prompts were already rendered (host work, before the probe); only the
-                         // tower forward -- the half that needs device memory -- runs here.
+                         // tower forward -- the half that needs device memory -- runs here. With a
+                         // reference that forward is the CONDITIONED one and the executor runs it inside
+                         // the yield (it owns the artifact's vision and text towers), so no plain embeds
+                         // are computed: a forward over rows that never saw the picture is not merely
+                         // wasted work, it is the copy this route used to return.
+                         const bool edit_route = planes.has_value();
+                         const std::vector<std::uint16_t> positive =
+                             edit_route ? std::vector<std::uint16_t>{} : prompt_embeds_(prompt);
                          const std::vector<std::uint16_t> negative =
-                             request.true_cfg_scale > kMinimumImageCFGScale
-                                 ? prompt_embeds_(negative_prompt)
-                                 : std::vector<std::uint16_t>{};
+                             edit_route || request.true_cfg_scale <= kMinimumImageCFGScale
+                                 ? std::vector<std::uint16_t>{}
+                                 : prompt_embeds_(negative_prompt);
+                         const EditConditioning edit{
+                             edit_route ? &*planes : nullptr, edit_route ? &prompt : nullptr,
+                             (edit_route && request.true_cfg_scale > kMinimumImageCFGScale)
+                                 ? &negative_prompt : nullptr};
                          finished = job_executor_(
-                             request, seed, prompt_embeds_(prompt), negative,
-                             reference.has_value() ? &*reference : nullptr, context.image_stream,
-                             record.progress);
+                             request, seed, positive, negative,
+                             edit_route ? &planes->vae : nullptr, context.image_stream,
+                             record.progress, edit_route ? &edit : nullptr);
                          store_.advance(record.id, JobUpdate{.to = ImageJobState::Restoring, .now = now});
                          return true;
                      });

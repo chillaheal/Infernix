@@ -88,24 +88,17 @@ struct VisionPatchGeometry {
 // The edit route's prompt half: the RAW ti2i template for tokens_per_image.size() references,
 // encoded with the genuine tokenizer and every pad expanded. drop_rows is the t2i route's: the pads
 // sit after the dropped system line, so the prefix length does not move.
-using ReferencePromptRendererProvider =
-    std::function<TowerPrompt(const std::string& prompt, const std::vector<std::uint64_t>& tokens_per_image)>;
+// `ReferencePromptRendererProvider` is declared in serve/image_generation_service.h: the admission
+// renders the ti2i prompt (and needs its token count) before it asks whether the job fits, so the
+// type belongs to the route, as TowerPrompt's does.
 [[nodiscard]] ReferencePromptRendererProvider
 make_tower_reference_prompt_renderer(const std::string& processor_dir);
 
 // The edit route's device halves, counterpart to make_tower_prompt_embeds_provider. Both lazy-bind
 // and share one reader, tower, embedding table and vision bind with the t2i provider for the same
-// artifact path; both must run inside the interlude.
-struct ConditionedPromptEmbeds {
-    std::vector<std::uint16_t> prompt_embeds; // [(S - drop_rows) * hidden] BF16 bits, pre-final-norm
-    std::vector<std::uint8_t> image_pad_mask; // [S - drop_rows], 1 on the rows that carry the picture
-};
-using VisionRowsProvider =
-    std::function<models::qwen_image::ConditionedVision(const ReferenceVisionPlane& plane)>;
-using ConditionedEmbedsProvider =
-    std::function<ConditionedPromptEmbeds(const TowerPrompt& rendered,
-                                          const models::qwen_image::ConditionedVision& vision)>;
-
+// artifact path; both must run inside the interlude. `ConditionedPromptEmbeds`, `VisionRowsProvider`
+// and `ConditionedEmbedsProvider` are declared in serve/image_generation_service.h for the same
+// reason as the renderer above.
 [[nodiscard]] VisionRowsProvider make_tower_vision_rows_provider(const std::string& image_artifact_path);
 [[nodiscard]] ConditionedEmbedsProvider
 make_tower_conditioned_embeds_provider(const std::string& image_artifact_path);
