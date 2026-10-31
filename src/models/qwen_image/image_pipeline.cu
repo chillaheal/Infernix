@@ -16,6 +16,7 @@
 #include "models/qwen_image/dit_block.h"
 #include "models/qwen_image/image_device_need.h"
 #include "models/qwen_image/image_device_util.h"
+#include "models/qwen_image/joint_layout.h"
 #include "models/qwen_image/rope.h"
 
 #include <cuda_runtime.h>
@@ -53,6 +54,26 @@ __global__ void transpose_u16_kernel(const std::uint16_t* __restrict__ in, std::
     if (i >= rows * cols) return;
     const int r = i / cols, c = i % cols;
     out[c * rows + r] = in[r * cols + c];
+}
+
+// M6 edit route: the joint hidden is SCATTERED, not concatenated. The reference's image tokens land on
+// the expanded <|image_pad|> slots INSIDE the text sequence (transformer_qwenimage21.py:860-865,
+// joint_hidden_states[:, image_pad_mask] = hidden_states), so position s takes either the next packed
+// img_in row (scatter_row[s] >= 0) or the next txt_in row (text_index[s]) -- the two source rows are
+// whole D-vectors, so one block copies one position and a row is never split across blocks. Every one
+// of the expanded positions is written, which is what lets the assembly skip a pre-zeroing pass: an
+// unwritten row reaching the block chain would be uninitialised device memory.
+__global__ __launch_bounds__(256) void joint_scatter_u16_kernel(
+    const std::uint16_t* __restrict__ img, const std::uint16_t* __restrict__ txt,
+    const int* __restrict__ scatter_row, const int* __restrict__ text_index,
+    std::uint16_t* __restrict__ joint, int dim) {
+    const int s = blockIdx.x;
+    const int row = scatter_row[s];
+    const std::uint16_t* __restrict__ src =
+        row >= 0 ? img + static_cast<std::size_t>(row) * dim
+                 : txt + static_cast<std::size_t>(text_index[s]) * dim;
+    std::uint16_t* __restrict__ dst = joint + static_cast<std::size_t>(s) * dim;
+    for (int d = threadIdx.x; d < dim; d += blockDim.x) dst[d] = src[d];
 }
 
 
@@ -423,7 +444,7 @@ GeneratedImage run_image_job(artifact::Reader& reader, const DiTWeights& dit, co
         throw std::runtime_error("image job: job inputs do not match the model dims or geometry");
     }
     const std::size_t all_img = ref_tokens + img_tokens; // the img_in/latent extent: [ref, target]
-    const std::size_t S = tp + all_img;
+    std::size_t S = 0; // the conditional pass's joint token count: the route below fixes its meaning
     const int Di = static_cast<int>(D), Hi = static_cast<int>(heads);
     const int Mi = static_cast<int>(mlp0), tp_i = static_cast<int>(tp);
     // True CFG adds a second pass with a DIFFERENT text length, so every sequence-sized buffer is sized
@@ -433,7 +454,83 @@ GeneratedImage run_image_job(artifact::Reader& reader, const DiTWeights& dit, co
     if (use_cfg && (tp_neg == 0 || inputs.negative_prompt_embeds.size() != tp_neg * D)) {
         throw std::runtime_error("image job: true CFG needs whole negative prompt embeds");
     }
-    const std::size_t S_neg  = tp_neg + all_img;
+    // M6 edit route: with a reference plane the joint sequence is NOT [text][ref][target] -- the
+    // reference tokens land on the expanded <|image_pad|> slots INSIDE the text sequence, so every
+    // length the text-to-image route reads off tp + all_img comes from build_joint_layout instead. The
+    // layout is host-only and built before any device work, so its x4 invariant (4 * image slots == the
+    // sum of the img_shapes blocks) fails the request here, on the host, rather than after the VRAM
+    // yield, which is what the reference's own build_token_metadata raises for.
+    JointLayout layout, layout_neg;
+    bool        edit_route = false;  // ref_grids set: the interleaved sequence, mask-driven blocks
+    bool        neg_edit   = false;  // ...and the negative pass carries a layout of its own
+    // The mask build_joint_layout wants is the pipeline's own img_mask row: the VLM's mask over the
+    // kept prompt rows plus one slot per 2x2 group of target latents (pipeline_qwenimage21.py
+    // append_target_slots:749-757), which the x4 expansion turns into the target's full tokens.
+    const auto joint_mask = [&](const std::vector<std::uint8_t>& vlm_mask, std::size_t rows,
+                                const char* which) {
+        if (vlm_mask.size() != rows) {
+            throw std::invalid_argument(std::string("image job: the ") + which +
+                                        " image pad mask has " + std::to_string(vlm_mask.size()) +
+                                        " rows but that prompt kept " + std::to_string(rows) + " rows");
+        }
+        if (img_tokens % 4 != 0) {
+            throw std::invalid_argument("image job: the target grid carries " + std::to_string(img_tokens) +
+                                        " tokens, not a whole number of 2x2 image pad slots");
+        }
+        std::vector<std::uint8_t> mask = vlm_mask;
+        mask.insert(mask.end(), img_tokens / 4, 1U);
+        return mask;
+    };
+    // img_shapes names every block in sequence order: one entry per reference (the grid its encoder
+    // returned) with the sampled target LAST -- the transformer takes the last block as the target and
+    // the packed img_in input is concatenated in exactly that order.
+    const auto joint_shapes = [&]() {
+        std::vector<ImageShape> shapes;
+        shapes.reserve(inputs.ref_grids.size() + 1);
+        for (const auto& g : inputs.ref_grids) {
+            shapes.push_back(ImageShape{1, static_cast<long long>(g.first), static_cast<long long>(g.second)});
+        }
+        shapes.push_back(ImageShape{1, static_cast<long long>(Hl), static_cast<long long>(Wl)});
+        return shapes;
+    };
+    std::size_t S_neg = 0;
+    if (inputs.ref_grids.empty()) {
+        S     = tp + all_img;
+        S_neg = tp_neg + all_img;
+    } else {
+        edit_route = true;
+        const std::vector<ImageShape> shapes    = joint_shapes();
+        const std::vector<std::uint8_t> mask    = joint_mask(inputs.prompt_image_pad_mask, tp, "prompt");
+        layout   = build_joint_layout(mask, shapes);
+        neg_edit = use_cfg;
+        // The negative pass is the same references with its OWN prompt rows, so it carries its own mask:
+        // a CFG run without one cannot be assembled (its image slots and its text rows are both unknown),
+        // and defaulting it to "no reference" would quietly drop the reference block from that pass.
+        if (neg_edit) {
+            const std::vector<std::uint8_t> mask_neg =
+                joint_mask(inputs.negative_prompt_image_pad_mask, tp_neg, "negative prompt");
+            layout_neg = build_joint_layout(mask_neg, shapes);
+        }
+        // What the job already summed from its own inputs and what the layout derived from the mask
+        // have to be the same numbers: they disagree only when the reference plane and the prompt were
+        // assembled from different geometries, and the sequence would carry the wrong rows in silence.
+        if (static_cast<std::size_t>(layout.ref_tokens) != ref_tokens) {
+            throw std::invalid_argument("image job: the joint layout counts " + std::to_string(layout.ref_tokens) +
+                                        " reference tokens but ref_grids sum to " + std::to_string(ref_tokens));
+        }
+        if (static_cast<std::size_t>(layout.target_tokens) != img_tokens) {
+            throw std::invalid_argument("image job: the joint layout's target block is " +
+                                        std::to_string(layout.target_tokens) + " tokens but the sampled grid is " +
+                                        std::to_string(img_tokens));
+        }
+        if (layout.expanded_len < static_cast<long long>(img_tokens)) {
+            throw std::invalid_argument("image job: the joint layout expanded to " +
+                                        std::to_string(layout.expanded_len) + " positions, fewer than the target's " +
+                                        std::to_string(img_tokens) + " tokens");
+        }
+        S     = static_cast<std::size_t>(layout.expanded_len);
+        S_neg = neg_edit ? static_cast<std::size_t>(layout_neg.expanded_len) : 0;
+    }
     const std::size_t tp_max = use_cfg && tp_neg > tp ? tp_neg : tp;
     const std::size_t s_max  = use_cfg && S_neg > S ? S_neg : S;
     const std::size_t sD = s_max * D, sMlp = s_max * mlp0;
@@ -512,15 +609,33 @@ GeneratedImage run_image_job(artifact::Reader& reader, const DiTWeights& dit, co
     }
     std::vector<std::pair<int, int>> ref_grids_i;
     for (const auto& g : inputs.ref_grids) ref_grids_i.emplace_back(static_cast<int>(g.first), static_cast<int>(g.second));
-    const std::vector<float> rot = build_joint_rope_blocks(tp_i, ref_grids_i, static_cast<int>(Hl), static_cast<int>(Wl));
-    if (rot.size() != S * 64 * 2) { throw std::runtime_error("image job: rope table size differs from S"); }
-    {
+    // The joint rope table. The text-to-image route asks the host rope module for it; the edit route
+    // already holds the [expanded_len,64,2] (cos,sin)-interleaved table that build_joint_layout walked
+    // with rope.{h,cpp}'s own emitter -- the very layout ops::rope_c64 uploads -- so it hands that
+    // straight over and adds no rope walk of its own.
+    if (edit_route) {
+        if (layout.rope.size() != static_cast<std::size_t>(layout.expanded_len) * 64 * 2) {
+            throw std::runtime_error("image job: edit rope table size differs from the expanded sequence");
+        }
+        const auto bits = bits_of(layout.rope);
+        drot.alloc(bits.size() * 2);
+        h2d(drot.d, bits.data(), bits.size() * 2);
+    } else {
+        const std::vector<float> rot = build_joint_rope_blocks(tp_i, ref_grids_i, static_cast<int>(Hl), static_cast<int>(Wl));
+        if (rot.size() != S * 64 * 2) { throw std::runtime_error("image job: rope table size differs from S"); }
         const auto bits = bits_of(rot);
         drot.alloc(bits.size() * 2);
         h2d(drot.d, bits.data(), bits.size() * 2);
     }
     Buf drot_neg;
-    if (use_cfg) {
+    if (neg_edit) {
+        if (layout_neg.rope.size() != static_cast<std::size_t>(layout_neg.expanded_len) * 64 * 2) {
+            throw std::runtime_error("image job: negative edit rope table size differs from the sequence");
+        }
+        const auto bits = bits_of(layout_neg.rope);
+        drot_neg.alloc(bits.size() * 2);
+        h2d(drot_neg.d, bits.data(), bits.size() * 2);
+    } else if (use_cfg) {
         const std::vector<float> rot_neg =
             build_joint_rope_blocks(static_cast<int>(tp_neg), ref_grids_i, static_cast<int>(Hl),
                                     static_cast<int>(Wl));
@@ -530,6 +645,62 @@ GeneratedImage run_image_job(artifact::Reader& reader, const DiTWeights& dit, co
         const auto bits = bits_of(rot_neg);
         drot_neg.alloc(bits.size() * 2);
         h2d(drot_neg.d, bits.data(), bits.size() * 2);
+    }
+
+    // The edit route's per-token layout arrays, uploaded ONCE (the sequence's structure is identical on
+    // every step, so the loop must never reach into host memory for an index again). target_token_mask
+    // and image_block_ids are the device U8 / I32 [S,1,1,1] arrays run_block reads for its modulation
+    // rows and its block-causal mask, and target_token_mask is the same array the final masked norm_out
+    // selects its modulation row with; scatter_row and text_index are joint_scatter_u16_kernel's two
+    // source selectors. text_index is built here, not in the layout module, because it is this job's
+    // addressing question: the reference builds the joint by repeat_interleave of [ALL VLM rows |
+    // zeros] (transformer_qwenimage21.py:915-923), so the s-th non-image joint position holds the
+    // s-th non-image VLM row AT ITS OWN VLM INDEX, not a running count -- when the pads sit inside
+    // the VLM sequence, a running count points at pad rows and the trailer text becomes pad-token
+    // embeddings (the M6 velocity's blackout #19 defect).
+    Buf d_target_mask, d_image_ids, d_scatter_row, d_text_index;
+    Buf d_target_mask_neg, d_image_ids_neg, d_scatter_row_neg, d_text_index_neg;
+    const auto upload_layout = [&](const JointLayout& ly, Buf& target_mask, Buf& image_ids, Buf& scatter,
+                                   Buf& text_idx) {
+        const std::size_t n = static_cast<std::size_t>(ly.expanded_len);
+        if (ly.expanded_image_pad_mask.size() != n || ly.scatter_row.size() != n ||
+            ly.target_token_mask.size() != n || ly.image_block_ids.size() != n) {
+            throw std::runtime_error("image job: the joint layout's arrays disagree with its length");
+        }
+        std::vector<std::int32_t> rows(n), ids(n), tix(n, -1);
+        // Walk the BASE mask through its repeats: a text base row b occupies the next expanded
+        // position and holds d_txt row b (its own VLM index); an image slot expands to four
+        // positions and consumes no txt_in row.
+        long long text_rows = 0;
+        std::size_t ep = 0;
+        for (std::size_t b = 0; b < ly.repeats.size(); ++b) {
+            const int rep = ly.repeats[b];
+            if (rep == 1) { tix[ep] = static_cast<std::int32_t>(b); ++text_rows; }
+            ep += static_cast<std::size_t>(rep);
+        }
+        if (ep != n) {
+            throw std::runtime_error("image job: the joint layout's repeats do not sum to its length");
+        }
+        // The same count the layout derived: if the two disagree, the kernel would read txt_in rows that
+        // were never written (or skip written ones), which is exactly the quiet wrongness to avoid.
+        if (text_rows != ly.text_tokens) {
+            throw std::runtime_error("image job: the joint layout's text rows differ from its mask");
+        }
+        for (std::size_t s = 0; s < n; ++s) {
+            rows[s] = static_cast<std::int32_t>(ly.scatter_row[s]);
+            ids[s]  = static_cast<std::int32_t>(ly.image_block_ids[s]);
+        }
+        target_mask.alloc(n);        h2d(target_mask.d, ly.target_token_mask.data(), n);
+        image_ids.alloc(n * 4);      h2d(image_ids.d, ids.data(), n * 4);
+        scatter.alloc(n * 4);        h2d(scatter.d, rows.data(), n * 4);
+        text_idx.alloc(n * 4);       h2d(text_idx.d, tix.data(), n * 4);
+    };
+    if (edit_route) {
+        upload_layout(layout, d_target_mask, d_image_ids, d_scatter_row, d_text_index);
+        if (neg_edit) {
+            upload_layout(layout_neg, d_target_mask_neg, d_image_ids_neg, d_scatter_row_neg,
+                          d_text_index_neg);
+        }
     }
 
     // Toplevel/front-end weights: resident for the whole loop.
@@ -612,23 +783,104 @@ GeneratedImage run_image_job(artifact::Reader& reader, const DiTWeights& dit, co
     // The AdaLN output modulation depends only on t, so both CFG passes share it.
     Tensor nlin_v = view(d_nlin.d, Di, 2);
 
+    // The edit route's per-pass device arrays. Every member is null on the text-to-image route (its
+    // Bufs were never allocated), and null is what keeps run_block and the final modulation on the
+    // prefix forms the certified assembly has always used.
+    struct EditArrays {
+        void* target_mask = nullptr;  // device U8  [S,1,1,1], 1 on the target block only
+        void* image_ids   = nullptr;  // device I32 [S,1,1,1], the img_shapes block of that position
+        void* scatter_row = nullptr;  // device I32 [S], packed img_in row, -1 on a text position
+        void* text_index  = nullptr;  // device I32 [S], txt_in row on a text position
+    };
+    const EditArrays edit_pos{d_target_mask.d, d_image_ids.d, d_scatter_row.d, d_text_index.d};
+    const EditArrays edit_neg{d_target_mask_neg.d, d_image_ids_neg.d, d_scatter_row_neg.d,
+                              d_text_index_neg.d};
+
+    // ---- INFERNIX_IMAGE_TRACE_DIR: the edit route's one-off diagnostic trace -------------------
+    // Blackout #21 measured the edit step's velocity as wrong by ~0.69 on EVERY target row. A uniform
+    // error of that size is a SHARED input every target row reads -- the modulation source (temb and the
+    // two rows causal_condition splits between), the assembled joint as block 0 receives it, or the block
+    // chain -- and all four are internal to dit_velocity below, so the test that has to name the culprit
+    // asks for them. When the variable names a directory, the FIRST DiT call of the job writes raw
+    // float32 files (temb.f32, nlin.f32, mod.f32, joint_in.f32, block_<l>.f32) in the token-major
+    // [rows, C] order the tensors already sit in, which is the order the torch dump's hooks produce.
+    // Unset -- the only setting a serving process ever has -- the two pointers below stay null and every
+    // dump branch is a single null test outside the compute; the certified routes are untouched.
+    const char* trace_dir = std::getenv("INFERNIX_IMAGE_TRACE_DIR");
+    if (trace_dir != nullptr && *trace_dir == '\0') { trace_dir = nullptr; }
+    bool traced = false;
+    auto trace_write = [&](const std::string& name, const std::uint16_t* bits, std::size_t n) {
+        std::vector<float> f(n);
+        for (std::size_t i = 0; i < n; ++i) {
+            const std::uint32_t u = static_cast<std::uint32_t>(bits[i]) << 16;  // BF16 -> FP32 bits
+            float v;
+            std::memcpy(&v, &u, sizeof(v));
+            f[i] = v;
+        }
+        const std::string path = std::string(trace_dir) + "\\" + name;
+        std::FILE* h = std::fopen(path.c_str(), "wb");
+        if (h == nullptr) { throw std::runtime_error("trace: cannot open " + path); }
+        const std::size_t written = std::fwrite(f.data(), sizeof(float), n, h);
+        std::fclose(h);
+        if (written != n) { throw std::runtime_error("trace: short write of " + path); }
+    };
+
     // ONE DiT forward: img_in over the [ref+target] latent, the joint [text + image] sequence, the
     // 32-block chain, norm_out + proj_out, then the target tokens' velocity to the host. The text
     // front-end, rope table and extents are parameters because true CFG runs this twice per step with
-    // different text (the reference pipeline builds a separate negative rope the same way).
-    const auto dit_velocity = [&](void* d_txt_p, void* d_rot_p, int tp_p, std::size_t S_p) -> T {
+    // different text (the reference pipeline builds a separate negative rope the same way). `ed` is that
+    // pass's layout: the negative pass of an edit carries the same references and its own prompt rows,
+    // so it needs its own mask, ids and scatter rows exactly as it needs its own rope table.
+    const auto dit_velocity = [&](void* d_txt_p, void* d_rot_p, int tp_p, std::size_t S_p,
+                                  const EditArrays& ed) -> T {
+        const bool do_trace = trace_dir != nullptr && !traced;   // declared here: the latent trace below
+                                                                   // is taken before the blocks run
         Tensor hs_img_v = view(d_hs_img.d, Di, static_cast<int>(all_img));
         ops::linear(view(d_lat.d, static_cast<int>(Cin), static_cast<int>(all_img)), Wimg.w, hs_img_v,
                     stream);
+        if (do_trace) {
+            // The packed img_in input and its output, BOTH halves. The gate that existed only ever looked
+            // at the reference half, so blackout #23's uncorrelated target rows (1.42, the distance two
+            // independent tensors sit at) could not say which of the three stages lost them: the upload
+            // of init_latent into d_lat, the GEMM's rows, or the scatter's indices. The synchronous null
+            // stream copy is ordered after the GEMM on the blocking image stream, exactly as the joint
+            // copy below is.
+            std::vector<std::uint16_t> hlat(static_cast<std::size_t>(all_img) * Cin);
+            cuda_ok(cudaMemcpy(hlat.data(), d_lat.d, hlat.size() * 2, cudaMemcpyDeviceToHost),
+                    "trace packed latent");
+            trace_write("latent_packed.f32", hlat.data(), hlat.size());
+            std::vector<std::uint16_t> himg(static_cast<std::size_t>(all_img) * Di);
+            cuda_ok(cudaMemcpy(himg.data(), d_hs_img.d, himg.size() * 2, cudaMemcpyDeviceToHost),
+                    "trace img_in");
+            trace_write("hs_img.f32", himg.data(), himg.size());
+        }
 
-        // assemble the joint [text + image(all_img)] token-major buffer (txt_in is stable in
-        // d_txt_p; only hs_img changes per step).
-        {
+        // assemble the joint token-major buffer (txt_in is stable in d_txt_p; only hs_img changes per
+        // step). Text-to-image is the plain [text + image(all_img)] concatenation; the edit route
+        // SCATTERS the same two row sets onto the expanded sequence, because its reference tokens belong
+        // on the <|image_pad|> slots inside the text rather than behind it. The kernel writes every one
+        // of the S_p positions, so no row of d_joint reaches the blocks uninitialised.
+        if (ed.scatter_row != nullptr) {
+            joint_scatter_u16_kernel<<<static_cast<unsigned>(S_p), 256, 0, stream>>>(
+                static_cast<const std::uint16_t*>(d_hs_img.d),
+                static_cast<const std::uint16_t*>(d_txt_p), static_cast<const int*>(ed.scatter_row),
+                static_cast<const int*>(ed.text_index), static_cast<std::uint16_t*>(d_joint.d), Di);
+            cuda_ok(cudaGetLastError(), "joint scatter");
+        } else {
             const std::size_t tpB = static_cast<std::size_t>(tp_p) * D * 2, imgB = all_img * D * 2;
             cuda_ok(cudaMemcpy(d_joint.d, d_txt_p, tpB, cudaMemcpyDeviceToDevice), "joint memcpy txt");
             cuda_ok(cudaMemcpy(static_cast<char*>(d_joint.d) + tpB, d_hs_img.d, imgB,
                                cudaMemcpyDeviceToDevice),
                     "joint memcpy img");
+        }
+
+        // Taken before the first block overwrites the ping-pong buffers: the joint exactly as block 0
+        // receives it (txt_in rows, scattered img_in rows) -- the torch dump hooks the same boundary.
+        std::vector<std::uint16_t> host_joint;
+        if (do_trace) {
+            host_joint.resize(S_p * static_cast<std::size_t>(Di));
+            cuda_ok(cudaMemcpy(host_joint.data(), d_joint.d, host_joint.size() * 2,
+                               cudaMemcpyDeviceToHost), "trace joint");
         }
 
         // 32-block chain: d_joint in, ping-pong with d_hb; after an even block count the result is
@@ -676,10 +928,29 @@ GeneratedImage run_image_job(artifact::Reader& reader, const DiTWeights& dit, co
             // The head-norm operands are BF16 Contiguous objects; their device address is the slot
             // base plus that role's offset (Weight::qdata is const, and run_block takes void*).
             auto* slot_base = static_cast<char*>(lane.slot_p[p]);
+            // The two trailing arrays are the edit route's layout (see dit_block.h): with them the block
+            // takes its modulation row from the target mask and its attention mask from the image block
+            // ids instead of one prefix boundary, which is what lets the reference rows behave like the
+            // text (t = 0 modulation, strictly causal to the target) while each image block stays
+            // internally bidirectional. On the text-to-image route both are null -- the values run_block
+            // defaults them to -- so that route's blocks are the certified ones.
             run_block(hin, hout, W[0], W[1], W[2], W[3], W[5], W[4], W[6],
                       slot_base + block_plan.offset[7], slot_base + block_plan.offset[8],
-                      d_mod.d, d_rot_p, d_ones.d, d_zeros.d, ws, Si_p, Di, Hi, Mi, tp_p, eps, stream);
+                      d_mod.d, d_rot_p, d_ones.d, d_zeros.d, ws, Si_p, Di, Hi, Mi, tp_p, eps, stream,
+                      ed.target_mask, ed.image_ids);
             cuda_ok(cudaEventRecord(lane.freed[p], stream), "slot freed record");
+            if (do_trace && (l == 0 || l == 1 || l == 2 || l == 4 || l == 8 || l == 16 || l == 24 ||
+                             l + 1 == NB)) {
+                std::vector<std::uint16_t> hb(host_joint.size());
+                cuda_ok(cudaMemcpy(hb.data(), hout, hb.size() * 2, cudaMemcpyDeviceToHost),
+                        "trace block");
+                // Two digits, the same names the torch dump uses (block_00_joint_f32.npy): blackout #23
+                // wrote block_0.f32 while the test opened block_00.f32, so five of the eight taps were
+                // silently never compared.
+                trace_write("block_" + (l < 10 ? std::string("0") : std::string()) +
+                                std::to_string(l) + ".f32",
+                            hb.data(), hb.size());
+            }
             ++upload_blocks;
             std::swap(hin, hout);
         }
@@ -689,14 +960,51 @@ GeneratedImage run_image_job(artifact::Reader& reader, const DiTWeights& dit, co
         Tensor hfinal_v = view(h_final, Di, Si_p), ln_v = view(d_ln.d, Di, Si_p);
         ops::layer_norm(hfinal_v, view(d_ones.d, Di, 1), view(d_zeros.d, Di, 1), eps, ln_v, stream);
         Tensor norm_out_v = view(d_norm_out.d, Di, Si_p);
-        ops::adaln_scale(ln_v, nlin_v, 0, tp_p, norm_out_v, stream);
+        if (ed.target_mask != nullptr) {
+            // The same target mask the blocks modulated with: the reference's final norm is
+            // norm_out(joint_hidden_states, temb, modulation_mask) with that mask, so the non-target
+            // rows -- text AND the reference image -- read the t = 0 row of the [D,2] table while only
+            // the target block reads the sampled one. Its non-target set is not a prefix, which is
+            // exactly why the prefix form below cannot express it.
+            ops::adaln_scale_masked(ln_v, nlin_v, 0, Tensor(ed.target_mask, DType::U8, {Si_p, 1, 1, 1}),
+                                    norm_out_v, stream);
+        } else {
+            ops::adaln_scale(ln_v, nlin_v, 0, tp_p, norm_out_v, stream);
+        }
         Tensor sample_v = view(d_sample.d, static_cast<int>(Cin), Si_p);
         ops::linear(norm_out_v, Wproj.w, sample_v, stream);
         cuda_ok(cudaStreamSynchronize(stream), "DiT step did not complete");
 
+        if (do_trace) {
+            // The step is synchronized, so these reads see finished work. Row order is the token-major
+            // order the buffers already hold: temb/nlin carry the sampled row then the t=0 row, mod the
+            // same two rows of the shared 4D modulation, joint_in the S assembled positions.
+            traced = true;
+            std::vector<std::uint16_t> h2(s2);
+            cuda_ok(cudaMemcpy(h2.data(), d_temb.d, s2 * 2, cudaMemcpyDeviceToHost), "trace temb");
+            trace_write("temb.f32", h2.data(), s2);
+            cuda_ok(cudaMemcpy(h2.data(), d_nlin.d, s2 * 2, cudaMemcpyDeviceToHost), "trace nlin");
+            trace_write("nlin.f32", h2.data(), s2);
+            const std::size_t nmod = 4 * s2;
+            std::vector<std::uint16_t> hm(nmod);
+            cuda_ok(cudaMemcpy(hm.data(), d_mod.d, nmod * 2, cudaMemcpyDeviceToHost), "trace mod");
+            trace_write("mod.f32", hm.data(), nmod);
+            trace_write("joint_in.f32", host_joint.data(), host_joint.size());
+            // the velocity head's input: layer_norm + masked adaln_scale, before proj_out
+            std::vector<std::uint16_t> hnoss(S_p * static_cast<std::size_t>(Di));
+            cuda_ok(cudaMemcpy(hnoss.data(), d_norm_out.d, hnoss.size() * 2, cudaMemcpyDeviceToHost),
+                    "trace norm_out");
+            trace_write("norm_out.f32", hnoss.data(), hnoss.size());
+        }
+
         // noise_pred = the target image tokens (last img_tokens) of the [S,Cin] velocity, token-major:
         // the reference block's velocity exists in the [S,Cin] output but is discarded (it is constant).
-        const std::size_t noise_off = (static_cast<std::size_t>(tp_p) + ref_tokens) * Cin * 2;
+        // The edit route's target really is the LAST img_tokens positions of the joint sequence (the
+        // pipeline slices noise_pred[:, -latents.size(1):]), while the concatenated route addresses it
+        // behind the text prefix and the reference block.
+        const std::size_t noise_off =
+            (ed.scatter_row != nullptr ? S_p - img_tokens : static_cast<std::size_t>(tp_p) + ref_tokens) *
+            Cin * 2;
         std::vector<std::uint16_t> noise_bits(img_tokens * Cin);
         cuda_ok(cudaMemcpy(noise_bits.data(), static_cast<char*>(d_sample.d) + noise_off,
                            noise_bits.size() * 2, cudaMemcpyDeviceToHost), "velocity D2H");
@@ -725,10 +1033,10 @@ GeneratedImage run_image_job(artifact::Reader& reader, const DiTWeights& dit, co
         ops::linear(temb_silu_v, Wmod.w, mod_v, stream);
         ops::linear(temb_silu_v, Wnolin.w, nlin_v, stream);
 
-        T noise_f = dit_velocity(d_txt.d, drot.d, tp_i, S);
+        T noise_f = dit_velocity(d_txt.d, drot.d, tp_i, S, edit_pos);
         if (use_cfg) {
-            const T noise_neg =
-                dit_velocity(d_txt_neg.d, drot_neg.d, static_cast<int>(tp_neg), S_neg);
+            const T noise_neg = dit_velocity(d_txt_neg.d, drot_neg.d, static_cast<int>(tp_neg), S_neg,
+                                             neg_edit ? edit_neg : EditArrays{});
             // neg + scale * (cond - neg), as the reference's true_cfg branch. Its model_output is
             // BF16, so the steered velocity is rounded to BF16 here instead of carried in float.
             T steered(noise_f.size());

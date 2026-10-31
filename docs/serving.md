@@ -1112,13 +1112,13 @@ server starts with both `--image-artifact` and `--image-text-processor`; without
 its working VRAM to the image lane, one DiT-plus-VAE job runs on its own CUDA stream, and the model's VRAM
 is restored afterward, so chat traffic resumes unchanged. Only one image job runs at a time: a second
 caller while one is on the device is told `429 image_interlude_in_flight` rather than queued. How much
-VRAM the model yields is computed from the request itself -- its geometry and
+VRAM the model yields is computed from the request itself -- its geometry, any reference image, and
 whether `true_cfg_scale` above 1 doubles the batch -- and a request that cannot fit is refused with
 `503 image_vram_insufficient` before the model yields anything, so the LLM keeps serving and the message
 names both the need and what the device could give.
 
 Accepted request fields are exactly `model`, `prompt`, `n`, `size`, `steps`, `response_format`, `user`,
-`seed`, `negative_prompt` and `true_cfg_scale`; any other field is rejected as
+`seed`, `image`, `negative_prompt` and `true_cfg_scale`; any other field is rejected as
 `unsupported_parameter` rather than silently ignored.
 
 | Field | Behavior |
@@ -1131,6 +1131,7 @@ Accepted request fields are exactly `model`, `prompt`, `n`, `size`, `steps`, `re
 | `response_format` | `b64_json` (the default) or `url`; any other value is rejected |
 | `seed` | optional non-negative integer; when omitted the Engine picks one |
 | `user` | opaque client tag, never echoed back |
+| `image` | optional reference image (product extension, no OpenAI counterpart): a base64 string, or an array of EXACTLY one such string, with an optional `data:…;base64,` prefix. PNG keeps its alpha, other formats get an opaque one; an `http(s)://` URL is never fetched; decoded payload at most 16 MiB. A second reference, an empty string, an empty array or a non-string item is `image_count_invalid`. The reference conditions the generation through the Qwen3-VL vision tower and the VAE encoder — its merger rows are scattered onto the image slots of the 36-layer text tower, including the three deepstack adds, and its latent tokens overwrite those slots in the joint sequence. N=1, no mask, no inpainting region; the KV cache stays off on this route |
 | `negative_prompt` | optional string, at most 4096 bytes: what to steer away from. Required when `true_cfg_scale` is above 1; ignored at 1 |
 | `true_cfg_scale` | guidance scale, number in `[1, 20]`; default `1`, which is a single DiT forward per step. Above 1 every step runs a second forward over the negative prompt, so the step cost roughly doubles |
 
@@ -1186,9 +1187,10 @@ Every failure names its code in the standard OpenAI error envelope:
 |---|---|---|
 | 400 | `unsupported_parameter`, `image_size_invalid`, `image_steps_invalid`, `image_n_not_supported`, `response_format_not_supported`, `string_above_max_length` | the request asks for behavior outside the accepted subset |
 | 400 | `image_cfg_scale_invalid`, `image_negative_prompt_required` | `true_cfg_scale` is outside `[1, 20]`, or it is above 1 with no `negative_prompt` |
+| 400 | `image_decode_failed`, `image_too_large`, `image_url_not_supported`, `image_data_uri_not_base64`, `image_count_invalid` | the `image` payload is not a base64 PNG/JPEG inside the byte budget, is sent as a URL, is a non-base64 `data:` URI, or is more or fewer references than this build draws (see `image` above). The decoders' own messages are never echoed |
 | 503 | `image_generation_not_configured` | the server started without the image options |
 | 503 | `image_interlude_unsupported` | the loaded model has no image interlude (only Qwen3.8-Flash-Next does) |
-| 503 | `image_vram_insufficient` | the request's size or CFG pass needs more VRAM than the model can yield right now; refused before anything is yielded, so the message can name the need and what the device could give. Retry a smaller `size` or with `true_cfg_scale` 1 |
+| 503 | `image_vram_insufficient` | the request's size, reference image or CFG pass needs more VRAM than the model can yield right now; refused before anything is yielded, so the message can name the need and what the device could give. Retry a smaller `size`, without `image`, or with `true_cfg_scale` 1 |
 | 503 | `engine_unavailable` | the Engine cannot accept work |
 | 429 | `image_interlude_in_flight` | another image generation is running |
 | 503 | `image_engine_degraded` | the interlude could not confirm the model's VRAM was restored |
@@ -1231,6 +1233,7 @@ it:
     "dimensions": {"min": 32, "max": 2048},
     "steps": {"min": 2, "max": 100},
     "true_cfg_scale": {"min": 1, "max": 20},
+    "reference_image": true,
     "automatic_from_chat": true,
     "chat_tool": "generate_image",
     "chat_max_images_per_request": 4
@@ -1247,8 +1250,15 @@ it:
 Every value is read from the running process, never from a model card: `chat_model` is the public alias,
 `image_generation.model` is the id the configured image artifact is served under, and
 `image_generation` is `null` when the server started without `--image-artifact` and
-`--image-text-processor`. `vision_input` follows `--vision`: it feeds a picture into the language model.
-`automatic_from_chat` says whether the chat
+`--image-text-processor`. `vision_input` follows `--vision`, and it is a separate surface from
+`reference_image`: the first feeds a picture into the language model, the second conditions a generation on
+a picture through the diffusion pipeline's own vision tower. `reference_image` is **true**, and it is that claim rather than
+a parsed field: it says the server follows an edit instruction instead of reproducing the reference. It is
+earned from the behavioral gate (`tests/models/qwen_image/test_image_edit_behavior.cu`), which renders the
+same fixture once per instruction and grades the PICTURES — not a copy of the reference (MAE and SSIM), the
+subject held inside the frame, and the named change actually present. A build that has not passed that CTest
+must keep the flag false; the field is parsed and the job admitted either way, so the flag is the difference
+between a documented capability and an unproven one. `automatic_from_chat` says whether the chat
 routes may generate an image on their own initiative, `chat_tool` names the tool they are given for it, and
 `chat_max_images_per_request` is how many pictures one chat request may draw. See
 [Images from a chat request](#images-from-a-chat-request).
@@ -1266,6 +1276,17 @@ behave the same way:
    the tool result.
 3. The model's next round produces the reply, which quotes that URL. A reply that described the picture
    instead of quoting it gets the URL appended, so a client always gets a usable reference.
+
+The tool takes one argument a model can actually write that the route does not: `image`, which redraws a
+picture that already exists. It names that picture in one of three forms, and this process resolves the
+name into the route's own base64 reference: the job id of a picture this server drew (`img-<created>-<sequence>`),
+the URL such a picture came back with (this server's `/v1/images/…`, absolute or as a bare path), or
+`attachment:N` — the Nth picture the user attached to *this* chat request, counted from zero. Every other
+form is refused as the tool's own error result with those three named in the text so the model can retry,
+base64 and URLs on other machines included: a model cannot type a 16 MiB payload, and fetching a
+stranger's picture is not this tool's job. A resolved reference then travels exactly as the HTTP route's
+`image` does, which means it raises what the draw needs: the same size that drew fine without a reference
+can answer `503 image_vram_insufficient` with one.
 
 The client sees none of this: no tool in its own list, no tool call, no tool result, no extra round — one
 assistant answer with a URL in it. The extra rounds are counted into the reported token usage, because they

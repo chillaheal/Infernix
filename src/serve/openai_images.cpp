@@ -15,7 +15,7 @@ namespace {
 // style or input_fidelity for honored behavior.
 constexpr std::string_view kAllowedKeys[] = {"model", "prompt",   "n",
                                              "size",  "response_format", "user", "seed", "steps",
-                                             "negative_prompt", "true_cfg_scale"};
+                                             "image", "negative_prompt", "true_cfg_scale"};
 
 [[nodiscard]] bool is_allowed_key(std::string_view key) {
     for (std::string_view allowed : kAllowedKeys) {
@@ -184,6 +184,54 @@ OpenAIImagesRequest parse_openai_images_request(const RequestJson& body) {
     if (output.true_cfg_scale > kMinimumImageCFGScale && output.negative_prompt.empty()) {
         bad_request("negative_prompt is required when true_cfg_scale is above 1", "negative_prompt",
                     "image_negative_prompt_required");
+    }
+
+    if (body.contains("image") && !body.at("image").is_null()) {
+        // The family takes a LIST of references; this build renders exactly one (kMaximumImageReferences
+        // says why: the ledger sizes one reference). The list FORM is still accepted at that cap, so a
+        // client written against the family -- "image": ["..."] -- parses here instead of getting a 400
+        // for a shape that is legal upstream. Anything the request asks for that the route cannot draw
+        // is a count error, not a type error: the payload is a picture however it is wrapped.
+        const RequestJson& field = body.at("image");
+        std::string value;
+        if (field.is_string()) {
+            value = field.get<std::string>();
+        } else if (field.is_array()) {
+            if (field.empty() || field.size() > kMaximumImageReferences) {
+                bad_request("image must carry exactly one reference image", "image",
+                            "image_count_invalid");
+            }
+            if (!field.at(0).is_string()) {
+                bad_request("image must be a base64 string, or an array of one", "image",
+                            "image_count_invalid");
+            }
+            value = field.at(0).get<std::string>();
+        } else {
+            bad_request("image must be a base64 string, or an array of one", "image",
+                        "image_count_invalid");
+        }
+        if (value.empty()) {
+            bad_request("image must carry exactly one reference image", "image", "image_count_invalid");
+        }
+        if (value.starts_with("http://") || value.starts_with("https://")) {
+            bad_request("image must be a base64-encoded image, not a URL", "image",
+                        "image_url_not_supported");
+        }
+        if (value.starts_with("data:")) {
+            const std::size_t comma = value.find(',');
+            const std::string_view prefix(value.data(),
+                                          comma == std::string_view::npos ? value.size() : comma);
+            if (comma == std::string_view::npos || prefix.find("base64") == std::string_view::npos) {
+                bad_request("image data: URIs must be base64", "image", "image_data_uri_not_base64");
+            }
+            value.erase(0, comma + 1);
+        }
+        // Cheap pre-gate on the base64 length (raw grows 4 bytes per 3); the exact decoded
+        // byte and pixel budgets are enforced where the image is decoded.
+        if (value.size() > (kMaximumImageInputBytes / 3) * 4 + 4) {
+            bad_request("image exceeds the maximum size", "image", "image_too_large");
+        }
+        output.image = std::move(value);
     }
 
     return output;

@@ -645,6 +645,14 @@ std::string make_capabilities_json(const ServeOptions& options, std::string_view
                      {"steps", Json{{"min", kMinimumImageSteps}, {"max", kMaximumImageSteps}}},
                      {"true_cfg_scale",
                       Json{{"min", kMinimumImageCFGScale}, {"max", kMaximumImageCFGScale}}},
+                     // Reference-image conditioning runs on the diffusion pipeline's own vision tower,
+                     // which sees only the picture being edited; --vision is a separate surface.
+                     // TRUE because the behavioural gate (tests/models/qwen_image/
+                     // test_image_edit_behavior.cu) is green: it renders the M9 fixture twice, once per
+                     // instruction, and grades the PICTURES -- not-a-copy (MAE/SSIM vs the reference),
+                     // subject held, instruction happened. Advertising true is exactly the claim that
+                     // gate exists to earn; it was false while every edit came back a copy.
+                     {"reference_image", true},
                      // A chat request to this process is given the tool below and the picture is
                      // drawn inside that same request, so a client needs no tool call of its own.
                      {"automatic_from_chat", true},

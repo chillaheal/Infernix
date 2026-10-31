@@ -126,9 +126,11 @@ int main() {
                               Json::array({"b64_json", "url"}) &&
                           configured.at("image_generation").at("automatic_from_chat") == true &&
                           configured.at("image_generation").at("chat_tool") == "generate_image" &&
-                          configured.at("image_generation").at("chat_max_images_per_request") == 4,
-                      "the image capability reports its id, artifact route, formats and the chat tool a "
-                      "client would otherwise have to run itself");
+                          configured.at("image_generation").at("chat_max_images_per_request") == 4 &&
+                          configured.at("image_generation").at("reference_image") == true,
+                      "the image capability reports its id, artifact route, formats, the chat tool a "
+                      "client would otherwise have to run itself, and the edit capability the behavioral "
+                      "gate certified");
     failures += check(plain.at("endpoints").at("images_generations") == "/v1/images/generations" &&
                           configured.at("endpoints").at("chat_completions") == "/v1/chat/completions" &&
                           configured.at("endpoints").at("messages") == "/v1/messages",

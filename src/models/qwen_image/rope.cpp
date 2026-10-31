@@ -11,12 +11,12 @@
 
 namespace infernix::models::qwen_image {
 
-namespace {
-
 // rope_params(index, dim) = polar(1, outer(index, 1/theta^(arange(0,dim,2)/dim))). Each freqs row
 // stores angle = index_value * theta^(-2*col/dim); the angle depends only on the integer position.
-std::vector<float> emit_rows(std::size_t S, const std::vector<long long>& frame,
-                             const std::vector<long long>& height, const std::vector<long long>& width) {
+// Public since the edit route (joint_layout.cpp) walks interleaved positions and shares this emitter.
+std::vector<float> emit_rope_rows(const std::vector<long long>& frame, const std::vector<long long>& height,
+                                  const std::vector<long long>& width) {
+    const std::size_t S = frame.size();
     const std::size_t axes[3] = {16, 56, 56};
     auto lookup = [&](std::size_t axis, long long v, std::size_t col, float& re, float& im) {
         const std::size_t dim = axes[axis];
@@ -37,8 +37,8 @@ std::vector<float> emit_rows(std::size_t S, const std::vector<long long>& frame,
     return rot;
 }
 
-void fill_grid(std::vector<long long>& frame, std::vector<long long>& height, std::vector<long long>& width,
-               long long block_start, long long h, long long w, long long frame_value) {
+void fill_rope_grid(std::vector<long long>& frame, std::vector<long long>& height, std::vector<long long>& width,
+                    long long block_start, long long h, long long w, long long frame_value) {
     for (long long i = 0; i < h * w; ++i) frame[block_start + i] = frame_value;
     for (long long hh = 0; hh < h; ++hh) {
         for (long long ww = 0; ww < w; ++ww) {
@@ -48,8 +48,6 @@ void fill_grid(std::vector<long long>& frame, std::vector<long long>& height, st
         }
     }
 }
-
-} // namespace
 
 std::vector<float> build_joint_rope_blocks(int text_prefix, const std::vector<std::pair<int, int>>& cond_grids,
                                            int H, int W) {
@@ -67,17 +65,17 @@ std::vector<float> build_joint_rope_blocks(int text_prefix, const std::vector<st
     cursor   += tp;
     for (const auto& g : cond_grids) {
         const long long ch = g.first, cw = g.second;
-        fill_grid(frame, height, width, cursor, ch, cw, position);
+        fill_rope_grid(frame, height, width, cursor, ch, cw, position);
         cursor += ch * cw;
         position += std::max(ch, cw); // the transformer's per-block frame advance
     }
-    fill_grid(frame, height, width, cursor, h, w, position);
+    fill_rope_grid(frame, height, width, cursor, h, w, position);
 
     for (long long s = 0; s < tp; ++s) {  // text: all three axes = frame index (image rows overwritten)
         height[s] = frame[s];
         width[s]  = frame[s];
     }
-    return emit_rows(static_cast<std::size_t>(S), frame, height, width);
+    return emit_rope_rows(frame, height, width);
 }
 
 std::vector<float> build_joint_rope(int text_prefix, int H, int W) {

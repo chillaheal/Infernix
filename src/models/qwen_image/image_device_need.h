@@ -90,13 +90,39 @@ inline constexpr VaeStage kVaeUpStages[5] = {
 // both at full pixel resolution.
 inline constexpr std::uint64_t kVaeFinalChannels = 144ULL + 4ULL;
 
+// The bound ViT's shape, as far as the ledger needs it: enough to derive the streamed block's roles
+// and the eleven live planes of vision_tower.cu rather than hardcode a number. All zero (or hidden
+// zero) means no vision lane -- the certified text-to-image route -- and the vision term is then
+// exactly zero, byte for byte.
+struct VisionLaneDims {
+    std::uint32_t hidden      = 0; // ViT hidden width (1152 in the shipped config)
+    std::uint32_t intermediate = 0; // the ViT MLP's inner width
+    std::uint32_t head_dim    = 0;
+    std::uint32_t patch       = 0; // patch size in pixels (16)
+    std::uint32_t temporal    = 0; // frames per patch (2)
+    std::uint32_t merge       = 0; // spatial_merge_size (2): merge*merge patches make one merged row
+    std::uint32_t out_hidden  = 0; // the merger's output width == the text tower's hidden
+};
+
+// The worst legal reference plane the ViT can ever be fed: prepare_reference_image resizes every
+// reference to the 1024x1024 area target on the 32-grid (reference_image.cpp:21,155-158), so the
+// largest patch grid is 1024/16 x 1024/16. The reference's size is independent of the requested
+// OUTPUT size, which is why this is a constant of the route and not of the geometry.
+inline constexpr std::uint64_t kVisionWorstReferencePatches = 64ULL * 64ULL;
+
 struct ImageDeviceNeedRequest {
     ImageGeometry geometry;             // the target image's snapped geometry
     DiTDims       dims;                 // the bound DiT's dimensions
-    std::uint32_t text_tokens     = 0;  // prompt rows the joint sequence carries
-    std::uint32_t negative_tokens = 0;  // negative-prompt rows (0 without true CFG)
+    std::uint32_t text_tokens     = 0;  // kept prompt rows, the <|image_pad|> rows included
+    std::uint32_t negative_tokens = 0;  // negative-prompt rows (0 without true CFG), same form
     std::uint32_t ref_tokens      = 0;  // reference-image latent tokens ahead of the target
     std::uint32_t blocks_resident = kImageResidentBlocks; // the shipped route's resident slots (2)
+    // The edit route only. Each vision token is one <|image_pad|> row INSIDE text_tokens and expands
+    // to four joint rows, which ref_tokens already counts (ref_tokens == 4 * vision_tokens). The joint
+    // sequence is therefore non-pad text + ref + target: passing the VLM length together with
+    // ref_tokens would count those rows twice (for a portrait reference, ~1014 rows too many).
+    std::uint32_t   vision_tokens = 0;
+    VisionLaneDims  vision;             // zero == no vision lane, and the vision term is then zero
 };
 
 struct ImageDeviceNeed {
@@ -105,23 +131,34 @@ struct ImageDeviceNeed {
     std::uint64_t resident_weights    = 0; // the allowance above plus the resident block(s)
     std::uint64_t vae_peak            = 0; // the widest simultaneous set of decode planes
     std::uint64_t rope_and_tables     = 0; // both rope tables and the shared constants
+    std::uint64_t vision_peak         = 0; // the ViT lane: one streamed block + its live set
 
     [[nodiscard]] std::uint64_t total() const noexcept {
-        return dit_activations + latent_and_velocity + resident_weights + vae_peak + rope_and_tables;
+        return dit_activations + latent_and_velocity + resident_weights + vae_peak + rope_and_tables +
+               vision_peak;
     }
 };
 
 // The need, term by term as the pipeline allocates. Every sequence-shaped buffer follows
-// `s_max = max(text + ref + target, negative + ref + target)`, exactly the `s_max` the job guards
-// with, so references and CFG raise the number by construction rather than by a tuned multiplier.
+// `s_max = max(non_pad_text + ref + target, negative_non_pad_text + ref + target)`, exactly the
+// `s_max` the job guards with, so references and CFG raise the number by construction rather than by
+// a tuned multiplier. `non_pad_text` is the prompt with its <|image_pad|> rows removed: those rows
+// are the reference's vision tokens, and the joint sequence carries each of them four times, already
+// counted in `ref`. The text-side stages still size by the FULL kept length (the tower's output
+// carries the pad rows), which is what `text_max` is for.
 [[nodiscard]] constexpr ImageDeviceNeed image_device_need(const ImageDeviceNeedRequest& req) noexcept {
     const std::uint64_t target = req.geometry.tokens; // hl * wl
     const std::uint64_t all_img = static_cast<std::uint64_t>(req.ref_tokens) + target;
     const std::uint64_t d       = req.dims.hidden;
     const std::uint64_t mlp     = req.dims.intermediate;
     const std::uint64_t cin     = req.dims.image_in;
-    const std::uint64_t s_pos   = static_cast<std::uint64_t>(req.text_tokens) + all_img;
-    const std::uint64_t s_neg   = static_cast<std::uint64_t>(req.negative_tokens) + all_img;
+    const std::uint64_t vision  = static_cast<std::uint64_t>(req.vision_tokens);
+    const std::uint64_t joint_pos =
+        (static_cast<std::uint64_t>(req.text_tokens) > vision ? static_cast<std::uint64_t>(req.text_tokens) - vision : 0ULL);
+    const std::uint64_t joint_neg =
+        (static_cast<std::uint64_t>(req.negative_tokens) > vision ? static_cast<std::uint64_t>(req.negative_tokens) - vision : 0ULL);
+    const std::uint64_t s_pos   = joint_pos + all_img;
+    const std::uint64_t s_neg   = joint_neg + all_img;
     const std::uint64_t s_max   = s_neg > s_pos ? s_neg : s_pos;
     const std::uint64_t text_max =
         static_cast<std::uint64_t>(req.negative_tokens > req.text_tokens ? req.negative_tokens
@@ -165,6 +202,35 @@ struct ImageDeviceNeed {
                                        static_cast<std::uint64_t>(req.geometry.width) *
                                        kImageElementBytes;
     if (final_planes > need.vae_peak) { need.vae_peak = final_planes; }
+
+    // The ViT lane runs inside the same interlude as the DiT loop, before it: peak == one block's
+    // roles + the per-item activation + one merger (vision_tower.h:15), and vision_tower.cu:197-219
+    // really does hold the whole live set across the block loop -- eleven planes at
+    // [hidden, patches], one at [intermediate, patches], the patch input, three int32/float index
+    // planes and the merger output. Sized by the worst legal reference (kVisionWorstReferencePatches),
+    // not the requested one: the reference's size is the route's, independent of the output size, and
+    // the probe has to refuse before the yield rather than OOM the resident LLM. Sequential with the
+    // decode, so it is SUMMED like vae_peak, never maxed against it.
+    if (req.vision.hidden != 0) {
+        const std::uint64_t vh   = req.vision.hidden;
+        const std::uint64_t vmlp = req.vision.intermediate;
+        const std::uint64_t p    = kVisionWorstReferencePatches;
+        const std::uint64_t merge = req.vision.merge != 0 ? req.vision.merge : 1U;
+        const std::uint64_t patch_width =
+            3ULL * (req.vision.temporal != 0 ? req.vision.temporal : 1U) *
+            (req.vision.patch != 0 ? req.vision.patch : 1U) *
+            (req.vision.patch != 0 ? req.vision.patch : 1U);
+        const std::uint64_t merged = p / (merge * merge);
+        need.vision_peak =
+            11ULL * p * vh * kImageElementBytes +                             // the eleven live planes
+            p * vmlp * kImageElementBytes +                                    // d_up
+            p * patch_width * kImageElementBytes +                             // d_patches
+            p * (2ULL * 4ULL + 4ULL * 4ULL + 4ULL * 4ULL) +                    // pos / idx / weights
+            merged * (req.vision.out_hidden != 0 ? req.vision.out_hidden : vh) *
+                kImageElementBytes +                                           // d_out, the merger rows
+            (4ULL * vh * vh + 3ULL * vmlp * vh +
+             2ULL * req.vision.head_dim * kImageElementBytes);                 // one block's roles
+    }
 
     need.resident_weights = kImageWeightResidentBytes +
                             static_cast<std::uint64_t>(req.blocks_resident) * image_block_bytes(req.dims);

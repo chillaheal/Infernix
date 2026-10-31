@@ -78,6 +78,57 @@ struct TextTowerWeights {
     std::uint64_t max_object_bytes = 0;
 };
 
+// The Qwen3-VL vision tower's geometry, derived from the artifact's "text" component config's
+// "vision_config" with the converter's own expressions (tools/convert/qwen_image.py::_build_vision).
+// Read here rather than through models/qwen3_5/config.cpp: that parser requires the LLM route's
+// member set and rejects the members this architecture carries (out_hidden_size,
+// deepstack_visual_indexes), and its merger width is taken from a TextConfig the image route has.
+struct VisionDims {
+    std::uint32_t depth        = 0;
+    std::uint32_t hidden       = 0;
+    std::uint32_t intermediate = 0;
+    std::uint32_t heads        = 0;
+    std::uint32_t head_dim     = 0; // hidden / heads
+    std::uint32_t patch        = 0;
+    std::uint32_t temporal     = 0;
+    std::uint32_t merge        = 0; // spatial_merge_size
+    std::uint32_t position_rows = 0; // num_position_embeddings
+    std::uint32_t position_grid_side = 0; // sqrt(position_rows)
+    std::uint32_t out_hidden   = 0; // the merger's output width (the text tower's hidden)
+    std::uint32_t patch_width  = 0; // 3 * temporal * patch * patch (vision/patch_embedding columns)
+    std::uint32_t merger_width = 0; // merge^2 * hidden (the deepstack LayerNorm's width)
+    // vision_config.deepstack_visual_indexes: the zero-based vision block AFTER which that block's
+    // hidden states are tapped and pushed through deepstack merger #index. Empty == no taps.
+    std::vector<std::uint32_t> deepstack_indexes;
+};
+
+// One vision encoder block: the two LayerNorms, the three QKV roles the converter split out of the
+// fused source row band (each with its own bias slice), the attention projection and the MLP.
+struct VisionBlockWeights {
+    artifact::ParameterReference norm1_weight, norm1_bias, norm2_weight, norm2_bias;
+    artifact::ParameterReference q, q_bias, k, k_bias, v, v_bias;
+    artifact::ParameterReference attention_output, attention_output_bias;
+    artifact::ParameterReference fc1, fc1_bias, fc2, fc2_bias;
+};
+
+// One Qwen3VLVisionPatchMerger: LayerNorm, fc1 + bias, exact GELU, fc2 + bias. The LayerNorm's width
+// is the difference between the two variants -- the main merger normalizes the pre-merge hidden
+// (hidden), a deepstack merger the merged row (merger_width); both keep fc1 at merger_width and fc2
+// at out_hidden. Qwen3VLVisionPatchMerger.forward normalizes the merged view only when its
+// use_postshuffle_norm is set, so which of the two widths applies follows from the width itself.
+struct VisionMergerWeights {
+    artifact::ParameterReference norm_weight, norm_bias, fc1, fc1_bias, fc2, fc2_bias;
+};
+
+struct VisionWeights {
+    VisionDims dims;
+    artifact::ParameterReference patch_embedding, patch_embedding_bias, position_embedding;
+    std::vector<VisionBlockWeights> blocks;
+    VisionMergerWeights merger;                 // norm width == dims.hidden
+    std::vector<VisionMergerWeights> deepstack; // norm width == dims.merger_width, one per index
+    std::uint64_t max_object_bytes = 0;
+};
+
 // The named VAE-decoder parameters the production decode route consumes, keyed by their artifact
 // binding names ("vae/..." -- the recipe maps every VAE source tensor one-to-one as a direct BF16
 // parameter, so the source key IS the contract). The decode walks a fixed chain: every operand it
@@ -104,5 +155,19 @@ struct VaeDenorm {
 [[nodiscard]] DiTWeights bind_dit(artifact::Binder& binder);
 [[nodiscard]] TextTowerWeights bind_text_encoder(artifact::Binder& binder);
 [[nodiscard]] VaeWeights bind_image_vae(artifact::Binder& binder);
+
+// The FP8 RowScale text/embed_tokens plane decoded ONCE into [vocab, hidden] row-major BF16 bits --
+// value = e4m3 code * the row's BF16 scale, rounded to BF16 (the production route's quantization
+// error, disclosed with the tower's device gate). run_text_tower and run_conditioned_text_tower gather
+// from exactly this, so the dequantization the serve route caches is the same code the tower tests gate.
+// A plane that is not [codes][scales] FP8 RowScale, or one shorter than its geometry, throws
+// std::runtime_error.
+[[nodiscard]] std::vector<std::byte> dequantize_embed_table(artifact::Reader& reader, const TextTowerWeights& tower);
+// The vision tower an edit conditions the text tower on: every vision/* parameter of the recipe
+// (patch embedding, position table, the depth blocks, the main merger and one merger per
+// deepstack_visual_indexes entry), all direct BF16 -- the FP8 recipe never names a vision role. A
+// component config without vision_config, a role the artifact does not store, or a shape that
+// differs from the recipe throws artifact::ArtifactError when the plan is built.
+[[nodiscard]] VisionWeights bind_image_vision(artifact::Binder& binder);
 
 } // namespace infernix::models::qwen_image

@@ -39,4 +39,20 @@ namespace infernix::models::qwen_image {
 [[nodiscard]] std::vector<float> build_joint_rope_blocks(
     int text_prefix, const std::vector<std::pair<int, int>>& cond_grids, int H, int W);
 
+// The two steps above are built from, exposed for the edit route's INTERLEAVED layout
+// (joint_layout.{h,cpp}), where text runs sit between image blocks rather than in front of all of them.
+// Sharing them is what makes the edit route's text-only case bit-identical to build_joint_rope: one
+// copy of the formula, so the two routes cannot drift apart.
+//
+// Emit the [rows,64,2] (cos,sin)-interleaved table from per-row positions; frame/height/width must have
+// the same length (that length is the row count).
+[[nodiscard]] std::vector<float> emit_rope_rows(const std::vector<long long>& frame,
+                                                const std::vector<long long>& height,
+                                                const std::vector<long long>& width);
+// Fill one image block's rows: `frame` frozen at frame_value, `height`/`width` the row-major h-by-w
+// grid centred at -(h - h/2) / -(w - w/2), starting at block_start.
+void fill_rope_grid(std::vector<long long>& frame, std::vector<long long>& height,
+                    std::vector<long long>& width, long long block_start, long long h, long long w,
+                    long long frame_value);
+
 } // namespace infernix::models::qwen_image

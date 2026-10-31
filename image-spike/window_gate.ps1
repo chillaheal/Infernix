@@ -182,6 +182,12 @@ function Set-Lock($ownerName) {
     # Exclusive create so two windows racing on the same second cannot both think they won. The
     # four-arg File.WriteAllText overload (string, string, Encoding, FileMode) does not exist on
     # .NET Framework / Windows PowerShell, so the mode goes through FileStream instead.
+    # A window that died with the machine (the 09:10 nvlddmkm bugcheck) leaves its lock file on
+    # disk: Get-Lock reports it stale so the port counts as free, but CreateNew then fails on that
+    # corpse forever and every later blackout is refused. Drop the corpse before creating.
+    if ((Test-Path -LiteralPath $LockFile) -and ((Get-Lock).state -eq 'stale')) {
+        Remove-Item -LiteralPath $LockFile -Force -ErrorAction SilentlyContinue
+    }
     $why = ''
     for ($try = 0; $try -lt 5; $try++) {
         $fs = $null

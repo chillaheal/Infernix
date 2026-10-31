@@ -17,12 +17,14 @@
 // restarts (the recovery unit the C5 state machine defines).
 
 #include "infernix/engine.h"
+#include "models/qwen_image/image_device_need.h" // VisionLaneDims: the ledger's ViT lane
 #include "models/qwen_image/image_weights.h"
 
 #include <nlohmann/json.hpp>
 
 #include "serve/image_job_store.h"
 #include "serve/openai_images.h"
+#include "serve/reference_image.h"
 #include "serve/request_json.h"
 
 #include <chrono>
@@ -104,7 +106,8 @@ public:
 // the interlude's dedicated stream (`image_stream`, a cudaStream_t). It stops at the last byte the
 // device touched: the encode, the base64 and the file are the service's work after the interlude.
 // `prompt_embeds` is the token-major BF16 bit payload.
-// `negative_embeds` carries the negative prompt's
+// `reference` carries the host-prepared reference-image plane (#75) whenever the request had an
+// `image` field; nullptr is plain text-to-image. `negative_embeds` carries the negative prompt's
 // BF16 bits when `request.true_cfg_scale` is above 1 (true CFG); empty means the single-forward route.
 // `progress` is the stored job's live progress state: the executor's pipeline reports each step
 // through it and honors its stall flag; a fake executor may ignore it.
@@ -112,7 +115,7 @@ using ImageJobExecutor =
     std::function<FinishedPicture(const OpenAIImagesRequest& request, std::uint64_t seed,
                                    std::span<const std::uint16_t> prompt_embeds,
                                    std::span<const std::uint16_t> negative_embeds,
-                                   void* image_stream,
+                                   const ReferencePixels* reference, void* image_stream,
                                    const std::shared_ptr<ImageJobProgress>& progress)>;
 
 // prompt -> prompt_embeds, split in the two halves the VRAM handoff needs: rendering is host work the
@@ -124,6 +127,14 @@ using PromptEmbedsProvider   = std::function<std::vector<std::uint16_t>(const To
 // config), lazy and cached by the caller: it must be readable before any yield, so it can never come
 // from the device-side weight binding.
 using DiTDimsProvider = std::function<infernix::models::qwen_image::DiTDims()>;
+
+// The bound ViT's dimensions for the ledger's vision term, read the same host-side way (the artifact's
+// component config, never the device-side binding). Optional: with no reference in the request the
+// term is zero and the provider is never called, so the certified text-to-image route does not need
+// one. A request WITH a reference and no provider is refused as unconfigured (503): an admission that
+// cannot name the ViT lane's shape cannot claim it fits, and under-reserving OOMs the resident LLM.
+using VisionLaneDimsProvider =
+    std::function<infernix::models::qwen_image::VisionLaneDims()>;
 
 // The production executor: lazy-binds the DiT + VAE weights and the VAE denormalization constants
 // from one .infernix image artifact (one streamed-only plan) and runs the merged pipeline entry
@@ -138,6 +149,13 @@ using DiTDimsProvider = std::function<infernix::models::qwen_image::DiTDims()>;
 // before the yield) and cached by the service, so the artifact opens once per process.
 [[nodiscard]] DiTDimsProvider make_artifact_dit_dims_provider(const std::string& image_artifact_path);
 
+// The host-side ViT dimensions of the same artifact, for the ledger's vision term. Same lazy, cached,
+// outside-any-interlude contract as make_artifact_dit_dims_provider; only the edit route asks for it.
+// Throws std::runtime_error when the artifact carries no vision component -- the caller must then
+// refuse an `image` request rather than admit one it cannot size.
+[[nodiscard]] VisionLaneDimsProvider
+make_artifact_vision_dims_provider(const std::string& image_artifact_path);
+
 // Standard-alphabet base64 (no line breaks), shared by the image route and its tests.
 [[nodiscard]] std::string base64_encode_bytes(std::span<const std::uint8_t> bytes);
 
@@ -146,6 +164,14 @@ using DiTDimsProvider = std::function<infernix::models::qwen_image::DiTDims()>;
 // the writer here and the GET /v1/images/<id> route both resolve through it. An id that is not the
 // job-id shape resolves to an empty path, so a request can never turn a name into a path.
 [[nodiscard]] std::filesystem::path generated_image_path(std::string_view id);
+
+// Reads a finished picture back off the same path. This is how the chat tool's `image` argument turns
+// into a reference: the picture the model names is this server's own file, not something it can paste.
+// Empty when `id` is not an id the artifact route serves, when the file cannot be read, or when it is
+// larger than `kMaximumImageInputBytes` -- the caller cannot tell those apart and must not claim to:
+// the picture is simply not available to draw from (never drawn here, or retired by the retention
+// sweep), which is what the tool tells the model.
+[[nodiscard]] std::vector<std::uint8_t> load_generated_image(std::string_view id);
 
 // What one retention pass removed, for the log line the caller reports.
 struct ImageRetentionResult {
@@ -195,9 +221,12 @@ private:
 
 class ImageGenerationService {
 public:
+    // `vision_dims` is only needed by the edit route (a request that carries an `image`); it defaults
+    // to null so every text-to-image caller and test keeps the exact same admission as before.
     ImageGenerationService(std::unique_ptr<ImageInterludeRunner> runner, ImageJobStore& store,
                            PromptRendererProvider prompt_renderer, PromptEmbedsProvider prompt_embeds,
-                           DiTDimsProvider dit_dims, ImageJobExecutor job_executor);
+                           DiTDimsProvider dit_dims, ImageJobExecutor job_executor,
+                           VisionLaneDimsProvider vision_dims = {});
 
     // False when serve started without the image pipeline: the route answers a documented 503.
     [[nodiscard]] bool is_configured() const noexcept;
@@ -213,7 +242,8 @@ public:
     //   503 image_engine_degraded              (Degraded: process restart is the recovery unit)
     //   503 image_interlude_failed             (the job never ran, e.g. a drain-deadline miss)
     //   500 image_generation_failed            (the job itself failed; restoration confirmed)
-    //   400 image_invalid                      (the `image` field could not be prepared)
+    //   400 image_too_large / image_decode_failed (the `image` payload exceeded its budget, or is not
+    //       a base64 PNG/JPEG the decoders accept; the codec's own words are never echoed)
     RequestJson generate(const OpenAIImagesRequest& request, std::int64_t now,
                          std::string_view artifact_url_base = {});
 
@@ -239,6 +269,7 @@ private:
     PromptRendererProvider prompt_renderer_;
     PromptEmbedsProvider prompt_embeds_;
     DiTDimsProvider dit_dims_;
+    VisionLaneDimsProvider vision_dims_;
     ImageJobExecutor job_executor_;
     std::mutex dims_mutex_;
     infernix::models::qwen_image::DiTDims dims_cache_;

@@ -20,12 +20,21 @@ constexpr int kKB    = 64;
 constexpr int kDims  = 32;              // channels per thread (kDim / 4 lanes share a row)
 constexpr int kBlock = kQB * 4;         // 256 threads
 
+// `image_ids` is null for the certified text-to-image form, whose rule is the prefix one: text
+// queries strictly causal, everything behind the prefix (the target block) sees every key. The edit
+// route passes the layout's per-token image block id instead -- -1 on text rows, and the index of
+// the image block otherwise -- which is the reference model's own mask,
+// `(q >= kv) | same_image_block`: the joint sequence stays causal while every image block, each
+// condition image and the target, is internally bidirectional. For the [text][target] layout the
+// two rules coincide (the target is the last and only block, so `q >= kv` already covers its every
+// key), which is what lets the text-to-image oracle keep passing.
 __global__ __launch_bounds__(kBlock) void attn_dit_joint_kernel(
     const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k,
     const __nv_bfloat16* __restrict__ v, __nv_bfloat16* __restrict__ out, int heads, int tokens,
-    int text_prefix) {
+    int text_prefix, const int* __restrict__ image_ids) {
     __shared__ __nv_bfloat16 sK[kKB][kDim];
     __shared__ __nv_bfloat16 sV[kKB][kDim];
+    __shared__ int sId[kKB];
 
     const int t = threadIdx.x;
     const int r = t >> 2;                       // query row within the block, 0..QB-1
@@ -34,6 +43,8 @@ __global__ __launch_bounds__(kBlock) void attn_dit_joint_kernel(
     const int head = blockIdx.y;
     const int s = blockIdx.x * kQB + r;         // global query token
     const bool row_valid = (s < tokens);
+    // This query's own image block id; the four lanes of a row agree, so it is read once per thread.
+    const int my_id = (image_ids != nullptr && row_valid) ? __ldg(&image_ids[s]) : -1;
 
     const float scale = rsqrtf(static_cast<float>(kDim));
     const float neg_inf = -INFINITY;
@@ -62,6 +73,8 @@ __global__ __launch_bounds__(kBlock) void attn_dit_joint_kernel(
             sK[jl][d] = __ldg(&k[d + kDim * off]);
             sV[jl][d] = __ldg(&v[d + kDim * off]);
         }
+        // One id per key token of the tile: kKB <= 64 <= kBlock, so one thread per key suffices.
+        if (image_ids != nullptr && t < jend) sId[t] = __ldg(&image_ids[kb + t]);
         __syncthreads();
 
         for (int j = 0; j < jend; ++j) {
@@ -72,7 +85,9 @@ __global__ __launch_bounds__(kBlock) void attn_dit_joint_kernel(
             dot += __shfl_xor_sync(0xffffffffu, dot, 2);
 
             const int kk = kb + j;
-            const bool allow = (s >= text_prefix) || (kk <= s);
+            const bool allow = (image_ids != nullptr)
+                ? ((s >= kk) || (my_id >= 0 && sId[j] == my_id))
+                : ((s >= text_prefix) || (kk <= s));
             const float score = allow ? dot * scale : neg_inf;
 
             const float new_m = (m > score) ? m : score;
@@ -97,13 +112,14 @@ __global__ __launch_bounds__(kBlock) void attn_dit_joint_kernel(
 } // namespace
 
 void attn_dit_joint_launch(const Tensor& q, const Tensor& k, const Tensor& v,
-                           std::int32_t text_prefix, Tensor* out, std::int32_t heads,
-                           std::int32_t tokens, cudaStream_t stream) {
+                           std::int32_t text_prefix, const Tensor* image_ids, Tensor* out,
+                           std::int32_t heads, std::int32_t tokens, cudaStream_t stream) {
     const unsigned grid_x = static_cast<unsigned>((tokens + kQB - 1) / kQB);
     attn_dit_joint_kernel<<<dim3(grid_x, static_cast<unsigned>(heads)), kBlock, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(q.data), static_cast<const __nv_bfloat16*>(k.data),
         static_cast<const __nv_bfloat16*>(v.data), static_cast<__nv_bfloat16*>(out->data),
-        static_cast<int>(heads), static_cast<int>(tokens), static_cast<int>(text_prefix));
+        static_cast<int>(heads), static_cast<int>(tokens), static_cast<int>(text_prefix),
+        image_ids == nullptr ? nullptr : static_cast<const int*>(image_ids->data));
     CUDA_CHECK(cudaGetLastError());
 }
 

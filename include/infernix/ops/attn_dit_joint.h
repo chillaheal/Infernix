@@ -37,4 +37,23 @@ namespace infernix::ops {
 void attn_dit_joint(const Tensor& q, const Tensor& k, const Tensor& v, std::int32_t text_prefix,
                     Tensor& out, cudaStream_t stream);
 
+/**
+ * The same joint attention with the reference model's own block-causal mask, for the interleaved
+ * edit sequence [prefix text][condition image(s)][trailer text][target].
+ *
+ *   allow(s, kk) = (s >= kk) || (image_ids[s] == image_ids[kk] && image_ids[s] >= 0)
+ *
+ * The joint sequence stays causal -- every token sees everything before it -- while each image block
+ * additionally reads its own block in both directions. Text rows carry -1, so they get the causal
+ * triangle and nothing else, exactly as above; two different image blocks never see each other
+ * forward, only backwards through the causal half. For the [text][target] layout the two rules agree
+ * row by row (the target is the last and only block), so the text-to-image oracle is unchanged.
+ *
+ * image_ids is a contiguous device I32 [S,1,1,1] with the same S as the activations, written by
+ * build_joint_layout; the Op reads exactly those S ints and does not write them. Shapes, dtypes,
+ * limits and the separate-output rule are as above.
+ */
+void attn_dit_joint_block_causal(const Tensor& q, const Tensor& k, const Tensor& v,
+                                 const Tensor& image_ids, Tensor& out, cudaStream_t stream);
+
 } // namespace infernix::ops

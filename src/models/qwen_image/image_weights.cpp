@@ -1,7 +1,10 @@
 #include "models/qwen_image/image_weights.h"
 
 #include "artifact/schema.h"
+#include "ops/common/canonical_math.h"
 
+#include <cmath>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -59,6 +62,24 @@ ParameterReference take(Binder& binder, std::uint64_t& high_water, std::string_v
     Bound bound = bind_streamed(binder, name, std::move(shape), exact_format);
     if (bound.max_bytes > high_water) { high_water = bound.max_bytes; }
     return std::move(bound.ref);
+}
+
+// One integer array of a component config. A key the config does not carry yields NO entries (that
+// is what "this architecture has no deepstack taps" means); a present key must be an array of
+// integers. The caller decides whether an empty result is legal for the route it serves.
+std::vector<std::uint64_t> cfg_integer_array(const Json& config, const char* key, std::string_view component) {
+    if (!config.contains(key)) { return {}; }
+    if (!config.at(key).is_array()) {
+        throw ArtifactError(std::string(component) + " config " + key + " is not an array");
+    }
+    std::vector<std::uint64_t> out;
+    for (const Json& value : config.at(key)) {
+        if (!value.is_number_integer()) {
+            throw ArtifactError(std::string(component) + " config array " + key + " holds a non-integer");
+        }
+        out.push_back(value.get<std::uint64_t>());
+    }
+    return out;
 }
 
 std::vector<float> cfg_float_array(const Json& config, const char* key, std::string_view component) {
@@ -205,6 +226,102 @@ TextTowerWeights bind_text_encoder(Binder& binder) {
     return out;
 }
 
+VisionWeights bind_image_vision(Binder& binder) {
+    // The vision tower lives in the text encoder's shards, so its geometry comes from that
+    // component's own "vision_config" -- the same object the converter read to declare the names
+    // bound here. Every role is direct BF16 (the FP8 recipe assigns only dit/* and text/*), so a
+    // quantized vision object in the artifact is a recipe drift and throws in bind_streamed.
+    const Directory& directory   = binder.reader().directory();
+    const Json& root             = directory.component("text").config;
+    const std::string_view component = "text";
+    if (!root.contains("vision_config")) { throw ArtifactError("text config lacks vision_config"); }
+    const Json& config = root.at("vision_config");
+
+    VisionWeights out;
+    out.dims.depth         = static_cast<std::uint32_t>(cfg_integer(config, "depth", component));
+    out.dims.hidden        = static_cast<std::uint32_t>(cfg_integer(config, "hidden_size", component));
+    out.dims.intermediate  = static_cast<std::uint32_t>(cfg_integer(config, "intermediate_size", component));
+    out.dims.heads         = static_cast<std::uint32_t>(cfg_integer(config, "num_heads", component));
+    out.dims.patch         = static_cast<std::uint32_t>(cfg_integer(config, "patch_size", component));
+    out.dims.temporal      = static_cast<std::uint32_t>(cfg_integer(config, "temporal_patch_size", component));
+    out.dims.merge         = static_cast<std::uint32_t>(cfg_integer(config, "spatial_merge_size", component));
+    out.dims.position_rows = static_cast<std::uint32_t>(cfg_integer(config, "num_position_embeddings", component));
+    out.dims.out_hidden    = static_cast<std::uint32_t>(cfg_integer(config, "out_hidden_size", component));
+    for (const std::uint64_t index : cfg_integer_array(config, "deepstack_visual_indexes", component)) {
+        if (index >= out.dims.depth) {
+            throw ArtifactError("vision config deepstack index is outside the block count");
+        }
+        out.dims.deepstack_indexes.push_back(static_cast<std::uint32_t>(index));
+    }
+
+    const std::uint64_t hidden      = out.dims.hidden;
+    const std::uint64_t inter       = out.dims.intermediate;
+    const std::uint64_t patch_width = 3ULL * out.dims.temporal * out.dims.patch * out.dims.patch;
+    const std::uint64_t merger      = static_cast<std::uint64_t>(out.dims.merge) * out.dims.merge * hidden;
+    const auto side                 = static_cast<std::uint32_t>(std::sqrt(double(out.dims.position_rows)));
+    out.dims.patch_width      = static_cast<std::uint32_t>(patch_width);
+    out.dims.merger_width     = static_cast<std::uint32_t>(merger);
+    out.dims.position_grid_side = side;
+    if (hidden == 0 || inter == 0 || patch_width == 0 || merger == 0 || out.dims.depth == 0 ||
+        out.dims.out_hidden == 0 || out.dims.heads == 0 || hidden % out.dims.heads != 0 ||
+        std::uint64_t(side) * side != out.dims.position_rows) {
+        throw ArtifactError("vision config derives an unusable dimension");
+    }
+    out.dims.head_dim = static_cast<std::uint32_t>(hidden / out.dims.heads);
+
+    const QType bf16 = QType::BF16;
+    out.patch_embedding =
+        take(binder, out.max_object_bytes, "vision/patch_embedding", {hidden, patch_width}, bf16);
+    out.patch_embedding_bias =
+        take(binder, out.max_object_bytes, "vision/patch_embedding_bias", {hidden}, bf16);
+    out.position_embedding =
+        take(binder, out.max_object_bytes, "vision/position_embedding", {out.dims.position_rows, hidden},
+             bf16);
+
+    out.blocks.resize(static_cast<std::size_t>(out.dims.depth));
+    for (std::uint32_t layer = 0; layer < out.dims.depth; ++layer) {
+        const std::string p  = "vision/layers/" + std::to_string(layer) + "/";
+        auto& row            = out.blocks[static_cast<std::size_t>(layer)];
+        auto row_take = [&](ParameterReference& slot, std::string_view suffix, Shape shape) {
+            slot = take(binder, out.max_object_bytes, p + std::string(suffix), std::move(shape), bf16);
+        };
+        row_take(row.norm1_weight, "norm1_weight", {hidden});
+        row_take(row.norm1_bias, "norm1_bias", {hidden});
+        row_take(row.norm2_weight, "norm2_weight", {hidden});
+        row_take(row.norm2_bias, "norm2_bias", {hidden});
+        row_take(row.q, "attention/query", {hidden, hidden});
+        row_take(row.q_bias, "attention/query_bias", {hidden});
+        row_take(row.k, "attention/key", {hidden, hidden});
+        row_take(row.k_bias, "attention/key_bias", {hidden});
+        row_take(row.v, "attention/value", {hidden, hidden});
+        row_take(row.v_bias, "attention/value_bias", {hidden});
+        row_take(row.attention_output, "attention/output", {hidden, hidden});
+        row_take(row.attention_output_bias, "attention/output_bias", {hidden});
+        row_take(row.fc1, "mlp/fc1", {inter, hidden});
+        row_take(row.fc1_bias, "mlp/fc1_bias", {inter});
+        row_take(row.fc2, "mlp/fc2", {hidden, inter});
+        row_take(row.fc2_bias, "mlp/fc2_bias", {hidden});
+    }
+
+    // One patch merger at the geometry the recipe declares: fc1 is merger-wide on both variants,
+    // fc2 lands on the text tower's width, and only the LayerNorm differs (hidden for the main
+    // merger, the merged row for a deepstack one) -- see Qwen3VLVisionPatchMerger.forward.
+    const auto bind_merger = [&](VisionMergerWeights& m, const std::string& p, std::uint64_t norm_width) {
+        m.norm_weight = take(binder, out.max_object_bytes, p + "norm_weight", {norm_width}, bf16);
+        m.norm_bias   = take(binder, out.max_object_bytes, p + "norm_bias", {norm_width}, bf16);
+        m.fc1         = take(binder, out.max_object_bytes, p + "fc1", {merger, merger}, bf16);
+        m.fc1_bias    = take(binder, out.max_object_bytes, p + "fc1_bias", {merger}, bf16);
+        m.fc2         = take(binder, out.max_object_bytes, p + "fc2", {out.dims.out_hidden, merger}, bf16);
+        m.fc2_bias    = take(binder, out.max_object_bytes, p + "fc2_bias", {out.dims.out_hidden}, bf16);
+    };
+    bind_merger(out.merger, "vision/merger/", hidden);
+    out.deepstack.resize(out.dims.deepstack_indexes.size());
+    for (std::size_t i = 0; i < out.deepstack.size(); ++i) {
+        bind_merger(out.deepstack[i], "vision/deepstack/" + std::to_string(i) + "/", merger);
+    }
+    return out;
+}
+
 VaeWeights bind_image_vae(Binder& binder) {
     // The production decode chain's named operands, exactly as the qualified route consumes them
     // (tests/models/qwen4_exp/test_image_interlude_dit_real.cu): every "vae/<source key>" tensor,
@@ -321,6 +438,38 @@ VaeWeights bind_image_vae(Binder& binder) {
     add("vae/encoder.conv_out.weight", {128, 768, 3, 3});
     add("vae/encoder.conv_out.bias", {128});
     return out;
+}
+
+std::vector<std::byte> dequantize_embed_table(artifact::Reader& reader, const TextTowerWeights& tower) {
+    const ParameterReference& ref = tower.embed_tokens;
+    if (ref.binding.parts.size() != 1) {
+        throw std::runtime_error("image text tower: embed_tokens binds more than one object");
+    }
+    const auto object = ref.binding.parts.front().object;
+    const WeightGeometry& g  = reader.geometry(object);
+    const std::size_t vocab  = static_cast<std::size_t>(tower.dims.vocab);
+    const std::size_t hidden = static_cast<std::size_t>(tower.dims.hidden);
+    if (g.format != QType::FP8_E4M3FN_ROW_BF16 || g.layout != QuantLayout::RowScale ||
+        g.code_bytes != vocab * hidden || g.scale_bytes != vocab * 2 || g.scale_offset < g.code_bytes) {
+        throw std::runtime_error("image text tower: embed_tokens is not a plain [codes][scales] FP8 plane");
+    }
+    const std::vector<std::byte> obj = reader.read_object(object);
+    if (obj.size() < g.scale_offset + g.scale_bytes) {
+        throw std::runtime_error("image text tower: embed_tokens object is shorter than its geometry");
+    }
+    const auto* codes  = reinterpret_cast<const std::uint8_t*>(obj.data());
+    const auto* scales = reinterpret_cast<const std::uint16_t*>(obj.data() + g.scale_offset);
+    std::vector<std::byte> table(vocab * hidden * 2);
+    auto* rows = reinterpret_cast<std::uint16_t*>(table.data());
+    for (std::size_t row = 0; row < vocab; ++row) {
+        const float scale = ops::canon::bf16_to_f32(scales[row]);
+        for (std::size_t col = 0; col < hidden; ++col) {
+            const std::uint8_t byte = codes[row * hidden + col];
+            const float value       = ops::canon::e4m3_value(byte & 0x7FU) * ((byte & 0x80U) ? -scale : scale);
+            rows[row * hidden + col] = ops::canon::f32_to_bf16_rn(value);
+        }
+    }
+    return table;
 }
 
 } // namespace infernix::models::qwen_image

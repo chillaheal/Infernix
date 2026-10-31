@@ -53,6 +53,19 @@ struct NpyArray {
         require(bytes.size() == numel, "bool array byte count mismatch");
         return bytes;
     }
+    // A torch token-id dump is int64 ('<i8'); the towers take int, so the values are narrowed here.
+    std::vector<int> ints() const {
+        require(descr == "<i8", "ints() on non-int64 array");
+        require(bytes.size() == numel * 8, "int array byte count mismatch");
+        std::vector<std::int64_t> wide(numel);
+        std::memcpy(wide.data(), bytes.data(), bytes.size());
+        std::vector<int> out(numel);
+        for (std::size_t i = 0; i < numel; ++i) {
+            require(wide[i] >= 0 && wide[i] <= 0x7fffffffLL, "token id outside the int range");
+            out[i] = static_cast<int>(wide[i]);
+        }
+        return out;
+    }
     std::vector<double> doubles() const {
         require(descr == "<f8" || descr == "<f4", "doubles() on non-float array");
         if (descr == "<f8") {
@@ -100,7 +113,11 @@ inline NpyArray read_npy(const std::string& path) {
     const std::size_t q2 = header.find('\'', q1 + 1);
     require(q1 != std::string::npos && q2 != std::string::npos, "npy descr quote parse");
     a.descr = header.substr(q1 + 1, q2 - q1 - 1);
-    require(header.find("'fortran_order': False") != std::string::npos, "npy not C-contiguous");
+    // Four of the M6 latents fixtures (target_latents_init_*, latents_after_step_*) were dumped from
+    // non-contiguous torch tensors and carry 'fortran_order': True. Their payload is the same array
+    // with the FIRST axis varying fastest, so it is gathered into row-major order below instead of
+    // refused.
+    const bool fortran_order = header.find("'fortran_order': True") != std::string::npos;
 
     const std::size_t spos = header.find("'shape'");
     require(spos != std::string::npos, "npy header missing shape");
@@ -115,11 +132,41 @@ inline NpyArray read_npy(const std::string& path) {
         while (j < dims.size() && dims[j] >= '0' && dims[j] <= '9') ++j;
         if (j > i) { a.shape.push_back(std::stoull(dims.substr(i, j - i))); i = j; } else { ++i; }
     }
-    const std::size_t elem = (a.descr == "<f4") ? 4u : ((a.descr == "<c8" || a.descr == "<f8") ? 8u : 1u);
+    const std::size_t elem =
+        (a.descr == "<f4") ? 4u : ((a.descr == "<c8" || a.descr == "<f8" || a.descr == "<i8") ? 8u : 1u);
     a.numel = 1;
     for (std::size_t s : a.shape) a.numel *= s;
     require(raw.size() == data_off + a.numel * elem, "npy payload size mismatch");
     a.bytes.assign(raw.begin() + data_off, raw.end());
+    if (fortran_order && a.shape.size() > 1) {
+        const std::size_t n = a.shape.size();
+        std::vector<std::size_t> stride_c(n), stride_f(n);   // element strides, C- and Fortran-order
+        stride_c[n - 1] = 1;
+        for (std::size_t k = n - 1; k-- > 0;) {
+            stride_c[k] = stride_c[k + 1] * a.shape[k + 1];
+        }
+        // Fortran order varies the FIRST axis fastest, so stride_f[0] = 1 and every later stride
+        // multiplies in the axis BEFORE it. Deriving stride_f from shape[k+1] (as an earlier revision
+        // did) makes it identical to stride_c and turns the gather below into a silent no-op: the four
+        // F-ordered M6 latents fixtures then reached the job transposed -- same numbers, wrong layout,
+        // Frobenius norm preserved, and every gate that compared them against the same misread file
+        // called that bit-exact. Blackouts #21-#25 chased it as a DiT bug.
+        stride_f[0] = 1;
+        for (std::size_t k = 1; k < n; ++k) {
+            stride_f[k] = stride_f[k - 1] * a.shape[k - 1];
+        }
+        std::vector<std::uint8_t> row_major(a.bytes.size());
+        for (std::size_t flat = 0; flat < a.numel; ++flat) {
+            std::size_t src = 0, rem = flat;
+            for (std::size_t k = 0; k < n; ++k) {
+                const std::size_t coord = rem / stride_c[k];
+                rem -= coord * stride_c[k];
+                src += coord * stride_f[k] * elem;
+            }
+            for (std::size_t b = 0; b < elem; ++b) row_major[flat * elem + b] = a.bytes[src + b];
+        }
+        a.bytes.swap(row_major);
+    }
     return a;
 }
 

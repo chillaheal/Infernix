@@ -146,6 +146,51 @@ infernix_add_op_test(infernix_image_texttower_prod_cuda_test
   LIBRARIES infernix_ops infernix_qwen_image)
 set_tests_properties(infernix_image_texttower_prod_cuda_test PROPERTIES SKIP_RETURN_CODE 77)
 
+# Instruction-guided edit (M3): the EDIT route's Qwen3-VL vision tower (src/models/qwen_image/
+# vision_tower.cu) on the production artifact's streamed vision/* weights, gated against torch's own
+# Qwen3VLVisionModel output on the same processor pixels -- both the merger rows the text tower
+# scatters onto the <|image_pad|> slots and one deepstack tensor per vision_config
+# deepstack_visual_indexes entry (blocks 8/16/24), so a wrong tap index cannot survive to M4.
+# A-priori tol 5e-2 rel Frobenius per gated tensor (the deep-BF16-chain precedent of the VAE gate);
+# never narrowed to pass. Also asserts the #17 ledger returns to zero on the success path and under a
+# device budget the tower cannot fit. Skips (77) without INFERNIX_TEST_ARTIFACT / INFERNIX_IMAGE_ORACLE;
+# returns 2 (runnable) with no CUDA device.
+infernix_add_op_test(infernix_image_vision_prod_cuda_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_image_vision_prod_cuda.cu"
+  LIBRARIES infernix_ops infernix_qwen_image infernix_qwen_image_runtime)
+set_tests_properties(infernix_image_vision_prod_cuda_test PROPERTIES SKIP_RETURN_CODE 77)
+
+# Instruction-guided edit (M4): the EDIT route's CONDITIONED text tower (src/models/qwen_image/
+# text_tower.cu run_conditioned_text_tower) -- the streamed 36-layer forward over an inputs_embeds whose
+# <|image_pad|> rows are the M3 tower's merger rows, with the deepstack rows added to those rows after
+# decoder layers 0/1/2. Gated on the artifact's own streamed text/* + vision/* weights (production
+# shapes, real FP8 embed dequantization) against torch's conditioned forward on the same artifact:
+# rel_fro(engine, f32) <= max(2 * floor, 1e-2) with floor = the reference's own BF16 error, per row, and
+# with the text and image row CLASSES gated separately. Plus three tolerance-free asserts: the
+# image_pad_mask equals the model's own byte for byte, the deepstack add measurably moves the image rows,
+# and a plain prompt (identity scatter, no adds) is BIT-identical to run_text_tower -- the certified t2i
+# route's regression. Also asserts the #17 ledger returns to zero on success and under a refused
+# allocation. Skips (77) without INFERNIX_TEST_ARTIFACT / INFERNIX_IMAGE_ORACLE; returns 2 with no CUDA.
+infernix_add_op_test(infernix_image_edit_prompt_cuda_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_image_edit_prompt_cuda.cu"
+  LIBRARIES infernix_ops infernix_qwen_image infernix_qwen_image_runtime)
+set_tests_properties(infernix_image_edit_prompt_cuda_test PROPERTIES SKIP_RETURN_CODE 77)
+
+# Instruction-guided edit (M6): ONE denoising step of the EDIT route's DiT -- run_image_job with ref_grids
+# set, so the joint sequence is the interleaved [expanded VLM rows][target] that joint_scatter_u16_kernel
+# assembles, modulated by target_token_mask and masked block-causally by image_block_ids. The step's target
+# velocity and the returned latent are gated against torch's own one-step dump (seed 7, use_kv_cache off,
+# no CFG) with the M4 gate: rel_fro(engine, f32) <= max(2 * floor, 1e-2), floor = the reference's own BF16
+# error, with the text and image classes gated separately. Two asserts the old certification never had: the
+# reference slot carries img_in(reference latents) and measurably NOT the VLM merger row, and the #17 ledger
+# returns to zero on the success path AND under each refused/inconsistent input. The certified
+# text-to-image step test stays the guard for the empty-ref branch. Skips (77) without
+# INFERNIX_TEST_ARTIFACT / INFERNIX_IMAGE_ORACLE; returns 2 with no CUDA device.
+infernix_add_op_test(infernix_image_edit_pipeline_prod_cuda_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_image_edit_pipeline_prod_cuda.cu"
+  LIBRARIES infernix_ops infernix_qwen_image infernix_qwen_image_runtime)
+set_tests_properties(infernix_image_edit_pipeline_prod_cuda_test PROPERTIES SKIP_RETURN_CODE 77)
+
 # GPU production-route qualification, VAE DECODER: the full Qwen-Image-2.1 single-frame VAE decoder
 # (AutoencoderKLQwenImage21, T=1 first-chunk) composed from production ops (ops::conv2d, ops::silu,
 # ops::add, ops::upsample_nearest_2x, ops::dupup3d, ops::spatial_attn, plus reused ops::linear +
@@ -247,6 +292,17 @@ infernix_add_op_test(infernix_image_tower_prompt_test
   LIBRARIES infernix_serve infernix_engine infernix_core infernix::json)
 set_tests_properties(infernix_image_tower_prompt_test PROPERTIES SKIP_RETURN_CODE 77)
 
+# Instruction-guided edit (M1): the raw ti2i template, the host-side reproduction of the
+# processor's <|image_pad|> expansion, the derived drop, the x4 vision/VAE geometry and the
+# PIL alpha-over-white parity, all gated against tests/models/qwen_image/oracle_edit_template.json
+# (genuine Qwen3-VL processor, synthetic plane). Also guards that the production chat-template
+# render of the t2i path has not moved. Host-only; skips (77) without INFERNIX_QWENVL_PROCESSOR.
+infernix_add_op_test(infernix_image_edit_template_test
+  NEEDS_SOURCE_DIR
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_image_edit_template.cpp"
+  LIBRARIES infernix_serve infernix_engine infernix_core infernix::json)
+set_tests_properties(infernix_image_edit_template_test PROPERTIES SKIP_RETURN_CODE 77)
+
 # Step 8 (8D): the PRODUCTION raw-prompt tower route (serve provider: compiled chat template +
 # genuine tokenizer + FP8-v2 streamed weights + one-time FP8 embed dequant) on device; its
 # pre-final-RMSNorm rows gated vs pre_norm_hidden[drop_idx,S) at the qualified tower test's a-priori
@@ -295,6 +351,19 @@ infernix_add_op_test(infernix_image_rope_prod_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_image_rope_prod.cpp"
   LIBRARIES infernix_qwen_image)
 
+# Instruction-guided image edit (M5): the joint index map (infernix_qwen_image::build_joint_layout) -- the
+# host arithmetic of transformer_qwenimage21.py's forward (repeats where(mask,4,1), x4 expansion, img_in
+# scatter rows onto the image slots, target_token_mask = the LAST img_shapes block, block ids, and the
+# interleaved rope walk). Gates: text-only equality (the mask [0]*tp+[1]*(H*W/4) must reproduce
+# build_joint_rope BIT-FOR-BIT across 7 geometries -- the certified t2i assembly cannot move), the
+# portrait row (30 text / 4056-token ref / 12 trailer / 4096 target: block ids, packed scatter rows,
+# target mask on the last block only, frame advance max(h,w) after each block, centred grids), two
+# adjacent images staying TWO blocks with TWO frame advances, and the x4 invariant throwing
+# std::invalid_argument (the host-side refusal the M7 ledger relies on). Host-only, no GPU, no env.
+infernix_add_op_test(infernix_image_joint_layout_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_joint_layout.cpp"
+  LIBRARIES infernix_qwen_image)
+
 # Production joint-sequence img_mask (infernix_qwen_image::build_img_mask): the DiT joint mask is the text
 # encoder's image_pad_mask_base row-concatenated with target_slots = (Hl*Wl)//4 packed-image ones
 # (dump_pipeline.py:124). The base widens with the N condition images' image_pad slots, so one rule covers
@@ -339,3 +408,18 @@ set_tests_properties(infernix_image_pipeline_gate_test PROPERTIES SKIP_RETURN_CO
 infernix_add_op_test(infernix_image_job_assembly_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_image_job_assembly.cpp"
   LIBRARIES infernix_qwen_image)
+
+# M9, THE SHIP GATE for the reference_image capability: the edit instruction graded on the picture
+# instead of on a row. The synthetic fixture (a blue field, a centred red square) goes through the
+# production route end to end -- the raw ti2i render, the genuine tokenizer and its pad expansion,
+# the vision tower, the conditioned 36-layer forward, the VAE encode and the DiT loop -- twice, with
+# two mutually exclusive instructions, and the assertions are pixel statistics only: not-a-copy (MAE
+# and a test-local SSIM), the subject held inside the round-trip tolerance, and the effect the
+# sentence names (a red field outside the square / a green band across the top). No VLM, no judge.
+# Links infernix_serve for the host halves the serving layer itself uses. Skips (77) without
+# INFERNIX_TEST_ARTIFACT / INFERNIX_QWENVL_PROCESSOR; returns 2 with no CUDA device. It runs the real
+# pipeline on the real GPU, so it never runs beside a live serve.
+infernix_add_op_test(infernix_image_edit_behavior_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_image_edit_behavior.cu"
+  LIBRARIES infernix_ops infernix_qwen_image infernix_qwen_image_runtime infernix_serve)
+set_tests_properties(infernix_image_edit_behavior_test PROPERTIES SKIP_RETURN_CODE 77)
