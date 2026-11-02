@@ -79,3 +79,19 @@ profiles/
 
 # Claude Code personal/local settings (may contain API tokens)
 .claude/settings.local.json
+
+# Local agent state (STATE.md/TODO.md live on disk, they are not project history)
+/.agent/
+
+# CTest scratch from running the gates in the source tree
+/Testing/
+
+# image-spike run output: captured binaries, decoder/API dumps, per-run directories
+/image-spike/_dl_apiref/
+/image-spike/dbg/
+/image-spike/portrait_look/
+/image-spike/ppl_out/
+/image-spike/repro_run/
+/image-spike/*.exe
+/image-spike/*.out
+/image-spike/*.err

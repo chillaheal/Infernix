@@ -1,0 +1,6 @@
+{
+  "model": "Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix",
+  "messages": [{"role": "user", "content": "Write a long story about a lighthouse keeper who befriends a seagull."}],
+  "max_tokens": 600,
+  "temperature": 0
+}
