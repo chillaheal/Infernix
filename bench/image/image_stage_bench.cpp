@@ -108,12 +108,12 @@ public:
                                                std::uint64_t seed,
                                                std::span<const std::uint16_t> prompt_embeds,
                                                std::span<const std::uint16_t> negative_embeds,
-                                               const infernix::serve::ReferencePixels* reference,
+                                               std::span<const infernix::serve::ReferencePlanes> references,
                                                void* image_stream,
                                                const std::shared_ptr<infernix::serve::ImageJobProgress>& progress,
                                                const infernix::serve::EditConditioning* edit) {
         const auto t0 = std::chrono::steady_clock::now();
-        auto picture  = inner_(request, seed, prompt_embeds, negative_embeds, reference, image_stream,
+        auto picture  = inner_(request, seed, prompt_embeds, negative_embeds, references, image_stream,
                                progress, edit);
         last_device_ms = ms_since(t0);
         return picture;
@@ -179,7 +179,7 @@ void run_row(infernix::serve::ImageGenerationService& images, TimingRunner& runn
                         row.kind);
             return;
         }
-        request.image = reference_b64;
+        request.images = { reference_b64 };
     }
 
     const auto t0 = std::chrono::steady_clock::now();
@@ -271,11 +271,19 @@ int main() {
             [executor_ptr = &executor](const infernix::serve::OpenAIImagesRequest& request, std::uint64_t seed,
                                         std::span<const std::uint16_t> prompt_embeds,
                                         std::span<const std::uint16_t> negative_embeds,
-                                        const infernix::serve::ReferencePixels* reference, void* image_stream,
-                                        const std::shared_ptr<infernix::serve::ImageJobProgress>& progress) {
-                return (*executor_ptr)(request, seed, prompt_embeds, negative_embeds, reference, image_stream,
-                                       progress);
-            }));
+                                        std::span<const infernix::serve::ReferencePlanes> references,
+                                        void* image_stream,
+                                        const std::shared_ptr<infernix::serve::ImageJobProgress>& progress,
+                                        const infernix::serve::EditConditioning* edit) {
+                return (*executor_ptr)(request, seed, prompt_embeds, negative_embeds, references, image_stream,
+                                       progress, edit);
+            }),
+        // The ref row needs both of these: the admission sizes the ti2i prompt with the reference
+        // renderer and reserves the vision lane from the artifact's own ViT dims, and a request that
+        // carries a reference with either one missing is refused as unconfigured. `tower` is the same
+        // processor directory the t2i renderer above reads.
+        infernix::serve::make_artifact_vision_dims_provider(image_artifact),
+        infernix::serve::make_tower_reference_prompt_renderer(tower));
 
     std::printf("BENCH engine max_context=%u expert_ram_gib=%llu image_artifact=%s\n", max_context,
                 static_cast<unsigned long long>(expert_ram / (1024ULL * 1024ULL * 1024ULL)),
