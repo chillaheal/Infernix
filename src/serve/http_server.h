@@ -121,6 +121,12 @@ private:
     void register_routes();
     void handle_chat_completions(const httplib::Request& req, httplib::Response& res);
     void handle_images_generations(const httplib::Request& req, httplib::Response& res);
+    // POST /v1/images/edits: the same request as generations, and the one rule that a reference is
+    // required. Accepts application/json and multipart/form-data.
+    void handle_images_edits(const httplib::Request& req, httplib::Response& res);
+    // The two image routes, which differ only in require_reference -- everything else (parse order,
+    // the model gate, the 503 until attach_images, the response) is shared by construction.
+    void handle_images(const httplib::Request& req, httplib::Response& res, bool require_reference);
     void handle_messages(const httplib::Request& req, httplib::Response& res);
     void handle_count_tokens(const httplib::Request& req, httplib::Response& res);
     void handle_decide(const httplib::Request& req, httplib::Response& res);

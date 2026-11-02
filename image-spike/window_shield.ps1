@@ -4,7 +4,9 @@ param(
     [string]$MarkerFile = 'C:\Users\Micke\Desktop\Infernix FlashNext\infernix-window.json',
     [string]$Reason = 'cert window',
     [int]$MaxMinutes = 90,        # hard stop: the stub must never hold the port longer than this
-    [int]$RetryAfterSec = 30,
+    [int]$RetryAfterSec = 30,     # the answer when no window end is known at all
+    [int]$RetryAfterMin = 15,     # never ask a client to wait less than this (a burst buys nothing)
+    [int]$RetryAfterMax = 300,    # nor more than this, however long the window is (see Get-RetryAfterSeconds)
     [switch]$NoWait,              # bind at once (a port the serve does not hold) - used to test
     [switch]$NoWindow             # no banner refresh (when started from another window)
 )
@@ -27,7 +29,9 @@ param(
 # reservation for the port, which a plain user process cannot count on.
 
 $ErrorActionPreference = 'Continue'
-$reasonOnly = 'infernix cert-window in progress (' + $Reason + ') - :8888 is down on purpose, not a crash'
+# The port is named from $Port, never as a literal: this stub is also run on a spare port to test it, and
+# a notice that says :8888 while answering on another port is the kind of text that gets quoted at someone.
+$reasonOnly = 'infernix cert-window in progress (' + $Reason + ') - :' + [string]$Port + ' is down on purpose, not a crash'
 
 function Say($m) { Write-Host ((Get-Date).ToString('HH:mm:ss') + ' ' + $m) }
 
@@ -48,7 +52,7 @@ function Set-Marker($secondsLeft, $ends) {
     if ($ends) { $endsText = $ends.ToString('yyyy-MM-dd HH:mm:ss') }
     $obj = @{ shield = 'image-spike/window_shield.ps1'; shield_pid = $PID; port = $Port; reason = $Reason;
              started_local = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss'); ends_local = $endsText;
-             seconds_left = $secondsLeft; answers = 'HTTP 503 with Retry-After ' + [string]$RetryAfterSec + ' s';
+             seconds_left = $secondsLeft; answers = 'HTTP 503 with Retry-After ' + [string](Get-RetryAfterSeconds $secondsLeft) + ' s';
              message = $reasonOnly } | ConvertTo-Json -Compress
     try { [System.IO.File]::WriteAllText($MarkerFile, $obj, (New-Object System.Text.UTF8Encoding($false))) } catch { Say ('marker write failed: ' + $_.Exception.Message) }
 }
@@ -66,6 +70,21 @@ function Get-RemainingSeconds($ends) {
     return $s
 }
 
+function Get-RetryAfterSeconds($secondsLeft) {
+    # Measured in the installed CLI (versions/2.1.233, the bytes behind ~/.local/bin/claude.exe): its
+    # retryRequest honours Retry-After EXACTLY and computes its own backoff only when the header is
+    # absent, and 503 is retryable (status>=500). The attempt count at that call site is unknown, so a
+    # client has a finite number of tries and each one is spent after the delay we name. A constant 30 s
+    # therefore fires every attempt long before a 20 min window ends -- the budget runs out while the
+    # server is still down. Asking for the time actually left spends the attempts where they can land on
+    # a live serve instead, clamped so a short window is not padded and a long one is not a blackout.
+    if ($null -eq $secondsLeft) { return $RetryAfterSec }
+    $s = [int]$secondsLeft
+    if ($s -lt $RetryAfterMin) { return $RetryAfterMin }
+    if ($s -gt $RetryAfterMax) { return $RetryAfterMax }
+    return $s
+}
+
 function Get-StubResponse($secondsLeft) {
     $mins = [Math]::Max(0, [Math]::Ceiling($secondsLeft / 60))
     $msg = $reasonOnly + ', about ' + [string]$mins + ' min left'
@@ -74,7 +93,7 @@ function Get-StubResponse($secondsLeft) {
     $bodyBytes = $enc.GetBytes($body)
     $head = 'HTTP/1.1 503 Service Unavailable' + "`r`n" +
             'Content-Type: application/json' + "`r`n" +
-            'Retry-After: ' + [string]$RetryAfterSec + "`r`n" +
+            'Retry-After: ' + [string](Get-RetryAfterSeconds $secondsLeft) + "`r`n" +
             'Connection: close' + "`r`n" +
             'Content-Length: ' + [string]$bodyBytes.Length + "`r`n`r`n"
     return @{ head = $enc.GetBytes($head); body = $bodyBytes; text = $body }
@@ -124,11 +143,11 @@ function Show-Banner($info, $secondsLeft, $answeredTotal) {
     if ($info.ends) { $endsText = $info.ends.ToString('HH:mm:ss') }
     Write-Host ''
     Write-Host $bar
-    Write-Host '  INFERNIX :8888 PAUSAS - CERT-/BENCH-FONSTER PAGAR'
+    Write-Host ('  INFERNIX :' + [string]$Port + ' PAUSAS - CERT-/BENCH-FONSTER PAGAR')
     Write-Host ('  agare:    ' + $info.owner)
     Write-Host ('  orsak:    ' + $Reason)
     Write-Host ('  kvar:     ~' + [Math]::Max(0, [int]($secondsLeft / 60)) + ' min (' + $secondsLeft + ' s), upp till ' + $endsText)
-    Write-Host ('  servern:  avsiktligt nere. Porten SVARAR 503 (Retry-After ' + $RetryAfterSec + ' s) i stallet for ECONNREFUSED.')
+    Write-Host ('  servern:  avsiktligt nere. Porten SVARAR 503 (Retry-After ' + [string](Get-RetryAfterSeconds $secondsLeft) + ' s, klamd ' + $RetryAfterMin + '-' + $RetryAfterMax + ' s) i stallet for ECONNREFUSED.')
     Write-Host ('  svarat:   ' + $answeredTotal + ' forfragningar sedan fonstret borjade')
     Write-Host ('  texten andra sessioner far: ' + $reasonOnly)
     Write-Host ('  markor:   ' + $MarkerFile)

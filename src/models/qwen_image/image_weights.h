@@ -15,6 +15,7 @@
 
 #include "artifact/binder.h"
 
+#include <array>
 #include <cstdint>
 #include <map>
 #include <string>
@@ -46,6 +47,14 @@ struct TextTowerDims {
     std::uint32_t vocab   = 0;
     float rope_theta = 0.0F;
     float eps        = 0.0F; // rms_norm_eps
+    // text_config.rope_scaling, read from the artifact and never defaulted: the M-RoPE axis split (T, H,
+    // W pair counts over the head's head_dim/2 pairs) and whether pairs are assigned to axes by the
+    // interleaved walk (pair i -> axis i % 3) that the tower's rotation kernel implements. A tower whose
+    // rotation the engine cannot describe from its own config is a tower that must not run --
+    // text_tower.cu's checked_dims refuses these fields when they are absent or do not describe the
+    // head, which is what "fail closed" means here.
+    std::array<std::uint32_t, 3> mrope_section{};
+    bool mrope_interleaved = false;
 };
 
 // One streamed reference per DiT-block role (the seven recipe-quantized linears plus the two

@@ -131,6 +131,14 @@ int main() {
         require_eq(text.dims.vocab, 151936, "text vocab");
         require(text.dims.rope_theta == 5000000.0F, "text rope_theta differs from 5e6");
         require(text.dims.eps == 1e-6F, "text eps differs from 1e-6");
+        // The M-RoPE split the tower rotates by is read from text_config.rope_scaling, never assumed:
+        // this artifact names 24 T / 20 H / 20 W over the 64 pairs of a 128-wide head and names the
+        // rotation interleaved. An artifact that stopped saying so fails the bind, not the run.
+        require(text.dims.mrope_interleaved,
+                "text rope_scaling does not name the interleaved M-RoPE this tower implements");
+        require(text.dims.mrope_section[0] == 24 && text.dims.mrope_section[1] == 20 &&
+                    text.dims.mrope_section[2] == 20,
+                "text mrope_section differs from the checkpoint's 24/20/20");
         require(text.layers.size() == 36, "bound text layer count differs from the config");
         require_role(binder, text.embed_tokens, QType::FP8_E4M3FN_ROW_BF16, "text/embed_tokens");
         require_role(binder, text.final_norm, QType::BF16, "text/final_norm");

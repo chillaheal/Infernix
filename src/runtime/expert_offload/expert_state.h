@@ -19,6 +19,8 @@ struct ExpertStateLoad {
     std::optional<SavedState> state;
     bool shipped      = false; // the state came from the artifact's profile, not a saved session
     std::string message; // why nothing was loaded
+    std::string profile_message; // when `shipped`: the profile's own source note, kept apart from
+                                 // the sidecar's refusal so a reader sees which source said what
 };
 
 // Writes `state` to `path` through `path.tmp` and a rename; returns an error message, empty on success.

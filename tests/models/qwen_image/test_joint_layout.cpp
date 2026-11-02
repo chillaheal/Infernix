@@ -383,12 +383,57 @@ void gate_against_reference() {
 
 } // namespace
 
+// (F) The closed-form joint token count the serve admission uses must BE the arithmetic
+// build_joint_layout performs, or the admission refuses requests it should serve and serves ones the
+// attention Op will throw on. Checked against three real layouts, not against a hand-computed number.
+void gate_token_count() {
+    using infernix::models::qwen_image::joint_token_count;
+    struct Case {
+        std::vector<long long> runs;   // alternating (text, image) counts, ending with target slots
+        std::vector<ImageShape> shapes;
+    };
+    const Case cases[] = {
+        // text-to-image: no reference, one 64x64 packed target.
+        {{37, 1024}, {{1, 64, 64}}},
+        // the M1 portrait edit: 30 text, a 4056-token reference (1014 slots), 12 trailer, 4096 target.
+        {{30, 1014, 12, 1024}, {{1, 78, 52}, {1, 64, 64}}},
+        // two references and the target with nothing between them: seven contiguous slots.
+        {{5, 7}, {{1, 2, 2}, {1, 2, 4}, {1, 4, 4}}},
+    };
+    for (const Case& c : cases) {
+        const std::vector<std::uint8_t> m = mask_of(c.runs);
+        const JointLayout L = build_joint_layout(m, c.shapes);
+        // prompt_rows is what the RENDERED prompt carries (it includes the expanded vision rows);
+        // vision_tokens is what of them carries the picture. The mask's last target_slots ones are
+        // the target's packed slots, so everything before them is the prompt.
+        const long long target       = c.shapes.back().tokens();
+        const long long target_slots = target / 4;
+        long long slots = 0, mask_len = 0;
+        for (const std::uint8_t bit : m) { mask_len += 1; slots += (bit != 0 ? 1 : 0); }
+        const long long vision      = slots - target_slots;
+        const long long prompt_rows = mask_len - target_slots;
+        const long long got    = joint_token_count(prompt_rows, vision, target);
+        check("joint token count matches the layout", got == L.expanded_len,
+              "count=" + std::to_string(got) + " expanded=" + std::to_string(L.expanded_len) +
+                  " rows=" + std::to_string(prompt_rows) + " vision=" + std::to_string(vision) +
+                  " target=" + std::to_string(target));
+    }
+    bool threw = false;
+    try {
+        (void)joint_token_count(10, 0, 17);  // not a whole number of 2x2 slots
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    check("token count refuses a target that is not packed", threw, threw ? "" : "no throw");
+}
+
 int main() {
     gate_text_only();
     gate_portrait();
     gate_adjacent_images();
     gate_invariants();
     gate_against_reference();
+    gate_token_count();
     if (!g_ok) { std::printf("IMAGE_JOINT_LAYOUT_TEST: FAIL\n"); return 1; }
     std::printf("IMAGE_JOINT_LAYOUT_TEST: PASS (joint index map: text-only rope bit-identical to "
                 "build_joint_rope, interleaved portrait blocks/scatter/target mask/frame advance, "

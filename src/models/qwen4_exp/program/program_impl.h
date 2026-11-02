@@ -3002,6 +3002,13 @@ public:
             expert_cache::warm_start_load(options_.expert_state, options_.expert_cache,
                                           options_.expert_state_identity, keys, options_.expert_profile);
         SeedSource source = !load.state ? SeedSource::None : load.shipped ? SeedSource::Shipped : SeedSource::Saved;
+        if (load.shipped) {
+            // Both reasons are readable now that they are separate fields: what seeded the frames,
+            // and what the sidecar said when it gave way.
+            diagnostic("expert cache: seeded from " + load.profile_message +
+                           "; the saved state said: " + load.message,
+                       DiagnosticLevel::Debug);
+        }
         if (!load.state && options_.expert_cache && !options_.expert_state.empty() && has_calibrated_order()) {
             diagnostic("expert cache: no saved state used: " + load.message, DiagnosticLevel::Debug);
             load.state = calibrated_expert_order();

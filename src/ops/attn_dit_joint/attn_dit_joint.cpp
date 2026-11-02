@@ -13,7 +13,8 @@ namespace {
 
 constexpr std::int32_t kHeadDim   = 128;
 constexpr std::int32_t kMaxHeads  = 40;
-constexpr std::int32_t kMaxTokens = 20480;
+// The one ceiling, from the header, so the serve admission and this check cannot drift apart.
+constexpr std::int32_t kMaxTokens = kAttnDitJointMaxTokens;
 
 bool aligned_to(const void* pointer, std::uintptr_t alignment) {
     return pointer != nullptr && (reinterpret_cast<std::uintptr_t>(pointer) & (alignment - 1)) == 0;

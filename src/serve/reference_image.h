@@ -32,10 +32,14 @@ struct ReferenceVisionPlane {
 };
 
 // Both copies from one decode + one resize. `vae` is byte-identical to what
-// prepare_reference_image returns.
+// prepare_reference_image returns. source_width_px/source_height_px are the DECODED size, before the
+// geometry snap: the canvas of an edit follows the reference's aspect, and it must follow the picture
+// the client sent rather than the plane the VAE was fed (see openai_images.h resolve_canvas_geometry).
 struct ReferencePlanes {
     ReferencePixels      vae;
     ReferenceVisionPlane vision;
+    std::uint32_t source_width_px  = 0;
+    std::uint32_t source_height_px = 0;
 };
 
 // Strict base64 (the OpenAI `image` payload's data URI and every reference plane input). Exposed
@@ -58,10 +62,22 @@ struct ReferencePlanes {
     return static_cast<std::uint64_t>(height_px / 32) * (width_px / 32);
 }
 
+// The pipeline's condition-image resize, byte-exact to
+// PIL.Image.resize((dst_w, dst_h), resample=LANCZOS, reducing_gap=None) on RGBA input: the
+// premultiplied-"RGBa" round trip Image.resize performs around an RGBA resize, then the separable
+// windowed-sinc resample (horizontal pass first) with Pillow's 22-bit fixed-point coefficients,
+// per-window normalization and clip8. `rgba` is row-major RGBA8 of src_w x src_h; `dst` comes back
+// row-major RGBA8 of dst_w x dst_h. Exposed because the P1 gate grades it against Pillow's own
+// output; production uses prepare_reference_planes. Throws std::invalid_argument on a null plane or a
+// non-positive dimension.
+void resize_rgba_pil_lanczos(const std::uint8_t* rgba, int src_w, int src_h, int dst_w, int dst_h,
+                             std::vector<std::uint8_t>& dst);
+
 // Decode the base64 payload, decode the image (PNG keeps its alpha as the fourth channel; other
 // formats get an opaque alpha), snap to the reference geometry -- the pipeline's
-// calculate_dimensions(1024^2, aspect ratio), rounded to multiples of 32 -- and resize with the
-// reference pipeline's PIL bilinear mapping (no antialias, half-pixel centers).
+// calculate_dimensions(1024^2, aspect ratio), rounded to multiples of 32 -- and resize it with
+// resize_rgba_pil_lanczos above, which is what VaeImageProcessor does (its processor is constructed
+// with no resample override, so the "lanczos" default governs BOTH the VAE copy and the vision copy).
 // Throws std::invalid_argument for invalid base64 or an undecodable/degenerate image and
 // media::decode::Error for a decoded-size budget violation.
 [[nodiscard]] ReferencePlanes prepare_reference_planes(const std::string& payload);

@@ -8,6 +8,12 @@
 
 namespace infernix::ops {
 
+// The longest joint sequence this module serves, both as documented below ("S is 1..20480") and as the
+// check every entry performs. Public because the serve layer has to answer the same question BEFORE it
+// yields the LLM's VRAM: a request whose sequence cannot be assembled is the client's to be told about
+// (HTTP 400, with the numbers), not a job that dies inside the interlude with a 500.
+inline constexpr std::int32_t kAttnDitJointMaxTokens = 20480;
+
 /**
  * Qwen-Image-2.1 DiT joint block-causal softmax attention over the text-prefix / image-suffix
  * sequence.

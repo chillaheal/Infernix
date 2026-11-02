@@ -5,12 +5,15 @@
 #include "serve/image_text_tower.h"
 
 #include "artifact/reader.h"
+#include "artifact/schema.h"
 #include "media/decode/decode.h"
 #include "media/encode/png_encode.h"
+#include "infernix/ops/attn_dit_joint.h"
 #include "models/qwen_image/image_device_need.h"
 #include "models/qwen_image/image_job.h"
 #include "models/qwen_image/image_pipeline.h"
 #include "models/qwen_image/image_weights.h"
+#include "models/qwen_image/joint_layout.h"
 #include "models/qwen_image/noise.h"
 
 #include <spdlog/logger.h>
@@ -44,6 +47,57 @@ constexpr std::uint64_t kMiB = 1024ULL * 1024ULL;
 // need is the failure mode that hurts: the allocation throws inside the interlude, and (depending on
 // where) the restoration is the thing that fails. Half a GiB is the price of not finding out.
 constexpr std::uint64_t kInterludeMarginBytes = 512ULL * kMiB;
+
+// What the prompt enhancer is promised before it is asked to load: measured, not estimated. One real
+// rewrite of the 5118-token kingfisher edit -- load, vision tower, prefill, 2473 tokens of thinking
+// -- costs 19564 MiB above an idle card on this machine, of which 17947 MiB is the checkpoint's BF16
+// weights, and the high-water mark the worker's own allocator reports for it is 19042 MiB reserved
+// (image-edit/_p10_resident.json, worker_cost_mib and torch_peak_reserved_mib). The number below is
+// that peak, so the promise the fit check makes -- this constant plus kInterludeMarginBytes plus the
+// engine's headroom -- comes to the measured peak plus half a GiB, and the fit check still keeps its
+// own margin on top: an allocation that lands a hair short is discovered here, not inside the worker.
+// The constant used to be 20 GiB, which is 1438 MiB above the measured peak, and that excess is what
+// made `prompt_enhance: "auto"` refuse itself: a request with 16000 MiB of yield and 4988 MiB already
+// free had 20988 MiB against a floor of 20480 + 512 + headroom and skipped the rewriter by a few MiB,
+// so the advertised auto never rewrote anything with the chat model resident. Over-reserving stays the
+// safe direction -- a refused enhancer is a skip for auto and a 503 naming the numbers for true, while
+// an under-reserved one allocates inside its own process while the resident LLM is quiesced and the
+// shortage is discovered by whatever touches the card next -- but the promise is now the measurement
+// plus the margin, not the measurement plus a second slack nobody re-measured.
+constexpr std::uint64_t kEnhancerReserveBytes = 19042ULL * kMiB;
+
+// Whether `prompt_enhance: "auto"` should spend an enhancer interlude on this request. The rule is
+// the two facts that decide whether the edit rewriter can do anything at all -- not a judgement about
+// the quality of the client's prose, which nothing outside a model could make here. PE-I2I reads the
+// picture, so with no reference a plain text-to-image call hands it nothing to read and the rewrite
+// buys ~68 s and ~19.5 GiB for nothing. And an instruction that already carries the tag the rewriter
+// is required to address its inputs with (image-edit/refs/q21_system_prompt_edit.txt:57-61, the very
+// tag serve/image_text_tower.cpp:229 renders) is a rewriter's own answer arriving back: running it
+// through the rewriter again is how a good prompt drifts. Anything else gets the rewrite, including
+// the one-phrase instruction -- which is exactly what the enhancer exists to be handed
+// (image-edit/CLAUDE.md, "A short client instruction is the intended input"). A client that sent
+// true never consults this: it asked for the rewrite, so it gets it or gets the documented refusal.
+// What `auto` asks for, told apart BY REASON: the three are three different facts (nothing to read,
+// already read, go and read it) and the stored record has to be able to say which one happened.
+enum class AutoWish : std::uint8_t { Rewrite, SkipNoReference, SkipAlreadyRewritten };
+
+[[nodiscard]] AutoWish wants_prompt_enhancement(const OpenAIImagesRequest& request) {
+    if (request.images.empty()) { return AutoWish::SkipNoReference; }
+    const std::string_view prompt = request.prompt;
+    for (std::size_t at = prompt.find("<image"); at != std::string_view::npos;
+         at = prompt.find("<image", at + 1)) {
+        std::size_t end = at + 6;                        // past the literal "<image"
+        while (end < prompt.size() && prompt[end] >= '0' && prompt[end] <= '9') { ++end; }
+        if (end > at + 6 && end < prompt.size() && prompt[end] == '>') {
+            return AutoWish::SkipAlreadyRewritten;
+        }
+    }
+    return AutoWish::Rewrite;
+}
+
+// The enum and its wire words live in the header, where the capability document can reach them: the
+// document lists these same strings by CALLING to_string, and a list kept in two places is a list that
+// drifts. Defined there (inline) rather than here, so it is not inside this file's anonymous namespace.
 
 // The job's device-memory need, from the pipeline's own buffer inventory (models/qwen_image). The
 // serving layer asks for it before it probes the yield, so the reference block and the longer of the
@@ -154,7 +208,7 @@ public:
     FinishedPicture operator()(const OpenAIImagesRequest& request, std::uint64_t seed,
                                std::span<const std::uint16_t> prompt_embeds,
                                std::span<const std::uint16_t> negative_embeds,
-                               const ReferencePixels* reference, void* image_stream,
+                               std::span<const ReferencePlanes> references, void* image_stream,
                                const std::shared_ptr<ImageJobProgress>& progress,
                                const EditConditioning* edit) {
         std::lock_guard lock(mutex_);
@@ -182,6 +236,10 @@ public:
         inputs.prompt_embeds.assign(prompt_embeds.begin(), prompt_embeds.end());
         inputs.timesteps = sched.timesteps;
         inputs.sigmas    = sched.sigmas;
+        // The one place a request's `seed` becomes pixels: this engine's own reproducible N(0,1) stream
+        // (models/qwen_image/noise.h), snapped to BF16 the way every other activation here is. A fixed-
+        // latent GPU regression does not go through this line -- it hands run_image_job its own
+        // init_latent, which is why the two are documented as separate contracts (image_pipeline.h).
         inputs.init_latent.resize(static_cast<std::size_t>(geom.tokens) * dit_.dims.image_in);
         {
             std::vector<float> noise(inputs.init_latent.size());
@@ -199,17 +257,23 @@ public:
 
         // #75: the host-prepared reference plane becomes the constant reference block of the
         // joint sequence, encoded with the same VAE the job decodes with (inside the yielded VRAM).
-        if (reference != nullptr) {
+        // #75: every host-prepared plane becomes part of the constant reference block of the joint
+        // sequence, encoded with the same VAE the job decodes with (inside the yielded VRAM). The
+        // blocks are concatenated in the order the client sent them, which is the order the ti2i
+        // template numbered them and the order build_joint_layout scatters them into the sequence --
+        // three lists that must agree, so all three are driven by this one loop over `references`.
+        for (const ReferencePlanes& plane : references) {
             qi::ReferenceEncodeInputs encode_in;
-            encode_in.pixels       = reference->pixels;
+            encode_in.pixels       = plane.vae.pixels;
             encode_in.latents_mean = denorm_.mean;
             encode_in.latents_std  = denorm_.std;
-            encode_in.height_px    = reference->height_px;
-            encode_in.width_px     = reference->width_px;
+            encode_in.height_px    = plane.vae.height_px;
+            encode_in.width_px     = plane.vae.width_px;
             const qi::EncodedReference encoded =
                 qi::encode_reference_image(*reader_, vae_, encode_in,
                                            static_cast<cudaStream_t>(image_stream));
-            inputs.ref_latents = std::move(encoded.latents);
+            inputs.ref_latents.insert(inputs.ref_latents.end(), encoded.latents.begin(),
+                                      encoded.latents.end());
             inputs.ref_grids.emplace_back(encoded.height_lat, encoded.width_lat);
         }
 
@@ -220,18 +284,54 @@ public:
         // by path). The VAE block above is what the route had before this existed, and on its own it
         // returns the near pixel copy the M9 behavioral gate was written to catch: a reference the text
         // conditioning never saw cannot be edited by an instruction.
-        if (edit != nullptr && edit->planes != nullptr && edit->prompt != nullptr) {
+        if (edit != nullptr && !references.empty() && edit->prompt != nullptr) {
             if (!vision_rows_ || !conditioned_) {
                 vision_rows_ = make_tower_vision_rows_provider(path_);
                 conditioned_ = make_tower_conditioned_embeds_provider(path_);
             }
-            const qi::ConditionedVision vision = vision_rows_(edit->planes->vision);
+            // One ViT pass per reference, their rows concatenated in request order.
+            // ConditionedVision already describes the WHOLE picture set -- merger_rows is
+            // [total pad rows, hidden] and grids are in pad order (models/qwen_image/text_tower.h) --
+            // so N references are N runs appended, which is what the reference family hands the tower
+            // when it is given a list. The merge constant and the deepstack level COUNT come from the
+            // artifact, not the picture: a second reference answering with a different number of
+            // levels means the tower disagrees with itself, which is our bug and a 500's worth of it.
+            qi::ConditionedVision vision;
+            bool first_reference = true;
+            for (const ReferencePlanes& plane : references) {
+                qi::ConditionedVision one = vision_rows_(plane.vision);
+                if (first_reference) {
+                    // The first answer IS the aggregate. Assigning the levels and then appending them
+                    // again -- which is what the loop below does -- leaves every deepstack level at
+                    // twice the pad rows while merger_rows stays correct, and the text tower's
+                    // coverage check is the only thing that catches it.
+                    vision.merge          = one.merge;
+                    vision.merger_rows    = std::move(one.merger_rows);
+                    vision.deepstack_rows = std::move(one.deepstack_rows);
+                    vision.grids          = std::move(one.grids);
+                    first_reference = false;
+                    continue;
+                }
+                if (vision.deepstack_rows.size() != one.deepstack_rows.size()) {
+                    throw std::runtime_error(
+                        "image job: the vision tower returned a different number of deepstack levels "
+                        "for two references of the same artifact");
+                }
+                vision.merger_rows.insert(vision.merger_rows.end(), one.merger_rows.begin(),
+                                          one.merger_rows.end());
+                for (std::size_t level = 0; level < one.deepstack_rows.size(); ++level) {
+                    vision.deepstack_rows[level].insert(vision.deepstack_rows[level].end(),
+                                                        one.deepstack_rows[level].begin(),
+                                                        one.deepstack_rows[level].end());
+                }
+                vision.grids.insert(vision.grids.end(), one.grids.begin(), one.grids.end());
+            }
             const ConditionedPromptEmbeds embeds = conditioned_(*edit->prompt, vision);
             inputs.prompt_embeds          = embeds.prompt_embeds;
             inputs.prompt_image_pad_mask  = embeds.image_pad_mask;
             if (edit->negative_prompt != nullptr) {
-                // Same reference, own text: the CFG joint differs only in the instruction rows, which is
-                // what the reference family trains.
+                // Same references, own text: the CFG joint differs only in the instruction rows,
+                // which is what the reference family trains.
                 const ConditionedPromptEmbeds negative = conditioned_(*edit->negative_prompt, vision);
                 inputs.negative_prompt_embeds         = negative.prompt_embeds;
                 inputs.negative_prompt_image_pad_mask = negative.image_pad_mask;
@@ -243,17 +343,9 @@ public:
             *reader_, dit_, vae_, inputs, static_cast<cudaStream_t>(image_stream),
             progress ? &view : nullptr, stage_logger());
 
-        // The certified route composites the decoded image's first three channels as RGB and
-        // emits opaque alpha.
-        const std::size_t pixels = static_cast<std::size_t>(out.height) * out.width;
-        std::vector<std::uint8_t> rgba(4ULL * pixels);
-        for (std::size_t i = 0; i < pixels; ++i) {
-            rgba[4ULL * i + 0] = static_cast<std::uint8_t>(to_unit8(out.channels[0 * pixels + i]));
-            rgba[4ULL * i + 1] = static_cast<std::uint8_t>(to_unit8(out.channels[1 * pixels + i]));
-            rgba[4ULL * i + 2] = static_cast<std::uint8_t>(to_unit8(out.channels[2 * pixels + i]));
-            rgba[4ULL * i + 3] = 255U;
-        }
-        return FinishedPicture{std::move(rgba), out.width, out.height};
+        // Four channels in, four channels out: the alpha is the VAE's own fourth decoded channel.
+        return FinishedPicture{rgba_from_generated_channels(out.channels, out.width, out.height),
+                               out.width, out.height};
     }
 
 private:
@@ -333,6 +425,25 @@ std::string base64_from(const std::uint8_t* data, std::size_t size) {
 
 } // namespace
 
+// See the header. The tie case of the rounding was checked rather than assumed: a channel value that
+// lands exactly on .5 of 255 must be of the form (2k-254)/255, and the only such BF16 value is 0,
+// where numpy's round-half-to-even and lround agree on 128 -- so this stays lround.
+std::vector<std::uint8_t> rgba_from_generated_channels(const std::vector<float>& channels,
+                                                       std::uint32_t width,
+                                                       std::uint32_t height) {
+    const std::size_t pixels = static_cast<std::size_t>(width) * height;
+    if (channels.size() != 4ULL * pixels) {
+        throw std::runtime_error("image job: the decoded plane is not the four channels the VAE emits");
+    }
+    std::vector<std::uint8_t> rgba(4ULL * pixels);
+    for (std::size_t i = 0; i < pixels; ++i) {
+        for (std::size_t c = 0; c < 4ULL; ++c) {
+            rgba[4ULL * i + c] = static_cast<std::uint8_t>(to_unit8(channels[c * pixels + i]));
+        }
+    }
+    return rgba;
+}
+
 std::unique_ptr<ImageInterludeRunner> make_engine_interlude_runner(infernix::Engine& engine) {
     return std::make_unique<EngineInterludeRunner>(engine);
 }
@@ -343,10 +454,11 @@ ImageJobExecutor make_artifact_image_job_executor(const std::string& image_artif
         std::make_shared<ArtifactImageJobExecutor>(image_artifact_path, std::move(logger));
     return [executor](const OpenAIImagesRequest& request, std::uint64_t seed,
                       std::span<const std::uint16_t> prompt_embeds,
-                      std::span<const std::uint16_t> negative_embeds, const ReferencePixels* reference,
-                      void* image_stream, const std::shared_ptr<ImageJobProgress>& progress,
+                      std::span<const std::uint16_t> negative_embeds,
+                                            std::span<const ReferencePlanes> references, void* image_stream,
+                      const std::shared_ptr<ImageJobProgress>& progress,
                       const EditConditioning* edit) {
-        return (*executor)(request, seed, prompt_embeds, negative_embeds, reference, image_stream,
+        return (*executor)(request, seed, prompt_embeds, negative_embeds, references, image_stream,
                            progress, edit);
     };
 
@@ -511,7 +623,8 @@ ImageGenerationService::ImageGenerationService(std::unique_ptr<ImageInterludeRun
                                                DiTDimsProvider dit_dims,
                                                ImageJobExecutor job_executor,
                                                VisionLaneDimsProvider vision_dims,
-                                               ReferencePromptRendererProvider reference_prompt_renderer)
+                                               ReferencePromptRendererProvider reference_prompt_renderer,
+                                               std::shared_ptr<PromptEnhancer> enhancer)
     : runner_(std::move(runner)),
       store_(store),
       prompt_renderer_(std::move(prompt_renderer)),
@@ -519,11 +632,58 @@ ImageGenerationService::ImageGenerationService(std::unique_ptr<ImageInterludeRun
       dit_dims_(std::move(dit_dims)),
       vision_dims_(std::move(vision_dims)),
       reference_prompt_renderer_(std::move(reference_prompt_renderer)),
-      job_executor_(std::move(job_executor)) {}
+      job_executor_(std::move(job_executor)),
+      enhancer_(std::move(enhancer)) {}
+
+namespace {
+// Registers one image job for the duration of its generate() and removes it on every way out.
+// RAII rather than a counter incremented and decremented by hand: generate() leaves through a throw
+// on almost every path, and a count left behind by a failed job would tell the keepalive that the
+// card is busy forever and no healing would ever happen again -- the opposite failure of the one
+// this exists to fix.
+class InFlightJob {
+public:
+    InFlightJob(std::mutex& mutex, std::map<std::uint64_t, std::int64_t>& in_flight,
+                std::uint64_t& token_source, std::int64_t now)
+        : mutex_(mutex), in_flight_(in_flight) {
+        const std::lock_guard lock(mutex_);
+        token_        = ++token_source;
+        in_flight_[token_] = now;
+    }
+    ~InFlightJob() {
+        const std::lock_guard lock(mutex_);
+        in_flight_.erase(token_);
+    }
+    InFlightJob(const InFlightJob&)            = delete;
+    InFlightJob& operator=(const InFlightJob&) = delete;
+
+private:
+    std::mutex& mutex_;
+    std::map<std::uint64_t, std::int64_t>& in_flight_;
+    std::uint64_t token_ = 0;
+};
+
+std::int64_t unix_now() {
+    return std::chrono::duration_cast<std::chrono::seconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+} // namespace
 
 bool ImageGenerationService::is_configured() const noexcept {
     return runner_ != nullptr && prompt_renderer_ != nullptr && prompt_embeds_ != nullptr &&
            dit_dims_ != nullptr && job_executor_ != nullptr;
+}
+
+std::size_t ImageGenerationService::in_flight_jobs() const {
+    const std::lock_guard lock(in_flight_mutex_);
+    return in_flight_.size();
+}
+
+std::int64_t ImageGenerationService::oldest_in_flight_age_seconds(std::int64_t now) const {
+    const std::lock_guard lock(in_flight_mutex_);
+    if (in_flight_.empty()) { return 0; }
+    return std::max<std::int64_t>(0, now - in_flight_.begin()->second);
 }
 
 // The DiT dimensions from the artifact's component config: host work, opened once and cached. It is
@@ -583,10 +743,19 @@ nlohmann::json ImageGenerationService::job_status_json(std::string_view id) cons
     const auto record = store_.get(std::string(id));
     if (record == nullptr) { return nullptr; }
     const bool running = !is_terminal(record->state);
-    return nlohmann::json{{"id", record->id},
+    nlohmann::json status{{"id", record->id},
                           {"status", running ? "running" : state_to_string(record->state)},
                           {"progress_percent",
                            record->progress ? record->progress->percent.load() : -1}};
+    // What the server decided about the rewriter, on the object a client can actually poll. A client that
+    // sent `prompt_enhance: "auto"` is entitled to know which of the four skips it got: the capability
+    // document describes that decision, and a described decision with no observable answer is exactly the
+    // situation the 2026-11-01 auto 503 came out of. Omitted -- never sent as "" -- for a record written
+    // before the key existed, so the document cannot promise an answer this particular job does not have.
+    if (record->request.contains("prompt_enhance_outcome")) {
+        status["prompt_enhance_outcome"] = record->request.at("prompt_enhance_outcome");
+    }
+    return status;
 }
 
 RequestJson ImageGenerationService::generate(const OpenAIImagesRequest& request, std::int64_t now,
@@ -605,18 +774,171 @@ RequestJson ImageGenerationService::generate(const OpenAIImagesRequest& request,
                                     "engine_unavailable"}};
     }
 
+    // From here the card is ours until the function returns, so this is where the busy signal starts:
+    // the rewriter's sampling, the yield, the diffusion and the encode all belong to it. /health reads
+    // it so a supervisor waits instead of killing a serve that is only busy.
+    const InFlightJob in_flight{in_flight_mutex_, in_flight_, in_flight_token_, unix_now()};
+
+    // The draw's starting noise, decided at submit rather than inside the yield: it is host work, it
+    // belongs to the request and not to the device, and the record below cannot carry it otherwise. A
+    // client that named no seed gets one the engine picked -- and the only way it can ever ask for that
+    // picture again is if the server remembers the number. It stays in the record; job_status_json
+    // reports id, status and progress, so this is a diagnosis field and not a new response field. It is
+    // picked BEFORE the enhancer because the enhancer samples on it too: the same request and the same
+    // seed then reproduce the instruction and the noise together, which is the only pairing a diagnosis
+    // of "the rewrite went wrong" can be written against.
+    std::uint64_t seed = 0;
+    if (request.seed.has_value()) {
+        seed = *request.seed;
+    } else {
+        std::random_device random;
+        seed = (static_cast<std::uint64_t>(random()) << 32U) | random();
+    }
+
+    // The family's prompt enhancer is a separate shipped model, not a template the server can put
+    // on an existing tower: PE-I2I is a fine-tuned Qwen3.5-VL 9B that reads the instruction AND the
+    // pictures and answers {rewritten_prompt, wh_ratio, ratio_follow}
+    // (image-edit/refs/q21_prompt_rewrite_README.md:1-12, q21_system_prompt_edit.txt:175-183), and
+    // the vision-language tower inside this image artifact is a different checkpoint that was never
+    // trained against that system prompt -- running it would return the picture's embeddings, not a
+    // better instruction. So it runs as its own process (tools/prompt_enhancer/pe_worker.py) behind
+    // --image-prompt-enhancer-url, and a client that asked for enhancement while that is absent or
+    // not answering is told so instead of getting a drawing made from words it believed had been
+    // rewritten.
+    //
+    // Its ~20 GB of BF16 weights (refs/q21_prompt_rewrite_README.md:52-56) come onto the card through
+    // an interlude of their own -- the same acquire/yield/restore the picture uses, one at a time --
+    // because this card also holds the resident LLM and the DiT and may not hold all three at once.
+    // The rewrite changes the INSTRUCTION. It may decide the canvas only where the request left the
+    // canvas free: a client that named size, wh_ratio or ratio_follow keeps what it named, since the
+    // enhancer's job is the wording and a server that overrode a client's explicit size would be
+    // changing the picture the client asked for.
+    OpenAIImagesRequest effective = request;
+    // `auto` is the client's judgement delegated (openai_images.h PromptEnhanceMode). Two things can
+    // make the rewrite impossible -- no rewriter answering, and no card to hand it -- and for auto
+    // both are a skip, because the client asked the server to choose rather than promising itself a
+    // rewrite. For true they stay the documented refusals: a client that believed its words were being
+    // rewritten must never be handed a picture drawn from them as written. healthy() is asked only
+    // when something was actually asked for, so a plain request still costs no sidecar round trip.
+    const bool auto_mode = request.prompt_enhance == PromptEnhanceMode::Auto;
+    EnhancerOutcome enhancer_outcome = EnhancerOutcome::Off;
+    bool enhance = request.prompt_enhance != PromptEnhanceMode::Off;
+    if (enhance && auto_mode) {
+        // A client that sent true never consults the wish: it asked for the rewrite, so it gets it or
+        // gets the documented refusal.
+        const AutoWish wish = wants_prompt_enhancement(request);
+        enhance = wish == AutoWish::Rewrite;
+        if (!enhance) {
+            enhancer_outcome = wish == AutoWish::SkipNoReference
+                                   ? EnhancerOutcome::SkippedNoReference
+                                   : EnhancerOutcome::SkippedAlreadyRewritten;
+        }
+    }
+    bool enhancer_up = false;
+    if (enhance) { enhancer_up = enhancer_ != nullptr && enhancer_->healthy(); }
+    if (enhance && !enhancer_up) {
+        if (!auto_mode) {
+            throw ApiException{ApiError{503, "server_error",
+                                        std::string("this build has no prompt enhancer running; the "
+                                                    "family's is ") +
+                                            std::string(kImagePromptEnhancerModel) +
+                                            " (serve --image-prompt-enhancer-url, see "
+                                            "tools/prompt_enhancer/pe_worker.py), and in its absence "
+                                            "the client writes the instruction itself (see GET "
+                                            "/v1/capabilities image_edit.instruction)",
+                                    "prompt_enhance", "image_prompt_enhancer_unavailable"}};
+        }
+        enhance          = false;
+        enhancer_outcome = EnhancerOutcome::SkippedNoRewriter;
+    }
+    // The rewrite itself, behind a lambda: the shortfall net inside the interlude measures itself
+    // against the probe that promised this much, so the two have to live in one scope -- and auto is
+    // allowed to decline after that probe, which must then skip the whole body rather than run it.
+    // The decline that actually happens is the one BELOW, inside the interlude: the probe only promised
+    // this much, and what it promised and what the yield unmapped are two different answers.
+    bool enhancer_declined = false;
+    const auto run_rewrite = [&](const ImageInterludeRunner::Fit& fit) {
+        EnhancerAnswer answer;
+        runner_->run(kEnhancerReserveBytes, kInterludeMarginBytes,
+                     [&](const infernix::ImageInterludeContext& context) -> bool {
+                         // The same shortfall net the picture runs: if the yield did not unmap what the
+                         // enhancer was promised, say so BEFORE it allocates, rather than letting a
+                         // foreign process discover the shortage in its own allocator while the LLM is
+                         // quiesced.
+                         if (context.freed_bytes + fit.device_free_bytes <
+                             kEnhancerReserveBytes + kInterludeMarginBytes + fit.headroom_bytes) {
+                             // The same rule the pre-probe applies, and for the same reason: for auto the
+                             // card not being there is a SKIP and never a refusal, because the client
+                             // delegated this judgement and the picture is then drawn from its own words.
+                             // Only a client that named prompt_enhance: true may be refused over the
+                             // enhancer -- it believed its words were being rewritten, and handing it the
+                             // words as written would be the lie the document above forbids.
+                             if (!auto_mode) {
+                                 throw_vram_insufficient(
+                                     kEnhancerReserveBytes,
+                                     ImageInterludeRunner::Fit{.fits = false,
+                                                               .freed_bytes_expected = context.freed_bytes,
+                                                               .device_free_bytes = fit.device_free_bytes,
+                                                               .headroom_bytes = fit.headroom_bytes});
+                             }
+                             // Nothing was allocated, so nothing has to be released: leave before the
+                             // Releaser is even constructed, and before the sidecar is asked for anything.
+                             enhancer_declined  = true;
+                             enhancer_outcome   = EnhancerOutcome::SkippedNoDevice;
+                             return false;
+                         }
+                         // Released whatever the rewrite does to us: weights left resident in the
+                         // sidecar would sit on the card the picture is about to yield for.
+                         struct Releaser {
+                             PromptEnhancer* enhancer;
+                             ~Releaser() {
+                                 try {
+                                     enhancer->unload();
+                                 } catch (...) { /* the idle timer in the worker is the backstop */ }
+                             }
+                         } releaser{enhancer_.get()};
+                         enhancer_->load();
+                         answer = enhancer_->rewrite(request.prompt, request.images, seed,
+                                                     request.images.size());
+                         return true;
+                     });
+        // A declined rewrite leaves `effective` exactly as the client spelled it. `answer` was never
+        // filled, and copying it would blank the very instruction the picture is about to be drawn from.
+        if (enhancer_declined) { return; }
+        effective.prompt = answer.rewritten_prompt;
+        if (!request.size_requested && !request.wh_ratio && !request.ratio_follow) {
+            if (!answer.wh_ratio.empty()) { effective.wh_ratio = answer.wh_ratio; }
+            if (!answer.ratio_follow.empty()) { effective.ratio_follow = answer.ratio_follow; }
+        }
+        enhancer_outcome = EnhancerOutcome::Applied;
+    };
+    if (enhance) {
+        // A request the client wrote itself if this probe declines auto: `effective` is replaced only
+        // inside run_rewrite, so a declined rewrite leaves it exactly as the client spelled it.
+        const auto fit = runner_->probe(kEnhancerReserveBytes, kInterludeMarginBytes);
+        if (!fit.fits && !auto_mode) { throw_vram_insufficient(kEnhancerReserveBytes, fit); }
+        if (!fit.fits && auto_mode) {
+            // The same judgement the interlude applies below, one level earlier: the pre-probe already
+            // said the card cannot hold the rewriter, so auto skips it and says WHICH reason. Left as
+            // Off it reported "the client asked for no rewrite", which is what a client reading the
+            // answer would retry forever over.
+            enhancer_outcome = EnhancerOutcome::SkippedNoDevice;
+        }
+        if (fit.fits) { run_rewrite(fit); }
+    }
+
     // #75 reference image: base64/decode/resize is host work and fails fast as a 400 before any
     // VRAM is yielded. The device encode of the prepared plane runs inside the job.
     // Both planes of one decode and one resize: the raw-alpha VAE plane the encoder consumes and the
     // white-composited copy the Qwen3-VL tower was trained on. They come from the same call so the two
     // can never disagree about what picture is being edited.
-    std::optional<ReferencePlanes> planes;
-    if (!request.image.empty()) {
+    std::vector<ReferencePlanes> planes;
+    for (const std::string& payload : request.images) {
         // The codec's own words never reach the wire: they name decoders, byte offsets and internal
         // limits, which is both a leak and noise to a client that only wants to know its picture was
         // bad. The CODE distinguishes the cases a caller can act on.
         try {
-            planes = prepare_reference_planes(request.image);
+            planes.push_back(prepare_reference_planes(payload));
         } catch (const md::Error& error) {
             throw ApiException{ApiError{400, "invalid_request_error",
                                         error.kind() == md::ErrorKind::BudgetExceeded
@@ -634,6 +956,28 @@ RequestJson ImageGenerationService::generate(const OpenAIImagesRequest& request,
         }
     }
 
+    // The canvas, decided once and here: an edit that named no size follows its reference's aspect
+    // (openai_images.h resolve_canvas_geometry), filled to the deployment's configured area. The
+    // reference it follows is the picture decoded just above, so the grid an edit is sampled onto and
+    // the picture conditioning it cannot disagree -- a fixed square default used to make a portrait
+    // reference generate a square, which is a conditioning mismatch the model was never trained on.
+    // Host work, before the probe: the ledger below and the job both size on this answer. (`effective`
+    // was made above, from the request and -- when enhancement ran -- from the enhancer's answer.)
+    // Which reference the canvas follows: the one `ratio_follow` names, else the LAST one -- the
+    // reference pipeline derives the geometry from image[-1]
+    // (image-edit/refs/q21_pipeline_qwenimage21.py:630-636). A tag naming a picture the request did
+    // not carry was refused at parse time, so the only states left here are "named one" and "none".
+    std::size_t followed = planes.size();
+    if (effective.ratio_follow) {
+        (void)parse_image_reference_tag(*effective.ratio_follow, planes.size(), followed);
+    } else if (!planes.empty()) {
+        followed = planes.size() - 1;
+    }
+    resolve_canvas_geometry(effective,
+                            followed < planes.size() ? planes[followed].source_width_px : 0U,
+                            followed < planes.size() ? planes[followed].source_height_px : 0U,
+                            effective.width, effective.height);
+
     // Admission, entirely before the LLM is touched. The reference's geometry comes first because the
     // prompt the admission sizes on is the one that carries the reference: the ti2i template with every
     // <|image_pad|> expanded into the vision rows, which is host work (tokenizer only) and therefore
@@ -649,19 +993,31 @@ RequestJson ImageGenerationService::generate(const OpenAIImagesRequest& request,
     // a 500 of our own making, raised host-side, before a single byte is yielded.
     std::size_t ref_tokens    = 0;
     std::size_t vision_tokens = 0;
+        std::vector<std::uint64_t> vision_per_image;  // one entry per reference, in request order
     qi::VisionLaneDims vision{};
-    if (planes.has_value()) {
-        ref_tokens =
-            static_cast<std::size_t>(planes->vae.height_px / qi::ImageGeometry::downscale()) *
-            (static_cast<std::size_t>(planes->vae.width_px) / qi::ImageGeometry::downscale());
-        vision_tokens = static_cast<std::size_t>(
-            vision_token_count(planes->vae.height_px, planes->vae.width_px));
-        if (4ULL * vision_tokens != ref_tokens) {
-            throw ApiException{ApiError{500, "server_error",
-                                        "the prepared reference disagrees with itself: 4 * " +
-                                            std::to_string(vision_tokens) + " vision tokens != " +
-                                            std::to_string(ref_tokens) + " latent tokens",
-                                        "image", "image_conditioning_inconsistent"}};
+    if (!planes.empty()) {
+        // Every reference conditions the same forward, so the joint sequence and the ledger are sized
+        // on the SUM over them: each one contributes 4 * its vision tokens of joint sequence and its
+        // own latent tokens to all_img (models/qwen_image/joint_layout.h, image_device_need.h).
+        // The x4 invariant is checked per plane -- one reference whose resize broke it is our bug,
+        // and the sums would hide it in the other references' numbers.
+        vision_per_image.reserve(planes.size());
+        for (const ReferencePlanes& plane : planes) {
+            const std::size_t ref =
+                static_cast<std::size_t>(plane.vae.height_px / qi::ImageGeometry::downscale()) *
+                (static_cast<std::size_t>(plane.vae.width_px) / qi::ImageGeometry::downscale());
+            const std::size_t vis = static_cast<std::size_t>(
+                vision_token_count(plane.vae.height_px, plane.vae.width_px));
+            if (4ULL * vis != ref) {
+                throw ApiException{ApiError{500, "server_error",
+                                            "a prepared reference disagrees with itself: 4 * " +
+                                                std::to_string(vis) + " vision tokens != " +
+                                                std::to_string(ref) + " latent tokens",
+                                            "image", "image_conditioning_inconsistent"}};
+            }
+            ref_tokens += ref;
+            vision_tokens += vis;
+            vision_per_image.push_back(vis);
         }
         // Two things an edit cannot be served without, both refused for the same reason the ledger
         // refuses a guess: the render is the only prompt whose token count is the one the job will run,
@@ -682,15 +1038,41 @@ RequestJson ImageGenerationService::generate(const OpenAIImagesRequest& request,
         vision = vision_dims_();
     }
     const auto render = [&](const std::string& text) {
-        return planes.has_value() ? reference_prompt_renderer_(text, {vision_tokens})
-                                  : prompt_renderer_(text);
+        return planes.empty() ? prompt_renderer_(text)
+                                  : reference_prompt_renderer_(text, vision_per_image);
     };
-    const TowerPrompt prompt = render(request.prompt);
+    const TowerPrompt prompt = render(effective.prompt);
     const TowerPrompt negative_prompt =
-        request.true_cfg_scale > kMinimumImageCFGScale ? render(request.negative_prompt)
+        request.true_cfg_scale > kMinimumImageCFGScale ? render(effective.negative_prompt)
                                                       : TowerPrompt{};
+
+    // The joint sequence's LENGTH is a host fact once the prompt is rendered, so it is admitted here
+    // and not discovered by the attention Op inside the interlude: every text row is one position and
+    // every image slot four (models/qwen_image/joint_layout.h), and the Op refuses a sequence longer
+    // than ops::kAttnDitJointMaxTokens. A request over that is the client's -- its prompt, its canvas --
+    // and it gets the numbers and a 400 before the LLM is quiesced, instead of a job that yields the
+    // card, throws and comes back a 500. The CFG negative pass is its own joint sequence over the SAME
+    // references, so its rows are admitted on their own count.
+    const qi::ImageGeometry canvas = qi::ImageGeometry::derive(effective.height, effective.width);
+    const std::pair<const char*, std::size_t> lanes[] = {
+        {"prompt", prompt.tokens()}, {"negative prompt", negative_prompt.tokens()}};
+    for (const auto& [lane, rows] : lanes) {
+        const long long joint = qi::joint_token_count(static_cast<long long>(rows),
+                                                      static_cast<long long>(vision_tokens),
+                                                      static_cast<long long>(canvas.tokens));
+        if (joint > ops::kAttnDitJointMaxTokens) {
+            throw ApiException{ApiError{
+                400, "invalid_request_error",
+                std::string("the ") + lane + " is too long for this canvas: it makes a joint sequence of " +
+                    std::to_string(joint) + " tokens, and the model serves at most " +
+                    std::to_string(ops::kAttnDitJointMaxTokens) + " (a smaller size or a shorter " +
+                    std::string(lane) + " both work)",
+                "prompt", "image_prompt_too_long"}};
+        }
+    }
+
     const std::uint64_t need =
-        image_need_bytes(request.width, request.height, prompt.tokens(), negative_prompt.tokens(),
+        image_need_bytes(effective.width, effective.height, prompt.tokens(), negative_prompt.tokens(),
                          ref_tokens, dit_dims_(), vision_tokens, vision);
     const auto fit = runner_->probe(need, kInterludeMarginBytes);
     if (!fit.fits) { throw_vram_insufficient(need, fit); }
@@ -700,10 +1082,16 @@ RequestJson ImageGenerationService::generate(const OpenAIImagesRequest& request,
     record.state    = ImageJobState::Queued;
     record.created  = now;
     record.progress = std::make_shared<ImageJobProgress>();
-    record.request  = nlohmann::json{{"prompt", request.prompt},
-                                     {"width", request.width},
-                                     {"height", request.height},
-                                     {"steps", request.steps}};
+    // What the job actually ran, not what was asked: a stored canvas that disagreed with the picture
+    // the client got back would make the record useless for a later diagnosis.
+    // `prompt_enhance_outcome` is the reason, not the request field: the field would say what the client
+    // asked and leave the four legitimate auto skips identical in the log.
+    record.request  = nlohmann::json{{"prompt", effective.prompt},
+                                     {"width", effective.width},
+                                     {"height", effective.height},
+                                     {"steps", effective.steps},
+                                     {"seed", seed},
+                                     {"prompt_enhance_outcome", to_string(enhancer_outcome)}};
     store_.put(record);
     {
         const std::lock_guard lock(progress_mutex_);
@@ -733,20 +1121,15 @@ RequestJson ImageGenerationService::generate(const OpenAIImagesRequest& request,
                          }
                          store_.advance(record.id, JobUpdate{.to = ImageJobState::Running, .now = now});
                          job_started = true;
-                         std::uint64_t seed = 0;
-                         if (request.seed.has_value()) {
-                             seed = *request.seed;
-                         } else {
-                             std::random_device random;
-                             seed = (static_cast<std::uint64_t>(random()) << 32U) | random();
-                         }
+                         // `seed` is the submit-time number above: the same one the record carries, so a
+                         // failed job's stored seed redraws the picture it did not produce.
                          // Both prompts were already rendered (host work, before the probe); only the
                          // tower forward -- the half that needs device memory -- runs here. With a
                          // reference that forward is the CONDITIONED one and the executor runs it inside
                          // the yield (it owns the artifact's vision and text towers), so no plain embeds
                          // are computed: a forward over rows that never saw the picture is not merely
                          // wasted work, it is the copy this route used to return.
-                         const bool edit_route = planes.has_value();
+                         const bool edit_route = !planes.empty();
                          const std::vector<std::uint16_t> positive =
                              edit_route ? std::vector<std::uint16_t>{} : prompt_embeds_(prompt);
                          const std::vector<std::uint16_t> negative =
@@ -754,13 +1137,14 @@ RequestJson ImageGenerationService::generate(const OpenAIImagesRequest& request,
                                  ? std::vector<std::uint16_t>{}
                                  : prompt_embeds_(negative_prompt);
                          const EditConditioning edit{
-                             edit_route ? &*planes : nullptr, edit_route ? &prompt : nullptr,
+                             edit_route ? &prompt : nullptr,
                              (edit_route && request.true_cfg_scale > kMinimumImageCFGScale)
                                  ? &negative_prompt : nullptr};
                          finished = job_executor_(
-                             request, seed, positive, negative,
-                             edit_route ? &planes->vae : nullptr, context.image_stream,
-                             record.progress, edit_route ? &edit : nullptr);
+                             effective, seed, positive, negative,
+                             edit_route ? std::span<const ReferencePlanes>(planes)
+                                        : std::span<const ReferencePlanes>{},
+                             context.image_stream, record.progress, edit_route ? &edit : nullptr);
                          store_.advance(record.id, JobUpdate{.to = ImageJobState::Restoring, .now = now});
                          return true;
                      });
@@ -775,6 +1159,11 @@ RequestJson ImageGenerationService::generate(const OpenAIImagesRequest& request,
         response = request.response_format == ImageResponseFormat::Url
                      ? make_openai_image_url_response(now, {std::string(artifact_url_base) + record.id})
                      : make_openai_image_response(now, {base64_encode_bytes(png)});
+        // Additive on the OpenAI image response, and the reason a client that never polls still learns
+        // which decision it got: the synchronous route is all some clients use, and the status object is
+        // only what the artifact route serves while no picture file exists. Advertised in
+        // /v1/capabilities image_edit.prompt_enhancer.reported_as, so nobody has to know it exists.
+        response["prompt_enhance_outcome"] = to_string(enhancer_outcome);
         store_.advance(record.id,
                        JobUpdate{.to = ImageJobState::Succeeded, .now = now,
                                  .response = nlohmann::json::parse(response.dump())});
@@ -818,6 +1207,22 @@ RequestJson ImageGenerationService::generate(const OpenAIImagesRequest& request,
             throw ApiException{ApiError{503, "server_error", message, "", "image_engine_degraded"}};
         }
         if (job_started) {
+            // The job ran and the LLM was restored, so the picture simply did not come -- but the family
+            // still matters, and not only for the log: chat_image_tool.cpp hands this code and message to
+            // the model as the tool's error result, and "try again" is the wrong advice for a kernel that
+            // refused the geometry it was handed. A std::invalid_argument from inside the job can only
+            // have come from an Op's own shape/range check -- every device failure is a runtime_error
+            // (image_device_util.h cuda_ok) -- so it names a case the host admission should have refused
+            // and never did: ours to fix, and retrying reproduces it.
+            if (dynamic_cast<const std::invalid_argument*>(&error) != nullptr) {
+                throw ApiException{ApiError{500, "server_error", message, "image",
+                                            "image_request_unservable"}};
+            }
+            if (dynamic_cast<const artifact::ArtifactError*>(&error) != nullptr) {
+                // A weight could not be bound or streamed: the artifact lane, not the request.
+                throw ApiException{ApiError{500, "server_error", message, "image_artifact",
+                                            "image_artifact_failed"}};
+            }
             throw ApiException{ApiError{500, "server_error", message, "", "image_generation_failed"}};
         }
         throw ApiException{ApiError{503, "server_error", message, "", "image_interlude_failed"}};

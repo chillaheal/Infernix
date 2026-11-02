@@ -25,6 +25,7 @@
 
 #include "serve/image_job_store.h"
 #include "serve/openai_images.h"
+#include "serve/prompt_enhancer.h"
 #include "serve/reference_image.h"
 #include "serve/request_json.h"
 
@@ -34,6 +35,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -95,6 +97,53 @@ struct FinishedPicture {
     std::uint32_t height = 0;
 };
 
+// The VAE of this checkpoint is a FOUR-channel image autoencoder -- encoder conv_in is [96,4,3,3] and
+// decoder conv_out is [4,144,3,3] -- and the reference pipeline hands all four decoded channels to
+// VaeImageProcessor.numpy_to_pil, which runs Image.fromarray on them uncut: the picture it returns is
+// RGBA and its alpha IS the fourth channel, never a constant. The input side already carries alpha raw
+// the same way (models/qwen_image/image_pipeline.h, ReferenceEncodeInputs). So the finished picture is
+// composed from all four planes: `channels` is the job's channel-major [-1,1] plane, and the result is
+// the RGBA8 `FinishedPicture` holds, with the reference's denormalize-then-round mapping.
+[[nodiscard]] std::vector<std::uint8_t> rgba_from_generated_channels(const std::vector<float>& channels,
+                                                                     std::uint32_t width,
+                                                                     std::uint32_t height);
+
+// What the server finally decided about the rewriter -- the answer to the question the capability
+// document's `when_auto` clause raises. Until 2026-11-01 the four ways an `auto` request can end up
+// drawn from the client's own words were indistinguishable from outside: the card-shortage one surfaced
+// only because a probe timed two identical requests against a live server and a capability sentence
+// turned out to be false. A skip is legitimate (delegating that judgement is what auto IS), so it is
+// RECORDED and reported rather than merely allowed -- "skipped_no_rewriter" versus "skipped_no_device"
+// is the difference between a deployment missing a sidecar and a deployment whose card is too tight.
+// These strings are the wire values, and the capability document lists them by CALLING to_string, so the
+// document can never advertise an outcome the server does not write.
+enum class EnhancerOutcome : std::uint8_t {
+    Off,                     // absent, false, or prompt_enhance: off
+    SkippedNoReference,      // auto, but PE-I2I has no picture to read
+    SkippedAlreadyRewritten, // auto, but the instruction already addresses <imageN>
+    SkippedNoRewriter,       // auto, but no sidecar answers healthy()
+    SkippedNoDevice,         // auto, but the yield cannot cover the rewriter's reserve
+    Applied,                 // the rewrite ran; its words are what the picture was drawn from
+};
+
+// The wire value for one outcome. The default branch exists for a value no enumerator produces today:
+// a reader gets "unknown" rather than being told "off", which would be a different claim.
+//
+// Inline HERE, not defined in the .cpp: a definition there lands inside that file's anonymous namespace,
+// and a call from the same translation unit then matches two functions (C2668), the header's and the
+// file-local one. One definition, at the one scope both the record and the capability document see.
+[[nodiscard]] inline const char* to_string(EnhancerOutcome outcome) noexcept {
+    switch (outcome) {
+        case EnhancerOutcome::Off:                     return "off";
+        case EnhancerOutcome::SkippedNoReference:      return "skipped_no_reference";
+        case EnhancerOutcome::SkippedAlreadyRewritten: return "skipped_already_rewritten";
+        case EnhancerOutcome::SkippedNoRewriter:       return "skipped_no_rewriter";
+        case EnhancerOutcome::SkippedNoDevice:         return "skipped_no_device";
+        case EnhancerOutcome::Applied:                 return "applied";
+    }
+    return "unknown";
+}
+
 // Seam over Engine's image interlude; the host test runs the job inline on a fake context.
 class ImageInterludeRunner {
 public:
@@ -125,8 +174,8 @@ public:
 // the interlude's dedicated stream (`image_stream`, a cudaStream_t). It stops at the last byte the
 // device touched: the encode, the base64 and the file are the service's work after the interlude.
 // `prompt_embeds` is the token-major BF16 bit payload.
-// `reference` carries the host-prepared reference-image plane (#75) whenever the request had an
-// `image` field; nullptr is plain text-to-image. `negative_embeds` carries the negative prompt's
+// `references` carries every host-prepared reference plane (#75), in request order, whenever the
+// request had an `image` field; empty is plain text-to-image. `negative_embeds` carries the prompt's
 // BF16 bits when `request.true_cfg_scale` is above 1 (true CFG); empty means the single-forward route.
 // `progress` is the stored job's live progress state: the executor's pipeline reports each step
 // through it and honors its stall flag; a fake executor may ignore it.
@@ -134,19 +183,23 @@ public:
 // `edit` is the edit route's half of the conditioning and is null for text-to-image, where every
 // byte of the certified path stays as it is. With a reference the prompt embeds are NOT pre-computed
 // (a plain text-tower forward would produce rows that have never seen the picture, which is the
-// 2026-10-28 near-copy): the service hands over the two rendered ti2i prompts and both planes of the
-// reference, and the executor runs the vision tower and the conditioned text tower inside the yield
+// 2026-10-28 near-copy): the service hands over the two rendered ti2i prompts and the planes of the
+// references, and the executor runs the vision tower and the conditioned text tower inside the yield
 // and reads `prompt_image_pad_mask` off the result. `prompt_embeds`/`negative_embeds` are then empty.
+// One ViT pass per reference; their rows are concatenated in the order they were sent, which is the
+// order the ti2i template numbered them and the order the joint layout scatters their blocks.
 struct EditConditioning {
-    const ReferencePlanes* planes           = nullptr; // both copies of the snapped reference
-    const TowerPrompt*     prompt           = nullptr; // the raw ti2i render, pads expanded
-    const TowerPrompt*     negative_prompt  = nullptr; // same images, own text; null without true CFG
+    // The two rendered ti2i prompts. The references themselves travel as the executor's
+    // `references` parameter: the VAE encode and the vision tower read the SAME planes, and a second
+    // pointer to them here is a second thing to keep in sync with the first.
+    const TowerPrompt* prompt          = nullptr; // the raw ti2i render, pads expanded
+    const TowerPrompt* negative_prompt = nullptr; // same images, own text; null without true CFG
 };
 using ImageJobExecutor =
     std::function<FinishedPicture(const OpenAIImagesRequest& request, std::uint64_t seed,
                                    std::span<const std::uint16_t> prompt_embeds,
                                    std::span<const std::uint16_t> negative_embeds,
-                                   const ReferencePixels* reference, void* image_stream,
+                                   std::span<const ReferencePlanes> references, void* image_stream,
                                    const std::shared_ptr<ImageJobProgress>& progress,
                                    const EditConditioning* edit)>;
 
@@ -258,14 +311,27 @@ public:
     // same admission as before. A request WITH a reference and either one missing is refused as
     // unconfigured: the renderer is what the admission sizes the ti2i prompt with, and guessing there
     // under-reserves the yield the resident LLM is resting in.
+    // `enhancer` is the family's prompt enhancer sidecar (serve/prompt_enhancer.h). Null -- or set but
+    // not answering -- keeps `prompt_enhance` on its documented 503, which is why it defaults: every
+    // existing caller and host test gets the text-to-image and edit admission unchanged.
     ImageGenerationService(std::unique_ptr<ImageInterludeRunner> runner, ImageJobStore& store,
                            PromptRendererProvider prompt_renderer, PromptEmbedsProvider prompt_embeds,
                            DiTDimsProvider dit_dims, ImageJobExecutor job_executor,
                            VisionLaneDimsProvider vision_dims = {},
-                           ReferencePromptRendererProvider reference_prompt_renderer = {});
+                           ReferencePromptRendererProvider reference_prompt_renderer = {},
+                           std::shared_ptr<PromptEnhancer> enhancer = {});
 
     // False when serve started without the image pipeline: the route answers a documented 503.
     [[nodiscard]] bool is_configured() const noexcept;
+
+    // How many pictures this process is drawing right now, and how long the oldest of them has been
+    // going. /health carries both so a supervisor can tell a BUSY engine from a dead one: a chat probe
+    // queued behind a two-minute picture times out, and a keepalive that reads that timeout as death
+    // taskkills the serve and the picture with it -- which is what happened on 2026-11-01 22:30. The
+    // count covers the whole of generate(), the rewriter's sampling included, because the card is held
+    // for all of it. Zero means no picture is in flight and the age is reported as 0.
+    [[nodiscard]] std::size_t in_flight_jobs() const;
+    [[nodiscard]] std::int64_t oldest_in_flight_age_seconds(std::int64_t now) const;
 
     // Synchronous generation. `now` is the store clock (epoch seconds), stamped as `created`.
     // `artifact_url_base` is the absolute URL prefix of this server's artifact route
@@ -308,12 +374,19 @@ private:
     VisionLaneDimsProvider vision_dims_;
     ReferencePromptRendererProvider reference_prompt_renderer_;
     ImageJobExecutor job_executor_;
+    std::shared_ptr<PromptEnhancer> enhancer_;
     std::mutex dims_mutex_;
     infernix::models::qwen_image::DiTDims dims_cache_;
     std::mutex sequence_mutex_;
     std::uint64_t sequence_ = 0;
     mutable std::mutex progress_mutex_;
     std::shared_ptr<ImageJobProgress> last_progress_;
+    // One entry per job inside generate(): the token InFlightJob was built with, mapped to the second
+    // it started. A map rather than a counter because the age has to survive jobs ending out of order,
+    // and std::map's first key is the oldest token, which is the oldest job.
+    mutable std::mutex in_flight_mutex_;
+    std::map<std::uint64_t, std::int64_t> in_flight_;
+    std::uint64_t in_flight_token_ = 0;
 };
 
 } // namespace infernix::serve

@@ -20,6 +20,7 @@
 #include <cstring>
 #include <memory>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace infernix::models::qwen_image {
@@ -62,9 +63,11 @@ __global__ void deepstack_add_rows_kernel(const std::uint16_t* __restrict__ add,
     }
 }
 
-// vision_config.rope_scaling.mrope_section of this checkpoint (image-spike/artifact/text_encoder/
-// config.json, read through AutoConfig): 24 T, 20 H and 20 W over the 64 pairs of a 128-wide head.
-constexpr int kMropeSection[3] = {24, 20, 20};
+// The M-RoPE axis split is NOT a constant of this file. It is text_config.rope_scaling.mrope_section of
+// the artifact (image-spike/artifact/text_encoder/config.json: 24 T, 20 H, 20 W over the 64 pairs of a
+// 128-wide head, with mrope_interleaved true), read into TextTowerDims by bind_text_encoder and asserted
+// by checked_dims below. The kernel's `d % 3` walk is only the reference's rule while the checkpoint says
+// its rope is interleaved, which is exactly why the bind refuses an artifact that does not.
 
 // The Qwen3-VL text tower's M-RoPE rotation. The FORMULA is the one ops::rope already implements for
 // its D128/R128 Text domain (include/infernix/ops/rope.h:10-19): pair i rotates the two elements
@@ -116,6 +119,13 @@ const TextTowerDims& checked_dims(const TextTowerWeights& tower) {
     const TextTowerDims& dims = tower.dims;
     if (dims.hidden == 0 || dims.intermediate == 0 || dims.heads == 0 || dims.kv_heads == 0 ||
         dims.head_dim == 0 || dims.heads % dims.kv_heads != 0 || dims.rope_theta <= 0.0F ||
+        !dims.mrope_interleaved ||
+        // The rotation below assigns every pair of the head an axis, so the sections have to name them
+        // all; bind_text_encoder already counted the interleaved walk back against them, and this is the
+        // same fact asserted at the last moment before a kernel uses it. A tower bound without them (zero
+        // sections, a head whose pairs the sections do not cover) is refused rather than rotated wrong.
+        dims.head_dim % 2 != 0 ||
+        dims.mrope_section[0] + dims.mrope_section[1] + dims.mrope_section[2] != dims.head_dim / 2 ||
         tower.layers.empty() || tower.layers.size() != dims.layers) {
         throw std::runtime_error("text tower: dims are unusable or layers differ from the config");
     }
@@ -264,7 +274,8 @@ std::vector<std::uint16_t> tower_forward(artifact::Reader& reader, const TextTow
         Tensor q3 = view(dqn.d, HD, HQ, Si), k3 = view(dkn.d, HD, HKV, Si);
         if (mrope) {
             const auto* p = static_cast<const int*>(dpos.d);
-            const int h_span = 3 * kMropeSection[1], w_span = 3 * kMropeSection[2];
+            const int h_span = 3 * static_cast<int>(dims.mrope_section[1]);
+            const int w_span = 3 * static_cast<int>(dims.mrope_section[2]);
             mrope_kernel<<<grid, block, 0, 0>>>(static_cast<std::uint16_t*>(dqn.d), p,
                                                 static_cast<const double*>(dinv.d), prepared.attention_scale, Si, HD,
                                                 HQ, h_span, w_span);
@@ -429,12 +440,25 @@ run_conditioned_text_tower(artifact::Reader& reader, const TextTowerWeights& tow
     const bool has_image = !pad_rows.empty();
     if (has_image) {
         const std::size_t rows_elements = pad_rows.size() * D;
+        // The two counts ARE the diagnosis -- a merger that answered pre-merge rows, a merge factor
+        // other than the one the prompt expansion assumed, or a merger wider than the text hidden all
+        // look identical without them -- so the numbers travel in the message, not just the verdict.
+        const std::string counts = std::string(" (merger_rows=") + std::to_string(vision.merger_rows.size()) +
+                                   " elements = " + std::to_string(D ? vision.merger_rows.size() / D : 0) +
+                                   " rows of " + std::to_string(D) + ", pad_tokens=" +
+                                   std::to_string(pad_rows.size()) + ", grids=" +
+                                   std::to_string(vision.grids.size()) + ", deepstack=" +
+                                   std::to_string(vision.deepstack_rows.size()) + "/" +
+                                   std::to_string(tower.layers.size()) + ")";
         if (vision.merger_rows.size() != rows_elements || vision.deepstack_rows.size() > tower.layers.size()) {
-            throw std::runtime_error("text tower: vision rows do not cover the image pad tokens");
+            throw std::runtime_error(std::string("text tower: vision rows do not cover the image pad tokens") +
+                                     counts);
         }
-        for (const auto& add : vision.deepstack_rows) {
-            if (add.size() != rows_elements) {
-                throw std::runtime_error("text tower: vision rows do not cover the image pad tokens");
+        for (std::size_t level = 0; level < vision.deepstack_rows.size(); ++level) {
+            if (vision.deepstack_rows[level].size() != rows_elements) {
+                throw std::runtime_error(std::string("text tower: vision rows do not cover the image pad tokens") +
+                                         counts + " deepstack[" + std::to_string(level) + "]=" +
+                                         std::to_string(vision.deepstack_rows[level].size()));
             }
         }
     } else if (!vision.merger_rows.empty() || !vision.deepstack_rows.empty() || !vision.grids.empty()) {

@@ -3,12 +3,15 @@
 // IMAGE_GENERATION_SERVICE_TEST: PASS
 #include "serve/image_generation_service.h"
 
+#include "artifact/schema.h"
 #include "media/encode/png_encode.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <iterator>
 #include <memory>
@@ -23,7 +26,7 @@ using namespace infernix::serve;
 int failures = 0;
 
 void check(bool ok, const std::string& what) {
-    std::cout << (ok ? "ok: " : "FAIL: ") << what << '\n';
+    std::cout << (ok ? "ok: " : "FAIL: ") << what << '\n' << std::flush;
     if (!ok) { ++failures; }
 }
 
@@ -43,7 +46,7 @@ public:
         ++probes;
         probed_target = target_bytes;
         probed_margin = margin_bytes;
-        return probe_answer;
+        return probe_for ? probe_for(target_bytes) : probe_answer;
     }
 
     std::uint64_t
@@ -60,12 +63,15 @@ public:
         if (mode_ == Mode::DrainFail) {
             throw std::runtime_error("image interlude: the LLM frontier did not drain in time");
         }
-        job(infernix::ImageInterludeContext{.freed_bytes = freed, .image_stream = nullptr});
+        // A case that needs the yield to fall short for ONE of the two asks -- the rewriter's reserve --
+        // and to hold for the other, the picture's own need, says so by target instead of by guesswork.
+        const std::uint64_t delivered = freed_for ? freed_for(target_bytes) : freed;
+        job(infernix::ImageInterludeContext{.freed_bytes = delivered, .image_stream = nullptr});
         if (mode_ == Mode::RestorationFault) {
             available = false;
             throw std::runtime_error("image interlude: pool restoration was not confirmed");
         }
-        return freed;
+        return delivered;
     }
 
     bool supports = true;
@@ -74,6 +80,12 @@ public:
     // admission compares these against its own computed need plus the margin.
     static constexpr std::uint64_t kGiB = 1024ULL * 1024ULL * 1024ULL;
     std::uint64_t freed      = 24ULL * kGiB;
+    // When set, answers what the yield actually unmapped per requested target (see run()).
+    std::function<std::uint64_t(std::uint64_t)> freed_for = {};
+    // The same per-target seam on the OTHER side: a case that needs the admission to refuse the
+    // rewriter's reserve and still admit the picture's own, smaller need. Unset, probe_answer is the
+    // answer to every ask, which is right for every case but the one that is about the rewriter alone.
+    std::function<Fit(std::uint64_t)> probe_for = {};
     Fit probe_answer{.fits = true, .freed_bytes_expected = 24ULL * kGiB, .device_free_bytes = 4ULL * kGiB};
     int probes       = 0;
     int runs         = 0;
@@ -87,6 +99,29 @@ private:
 
 // Rendering is the host half of the tower seam: a fixed four-token prompt, with the drop-row count
 // non-zero so a mistake (counting the dropped rows as conditioning) changes the need and shows up.
+// A rewriter that answers without a sidecar listening on a port, so the service's DECISION about the
+// enhancer -- run, skip, or refuse -- is checkable on the host. It counts what it was asked for, because
+// the claim under test is usually that it was asked for nothing.
+class FakeEnhancer final : public PromptEnhancer {
+public:
+    FakeEnhancer() : PromptEnhancer("http://127.0.0.1:9", std::chrono::milliseconds{50}) {}
+
+    [[nodiscard]] bool healthy() const override { return healthy_result; }
+    void load() const override { ++loads; }
+    void unload() const override { ++unloads; }
+    [[nodiscard]] EnhancerAnswer rewrite(const std::string& prompt,
+                                         const std::vector<std::string>&,
+                                         std::uint64_t, std::size_t) const override {
+        ++rewrites;
+        return EnhancerAnswer{.rewritten_prompt = "REWRITTEN: " + prompt};
+    }
+
+    bool healthy_result = true;
+    mutable int loads   = 0;
+    mutable int unloads = 0;
+    mutable int rewrites = 0;
+};
+
 PromptRendererProvider fixed_renderer() {
     return [](const std::string& prompt) {
         TowerPrompt rendered;
@@ -164,7 +199,7 @@ ReferencePromptRendererProvider fixed_reference_renderer() {
 
 ImageJobExecutor fixed_executor() {
     return [](const OpenAIImagesRequest&, std::uint64_t, std::span<const std::uint16_t>,
-              std::span<const std::uint16_t>, const ReferencePixels*, void*,
+              std::span<const std::uint16_t>, std::span<const ReferencePlanes>, void*,
               const std::shared_ptr<ImageJobProgress>&, const EditConditioning*) {
         return fake_picture(0x01U);
     };
@@ -172,7 +207,7 @@ ImageJobExecutor fixed_executor() {
 
 ImageJobExecutor throwing_executor() {
     return [](const OpenAIImagesRequest&, std::uint64_t, std::span<const std::uint16_t>,
-              std::span<const std::uint16_t>, const ReferencePixels*,
+              std::span<const std::uint16_t>, std::span<const ReferencePlanes>,
               void*, const std::shared_ptr<ImageJobProgress>&, const EditConditioning*) -> FinishedPicture {
         throw std::runtime_error("image job exploded");
     };
@@ -191,6 +226,7 @@ struct Attempt {
     bool threw   = false;
     int status   = 0;
     std::string code;
+    std::string param;   // which field the refusal blames
     RequestJson response;
 };
 
@@ -202,6 +238,7 @@ Attempt attempt(const std::function<RequestJson()>& call) {
         outcome.threw  = true;
         outcome.status = exception.error().status;
         outcome.code   = exception.error().code;
+        outcome.param    = exception.error().param;
     }
     return outcome;
 }
@@ -258,7 +295,27 @@ int main() {
                   record->id == "img-1000-1" && record->response.contains("data"),
               "success stores one Succeeded job with its response");
         check(service.next_job_id(1001) == "img-1001-2", "job ids increment per process");
+        // The seed is decided at submit time and recorded, so the job record says which pixels it
+        // drew: an explicit seed verbatim, an omitted one the engine drew (and only the engine knows).
+        check(record != nullptr && record->request.contains("seed") &&
+                  record->request.at("seed").is_number_unsigned(),
+              "a request with no seed still records the seed the engine drew");
     }
+    {
+        // The seed is decided at submit time, so the record says which pixels this job drew: an
+        // explicit seed verbatim, an omitted one the engine draw that nobody can recover after.
+        ImageJobStore store(8, 1 << 20);
+        ImageGenerationService service(std::make_unique<FakeRunner>(), store, fixed_renderer(), fixed_provider(), fixed_dims(),
+                                       fixed_executor());
+        OpenAIImagesRequest pinned = sample_request();
+        pinned.seed = 123456789ULL;
+        check(!attempt([&] { return service.generate(pinned, 1000); }).threw,
+              "a request with a pinned seed is served");
+        const auto record = only_record(store);
+        check(record && record->request.at("seed") == 123456789ULL,
+              "an explicit seed reaches the record unchanged");
+    }
+
 
     {
         auto runner = std::make_unique<FakeRunner>();
@@ -291,6 +348,45 @@ int main() {
                   record->error["message"].get<std::string>().find("exploded") !=
                       std::string::npos,
               "job failure stores Failed with the job error");
+    }
+
+    // The taxonomy of a job that died AFTER it started. The chat tool forwards this code and message to
+    // the model as the tool's error result, so "the draw failed" and "a kernel refused this geometry"
+    // must not share a code: retrying the second reproduces it.
+        {
+        // Each family throws its own type, exactly as the device code does: an Op rejects a shape with
+        // std::invalid_argument (image_device_util.h makes every CUDA failure a runtime_error).
+        const ImageJobExecutor rejected_by_an_op = [](
+            const OpenAIImagesRequest&, std::uint64_t, std::span<const std::uint16_t>,
+            std::span<const std::uint16_t>, std::span<const ReferencePlanes>, void*,
+            const std::shared_ptr<ImageJobProgress>&, const EditConditioning*) -> FinishedPicture {
+            throw std::invalid_argument("attn_dit_joint: S must be 1..20480");
+        };
+        const ImageJobExecutor artifact_unbound = [](
+            const OpenAIImagesRequest&, std::uint64_t, std::span<const std::uint16_t>,
+            std::span<const std::uint16_t>, std::span<const ReferencePlanes>, void*,
+            const std::shared_ptr<ImageJobProgress>&, const EditConditioning*) -> FinishedPicture {
+            throw infernix::artifact::ArtifactError("text/embed_tokens is not bound");
+        };
+        ImageJobStore store(8, 1 << 20);
+        ImageGenerationService refused_by_an_op(std::make_unique<FakeRunner>(), store,
+                                                fixed_renderer(), fixed_provider(), fixed_dims(),
+                                                rejected_by_an_op);
+        const auto op_outcome =
+            attempt([&] { return refused_by_an_op.generate(sample_request(), 1000); });
+        check(op_outcome.threw && op_outcome.status == 500 &&
+                  op_outcome.code == "image_request_unservable",
+              "an Op refusing the job geometry -> 500 image_request_unservable, not a draw failure");
+
+        ImageJobStore artifact_store(8, 1 << 20);
+        ImageGenerationService artifact_failed(std::make_unique<FakeRunner>(), artifact_store,
+                                               fixed_renderer(), fixed_provider(), fixed_dims(),
+                                               artifact_unbound);
+        const auto artifact_outcome =
+            attempt([&] { return artifact_failed.generate(sample_request(), 1000); });
+        check(artifact_outcome.threw && artifact_outcome.status == 500 &&
+                  artifact_outcome.code == "image_artifact_failed",
+              "an artifact bind failure -> 500 image_artifact_failed");
     }
 
     // A second concurrent request is told the interlude is already in flight (429).
@@ -337,7 +433,7 @@ int main() {
         bool executor_ran    = false;
         ImageJobExecutor watch =
             [&executor_ran](const OpenAIImagesRequest&, std::uint64_t, std::span<const std::uint16_t>,
-                            std::span<const std::uint16_t>, const ReferencePixels*, void*,
+                            std::span<const std::uint16_t>, std::span<const ReferencePlanes>, void*,
                             const std::shared_ptr<ImageJobProgress>&, const EditConditioning*) {
                 executor_ran = true;
                 return fake_picture(0x01U);
@@ -376,6 +472,49 @@ int main() {
               "restoration fault stores FailedEngineDegraded with both errors");
     }
 
+    // The busy signal /health carries. A supervisor has to be able to ask whether a picture is being
+    // drawn, because a chat probe queued behind one times out and a keepalive that reads that timeout
+    // as death kills a job that was succeeding (measured 2026-11-01 22:30). Read from INSIDE the
+    // executor -- the only point that is certainly during the draw -- and again after it returns, so a
+    // count left behind by a finished job cannot pass.
+    {
+        ImageJobStore store(8, 1ULL << 20);
+        ImageGenerationService* self    = nullptr;
+        std::size_t             during  = 0;
+        std::int64_t            age_now = -1;
+        std::int64_t            age_ahead = -1;
+        ImageJobExecutor watch  =
+            [&](const OpenAIImagesRequest&, std::uint64_t, std::span<const std::uint16_t>,
+                std::span<const std::uint16_t>, std::span<const ReferencePlanes>, void*,
+                const std::shared_ptr<ImageJobProgress>&, const EditConditioning*) {
+                const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count();
+                during    = self->in_flight_jobs();
+                age_now   = self->oldest_in_flight_age_seconds(static_cast<std::int64_t>(now));
+                age_ahead = self->oldest_in_flight_age_seconds(static_cast<std::int64_t>(now) + 3600);
+                return fake_picture(0x01U);
+            };
+        ImageGenerationService service(std::make_unique<FakeRunner>(), store, fixed_renderer(),
+                                       fixed_provider(), fixed_dims(), watch);
+        self = &service;
+        check(service.in_flight_jobs() == 0, "no job means nothing is in flight");
+        (void)attempt([&] { return service.generate(sample_request(), 1000); });
+        check(during == 1, "the executor sees its own job in flight");
+        check(age_now >= 0 && age_now <= 2, "a job that just started reads an age of about zero");
+        check(age_ahead >= 3598 && age_ahead <= 3602,
+              "the age is the real elapsed time, not a constant: asked an hour ahead it says an hour");
+        check(service.in_flight_jobs() == 0, "a finished job leaves no count behind");
+
+        // The path that makes RAII the point: generate() leaves through a throw on almost every
+        // failure, and a count surviving one of those would tell a supervisor the card is busy forever.
+        ImageJobStore failing_store(8, 1ULL << 20);
+        ImageGenerationService failing(std::make_unique<FakeRunner>(), failing_store, fixed_renderer(),
+                                       fixed_provider(), fixed_dims(), throwing_executor());
+        const auto failed = attempt([&] { return failing.generate(sample_request(), 1000); });
+        check(failed.threw, "the throwing executor really threw");
+        check(failing.in_flight_jobs() == 0, "a job that threw leaves no count behind either");
+    }
+
     // #75 reference image: a valid base64 PNG reaches the executor as the prepared plane with the
     // reference geometry (PIL calculate_dimensions at 1024^2 area, 64x48 -> 1184x896), and the PNG's
     // alpha survives as the real fourth channel. An undecodable payload is a pre-interlude 400.
@@ -400,27 +539,27 @@ int main() {
         std::uint32_t vision_w = 0, vision_h = 0;
         ImageJobExecutor capture = [&](const OpenAIImagesRequest&, std::uint64_t,
                                        std::span<const std::uint16_t>, std::span<const std::uint16_t>,
-                                       const ReferencePixels* ref, void*,
+                                       std::span<const ReferencePlanes> ref, void*,
                                        const std::shared_ptr<ImageJobProgress>&,
                                        const EditConditioning* edit)
             -> FinishedPicture {
-            saw_reference = ref != nullptr;
+            saw_reference = !ref.empty();
             if (edit != nullptr) {
-                saw_edit_planes = edit->planes != nullptr && edit->prompt != nullptr &&
+                saw_edit_planes = !ref.empty() && edit->prompt != nullptr &&
                                   edit->negative_prompt == nullptr; // true_cfg_scale is 1 here
-                if (edit->planes != nullptr) {
-                    vision_rgb_bytes = edit->planes->vision.rgb.size();
-                    vision_w         = edit->planes->vision.width_px;
-                    vision_h         = edit->planes->vision.height_px;
+                if (!ref.empty()) {
+                    vision_rgb_bytes = ref[0].vision.rgb.size();
+                    vision_w         = ref[0].vision.width_px;
+                    vision_h         = ref[0].vision.height_px;
                 }
                 if (edit->prompt != nullptr) { edit_rows = edit->prompt->tokens(); }
             }
-            if (ref != nullptr) {
-                plane_floats = ref->pixels.size();
-                plane_w      = ref->width_px;
-                plane_h      = ref->height_px;
-                const std::size_t pixels = static_cast<std::size_t>(ref->width_px) * ref->height_px;
-                const float* alpha       = ref->pixels.data() + 3 * pixels;
+            if (!ref.empty()) {
+                plane_floats = ref[0].vae.pixels.size();
+                plane_w      = ref[0].vae.width_px;
+                plane_h      = ref[0].vae.height_px;
+                const std::size_t pixels = static_cast<std::size_t>(ref[0].vae.width_px) * ref[0].vae.height_px;
+                const float* alpha       = ref[0].vae.pixels.data() + 3 * pixels;
                 const auto [lo, hi]      = std::minmax_element(alpha, alpha + pixels);
                 alpha_min                = *lo;
                 alpha_max                = *hi;
@@ -432,7 +571,7 @@ int main() {
         ImageGenerationService service(std::make_unique<FakeRunner>(), store, fixed_renderer(), fixed_provider(), fixed_dims(),
                                        capture, fixed_vision(), fixed_reference_renderer());
         OpenAIImagesRequest request = sample_request();
-        request.image               = payload;
+        request.images              = {payload};
         service.generate(request, 1000);
         check(saw_reference && plane_w == 1184U && plane_h == 896U &&
                   plane_floats == 4ULL * 1184ULL * 896ULL,
@@ -453,7 +592,7 @@ int main() {
         ImageGenerationService bad_service(std::make_unique<FakeRunner>(), bad_store,
                                            fixed_renderer(), fixed_provider(), fixed_dims(), capture);
         OpenAIImagesRequest bad = sample_request();
-        bad.image               = "not base64 at all!!";
+        bad.images              = {"not base64 at all!!"};
         const auto outcome      = attempt([&] { return bad_service.generate(bad, 1000); });
         // The codec's own words are never echoed to the client, so the CODE is the contract here: a
         // payload that is not base64 PNG/JPEG is image_decode_failed, not the generic image_invalid and
@@ -461,6 +600,376 @@ int main() {
         check(outcome.threw && outcome.status == 400 && outcome.code == "image_decode_failed",
               "undecodable image -> 400 image_decode_failed");
         check(bad_store.size() == 0U, "invalid image stores no job (fails before the interlude)");
+    }
+
+    // The family's prompt enhancer is a SEPARATE shipped model (Qwen/Qwen-Image-2.1-PE-I2I, a
+    // fine-tuned Qwen3.5-VL 9B that reads the instruction and the pictures and answers
+    // {rewritten_prompt, wh_ratio, ratio_follow}); the tower inside the image artifact is a
+    // different checkpoint and cannot stand in for it. None is installed in this build, so asking
+    // for one is a refusal that names what is missing -- never a drawing made from words the client
+    // believed had been rewritten. Nothing is stored or yielded for a request that cannot run.
+    {
+        ImageJobStore store(8, 1 << 20);
+        auto runner = std::make_unique<FakeRunner>();
+        FakeRunner* eyes = runner.get();
+        ImageGenerationService service(
+            std::move(runner), store, fixed_renderer(), fixed_provider(), fixed_dims(),
+            [](const OpenAIImagesRequest&, std::uint64_t, std::span<const std::uint16_t>,
+               std::span<const std::uint16_t>, std::span<const ReferencePlanes>, void*,
+               const std::shared_ptr<ImageJobProgress>&,
+               const EditConditioning*) { return fake_picture(0x01U); });
+        OpenAIImagesRequest request = sample_request();
+        request.prompt_enhance = PromptEnhanceMode::On;
+        const auto outcome = attempt([&] { return service.generate(request, 1000); });
+        check(outcome.threw && outcome.status == 503 &&
+                  outcome.code == "image_prompt_enhancer_unavailable",
+              "prompt_enhance without a rewriter -> 503 image_prompt_enhancer_unavailable");
+        check(outcome.param == "prompt_enhance",
+              "the refusal names the field the client asked about");
+        check(eyes->probes == 0 && eyes->runs == 0,
+              "the refusal never probes the yield and never runs a job");
+        check(store.size() == 0U, "the refusal stores nothing");
+
+        // The same request with the judgement delegated. auto told the server to choose, so a build
+        // with no rewriter answers it by drawing from the client's own words rather than refusing --
+        // the difference between auto and true is exactly this 503, and nothing else about the
+        // request changed. Measured against the counters rather than against zero, so it still says
+        // what it means after the request above touched them.
+        const auto probes_before_auto = eyes->probes;
+        const auto runs_before_auto = eyes->runs;
+        request.prompt_enhance = PromptEnhanceMode::Auto;
+        const auto automatic = attempt([&] { return service.generate(request, 1002); });
+        check(!automatic.threw, "prompt_enhance \"auto\" without a rewriter is served, not refused");
+        const auto probes_after_auto = eyes->probes;
+        const auto runs_after_auto = eyes->runs;
+
+        // And the same request without the switch is served: the refusal is about the switch, not
+        // about the route.
+        request.prompt_enhance = PromptEnhanceMode::Off;
+        const auto served = attempt([&] { return service.generate(request, 1001); });
+        check(!served.threw, "the same request without the switch is served");
+
+        // The claim that matters is not "auto spent nothing" -- the picture's own interlude goes
+        // through the same two counters, so an absolute zero here would be a claim about the fake.
+        // What auto promised is that declining the rewriter costs the request nothing it would not
+        // have paid anyway, and that is an equality against the identical request without the switch.
+        check(probes_after_auto - probes_before_auto == eyes->probes - probes_after_auto &&
+                  runs_after_auto - runs_before_auto == eyes->runs - runs_after_auto,
+              "auto with no rewriter costs exactly what the identical plain request costs");
+    }
+
+    // The OTHER half of the auto promise, which no case above touches: not "no rewriter installed" but
+    // "the card cannot be had for one". The pre-probe declines for auto already; what that probe merely
+    // PROMISED is measured a second time inside the interlude, where the yield has actually unmapped
+    // something -- and that second check threw for BOTH modes. So the server's own sentence, "the card
+    // cannot be had for one, which for auto is a skip and never a 503", was false on the wire: a real
+    // auto edit came back 503 image_vram_insufficient. The fake drives exactly the split that produces
+    // it -- the probe says yes, the yield delivers enough for the picture and not for the rewriter.
+    {
+        const auto short_for_rewriter = [](std::uint64_t target_bytes) {
+            // The rewriter asks for its whole reserve -- 19042 MiB, image_generation_service.cpp:67 --
+            // and the picture asks for its own, far smaller, need. Short only for the first, so nothing
+            // else in the request can be the reason for a refusal. The bound sits between the two and has
+            // to be read against that constant: it was 20 GiB while the reserve was 20 GiB, and the
+            // reserve dropped under it the day it became the measured peak instead of a second slack.
+            return target_bytes >= 16ULL * FakeRunner::kGiB ? 8ULL * FakeRunner::kGiB
+                                                            : 24ULL * FakeRunner::kGiB;
+        };
+        const std::string reference = base64_encode_bytes(
+            infernix::media::encode::encode_png_rgba8(
+                64, 48, std::vector<std::uint8_t>(64U * 48U * 4, 90U)));
+
+        ImageJobStore store(8, 1 << 20);
+        auto        runner  = std::make_unique<FakeRunner>();
+        FakeRunner* eyes    = runner.get();
+        eyes->freed_for     = short_for_rewriter;
+        auto          enhancer = std::make_shared<FakeEnhancer>();
+        std::string   drawn_prompt;
+        ImageJobExecutor watch = [&drawn_prompt](const OpenAIImagesRequest& req, std::uint64_t,
+                                                 std::span<const std::uint16_t>,
+                                                 std::span<const std::uint16_t>,
+                                                 std::span<const ReferencePlanes>, void*,
+                                                 const std::shared_ptr<ImageJobProgress>&,
+                                                 const EditConditioning*) {
+            drawn_prompt = req.prompt;
+            return fake_picture(0x02U);
+        };
+        ImageGenerationService service(std::move(runner), store, fixed_renderer(), fixed_provider(),
+                                       fixed_dims(), watch, fixed_vision(),
+                                       fixed_reference_renderer(), enhancer);
+        OpenAIImagesRequest request        = sample_request();
+        request.images                     = {reference};
+        request.prompt_enhance             = PromptEnhanceMode::Auto;
+        const auto auto_outcome = attempt([&] { return service.generate(request, 1100); });
+        check(!auto_outcome.threw, "auto is SERVED when the card cannot be had for the rewriter");
+        check(enhancer->rewrites == 0 && enhancer->loads == 0 && enhancer->unloads == 0,
+              "the declined rewrite never asked the sidecar for weights or for words");
+        check(drawn_prompt == request.prompt,
+              "a declined rewrite draws the client's own words, not the unfilled answer");
+        check(eyes->runs == 2,
+              "the request paid one interlude it declined and one for the picture");
+        check(store.size() == 1U, "the served auto request is stored like any other");
+        const auto stored = store.get("img-1100-1");
+        check(stored && stored->request.at("prompt_enhance_outcome") == "skipped_no_device",
+              "the record names WHICH auto skip this was, not only that one happened");
+        // The two surfaces a client can read without a log. The status object is what GET /v1/images/<id>
+        // serves while no picture file exists, which is the only time a client ever sees it -- so the
+        // synchronous body is the one that reaches a client that does not poll.
+        check(auto_outcome.response.contains("prompt_enhance_outcome") &&
+                  auto_outcome.response.at("prompt_enhance_outcome") == "skipped_no_device",
+              "the synchronous answer carries the reason, for a client that never polls");
+        const auto polled = service.job_status_json("img-1100-1");
+        check(!polled.is_null() && polled.contains("prompt_enhance_outcome") &&
+                  polled.at("prompt_enhance_outcome") == "skipped_no_device",
+              "the status object a polling client reads carries the same reason");
+
+        // The asymmetry the parameter is defined by: the same shortage IS a refusal for a client that
+        // named prompt_enhance: true, because handing it the words it believed had been rewritten is
+        // the lie this field exists to prevent.
+        auto refusing_runner         = std::make_unique<FakeRunner>();
+        refusing_runner->freed_for   = short_for_rewriter;
+        auto refusing_enhancer       = std::make_shared<FakeEnhancer>();
+        ImageGenerationService refusing(std::move(refusing_runner), store, fixed_renderer(),
+                                        fixed_provider(), fixed_dims(), watch, fixed_vision(),
+                                        fixed_reference_renderer(), refusing_enhancer);
+        OpenAIImagesRequest asked      = request;
+        asked.prompt_enhance           = PromptEnhanceMode::On;
+        const auto asked_outcome = attempt([&] { return refusing.generate(asked, 1101); });
+        check(asked_outcome.threw && asked_outcome.status == 503 &&
+                  asked_outcome.code == "image_vram_insufficient",
+              "prompt_enhance: true keeps its 503 for the very shortage auto skips");
+        check(refusing_enhancer->rewrites == 0, "the refusal never reached the sidecar either");
+        check(store.get("img-1101-1") == nullptr,
+              "the refused request stored no record for anyone to misread later");
+
+        // The positive control, without which the two above only prove the fake is inert: handed a card,
+        // true really pays the rewriter, hands the card back, and is drawn from the REWRITTEN words.
+        auto generous_runner   = std::make_unique<FakeRunner>();
+        auto generous_enhancer = std::make_shared<FakeEnhancer>();
+        std::string rewritten_seen;
+        ImageJobExecutor note  = [&rewritten_seen](const OpenAIImagesRequest& req, std::uint64_t,
+                                                   std::span<const std::uint16_t>,
+                                                   std::span<const std::uint16_t>,
+                                                   std::span<const ReferencePlanes>, void*,
+                                                   const std::shared_ptr<ImageJobProgress>&,
+                                                   const EditConditioning*) {
+            rewritten_seen = req.prompt;
+            return fake_picture(0x03U);
+        };
+        ImageGenerationService generous(std::move(generous_runner), store, fixed_renderer(),
+                                        fixed_provider(), fixed_dims(), note, fixed_vision(),
+                                        fixed_reference_renderer(), generous_enhancer);
+        const auto paid_outcome = attempt([&] { return generous.generate(asked, 1102); });
+        check(!paid_outcome.threw && generous_enhancer->rewrites == 1 &&
+                  generous_enhancer->loads == 1 && generous_enhancer->unloads == 1 &&
+                  rewritten_seen == "REWRITTEN: " + asked.prompt,
+              "given the card, true pays the rewriter, releases it, and draws the rewritten words");
+        const auto paid = store.get("img-1102-1");
+        check(paid && paid->request.at("prompt_enhance_outcome") == "applied",
+              "the record says the rewrite was applied when it was");
+
+        // The same skip one level EARLIER, which measured live said "off" instead. The block above
+        // lets the probe promise the card and lets the yield fall short; this one is the pre-probe
+        // itself saying no, before any interlude. That branch ran with enhancer_outcome still at Off,
+        // so the answer told the client "no rewrite was asked for" when the truth was "the card cannot
+        // hold one" -- the reader cannot tell a rewriter worth waiting for from one that never comes.
+        {
+            // The rewriter asks for its whole 19042 MiB reserve (image_generation_service.cpp:67) and
+            // the picture for its own, far smaller need: refuse only the first, so the request that
+            // survives is the picture and nothing else can be the reason for a refusal.
+            const auto nofit_for_rewriter = [](std::uint64_t target_bytes) {
+                if (target_bytes >= 16ULL * FakeRunner::kGiB) { return ImageInterludeRunner::Fit{}; }
+                return ImageInterludeRunner::Fit{.fits = true,
+                                                 .freed_bytes_expected = 24ULL * FakeRunner::kGiB,
+                                                 .device_free_bytes  = 4ULL * FakeRunner::kGiB};
+            };
+            auto            nofit_runner   = std::make_unique<FakeRunner>();
+            FakeRunner*     nofit          = nofit_runner.get();
+            nofit->probe_for               = nofit_for_rewriter;
+            auto            nofit_enhancer = std::make_shared<FakeEnhancer>();
+            std::string     kept_prompt;
+            ImageJobExecutor keep          = [&kept_prompt](const OpenAIImagesRequest& req, std::uint64_t,
+                                                            std::span<const std::uint16_t>,
+                                                            std::span<const std::uint16_t>,
+                                                            std::span<const ReferencePlanes>, void*,
+                                                            const std::shared_ptr<ImageJobProgress>&,
+                                                            const EditConditioning*) {
+                kept_prompt = req.prompt;
+                return fake_picture(0x04U);
+            };
+            ImageGenerationService noservice(std::move(nofit_runner), store, fixed_renderer(),
+                                             fixed_provider(), fixed_dims(), keep, fixed_vision(),
+                                             fixed_reference_renderer(), nofit_enhancer);
+            OpenAIImagesRequest ask          = request;
+            ask.images                       = {reference};
+            ask.prompt_enhance               = PromptEnhanceMode::Auto;
+            const auto declined              = attempt([&] { return noservice.generate(ask, 1103); });
+            check(!declined.threw,
+                  "a pre-probe that cannot hold the rewriter still draws the picture for auto");
+            check(nofit->probes == 2 && nofit->runs == 1,
+                  "the declined rewrite was probed and never entered an interlude: the picture paid the only one");
+            check(nofit_enhancer->loads == 0 && nofit_enhancer->rewrites == 0,
+                  "the sidecar was never asked for weights or for words");
+            check(kept_prompt == ask.prompt,
+                  "the picture is drawn from the client's own words");
+            const auto declined_record = store.get("img-1103-1");
+            check(declined_record &&
+                      declined_record->request.at("prompt_enhance_outcome") == "skipped_no_device",
+                  "the pre-probe decline names skipped_no_device, not off");
+
+            auto            nofit_refusing   = std::make_unique<FakeRunner>();
+            nofit_refusing->probe_for         = nofit_for_rewriter;
+            auto            nofit_refuse_enhancer = std::make_shared<FakeEnhancer>();
+            ImageGenerationService nofit_refusal(std::move(nofit_refusing), store, fixed_renderer(),
+                                                 fixed_provider(), fixed_dims(), keep, fixed_vision(),
+                                                 fixed_reference_renderer(), nofit_refuse_enhancer);
+            OpenAIImagesRequest believed = ask;
+            believed.prompt_enhance      = PromptEnhanceMode::On;
+            const auto refused           = attempt([&] { return nofit_refusal.generate(believed, 1104); });
+            check(refused.threw && refused.status == 503 &&
+                      refused.code == "image_vram_insufficient",
+                  "the same pre-probe shortage stays a 503 for a client that believed its words were rewritten");
+        }
+
+        // The four endings that need no shortage at all, each with its OWN reason in the record. They
+        // look identical from outside the server -- one picture, drawn from the client's own words --
+        // and they are four different things a reader of the log must be able to tell apart: the client
+        // did not ask, there was no picture to read, the instruction was already the rewriter's answer,
+        // and no sidecar is answering. The last is a deployment gap; the others are ordinary requests.
+        struct SkipCase {
+            PromptEnhanceMode mode;
+            bool              reference;
+            bool              marked;
+            bool              rewriter_up;
+            const char*       outcome;
+        };
+        const SkipCase skips[] = {
+            {PromptEnhanceMode::Off,  true,  false, true,  "off"},
+            {PromptEnhanceMode::Auto, false, false, true,  "skipped_no_reference"},
+            {PromptEnhanceMode::Auto, true,  true,  true,  "skipped_already_rewritten"},
+            {PromptEnhanceMode::Auto, true,  false, false, "skipped_no_rewriter"},
+        };
+        for (const auto& c : skips) {
+            ImageJobStore    skip_store(8, 1 << 20);
+            auto             skip_runner   = std::make_unique<FakeRunner>();
+            auto             skip_enhancer = std::make_shared<FakeEnhancer>();
+            skip_enhancer->healthy_result  = c.rewriter_up;
+            std::string      seen;
+            ImageJobExecutor note2         = [&seen](const OpenAIImagesRequest& req, std::uint64_t,
+                                                    std::span<const std::uint16_t>,
+                                                    std::span<const std::uint16_t>,
+                                                    std::span<const ReferencePlanes>, void*,
+                                                    const std::shared_ptr<ImageJobProgress>&,
+                                                    const EditConditioning*) {
+                seen = req.prompt;
+                return fake_picture(0x04U);
+            };
+            ImageGenerationService skip(std::move(skip_runner), skip_store, fixed_renderer(),
+                                        fixed_provider(), fixed_dims(), note2, fixed_vision(),
+                                        fixed_reference_renderer(), skip_enhancer);
+            OpenAIImagesRequest r = sample_request();
+            if (c.reference) { r.images = {reference}; }
+            if (c.marked) { r.prompt = "On <image1>, make the ground green."; }
+            r.prompt_enhance = c.mode;
+            const auto served = attempt([&] { return skip.generate(r, 1200); });
+            check(!served.threw && seen == r.prompt && skip_enhancer->rewrites == 0 &&
+                      served.response.contains("prompt_enhance_outcome") &&
+                      served.response.at("prompt_enhance_outcome") == c.outcome,
+                  std::string(c.outcome) + ": served from the client's own words, rewriter untouched, "
+                                            "and the body says so");
+            const auto rec = skip_store.get("img-1200-1");
+            check(rec && rec->request.at("prompt_enhance_outcome") == c.outcome,
+                  std::string(c.outcome) + ": the record carries that reason");
+        }
+    }
+
+    // P9 multi-reference: every reference conditions the SAME forward, so the contract is that all
+    // of them arrive and none is quietly dropped or averaged. Three things must hold together, and
+    // they are the three the executor's joint assembly cannot recover from getting wrong: the
+    // renderer is handed one vision count per picture (the pad runs it expands, and therefore the
+    // joint sequence the admission sizes on, is the SUM over them), the executor is handed one plane
+    // per picture in request order, and the canvas follows the LAST reference when the client named
+    // no size -- image[-1] in the reference pipeline
+    // (image-edit/refs/q21_pipeline_qwenimage21.py:630-636).
+    {
+        const std::string wide = base64_encode_bytes(
+            infernix::media::encode::encode_png_rgba8(
+                64, 48, std::vector<std::uint8_t>(64U * 48U * 4, 90U)));   // -> 1184x896
+        const std::string tall = base64_encode_bytes(
+            infernix::media::encode::encode_png_rgba8(
+                48, 64, std::vector<std::uint8_t>(48U * 64U * 4, 200U)));  // -> 896x1184
+
+        std::vector<std::uint64_t> rendered_pads;
+        ReferencePromptRendererProvider recorder = [&](const std::string& prompt,
+                                                     const std::vector<std::uint64_t>& pads) {
+            rendered_pads = pads;
+            TowerPrompt rendered;
+            rendered.rendered = prompt;
+            std::size_t rows = 8ULL;
+            for (const std::uint64_t pad : pads) { rows += pad; }
+            rendered.ids.assign(rows, 7);
+            rendered.drop_rows = 2U;
+            return rendered;
+        };
+
+        std::size_t   planes_at_executor = 0;
+        std::uint32_t first_w = 0, first_h = 0, last_w = 0, last_h = 0;
+        std::uint32_t canvas_w = 0, canvas_h = 0;
+        std::uint64_t probed_with_two = 0, probed_with_one = 0;
+        ImageJobExecutor capture = [&](const OpenAIImagesRequest& effective, std::uint64_t,
+                                       std::span<const std::uint16_t>, std::span<const std::uint16_t>,
+                                       std::span<const ReferencePlanes> refs, void*,
+                                       const std::shared_ptr<ImageJobProgress>&,
+                                       const EditConditioning*) -> FinishedPicture {
+            planes_at_executor = refs.size();
+            if (!refs.empty()) {
+                first_w = refs.front().vae.width_px;
+                first_h = refs.front().vae.height_px;
+                last_w  = refs.back().vae.width_px;
+                last_h  = refs.back().vae.height_px;
+            }
+            canvas_w = effective.width;
+            canvas_h = effective.height;
+            return fake_picture(0x02U);
+        };
+
+        ImageJobStore store(8, 1 << 20);
+        auto runner = std::make_unique<FakeRunner>();
+        FakeRunner* eyes = runner.get();
+        ImageGenerationService service(std::move(runner), store, fixed_renderer(), fixed_provider(),
+                                       fixed_dims(), capture, fixed_vision(), recorder);
+
+        OpenAIImagesRequest request = sample_request();
+        request.size_requested = false;  // an edit that named no size: the reference decides the canvas
+        request.images         = {wide, tall};
+        service.generate(request, 1000);
+        probed_with_two = eyes->probed_target;
+
+        check(rendered_pads.size() == 2ULL && rendered_pads[0] == 1036ULL &&
+                  rendered_pads[1] == 1036ULL,
+              "two references render one pad run each, not one run for the pair");
+        check(planes_at_executor == 2ULL && first_w == 1184U && first_h == 896U &&
+                  last_w == 896U && last_h == 1184U,
+              "both planes reach the executor, in the order the client sent them");
+        check(canvas_w == 672U && canvas_h == 896U,
+              "with no size named the canvas follows the LAST reference, as the pipeline does");
+
+        // The same request naming <image1> is the client saying "the canvas is THAT picture": the
+        // other reference still conditions the edit, and only the geometry it follows moves.
+        request.ratio_follow = "<image1>";
+        service.generate(request, 1001);
+        check(canvas_w == 896U && canvas_h == 672U && planes_at_executor == 2ULL,
+              "ratio_follow moves the canvas without dropping a reference");
+
+        // The ledger is the resident LLM's protection, so the sum has to be in the NUMBER and not
+        // only in the prompt: one reference of the same two is strictly cheaper.
+        OpenAIImagesRequest one_ref = sample_request();
+        one_ref.size_requested = false;
+        one_ref.images         = {wide};
+        service.generate(one_ref, 1002);
+        probed_with_one = eyes->probed_target;
+        check(probed_with_two > probed_with_one,
+              "the second reference is reserved for, not just conditioned on");
     }
 
     // M7 admission with a reference. The ledger is what protects the resident LLM, so every case here
@@ -481,7 +990,7 @@ int main() {
             ImageGenerationService service(std::move(runner), store, fixed_renderer(), fixed_provider(),
                                            fixed_dims(), fixed_executor());
             OpenAIImagesRequest request = sample_request();
-            request.image = payload;
+            request.images = {payload};
             const auto outcome = attempt([&] { return service.generate(request, 1900); });
             check(outcome.threw && outcome.status == 503 &&
                       outcome.code == "image_generation_not_configured",
@@ -504,7 +1013,7 @@ int main() {
             (void)attempt([&] { return service.generate(sample_request(), 1910); });
             asked_without = eyes->probed_target;
             OpenAIImagesRequest request = sample_request();
-            request.image = payload;
+            request.images = {payload};
             const auto outcome = attempt([&] { return service.generate(request, 1920); });
             asked_with = eyes->probed_target;
             check(!outcome.threw, "the sized reference request is admitted");
@@ -519,7 +1028,7 @@ int main() {
             bool executor_ran = false;
             ImageJobExecutor watch =
                 [&executor_ran](const OpenAIImagesRequest&, std::uint64_t, std::span<const std::uint16_t>,
-                                std::span<const std::uint16_t>, const ReferencePixels*, void*,
+                                std::span<const std::uint16_t>, std::span<const ReferencePlanes>, void*,
                                 const std::shared_ptr<ImageJobProgress>&, const EditConditioning*) {
                     executor_ran = true;
                     return fake_picture(0x01U);
@@ -528,7 +1037,7 @@ int main() {
                                            fixed_dims(), watch, fixed_vision(),
                                            fixed_reference_renderer());
             OpenAIImagesRequest request = sample_request();
-            request.image = payload;
+            request.images = {payload};
             const auto outcome = attempt([&] { return service.generate(request, 1930); });
             check(outcome.threw && outcome.status == 503 &&
                       outcome.code == "image_vram_insufficient",
@@ -552,7 +1061,7 @@ int main() {
         ImageJobExecutor capture = [&](const OpenAIImagesRequest& request, std::uint64_t,
                                        std::span<const std::uint16_t>,
                                        std::span<const std::uint16_t> negative,
-                                       const ReferencePixels*, void*, const std::shared_ptr<ImageJobProgress>&, const EditConditioning*)
+                                       std::span<const ReferencePlanes>, void*, const std::shared_ptr<ImageJobProgress>&, const EditConditioning*)
             -> FinishedPicture {
             neg_size   = negative.size();
             seen_scale = request.true_cfg_scale;
@@ -588,7 +1097,7 @@ int main() {
         const FinishedPicture picture = fake_picture(0x89U);
         ImageJobExecutor writer = [&](const OpenAIImagesRequest&, std::uint64_t,
                                       std::span<const std::uint16_t>, std::span<const std::uint16_t>,
-                                      const ReferencePixels*, void*, const std::shared_ptr<ImageJobProgress>&, const EditConditioning*)
+                                      std::span<const ReferencePlanes>, void*, const std::shared_ptr<ImageJobProgress>&, const EditConditioning*)
             -> FinishedPicture {
             return picture;
         };
@@ -616,7 +1125,7 @@ int main() {
         const FinishedPicture picture = fake_picture(0x0DU);
         ImageJobExecutor writer = [&](const OpenAIImagesRequest&, std::uint64_t,
                                       std::span<const std::uint16_t>, std::span<const std::uint16_t>,
-                                      const ReferencePixels*, void*, const std::shared_ptr<ImageJobProgress>&, const EditConditioning*)
+                                      std::span<const ReferencePlanes>, void*, const std::shared_ptr<ImageJobProgress>&, const EditConditioning*)
             -> FinishedPicture {
             return picture;
         };
@@ -659,7 +1168,7 @@ int main() {
     {
         ImageJobExecutor stepping = [](const OpenAIImagesRequest&, std::uint64_t,
                                        std::span<const std::uint16_t>, std::span<const std::uint16_t>,
-                                       const ReferencePixels*, void*,
+                                       std::span<const ReferencePlanes>, void*,
                                        const std::shared_ptr<ImageJobProgress>& progress, const EditConditioning*)
             -> FinishedPicture {
             progress->advance(24);
@@ -679,7 +1188,7 @@ int main() {
 
         ImageJobExecutor stalled = [](const OpenAIImagesRequest&, std::uint64_t,
                                       std::span<const std::uint16_t>, std::span<const std::uint16_t>,
-                                      const ReferencePixels*, void*,
+                                      std::span<const ReferencePlanes>, void*,
                                       const std::shared_ptr<ImageJobProgress>& progress, const EditConditioning*)
             -> FinishedPicture {
             progress->stalled = true;
@@ -811,6 +1320,77 @@ int main() {
         check(!std::filesystem::exists(directory) &&
                   sweep_generated_images(store, retention, now).files == 0,
               "a missing images directory is an ordinary empty sweep");
+    }
+
+    // The joint sequence is admitted on the host, before the probe: a request whose rendered prompt and
+    // canvas cannot be assembled is a 400 that names its own numbers, not a job that yields the card and
+    // then dies inside the attention Op with a 500. 2048x2048 is 16384 target tokens, so 4096 prompt
+    // rows sit exactly on the 20480 ceiling (admitted) and 4097 is the first refusal.
+    {
+        const auto rows_renderer = [](std::size_t rows) {
+            return [rows](const std::string&) {
+                TowerPrompt rendered;
+                rendered.ids       = std::vector<int>(rows, 1);
+                rendered.drop_rows = 0;
+                return rendered;
+            };
+        };
+        const auto big_canvas = [] {
+            OpenAIImagesRequest request = sample_request();
+            request.width  = 2048U;
+            request.height = 2048U;
+            return request;
+        };
+        ImageJobStore store(8, 1 << 20);
+        auto at_ceiling = std::make_unique<FakeRunner>();
+        FakeRunner& ceiling_runner = *at_ceiling;
+        ImageGenerationService at_limit(std::move(at_ceiling), store, rows_renderer(4096),
+                                        fixed_provider(), fixed_dims(), fixed_executor());
+        check(!attempt([&] { return at_limit.generate(big_canvas(), 1000); }).threw,
+              "a joint sequence of exactly the ceiling is served");
+        check(ceiling_runner.probes == 1, "the admitted request reached the probe");
+
+        ImageJobStore refused_store(8, 1 << 20);
+        auto over = std::make_unique<FakeRunner>();
+        FakeRunner& over_runner = *over;
+        ImageGenerationService past_limit(std::move(over), refused_store, rows_renderer(4097),
+                                          fixed_provider(), fixed_dims(), fixed_executor());
+        const auto outcome = attempt([&] { return past_limit.generate(big_canvas(), 1000); });
+        check(outcome.threw && outcome.status == 400 && outcome.code == "image_prompt_too_long",
+              "one row past the ceiling is a 400 image_prompt_too_long");
+        check(over_runner.probes == 0 && refused_store.size() == 0U,
+              "the refusal never probes the device and stores no job");
+    }
+
+    // The four-channel composition the reference does: alpha is the VAE's fourth decoded plane, not a
+    // constant 255. The tie case (a channel of exactly 0 -> 127.5) is in here because it is the only
+    // value where the rounding rule could be seen to differ from numpy's.
+    {
+        constexpr std::size_t kPixels = 6ULL;
+        std::vector<float> channels(4ULL * kPixels);
+        for (std::size_t i = 0; i < kPixels; ++i) {
+            channels[0 * kPixels + i] = -1.0F; // red   -> 0
+            channels[1 * kPixels + i] =  1.0F; // green -> 255
+            channels[2 * kPixels + i] =  0.0F; // blue  -> 128
+            channels[3 * kPixels + i] = -0.5F; // alpha -> 64
+        }
+        const std::vector<std::uint8_t> rgba = rgba_from_generated_channels(channels, 3U, 2U);
+        bool pixels_ok = rgba.size() == 4ULL * kPixels;
+        for (std::size_t i = 0; i < kPixels && pixels_ok; ++i) {
+            pixels_ok = rgba[4 * i + 0] == 0U && rgba[4 * i + 1] == 255U &&
+                        rgba[4 * i + 2] == 128U && rgba[4 * i + 3] == 64U;
+        }
+        check(pixels_ok, "all four planes map through the reference's denormalize-round, alpha included");
+        check(rgba_from_generated_channels(std::vector<float>(4ULL * 4, 1.0F), 2U, 2U) ==
+                  std::vector<std::uint8_t>(4ULL * 4, 255U),
+              "an opaque decode still comes back opaque");
+        bool refused = false;
+        try {
+            (void)rgba_from_generated_channels(std::vector<float>(3ULL * 4, 0.0F), 2U, 2U);
+        } catch (const std::runtime_error&) {
+            refused = true;
+        }
+        check(refused, "a plane that is not the VAE's four channels is refused, not read past its end");
     }
 
     // Every check that reached a job wrote its picture into the working directory; leave nothing behind.

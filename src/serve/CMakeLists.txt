@@ -23,6 +23,7 @@ add_library(infernix_serve STATIC
   openai_images_http.cpp
   chat_image_tool.cpp
   image_generation_service.cpp
+  prompt_enhancer.cpp
   image_text_tower.cpp
   translate.cpp
   generation_service.cpp

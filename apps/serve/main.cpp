@@ -348,6 +348,19 @@ int main(int argc, char** argv) {
                     options.image_text_processor_path);
             }
             image_jobs = std::make_unique<infernix::serve::ImageJobStore>(64, 256ULL << 20);
+            // The family's prompt enhancer is a separate checkpoint in a separate process (it wants
+            // about 20 GB of the card the LLM and the DiT also live on), and this is the handle on it.
+            // A configured sidecar that is not answering is deliberately NOT a startup failure: the
+            // route answers its documented 503 for prompt_enhance and every other request keeps
+            // serving, so an operator who starts the worker late -- or not at all -- loses one field.
+            std::shared_ptr<infernix::serve::PromptEnhancer> enhancer;
+            if (!options.image_prompt_enhancer_url.empty()) {
+                enhancer = std::make_shared<infernix::serve::PromptEnhancer>(
+                    options.image_prompt_enhancer_url, std::chrono::minutes(15));
+                logger->info("image prompt enhancer configured at {} ({})",
+                             options.image_prompt_enhancer_url,
+                             enhancer->healthy() ? "answering" : "not answering now");
+            }
             images     = std::make_unique<infernix::serve::ImageGenerationService>(
                 infernix::serve::make_engine_interlude_runner(service.engine()), *image_jobs,
                 std::move(prompt_renderer), std::move(prompt_embeds),
@@ -359,7 +372,7 @@ int main(int argc, char** argv) {
                 // run yet; without it a reference request is refused rather than guessed, because an
                 // under-reserved interlude takes the resident LLM down with it.
                 infernix::serve::make_artifact_vision_dims_provider(options.image_artifact_path),
-                std::move(reference_prompt_renderer));
+                std::move(reference_prompt_renderer), std::move(enhancer));
             server.attach_images(*images);
             // A picture's URL is the only handle a chat reply hands out, so the file behind it is kept
             // for a stated number of days and then swept; 0 switches the cleanup off, and the server

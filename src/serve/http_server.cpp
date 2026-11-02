@@ -523,8 +523,24 @@ void HttpServer::register_routes() {
     server_.Get("/health", [this](const httplib::Request&, httplib::Response& res) {
         const bool available = service_ != nullptr && service_->is_available();
         res.status           = available ? 200 : 503;
-        res.set_content(nlohmann::json{{"status", available ? "ok" : "unavailable"}}.dump(),
-                        "application/json");
+        nlohmann::json body  = {{"status", available ? "ok" : "unavailable"}};
+        // The busy signal. A keepalive that only asks "does the chat model answer" cannot tell a
+        // drawing engine from a dead one: a chat request queued behind a two-minute picture waits
+        // through the whole interlude and times out, and killing the serve at that moment destroys a
+        // job that was succeeding -- measured on 2026-11-01 22:30. Only this server knows whether a
+        // picture is in flight, so it says so here, where a supervisor looks first. Omitted entirely
+        // when no image pipeline was configured, rather than promising a zero nobody can distinguish
+        // from an answer.
+        if (images_ != nullptr) {
+            const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                                 std::chrono::system_clock::now().time_since_epoch())
+                                 .count();
+            body["image_jobs"] = {{"in_flight", images_->in_flight_jobs()},
+                                  {"oldest_age_seconds",
+                                   images_->oldest_in_flight_age_seconds(
+                                       static_cast<std::int64_t>(now))}};
+        }
+        res.set_content(body.dump(), "application/json");
     });
     server_.Get(api_route_pattern("/models"),
                 [this](const httplib::Request& req, httplib::Response& res) {
@@ -559,6 +575,13 @@ void HttpServer::register_routes() {
     server_.Post(api_route_pattern("/images/generations"),
                  [this](const httplib::Request& req, httplib::Response& res) {
                      handle_images_generations(req, res);
+                 });
+    // The OpenAI images/edits name, honored: same fields, and a reference that must be there. It
+    // is a route of its own rather than a flag on generations because that is what makes forgetting
+    // the picture a refusal instead of a text-to-image surprise.
+    server_.Post(api_route_pattern("/images/edits"),
+                 [this](const httplib::Request& req, httplib::Response& res) {
+                     handle_images_edits(req, res);
                  });
     // The finished picture, addressed by the artifact id the generation returned. The id is validated
     // against its stored shape before any path is built, so a request cannot name a file.
@@ -639,12 +662,33 @@ std::string make_capabilities_json(const ServeOptions& options, std::string_view
         image = Json{{"model", image_model_id},
                      {"endpoint", "/v1/images/generations"},
                      {"artifact_endpoint", std::string(kImageArtifactRoutePrefix) + "<id>"},
+                     // How to tell a drawing engine from a dead one without a private protocol. A
+                     // supervisor that only asks whether the chat model answers reads a picture's
+                     // queue as death and kills the job: /health names the two fields that say
+                     // otherwise, so the client that reads only this document can hold off healing
+                     // without knowing anything about interludes.
+                     {"health",
+                      Json{{"endpoint", "/health"},
+                           {"busy_field", "image_jobs.in_flight"},
+                           {"age_field", "image_jobs.oldest_age_seconds"},
+                           {"meaning", "an in_flight above 0 means the card is drawing a picture, not "
+                                       "hung: the chat routes resume once the interlude restores the LLM"}}},
                      {"response_formats", Json::array({"b64_json", "url"})},
                      {"dimensions",
                       Json{{"min", kMinimumImageDimension}, {"max", kMaximumImageDimension}}},
                      {"steps", Json{{"min", kMinimumImageSteps}, {"max", kMaximumImageSteps}}},
                      {"true_cfg_scale",
                       Json{{"min", kMinimumImageCFGScale}, {"max", kMaximumImageCFGScale}}},
+                     // The other half of steering, named so a client that reads nothing but this
+                     // document can find it: scale above 1 means a second DiT forward against this
+                     // text, and without it the steer would silently mean nothing, so the pair is
+                     // refused at parse (openai_images.cpp:321) instead of degraded in the engine.
+                     {"negative_prompt",
+                      Json{{"type", "string"},
+                           {"max_bytes", kMaximumImagePromptBytes},
+                           {"required_when", "true_cfg_scale above 1"},
+                           {"omitted_with_scale_above_1",
+                            "HTTP 400 image_negative_prompt_required"}}},
                      // Reference-image conditioning runs on the diffusion pipeline's own vision tower,
                      // which sees only the picture being edited; --vision is a separate surface.
                      // TRUE because the behavioural gate (tests/models/qwen_image/
@@ -653,21 +697,428 @@ std::string make_capabilities_json(const ServeOptions& options, std::string_view
                      // subject held, instruction happened. Advertising true is exactly the claim that
                      // gate exists to earn; it was false while every edit came back a copy.
                      {"reference_image", true},
+                     // How the picture is sized, in the client's terms. Naming the three keys and the
+                     // reference-following default here is what lets a client that reads nothing but
+                     // this document know that an edit of a portrait should come back portrait: the
+                     // canvas is the thing a fixed square default used to get wrong.
+                     {"canvas", Json{{"keys", Json::array({"size", "wh_ratio", "ratio_follow"})},
+                                     {"give_at_most_one", true},
+                                     {"size", "WIDTHxHEIGHT, multiples of 32 in [32,2048]"},
+                                     {"wh_ratio", "\"W:H\" held at the working area, e.g. \"16:9\""},
+                                     {"ratio_follow", "\"<image1>\": the canvas keeps the reference's aspect"},
+                                     // The codes each rule above earns, beside the rule. A client that read
+                                     // the rule and still guessed wrong is told WHICH rule it broke only if
+                                     // the code is next to the text that describes it -- otherwise the
+                                     // document teaches the format and the wire answers in a vocabulary the
+                                     // client has to already know.
+                                     {"refusals",
+                                      Json{{"size_not_a_multiple_of_32_or_out_of_range",
+                                           "HTTP 400 image_size_invalid"},
+                                           {"wh_ratio_malformed_or_outside_the_supported_span",
+                                            "HTTP 400 image_ratio_invalid"},
+                                           {"ratio_follow_not_an_imageN_tag_naming_a_sent_reference",
+                                            "HTTP 400 image_ratio_follow_unsupported"},
+                                           {"more_than_one_of_the_three_keys",
+                                            "HTTP 400 image_size_conflict: the keys are mutually "
+                                            "exclusive, name at most one"}}},
+                                     {"default_with_reference", "the reference's own aspect"},
+                                     {"default_without_reference", "768x768"}}},
+                     // What a prompt may be. The byte bound is what one request may carry; the whole
+                     // text reaches the model, nothing is truncated, and the model's own limit is the
+                     // joint sequence -- which depends on the canvas, so it is answered per request (400
+                     // image_prompt_too_long names both numbers). A client that reads only this document
+                     // can therefore write a long instruction without guessing whether it will survive.
+                     {"prompt", Json{{"max_bytes", kMaximumImagePromptBytes},
+                                     {"truncated", false},
+                                     {"too_long", "HTTP 400 image_prompt_too_long, naming the joint "
+                                                  "sequence and its ceiling"}}},
+                     // The rest of the refusals one of these two routes can answer, split the only way a
+                     // client can act on: the 400s are the client's own request to fix, the 429 is worth
+                     // retrying as it stands, and the 503 is a card that cannot hold this canvas -- which
+                     // is a smaller picture away, not a reason to give up. Without this block a client has
+                     // to have met the answer before to know which of the three it is holding.
+                     {"refusals",
+                      Json{{"steps_out_of_range", "HTTP 400 image_steps_invalid"},
+                           {"true_cfg_scale_out_of_range", "HTTP 400 image_cfg_scale_invalid"},
+                           {"n_other_than_one", "HTTP 400 image_n_not_supported"},
+                           // The route takes the family's LIST form: one to kMaximumImageReferences
+                           // pictures, each one conditioning the forward. The number is written from the
+                           // constant the parser enforces, so the document can never advertise a cap the
+                           // route does not have -- it used to promise "exactly one picture", which the
+                           // parser has not enforced since the list form landed.
+                           {"reference_count_out_of_range",
+                            "HTTP 400 image_count_invalid: the reference takes between 1 and " +
+                                std::to_string(kMaximumImageReferences) +
+                                " base64 pictures, each of them conditioning the draw"},
+                           {"reference_given_as_a_url",
+                            "HTTP 400 image_url_not_supported: base64 only, never a URL"},
+                           {"reference_data_uri_without_base64",
+                            "HTTP 400 image_data_uri_not_base64: a data: URI is accepted only when it "
+                            "carries base64"},
+                           {"reference_over_the_decoding_budget", "HTTP 400 image_too_large"},
+                           {"reference_not_a_decodable_png_or_jpeg", "HTTP 400 image_decode_failed"},
+                           {"multipart_file_field_other_than_image",
+                            "HTTP 400 image_unsupported_file_field"},
+                           {"another_draw_holds_the_card",
+                            "HTTP 429 image_interlude_in_flight: retry the same request"},
+                           {"the_yield_cannot_cover_this_canvas",
+                            "HTTP 503 image_vram_insufficient: the message names the bytes needed and the "
+                            "bytes the model can yield, and a smaller size is the fix"},
+                           // Three answers that come from outside the request, so nothing the client sent
+                           // predicts them -- which is exactly when a name pays: an unknown id is final, an
+                           // unconfigured pipeline is the operator's to fix, and a rewriter that answered
+                           // badly is one switch away from being drawn without.
+                           {"artifact_or_job_id_unknown",
+                            "HTTP 404 image_not_found: no job and no picture carries this id, so polling it "
+                            "again will not help"},
+                           {"pipeline_not_configured",
+                            "HTTP 503 image_generation_not_configured: this process has no image model, so "
+                            "no request can be drawn until one is loaded"},
+                           {"enhancer_answered_badly",
+                            "HTTP 500 image_prompt_enhancer_failed: the prompt rewriter answered an error "
+                            "status or something that is not JSON; the same request with prompt_enhance "
+                            "false goes straight to the draw"},
+                           // The rest are the answers that are nobody's request to fix, and the document
+                           // gives them anyway because the one thing a caller can still do is choose
+                           // BETWEEN them: wait, walk away, or stop spending the card on a retry that
+                           // reproduces. Without these names 503 and 500 are one blob and a client cannot
+                           // tell the canvas that wants to be smaller (above) from the engine that wants
+                           // to be left alone, nor a draw that simply failed from a kernel that will refuse
+                           // the same geometry forever.
+                           {"the_card_is_not_healthy_right_now",
+                            "HTTP 503 image_engine_degraded: the draw failed and the text model could not "
+                            "be confirmed restored, so nothing about this request is wrong -- leave the "
+                            "card alone and come back later"},
+                           {"the_handover_failed_before_the_draw",
+                            "HTTP 503 image_interlude_failed: the card could not be taken or given back "
+                            "before the draw began, so the same request may go through once it is free"},
+                           {"this_model_has_no_handover_to_give",
+                            "HTTP 503 image_interlude_unsupported: the loaded image model supports no "
+                            "interlude, so a request that needs one will never be served here and retrying "
+                            "changes nothing"},
+                           {"every_job_slot_is_busy",
+                            "HTTP 503 image_store_active_full: this process holds no free job slot, which is "
+                            "the store's own half of the overload policy -- the same request is worth "
+                            "retrying"},
+                           {"the_draw_simply_failed",
+                            "HTTP 500 image_generation_failed: the draw ran, the text model was restored, "
+                            "and the picture just did not come, so a retry is fair"},
+                           {"a_weight_could_not_be_bound",
+                            "HTTP 500 image_artifact_failed: a weight could not be bound or streamed, which "
+                            "is the artifact lane rather than this request"},
+                           {"a_shape_the_admission_missed",
+                            "HTTP 500 image_request_unservable: a kernel refused the geometry it was handed, "
+                            "which is the server's to fix -- the same request reproduces it, so do not "
+                            "retry it as it stands"},
+                           {"a_reference_that_disagrees_with_itself",
+                            "HTTP 500 image_conditioning_inconsistent: a prepared reference carries a vision "
+                            "token count that contradicts its own latent size, and the same picture "
+                            "reproduces it"}}},
                      // A chat request to this process is given the tool below and the picture is
                      // drawn inside that same request, so a client needs no tool call of its own.
                      {"automatic_from_chat", true},
                      {"chat_tool", std::string(kChatImageToolName)},
-                     {"chat_max_images_per_request", kMaximumChatImageGenerations}};
+                     {"chat_max_images_per_request", kMaximumChatImageGenerations},
+                     // A picture a chat request attaches goes through the same parsing on all three
+                     // protocols, and the one field of it this server cannot honour is a downscale: only
+                     // auto and high exist here, so a client that sent "low" is told which field to drop
+                     // instead of being left with a bare 400 and a picture it believes it sent.
+                     {"chat_picture_detail",
+                      "a picture part may ask for detail \"auto\" or \"high\"; anything else is HTTP 400 "
+                      "image_detail_not_supported"},
+                     // A chat edit goes through the very same parser as the routes, so its refusals ARE
+                     // image_generation.refusals -- the tool hands the model back the route's own code, and
+                     // the model retries smaller or waits. Only these two names come from the tool itself
+                     // rather than from the route, and a client reading only this document is the one who
+                     // needs to know which is which: the first is a per-request budget, the second means
+                     // the arguments never were a request.
+                     {"chat_tool_refusals",
+                      Json{{"more_pictures_than_one_request_may_draw",
+                            "image_generation_limit_reached: one chat request draws at most " +
+                                std::to_string(kMaximumChatImageGenerations) + " pictures, the rest of the "
+                                "calls are refused as tool errors"},
+                           {"arguments_not_readable",
+                            "image_arguments_invalid: the tool call is not a JSON object, so no route "
+                            "refusal can apply to it"}}}};
     }
+    // The edit surface, named on its own. image_generation says a picture can be drawn; this says
+    // how to change one you already have, which is the question a fresh client actually asks. Every
+    // field is the generations one except the reference, so the block points there instead of
+    // restating geometry and step bounds a change would then have to make twice.
+    // Whether this process was started with the enhancer's sidecar address. "Configured" is the honest
+    // word the document can answer without asking the sidecar: a capabilities request is a cheap read,
+    // and a health probe of another process does not belong in it. A configured sidecar that has since
+    // stopped answering still answers the request with the documented 503 below, so a client that acts
+    // on this field and gets that answer has lost nothing but a round trip.
+    const bool enhancer_configured = !options.image_prompt_enhancer_url.empty();
+    Json edit = Json(nullptr);
+    if (!image_model_id.empty()) {
+        edit = Json{{"model", image_model_id},
+                     {"endpoint", "/v1/images/edits"},
+                     {"fields", "every field /v1/images/generations takes"},
+                     {"content_types", Json::array({"application/json", "multipart/form-data"})},
+                     {"reference_required", true},
+                     {"reference_max", kMaximumImageReferences},
+                     {"reference_formats",
+                      Json::array({"base64 in the image field (a data: URI prefix is accepted)",
+                                   "a multipart file part named image",
+                                   "a multipart text field named image holding the base64"})},
+                     {"accepts_url_reference", false},
+                     // The chat route reaches the same edit with no wire work at all: the tool the server
+                     // injects into every chat request takes these forms of image, one of them or a list of
+                     // up to reference_max -- the same cap this block states two lines above, because the
+                     // chat tool resolves each element and hands the route the list the route already took.
+                     // The http routes test reads the tool's own schema for this, so the pair cannot drift.
+                     {"chat_tool_image_argument",
+                      Json::array({"a job id img-<created>-<sequence> this server drew",
+                                   "that picture's own URL",
+                                   "attachment:N of the chat request",
+                                   "a JSON list of 1..reference_max of those forms, which is what lets an "
+                                   "instruction address them as <image1>, <image2>, ... in the order given"})},
+                     {"missing_reference",
+                      "HTTP 400 image_reference_required -- this route never draws a picture "
+                      "nobody attached"},
+                     {"mask", "not supported: HTTP 400 image_mask_not_supported"},
+                     {"prompt_enhancer",
+                      Json{{"available", enhancer_configured},
+                           {"model", std::string(kImagePromptEnhancerModel)},
+                           {"field", "prompt_enhance"},
+                           // Which route the field belongs to, said out loud. The tool this server injects
+                           // into every chat request -- the path a fresh client reaches for first, because
+                           // it needs no base64 and no second call -- carries the same argument: its
+                           // arguments go through the images route's own parser, so an edit drawn inside a
+                           // chat request can be rewritten too. The document and the tool schema are held
+                           // to each other by the http routes test, so neither can advertise a switch the
+                           // other does not have.
+                           {"via", "the images routes (/v1/images/generations and /v1/images/edits) and the "
+                                   "chat tool this server injects into every chat request: put prompt_enhance "
+                                   "in the tool call and it reaches the same parser the routes use. Absent is "
+                                   "no rewrite, so a chat edit is drawn from the words exactly as written "
+                                   "unless the call asks"},
+                           {"values", Json::array({"true", "false", "auto"})},
+                           {"when_auto",
+                            enhancer_configured
+                                ? "the server decides per request: the rewrite runs when the request "
+                                  "carries a reference picture and the instruction is not already a "
+                                  "rewriter's own answer (one that addresses its inputs as <imageN>), and "
+                                  "is skipped otherwise -- and also when no rewriter is reachable or the "
+                                  "card cannot be had for one, which for auto is a skip and never a 503, "
+                                  "because auto asked the server to choose"
+                                : "the picture is drawn from the instruction exactly as written: this "
+                                  "build has no rewriter to run, and auto does not refuse over it -- only "
+                                  "true gets the 503"},
+                           {"when_true",
+                            enhancer_configured
+                                ? "the server rewrites the instruction with the enhancer before drawing; its "
+                                  "rewritten_prompt is what reaches the model, and its wh_ratio or ratio_follow "
+                                  "decides the canvas only where this request named no size of its own. HTTP "
+                                  "503 image_prompt_enhancer_unavailable if the sidecar has stopped answering, "
+                                  "500 image_prompt_enhancer_bad_answer if its answer breaks the contract below"
+                                : "HTTP 503 image_prompt_enhancer_unavailable -- no rewriter is running in this "
+                                  "build (serve --image-prompt-enhancer-url), so the client is the rewriter"},
+                           {"answers",
+                            "rewritten_prompt, wh_ratio, ratio_follow -- the two size fields are the "
+                            "same ones the images routes take, mutually exclusive, and rewritten_prompt carries no "
+                            "resolution or ratio of its own"},
+                           // The answer to when_auto, per job. The strings come from the code that writes
+                           // them (to_string) rather than from a list here, because a capability document
+                           // that keeps its own copy is a document that can advertise an outcome the
+                           // server never produces.
+                           {"reported_as",
+                            Json{{"field", "prompt_enhance_outcome"},
+                                 {"on", Json::array({"the successful POST response body",
+                                                     "the job's status object, which GET /v1/images/<id> "
+                                                     "serves while no picture file exists (an in-flight job, "
+                                                     "or one that failed)",
+                                                     "the stored record"})},
+                                 {"values", Json::array({to_string(EnhancerOutcome::Off),
+                                                          to_string(EnhancerOutcome::SkippedNoReference),
+                                                          to_string(EnhancerOutcome::SkippedAlreadyRewritten),
+                                                          to_string(EnhancerOutcome::SkippedNoRewriter),
+                                                          to_string(EnhancerOutcome::SkippedNoDevice),
+                                                          to_string(EnhancerOutcome::Applied)})},
+                                 {"meaning", "which decision this job got; every skip_* value is legitimate for "
+                                             "auto, and only skipped_no_rewriter and skipped_no_device point at "
+                                             "the deployment rather than at the request"}}}}},
+                     // Not just true: auto rewrites too, whenever its own rule is met, and a client told
+                     // only about true pays the rewriter on requests that do not need it -- or believes a
+                     // short instruction is impossible under auto. Absent is spelled out because the
+                     // request's own default is the third answer and the client cannot guess it.
+                     {"short_instruction",
+                      enhancer_configured
+                          ? "acceptable when prompt_enhance is true, and also when it is the string auto and "
+                            "the request carries a reference picture the instruction does not already address "
+                            "as <imageN>: the server rewrites it first. Absent or false is no rewrite at all "
+                            "(the request default is false), so on those requests the words reach the model "
+                            "exactly as written and the instruction below is what carries the edit"
+                          : "not sufficient in this build: nothing between the client and the model rewrites it, "
+                            "so a one-phrase instruction reaches the diffusion model exactly as written"},
+                     {"instruction",
+                      Json::array({
+                          "lead with the operation, not a description of the finished picture",
+                          "name the target concretely, and push the named attribute to a strong and unmistakable "
+                              "degree",
+                          "hold everything else at input fidelity: say what stays by type, position and role, never "
+                              "by describing its appearance",
+                          "one blanket preservation clause beats a checklist -- describing the things you meant to keep "
+                              "is what makes them drift",
+                          "point identity at the reference image instead of describing features in words",
+                          "with more than one reference, address them as <image1>, <image2>, ... and say which one is "
+                              "the canvas and which supply material; with one reference, refer to it naturally",
+                          "put no resolution or aspect ratio in the instruction: size travels only in size, wh_ratio "
+                              "or ratio_follow",
+                          "commit to the exact characters of any text that will be rendered into the picture, in the "
+                              "image's own dominant language",
+                          "state what must be preserved affirmatively, not as a prohibition",
+                          "describe only what is visibly there -- a preserved element named at a higher abstraction "
+                              "is safer than an invented specific",
+                          "ask for nothing that was not requested, and say enough about any newly exposed region that "
+                              "the result stays physically coherent",
+                      })},
+                     {"canvas_default", "the reference's own aspect (see image_generation.canvas)"}};
+    }
+    // The rewriter is not an edit-only argument: prompt_enhance is parsed by the images routes'
+    // shared parser, so a draw with no reference takes it too. A client that reads only
+    // image_generation could not find the switch at all -- it had to guess that a field named under
+    // image_edit also exists one level up. Copied out of the edit block rather than written twice,
+    // so the two blocks cannot advertise different rules for the same argument.
+    if (!image.is_null() && !edit.is_null()) { image["prompt_enhancer"] = edit["prompt_enhancer"]; }
     const Json payload = {
         {"object", "infernix.capabilities"},
         {"chat_model", chat_model_id},
         {"vision_input", options.enable_vision},
         {"image_generation", std::move(image)},
+        {"image_edit", std::move(edit)},
+        // The decide route is the third surface a client with no files can post to, and the document
+        // said nothing about it. It shares no prefix with the image_ and canvas_ codes, so the
+        // coverage probe could not even see it, and the route answers a caller's failure THREE ways
+        // (decide_http.cpp:202-217): a 400 for a malformed question, an error object riding inside
+        // the 200 as that question's answer, and an engine fault raised per question. A client that
+        // read those as one category retries a request it has to rewrite, or trusts a run that never
+        // produced an answer. Every entry below is copied from the call that answers it.
+        {"decide", Json{{"endpoint", "/v1/decide"},
+                        {"alias", "POST /v1/systemone is the same request under the other name: one "
+                                  "handler answers both, so a client written for that API changes only "
+                                  "the URL"},
+                        {"request", Json{
+                            {"model", "optional string, one of the ids /v1/models lists"},
+                            {"state", "required: the evidence every question is answered over, either a "
+                                      "JSON value or an array of content parts. A point or a box needs "
+                                      "exactly one image in it, since both are scaled by its sides. "
+                                      "Omitting it is the one 400 that carries no code at all -- match it "
+                                      "on its param instead"},
+                            {"questions", "required: a non-empty object of question id to question. The "
+                                          "answers come back under those same ids"},
+                            {"question_fields", Json::array({"type", "instructions", "question", "criteria",
+                                                             "options", "digits"})},
+                            {"question_types", Json::array({"noul", "choice", "score", "number", "scalar",
+                                                            "point", "box"})},
+                            {"options", "at most 256 of them, and in practice fewer: a question with more "
+                                        "options than the loaded tokenizer can name as single, distinct "
+                                        "tokens is refused rather than served with two options sharing a "
+                                        "token"},
+                            {"digits", "the field width for number, point and box (default 3, at most 6) "
+                                       "and the ceiling for scalar (default 8, at most 15); outside those "
+                                       "it is the digits_out_of_range 400. point and box are answered in "
+                                       "the submitted picture's own pixels"},
+                            {"thinking", "enable_thinking is refused: a decision is read at the position "
+                                         "the prompt ends, where a thinking prompt would open a reasoning "
+                                         "block instead of an answer"},
+                        }},
+                        {"answers", "an object keyed by each question's id. EVERY question gets an entry, "
+                                    "an answer or an error object, never a missing key, so a caller can "
+                                    "walk the request it sent"},
+                        {"answer", Json{
+                            {"type", "one of question_types, and the object's discriminator"},
+                            {"answer_mass", "on every answer: the declared options' share of the WHOLE "
+                                            "next-token distribution, clamped to 0..1. It is the number a "
+                                            "tolerance is tuned against, and it is NOT the probability of "
+                                            "any one option. A report, not a gate -- nothing in the server "
+                                            "compares it against a threshold, so no value of it is a refusal "
+                                            "and no floor is published for it"},
+                            {"confidence", "choice and score: the top probability, which is the abstention "
+                                           "signal. A low one is a question to restate, not a failure"},
+                            {"uncertainty", "number, scalar, point and box: how wide the digit steps left "
+                                            "the value, in the unit that field is reported in"},
+                        }},
+                        {"error_answer", "a question that failed answers as an object of type error with "
+                                         "code and message, riding INSIDE the 200 as that question's entry. "
+                                         "Its status only becomes the response's when no question in the "
+                                         "request got an answer at all"},
+                        {"usage", Json::array({"input_tokens", "output_tokens", "cached_input_tokens",
+                                               "computed_prefill_tokens"})},
+                        {"refusals", Json{
+                            // Named at questions.<id>, about the request, fixable without the server.
+                            {"bad_request_400", Json{
+                                {"thinking_unsupported", "enable_thinking was set on a decision"},
+                                {"malformed_criteria", "criteria is not what the question's type asks for: "
+                                                       "noul wants an object of true and false, choice an "
+                                                       "object of option to description, score an array of "
+                                                       "levels"},
+                                {"missing_criteria", "a choice came with no criteria, which is where its "
+                                                    "options live"},
+                                {"no_options", "a choice declared no options at all"},
+                                {"unclean_option", "an option has a blank name"},
+                                {"too_few_levels", "a score declared fewer than two levels"},
+                                {"malformed_question", "the question is not an object, or its type is not a "
+                                                      "string"},
+                                {"question_type_unsupported", "the type is a known question kind this "
+                                                             "endpoint does not serve"},
+                                {"unsupported_field", "the question carries a field the route does not "
+                                                     "know; only question_fields are read"},
+                                {"empty_instructions", "instructions is missing or empty; it must be a "
+                                                      "non-empty string, object or array"},
+                                {"criteria_unsupported", "a generated kind (number, scalar, point, box) was "
+                                                        "given criteria, which it never reads"},
+                                {"digits_unsupported", "digits was given to a question that reads one "
+                                                      "position, so nothing can honour it"},
+                                {"digits_out_of_range", "digits is not an integer in the served range"},
+                                {"too_many_options", "more options than this model's labels can name"},
+                                {"too_many_steps", "the question needs more generated steps than are served "
+                                                   "-- its digits or its axes are too wide, not the "
+                                                   "server's fault"},
+                                {"no_questions", "questions is missing, empty, or not an object of id to "
+                                                "question"},
+                                {"spatial_needs_one_image", "a point or box was asked over a state that "
+                                                           "does not carry exactly one image"},
+                            }},
+                            // The request was well formed and the run went off its own token schedule. The
+                            // 200 is the status; these are the answer. Retrying the identical bytes gets
+                            // the same error, so restate the question or narrow its digits.
+                            {"in_answer_200", Json{
+                                {"off_schedule", "the run is longer than its schedule, or a step committed "
+                                                "a token that step does not permit"},
+                                {"run_cut_short", "the engine stopped before the run closed its object or "
+                                                 "reached its cap, so its digits are the front of a number "
+                                                 "and not a number"},
+                                {"too_many_digits", "the run spells more digits than the question allowed"},
+                                {"malformed_scalar", "the digits the run spelled do not read as a number"},
+                                {"image_size_unknown", "the submitted picture's size is unknown, so a point "
+                                                      "or box has nothing to scale against"},
+                            }},
+                            // The engine's own fault, carried per question: the same request is worth
+                            // sending again. cancelled is 499 and belongs to the client hanging up, so it
+                            // is not a retry signal.
+                            {"run_499_or_500", Json{
+                                {"cancelled", "HTTP 499: the client disconnected, or the engine's finish "
+                                              "reason was cancelled. Not a server fault and not a retry "
+                                              "signal"},
+                                {"no_trace", "HTTP 500: the engine returned an incomplete trace for a "
+                                             "generated question"},
+                                {"no_readout", "HTTP 500: the engine returned no readout, or one whose "
+                                               "length does not match the question's options"},
+                                {"tokenizer_unsupported", "HTTP 500: this model's tokenizer spells a label "
+                                                          "as more than one token, and a constrained step "
+                                                          "names single tokens"},
+                                {"internal_error", "HTTP 500: anything unexpected while answering that "
+                                                   "question"},
+                            }},
+                        }}}},
         {"endpoints", Json{{"chat_completions", "/v1/chat/completions"},
                            {"responses", "/v1/responses"},
                            {"messages", "/v1/messages"},
-                           {"images_generations", "/v1/images/generations"}}}};
+                           {"images_generations", "/v1/images/generations"},
+                           {"images_edits", "/v1/images/edits"}}}};
     return payload.dump();
 }
 

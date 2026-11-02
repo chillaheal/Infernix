@@ -33,6 +33,13 @@ namespace infernix::models::qwen_image {
 // ImageGeometry); height/width are the snapped job dimensions in pixels.
 struct ImageJobInputs {
     std::vector<std::uint16_t> prompt_embeds; // [text_tokens, hidden] token-major BF16 bits
+    // The starting latents, taken verbatim: run_image_job validates the size and uploads these bits and
+    // never draws noise itself. That makes it the fixed-latent seam a model regression pins -- two builds
+    // that agree on init_latent, prompt_embeds, schedule and reference latents differ only in the model,
+    // which is what such a test is for. The SERVED route does not use it that way: the public contract is
+    // `seed`, and serve/image_generation_service.cpp turns seed into this buffer with fill_normal before
+    // calling (so a pinned-latent test result is not a claim about what any client's seed produces, and a
+    // seed is not portable to another implementation's generator either).
     std::vector<std::uint16_t> init_latent;   // [latents.tokens, image_in] token-major BF16 bits
     std::vector<float> timesteps;             // [steps]
     std::vector<float> sigmas;                // [steps + 1]

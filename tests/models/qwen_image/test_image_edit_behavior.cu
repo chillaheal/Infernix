@@ -25,6 +25,14 @@
 //                 failed for (the plan's own premise), so the ship gate asks for the two recolourings
 //                 the reference demonstrably performs; the bar cases stay in the control as documented
 //                 negatives, printed and not counted.
+//   reference carried  a third fixture adds a magenta disc that the instruction names by colour but
+//                 NEVER by position, so only the reference's own pixels can say where it belongs; the
+//                 same run with the reference latents blinded to zero must LOSE it, which is what
+//                 makes that assertion a test of the VAE's fourth channel rather than a hope (P3),
+//   canvas         the same route on a 544x608 canvas has to return 544x608 and hold the subject
+//                 under the independent x/y scale (roadmap P2). The resampler (P1) is not a GPU
+//                 question at all and is graded where the resize happens, in
+//                 tests/models/qwen_image/test_image_resize.cpp against a torch oracle.
 // The route is the production one end to end: the same host renderers, packer, vision tower,
 // conditioned text tower, VAE encoder and DiT loop the serving layer drives (serve/image_text_tower,
 // serve/reference_image, models/qwen_image run_image_job), with the seed, steps and guidance the plan
@@ -78,6 +86,13 @@ constexpr std::uint32_t kOutSide   = 512;
 constexpr std::uint32_t kSteps     = 20;
 constexpr std::uint64_t kSeed      = 7;
 constexpr float       kCfgScale  = 1.0F;   // single forward: the instruction must carry it alone
+
+// P12 widened the gate with the three runs the two recolourings above cannot express (their
+// reasoning is at the block in main). The disc is drawn in the reference's own pixels, in the
+// lower left, where no probe of the two graded instructions looks.
+constexpr int kMark[3] = {200, 20, 200};  // magenta: high R, LOW G, high B -- none of the others
+constexpr std::uint32_t kMarkCx = 48, kMarkCy = 208, kMarkR = 24;
+constexpr std::uint32_t kCanvasW = 544, kCanvasH = 608;  // multiples of 32, never a square
 
 constexpr int kBg[3] = {20, 40, 200};      // the field: blue
 constexpr int kSub[3] = {220, 30, 30};     // the subject: red
@@ -140,6 +155,32 @@ srv::ReferencePlanes fixture_planes() {
     }
     return planes;
 }
+
+// The same fixture with one thing the words never say. The alpha channel keeps the raw opaque
+// 1.0 fixture_planes gave it, so this repaints only the three colour channels of both planes --
+// the vision plane and the VAE plane stay the same two views of one RGB8 the fixture always is.
+srv::ReferencePlanes fixture_planes_with_mark() {
+    srv::ReferencePlanes planes = fixture_planes();
+    std::vector<std::uint8_t>& rgb = planes.vision.rgb;
+    for (std::uint32_t y = 0; y < kRefSide; ++y) {
+        for (std::uint32_t x = 0; x < kRefSide; ++x) {
+            const double dx = static_cast<double>(x) - static_cast<double>(kMarkCx);
+            const double dy = static_cast<double>(y) - static_cast<double>(kMarkCy);
+            if (dx * dx + dy * dy > static_cast<double>(kMarkR) * kMarkR) { continue; }
+            const std::size_t i = (static_cast<std::size_t>(y) * kRefSide + x) * 3ULL;
+            for (int c = 0; c < 3; ++c) { rgb[i + static_cast<std::size_t>(c)] = static_cast<std::uint8_t>(kMark[c]); }
+        }
+    }
+    const std::size_t plane = static_cast<std::size_t>(kRefSide) * kRefSide;
+    for (std::size_t p = 0; p < plane; ++p) {
+        for (int c = 0; c < 3; ++c) {
+            planes.vae.pixels[static_cast<std::size_t>(c) * plane + p] =
+                static_cast<float>(rgb[p * 3ULL + static_cast<std::size_t>(c)]) / 127.5F - 1.0F;
+        }
+    }
+    return planes;
+}
+
 
 // ---- reading the picture back -------------------------------------------------------------------
 
@@ -232,6 +273,43 @@ double ssim_vs_reference(const GeneratedImage& img) {
     }
     return windows == 0ULL ? 0.0 : total / static_cast<double>(windows);
 }
+
+// The disc's mean in one channel, in the output's own grid: the disc is placed in reference
+// pixels and the job scales each axis by its own factor, so the centre and radius scale with it.
+double mean_byte_in_disc(const GeneratedImage& img, int c) {
+    const double sx = static_cast<double>(img.width) / kRefSide;
+    const double sy = static_cast<double>(img.height) / kRefSide;
+    const double cx = static_cast<double>(kMarkCx) * sx;
+    const double cy = static_cast<double>(kMarkCy) * sy;
+    const double rx = static_cast<double>(kMarkR) * sx;
+    const double ry = static_cast<double>(kMarkR) * sy;
+    double sum = 0.0;
+    std::size_t n = 0;
+    for (std::uint32_t y = 0; y < img.height; ++y) {
+        for (std::uint32_t x = 0; x < img.width; ++x) {
+            const double dx = (static_cast<double>(x) - cx) / rx;
+            const double dy = (static_cast<double>(y) - cy) / ry;
+            if (dx * dx + dy * dy > 1.0) { continue; }
+            sum += channel_byte(img, c, x, y);
+            ++n;
+        }
+    }
+    return n == 0ULL ? 0.0 : sum / static_cast<double>(n);
+}
+
+// Magenta means strong red AND strong blue with the green held down: not the field (blue), not
+// the recolourings the instructions ask for (red, green), not the square (red has no blue). The
+// band is wide because this is a semantic question, like every other number in this file.
+bool disc_kept(const GeneratedImage& img, const char* what) {
+    const double r = mean_byte_in_disc(img, 0);
+    const double g = mean_byte_in_disc(img, 1);
+    const double b = mean_byte_in_disc(img, 2);
+    const bool kept = r > 140.0 && b > 140.0 && g < 100.0;
+    std::cout << "  " << what << ": disc r=" << r << " g=" << g << " b=" << b
+              << " -> " << (kept ? "kept" : "absent") << "\n";
+    return kept;
+}
+
 
 // ---- one instruction, graded ---------------------------------------------------------------------------------
 
@@ -439,6 +517,159 @@ int main() {
                     std::string(ins.what) + ": the job left image device bytes live");
 
             grade(out, ins, failures);
+        }
+
+        // ---- P12: the runs the two recolourings above cannot express -------------------------
+        //
+        // (a) WHERE THE DISC WAS IS ONLY IN THE REFERENCE. The instruction names the disc's COLOUR
+        //     and never its position, so the colour can come from the words but the place cannot:
+        //     only the reference's pixels can say bottom-left. The first run of this gate is why the
+        //     wording is like this -- with "Keep the red square in the center." and nothing about the
+        //     disc, the model painted the green field straight over it (disc r=53.4, g=187.1, b=52.3,
+        //     the field's own green) -- and an instruction the checkpoint does not obey is not
+        //     something the engine may be failed for, which this file's header already says.
+        // (b) THE SAME RUN WITH THE REFERENCE BLINDED. The reference latents are zeroed with the
+        //     layout untouched -- same grids, same token count -- so the only variable is whether
+        //     the fourth channel carries anything. If the disc is still kept with nothing to read,
+        //     assertion (a) never tested the reference and the gate says so out loud. That is the
+        //     roadmap's P3 row: the reference conditioning is load-bearing, proved rather than
+        //     assumed.
+        // (c) A NON-SQUARE CANVAS. The gate was square in, square out, so nothing in it could
+        //     notice a route that ignored the requested aspect. Here the same fixture goes to
+        //     544x608 and must come back 544x608 with the subject under the independent x/y
+        //     scale -- the
+        //     roadmap's P2 row. (P1, the resampler, is a deterministic host function and is
+        //     graded in test_image_resize.cpp, not on a GPU.)
+        //
+        // Three more jobs (512^2, 512^2, 544x608) on the route the loop above already built, the
+        // same seed, the same steps, the same ledger gate on every one of them.
+        const auto run_route = [&](const srv::ReferencePlanes& in_planes,
+                                  const std::string& text, std::uint32_t canvas_w,
+                                  std::uint32_t canvas_h, bool blind_reference) {
+            const std::uint64_t vtok =
+                srv::vision_token_count(in_planes.vision.height_px, in_planes.vision.width_px);
+            const auto rendered = render(text, {vtok});
+            const auto vision   = vision_rows(in_planes.vision);
+            const auto embeds   = conditioned(rendered, vision);
+            std::size_t pads = 0;
+            for (const std::uint8_t m : embeds.image_pad_mask) { pads += m; }
+            require(pads == vtok, "the extra run: only " + std::to_string(pads) + " of " +
+                                      std::to_string(vtok) + " kept rows carry the picture");
+            EncodedReference reference;
+            {
+                ReferenceEncodeInputs enc;
+                enc.pixels       = in_planes.vae.pixels;
+                enc.latents_mean = denorm.mean;
+                enc.latents_std  = denorm.std;
+                enc.height_px    = in_planes.vae.height_px;
+                enc.width_px     = in_planes.vae.width_px;
+                cudaStream_t encode_stream = nullptr;
+                if (cudaStreamCreate(&encode_stream) != cudaSuccess) {
+                    throw std::runtime_error("no encode stream");
+                }
+                reference = encode_reference_image(reader, vae, enc, encode_stream);
+                cudaStreamDestroy(encode_stream);
+            }
+            require(image_device_bytes_live() == 0,
+                    "the extra run: the VAE encode left image device bytes live");
+            const ImageGeometry g = ImageGeometry::derive(canvas_h, canvas_w);
+            const Schedule job_sched =
+                ImageJob{g.width, g.height, kSteps}.schedule(SchedulerConfig{});
+            ImageJobInputs inputs;
+            inputs.prompt_embeds         = embeds.prompt_embeds;
+            inputs.prompt_image_pad_mask = embeds.image_pad_mask;
+            inputs.ref_latents           = reference.latents;
+            inputs.ref_grids.emplace_back(reference.height_lat, reference.width_lat);
+            if (blind_reference) { std::fill(inputs.ref_latents.begin(), inputs.ref_latents.end(),
+                                            static_cast<std::uint16_t>(0)); }
+            inputs.timesteps      = job_sched.timesteps;
+            inputs.sigmas         = job_sched.sigmas;
+            inputs.latents_mean   = denorm.mean;
+            inputs.latents_std    = denorm.std;
+            inputs.height_px      = g.height;
+            inputs.width_px       = g.width;
+            inputs.true_cfg_scale = kCfgScale;
+            {
+                std::vector<float> noise(static_cast<std::size_t>(g.tokens) * dit.dims.image_in);
+                fill_normal(kSeed, noise);
+                inputs.init_latent = bits_of(noise);
+            }
+            cudaStream_t stream = nullptr;
+            if (cudaStreamCreate(&stream) != cudaSuccess) {
+                throw std::runtime_error("no image stream");
+            }
+            GeneratedImage out;
+            try {
+                out = run_image_job(reader, dit, vae, inputs, stream);
+            } catch (...) {
+                cudaStreamDestroy(stream);
+                require(image_device_bytes_live() == 0,
+                        "the refused extra run left image device bytes live");
+                throw;
+            }
+            cudaStreamDestroy(stream);
+            require(image_device_bytes_live() == 0,
+                    "the extra run left image device bytes live");
+            return out;
+        };
+
+        {
+            const srv::ReferencePlanes marked = fixture_planes_with_mark();
+            const std::string keep =
+                "Change the background to solid green. Keep the red square and the magenta disc "
+                "exactly as they are.";
+            const GeneratedImage kept = run_route(marked, keep, kOutSide, kOutSide, false);
+            require(kept.width == kOutSide && kept.height == kOutSide,
+                    "the disc run returned the wrong geometry");
+            if (!disc_kept(kept, "reference carried")) {
+                failures.push_back("the magenta disc is not at the reference's own place in its own "
+                                   "colour: the words named the colour, only the reference could name "
+                                   "the place (the VAE's fourth channel, roadmap P3)");
+            }
+            // And the field really did turn green: otherwise the disc check could be satisfied by
+            // a run that simply never edited anything. The band stops above the square, where no
+            // disc pixel reaches.
+            const Rect above{4U, 4U, kOutSide - 4U, 148U};
+            const double field_green = mean_byte(kept, 1, above);
+            std::cout << "  disc run: field green=" << field_green << "\n";
+            if (!(field_green > 120.0)) {
+                failures.push_back("the disc run never recoloured the field (green=" +
+                                   std::to_string(field_green) + ")");
+            }
+
+            const GeneratedImage blind = run_route(marked, keep, kOutSide, kOutSide, true);
+            if (disc_kept(blind, "reference blinded")) {
+                failures.push_back("the disc survived with the reference latents zeroed, so the "
+                                   "assertion above does not test the reference: move the mark or "
+                                   "pick another colour");
+            }
+        }
+
+        {
+            const GeneratedImage wide = run_route(fixture_planes(),
+                                                  "Keep the image exactly as it is.",
+                                                  kCanvasW, kCanvasH, false);
+            require(wide.width == kCanvasW && wide.height == kCanvasH,
+                    "the canvas run returned " + std::to_string(wide.width) + "x" +
+                        std::to_string(wide.height) + " instead of " +
+                        std::to_string(kCanvasW) + "x" + std::to_string(kCanvasH) +
+                        " (roadmap P2: the canvas aspect never reached the job)");
+            const std::uint32_t sx = static_cast<std::uint32_t>(96.0 * kCanvasW / kRefSide);
+            const std::uint32_t sy = static_cast<std::uint32_t>(96.0 * kCanvasH / kRefSide);
+            const std::uint32_t cx = (kCanvasW - sx) / 2ULL;
+            const std::uint32_t cy = (kCanvasH - sy) / 2ULL;
+            const Rect centre{cx + 8U, cy + 8U, cx + sx - 8U, cy + sy - 8U};
+            double held = 0.0;
+            for (int c = 0; c < 3; ++c) {
+                held = std::max(held, std::abs(mean_byte(wide, c, centre) -
+                                                static_cast<double>(kSub[c])));
+            }
+            std::cout << "  canvas run: " << wide.width << "x" << wide.height
+                      << " subject max channel delta=" << held << "\n";
+            if (!(held <= kHoldTolerance)) {
+                failures.push_back("the canvas run lost the subject under the non-square mapping (" +
+                                   std::to_string(held) + " levels)");
+            }
         }
 
         for (const auto& f : failures) { std::cout << "  FAIL " << f << "\n"; }

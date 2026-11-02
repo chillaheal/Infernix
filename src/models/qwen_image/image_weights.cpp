@@ -3,6 +3,7 @@
 #include "artifact/schema.h"
 #include "ops/common/canonical_math.h"
 
+#include <array>
 #include <cmath>
 #include <stdexcept>
 #include <string>
@@ -191,6 +192,56 @@ TextTowerWeights bind_text_encoder(Binder& binder) {
     out.dims.layers       = static_cast<std::uint32_t>(cfg_integer(config, "num_hidden_layers", component));
     out.dims.rope_theta   = cfg_number(config, "rope_theta", component);
     out.dims.eps          = cfg_number(config, "rms_norm_eps", component);
+
+    // The M-RoPE split the tower rotates by comes from the artifact, validated the way the LLM's own
+    // config parser validates it (models/qwen3_5/config.cpp rope): three positive sections, their sum
+    // equal to the head's pair count, and the interleaved walk actually producing those counts. Nothing
+    // is defaulted -- a checkpoint whose rope_scaling is absent, or is not the interleaved form this
+    // tower's kernel implements, is refused at bind time instead of being rotated by a guessed rule.
+    if (!config.contains("rope_scaling")) {
+        throw ArtifactError("text config lacks rope_scaling, so its M-RoPE cannot be read");
+    }
+    const Json& scaling = config.at("rope_scaling");
+    if (!scaling.is_object()) { throw ArtifactError("text rope_scaling is not an object"); }
+    if (!scaling.contains("mrope_interleaved") || !scaling.at("mrope_interleaved").is_boolean() ||
+        !scaling.at("mrope_interleaved").get<bool>()) {
+        throw ArtifactError("text M-RoPE is not the interleaved form this tower implements");
+    }
+    const Json sections = scaling.contains("mrope_section") ? scaling.at("mrope_section") : Json();
+    if (!sections.is_array() || sections.size() != 3) {
+        throw ArtifactError("text M-RoPE requires three sections");
+    }
+    std::uint64_t section_sum = 0;
+    for (std::size_t i = 0; i < 3; ++i) {
+        const Json& entry = sections[i];
+        // is_number_unsigned, not is_number_integer: a section is a count, so this is the check
+        // that rejects a negative one here instead of letting the reader throw on the conversion.
+        if (!entry.is_number_unsigned()) {
+            throw ArtifactError("text M-RoPE section is not a non-negative integer");
+        }
+        out.dims.mrope_section[i] = static_cast<std::uint32_t>(entry.get<std::uint64_t>());
+        section_sum += out.dims.mrope_section[i];
+    }
+    out.dims.mrope_interleaved = true;
+    const std::uint64_t pairs = out.dims.head_dim / 2ULL;
+    if (out.dims.head_dim % 2 != 0 || section_sum != pairs) {
+        throw ArtifactError("text M-RoPE sections differ from the head's pair count");
+    }
+    // Count the assignment the rotation kernel performs back against the declared sections: H owns the
+    // pairs i % 3 == 1 below 3 * section[1], W the pairs i % 3 == 2 below 3 * section[2], T the rest.
+    // Sections the walk cannot produce would rotate some pairs with the wrong axis' position and every
+    // row of the tower would inherit the error.
+    std::array<std::uint32_t, 3> counts{};
+    for (std::uint32_t pair = 0; pair < pairs; ++pair) {
+        const std::size_t axis = pair % 3 == 1 && pair < 3ULL * out.dims.mrope_section[1]   ? 1
+                                 : pair % 3 == 2 && pair < 3ULL * out.dims.mrope_section[2] ? 2
+                                                                                            : 0;
+        ++counts[axis];
+    }
+    if (counts != out.dims.mrope_section) {
+        throw ArtifactError("text M-RoPE sections exceed the interleaved axis ranges");
+    }
+
     const std::uint64_t hidden = out.dims.hidden;
     const std::uint64_t q      = static_cast<std::uint64_t>(out.dims.heads) * out.dims.head_dim;
     const std::uint64_t kv     = static_cast<std::uint64_t>(out.dims.kv_heads) * out.dims.head_dim;
