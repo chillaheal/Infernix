@@ -20,12 +20,15 @@ constexpr std::string_view kChatImageToolSchema = R"JSON({
   "type": "object",
   "properties": {
     "prompt": {"type": "string", "description": "What to draw: subject, style, lighting, composition."},
-    "size": {"type": "string", "description": "WIDTHxHEIGHT, each a multiple of 32 in [32,2048]. Default 768x768."},
+    "size": {"type": "string", "description": "WIDTHxHEIGHT, each a multiple of 32 in [32,2048]. Default 768x768. Give at most one of size, wh_ratio and ratio_follow."},
+    "wh_ratio": {"type": "string", "description": "Aspect ratio \"W:H\" such as \"16:9\" or \"9:16\", drawn at the engine's working area instead of a fixed size. Give at most one of size, wh_ratio and ratio_follow."},
+    "ratio_follow": {"type": "string", "description": "\"<image1>\" to draw on the reference picture's own aspect ratio. This is what an edit of a photo should usually do -- a portrait reference should not come back square. Give at most one of size, wh_ratio and ratio_follow; with a reference and none of the three, the canvas follows the reference."},
     "steps": {"type": "integer", "description": "Denoise steps, 2 to 100. Default 40."},
     "negative_prompt": {"type": "string", "description": "What must not appear. Only used when true_cfg_scale is above 1."},
     "true_cfg_scale": {"type": "number", "description": "Guidance 1 to 20; 1 (default) runs one forward per step."},
     "seed": {"type": "integer", "description": "Repeatable draw."},
-    "image": {"type": "string", "description": "Draw from an existing picture instead of from nothing. Three forms only: a job id this server drew (\"img-...\"), the URL of a picture this server drew (\".../v1/images/img-...\"), or \"attachment:N\" for the Nth picture attached to this chat request, counted from zero. Not base64, and not a picture from another machine."}
+    "prompt_enhance": {"type": "string", "description": "Ask this server to rewrite `prompt` with its image prompt enhancer before drawing. \"auto\" rewrites when the call carries a reference and the prompt does not already address it as <imageN>; \"true\" always rewrites and fails with image_prompt_enhancer_unavailable when no rewriter is running; \"false\" never rewrites. Absent means false. A short, ordinary-language instruction is what the enhancer expects -- a prompt you wrote out in full does not need it. The rewrite runs a second model before the draw, so the request takes longer. The booleans true and false are accepted for the same switch."},
+    "image": {"type": "string", "description": "Draw from an existing picture instead of from nothing. Three forms only: a job id this server drew (\"img-...\"), the URL of a picture this server drew (\".../v1/images/img-...\"), or \"attachment:N\" for the Nth picture attached to this chat request, counted from zero. Not base64, and not a picture from another machine. To condition on several pictures at once, pass a JSON LIST of those same forms (up to 4): the instruction then addresses them as <image1>, <image2>, ... in the order given, so a swap names one as the canvas and one as the material source."}
   },
   "required": ["prompt"]
 })JSON";
@@ -246,15 +249,43 @@ ChatImageToolRound run_chat_image_tool_round(GenerationRequest& request,
                 body["model"]             = image_model_id;
                 body["n"]                 = 1;
                 body["response_format"]   = "url";
-                // `image` is the one argument the model cannot give the route directly: it names a
-                // picture, the route wants its bytes. Resolved here, before the route's parser, so a
-                // name that means nothing comes back naming the forms that do. An empty string is
-                // the route's own "no reference" and is left to it.
-                if (auto field = body.find("image");
-                    field != body.end() && field->is_string() &&
-                    !field->get_ref<const std::string&>().empty()) {
-                    (*field) = resolve_chat_image_reference(field->get<std::string>(), request,
-                                                            artifact_url_base);
+                // `image` is the one argument the model cannot give the route directly: it names
+                // pictures, the route wants their bytes. Resolved here, before the route's parser, so a
+                // name that means nothing comes back naming the forms that do. The route takes one
+                // reference or up to kMaximumImageReferences of them (openai_images.cpp), and the chat
+                // argument carries the same two shapes: one name, or a list of them each resolved on its
+                // own -- without the list form an instruction addressed at <image1> and <image2> could
+                // never be answered from a chat request at all, because every element past the first was
+                // left as the model typed it and died as an undecodable reference. An empty string is the
+                // route's own "no reference" and is left to it, and so is a non-string element: count and
+                // shape refusals belong to the route, whose codes the client was told to expect.
+                if (auto field = body.find("image"); field != body.end()) {
+                    // A model that reads the declared type of `image` as a string and still wants the
+                    // list form types that list as TEXT. Measured 2026-11-02 19:21 on
+                    // /v1/chat/completions with two attachments: the argument arrived as the string
+                    // ["attachment:0", "attachment:1"] and died as an unusable job id, so the chat path
+                    // could not answer a two-reference instruction at all while the route can. The bytes
+                    // ARE the list form, so they are read as one here; a bracket that is not a JSON array
+                    // stays the string it is and the resolver below refuses it with the forms named.
+                    if (field->is_string() && !field->get_ref<const std::string&>().empty() &&
+                        field->get_ref<const std::string&>().front() == '[') {
+                        const RequestJson parsed =
+                            RequestJson::parse(field->get<std::string>(), nullptr, false);
+                        if (parsed.is_array()) { *field = parsed; }
+                    }
+                    if (field->is_string()) {
+                        if (!field->get_ref<const std::string&>().empty()) {
+                            (*field) = resolve_chat_image_reference(field->get<std::string>(), request,
+                                                                    artifact_url_base);
+                        }
+                    } else if (field->is_array()) {
+                        for (RequestJson& item : *field) {
+                            if (item.is_string() && !item.get_ref<const std::string&>().empty()) {
+                                item = resolve_chat_image_reference(item.get<std::string>(), request,
+                                                                    artifact_url_base);
+                            }
+                        }
+                    }
                 }
                 const OpenAIImagesRequest image_request = parse_openai_images_request(body);
                 const RequestJson response = generate(image_request);
