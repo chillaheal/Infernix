@@ -924,7 +924,24 @@ RequestJson ImageGenerationService::generate(const OpenAIImagesRequest& request,
             // answer would retry forever over.
             enhancer_outcome = EnhancerOutcome::SkippedNoDevice;
         }
-        if (fit.fits) { run_rewrite(fit); }
+        if (fit.fits) {
+            try {
+                run_rewrite(fit);
+            } catch (const ApiException& exception) {
+                // The two ways the rewriter can be impossible were both written down as a skip for
+                // auto, but only one of them was ever checked: `healthy()` is a GET on a port that
+                // answers, and the load that follows it is the ~19 GB that may not be there beside the
+                // resident LLM. A sidecar that dies under that load is the same impossibility as a
+                // refused connection -- the rewrite did not happen, and the client that delegated the
+                // judgement gets its own words drawn rather than an error it can do nothing with. A
+                // client that named prompt_enhance: true believed its words were rewritten, and keeps
+                // the documented refusal; any other code is not this case and travels unchanged.
+                if (!auto_mode || exception.error().code != "image_prompt_enhancer_unavailable") {
+                    throw;
+                }
+                enhancer_outcome = EnhancerOutcome::SkippedNoRewriter;
+            }
+        }
     }
 
     // #75 reference image: base64/decode/resize is host work and fails fast as a 400 before any

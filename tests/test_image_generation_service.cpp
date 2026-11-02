@@ -107,7 +107,18 @@ public:
     FakeEnhancer() : PromptEnhancer("http://127.0.0.1:9", std::chrono::milliseconds{50}) {}
 
     [[nodiscard]] bool healthy() const override { return healthy_result; }
-    void load() const override { ++loads; }
+    void load() const override {
+        ++loads;
+        // The way the sidecar actually died on this machine: /health answered, the load did not come
+        // back, because the ~19 GB it stages cannot be had beside the resident LLM. This is the exact
+        // ApiException the worker's POST failure produces in prompt_enhancer.cpp:217.
+        if (load_throws) {
+            throw ApiException{ApiError{503, "server_error",
+                                        "the prompt enhancer at 127.0.0.1:9 is not answering at "
+                                        "127.0.0.1:9 (Failed to read connection)", "prompt_enhance",
+                                        "image_prompt_enhancer_unavailable"}};
+        }
+    }
     void unload() const override { ++unloads; }
     [[nodiscard]] EnhancerAnswer rewrite(const std::string& prompt,
                                          const std::vector<std::string>&,
@@ -117,6 +128,7 @@ public:
     }
 
     bool healthy_result = true;
+    bool load_throws    = false;
     mutable int loads   = 0;
     mutable int unloads = 0;
     mutable int rewrites = 0;
@@ -767,6 +779,57 @@ int main() {
         const auto paid = store.get("img-1102-1");
         check(paid && paid->request.at("prompt_enhance_outcome") == "applied",
               "the record says the rewrite was applied when it was");
+
+        // The third way the rewriter can be impossible, and the only one no case covered: the sidecar
+        // is healthy on /health and then DIES on the load the interlude asks of it -- what the card has
+        // no room for, the host has no room to stage either. It reaches the service as the unavailable
+        // 503 from the POST, not as a refused connection, and it used to escape the auto judgement
+        // entirely: a real auto edit on this machine came back 503 image_prompt_enhancer_unavailable
+        // after 7 s, while the document and the two branches above promise auto is always served.
+        auto dead_runner     = std::make_unique<FakeRunner>();
+        auto dead_enhancer   = std::make_shared<FakeEnhancer>();
+        dead_enhancer->load_throws = true;
+        std::string own_words;
+        ImageJobExecutor remember  = [&own_words](const OpenAIImagesRequest& req, std::uint64_t,
+                                                 std::span<const std::uint16_t>,
+                                                 std::span<const std::uint16_t>,
+                                                 std::span<const ReferencePlanes>, void*,
+                                                 const std::shared_ptr<ImageJobProgress>&,
+                                                 const EditConditioning*) {
+            own_words = req.prompt;
+            return fake_picture(0x05U);
+        };
+        ImageGenerationService dead(std::move(dead_runner), store, fixed_renderer(), fixed_provider(),
+                                    fixed_dims(), remember, fixed_vision(),
+                                    fixed_reference_renderer(), dead_enhancer);
+        const auto dead_outcome = attempt([&] { return dead.generate(request, 1104); });
+        check(!dead_outcome.threw, "a sidecar that dies on the load is served, not refused, for auto");
+        check(own_words == request.prompt,
+              "the picture is drawn from the client's own words, not from the answer that never arrived");
+        const auto dead_record = store.get("img-1104-1");
+        check(dead_record &&
+                  dead_record->request.at("prompt_enhance_outcome") == "skipped_no_rewriter",
+              "a sidecar that died mid-load is recorded as no rewriter, the same reason a refused one is");
+        check(dead_enhancer->unloads == 1,
+              "the weights a dying load had begun to take are handed back on the way out");
+
+        // The refusal still belongs to the client that asked for the rewrite by name: the same dead
+        // sidecar must still answer true with the documented 503, or this fix would have quietly
+        // turned a promised rewrite into a silent one.
+        auto dead_asked_runner  = std::make_unique<FakeRunner>();
+        auto dead_asked         = std::make_shared<FakeEnhancer>();
+        dead_asked->load_throws = true;
+        ImageGenerationService dead_true(std::move(dead_asked_runner), store, fixed_renderer(),
+                                         fixed_provider(), fixed_dims(), remember, fixed_vision(),
+                                         fixed_reference_renderer(), dead_asked);
+        OpenAIImagesRequest asked_dead = request;
+        asked_dead.prompt_enhance      = PromptEnhanceMode::On;
+        const auto dead_asked_outcome  = attempt([&] { return dead_true.generate(asked_dead, 1105); });
+        check(dead_asked_outcome.threw && dead_asked_outcome.status == 503 &&
+                  dead_asked_outcome.code == "image_prompt_enhancer_unavailable",
+              "prompt_enhance: true keeps the 503 for the very same dead sidecar");
+        check(store.get("img-1105-1") == nullptr,
+              "and the refused request leaves no record a client could mistake for a picture");
 
         // The same skip one level EARLIER, which measured live said "off" instead. The block above
         // lets the probe promise the card and lets the yield fall short; this one is the pre-probe
