@@ -122,6 +122,12 @@ void test_injection() {
     const ToolDefinition definition = make_chat_image_tool_definition();
     check(RequestJson::parse(definition.input_schema_json).contains("required"),
           "the hidden tool carries a parseable input schema with a required prompt");
+    // The schema is the only place the model reads its limits, so the joint-sequence ceiling belongs in
+    // its text: a model that learns the ceiling only from a 400 spends a round per guess to find it,
+    // which is the five wasted rounds the refusal was measured costing.
+    check(definition.input_schema_json.find("20480") != std::string::npos &&
+              definition.input_schema_json.find("(W/16)x(H/16)") != std::string::npos,
+          "the schema states the ceiling the canvas and the words share and how a canvas is counted");
 
     GenerationRequest disabled;
     disabled.tool_choice.mode = ToolChoiceMode::None;

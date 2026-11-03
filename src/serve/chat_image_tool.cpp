@@ -20,7 +20,7 @@ constexpr std::string_view kChatImageToolSchema = R"JSON({
   "type": "object",
   "properties": {
     "prompt": {"type": "string", "description": "What to draw: subject, style, lighting, composition."},
-    "size": {"type": "string", "description": "WIDTHxHEIGHT, each a multiple of 32 in [32,2048]. Default 768x768. Give at most one of size, wh_ratio and ratio_follow."},
+    "size": {"type": "string", "description": "WIDTHxHEIGHT, each a multiple of 32 in [32,2048]. Default 768x768. The picture and the words share ONE attention sequence of at most 20480 tokens: the canvas costs (W/16)x(H/16) of them, every attached reference costs triple its vision tokens, and your words cost their rows. So 2048x2048 only fits a text-to-picture draw with almost no words; with a reference attached it does not fit at all, and 1792x1792 is the largest edit measured to draw on this machine. An ask over the ceiling is refused before anything is drawn and the refusal names the largest canvas that fits this prompt -- ask that one. Give at most one of size, wh_ratio and ratio_follow."},
     "wh_ratio": {"type": "string", "description": "Aspect ratio \"W:H\" such as \"16:9\" or \"9:16\", drawn at the engine's working area instead of a fixed size. Give at most one of size, wh_ratio and ratio_follow."},
     "ratio_follow": {"type": "string", "description": "\"<image1>\" to draw on the reference picture's own aspect ratio. This is what an edit of a photo should usually do -- a portrait reference should not come back square. Give at most one of size, wh_ratio and ratio_follow; with a reference and none of the three, the canvas follows the reference."},
     "steps": {"type": "integer", "description": "Denoise steps, 2 to 100. Default 40."},

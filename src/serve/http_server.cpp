@@ -1,5 +1,6 @@
 #include "serve/http_server.h"
 
+#include "infernix/ops/attn_dit_joint.h"
 #include "product/logging/logging.h"
 #include "product/speculative_options.h"
 #include "serve/anthropic_messages.h"
@@ -706,6 +707,23 @@ std::string make_capabilities_json(const ServeOptions& options, std::string_view
                                      {"size", "WIDTHxHEIGHT, multiples of 32 in [32,2048]"},
                                      {"wh_ratio", "\"W:H\" held at the working area, e.g. \"16:9\""},
                                      {"ratio_follow", "\"<image1>\": the canvas keeps the reference's aspect"},
+                                     // The one ceiling a canvas can break that is NOT about memory: the DiT
+                                     // serves one attention sequence over the text rows and the picture
+                                     // tokens together, and that range belongs to the model. It is published
+                                     // here so a client sizes to it instead of discovering it as a 400 -- and
+                                     // so nobody reaches for free VRAM to raise it, because freeing memory
+                                     // changes nothing: 2048x2048 draws from words and is refused as an edit.
+                                     {"joint_sequence",
+                                      Json{{"ceiling_tokens", ops::kAttnDitJointMaxTokens},
+                                           {"counts", "the canvas costs (W/16)x(H/16) tokens, every "
+                                                      "reference triple its vision tokens, and every text "
+                                                      "row one token; the sum must stay under the ceiling"},
+                                           {"measured", "2048x2048 fits a draw from words alone; with one "
+                                                        "reference the largest edit measured to draw here "
+                                                        "is 1792x1792"},
+                                           {"ask_the_server", "the refusal names the largest canvas that "
+                                                              "fits this prompt and reference -- take that "
+                                                              "one rather than shrinking by guess"}}},
                                      // The codes each rule above earns, beside the rule. A client that read
                                      // the rule and still guessed wrong is told WHICH rule it broke only if
                                      // the code is next to the text that describes it -- otherwise the

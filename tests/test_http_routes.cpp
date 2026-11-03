@@ -1,3 +1,4 @@
+#include "infernix/ops/attn_dit_joint.h"
 #include "serve/chat_image_tool.h"
 #include "serve/http_server.h"
 #include "serve/image_generation_service.h"
@@ -156,6 +157,15 @@ int main() {
                                   .get<std::string>().find("image_prompt_too_long") != std::string::npos,
                       "the capability states the prompt byte bound, that nothing is truncated, and the "
                       "error a too-long prompt produces");
+    // The other half of sizing, and the half a client cannot infer: the ceiling the canvas shares with
+    // the words belongs to the model, not to the card, so freeing VRAM never raises it. Without this the
+    // two limits look like one and a client keeps asking the machine for memory it cannot spend.
+    failures += check(
+        configured.at("image_generation").at("canvas").at("joint_sequence").at("ceiling_tokens") ==
+            static_cast<int>(infernix::ops::kAttnDitJointMaxTokens) &&
+            configured.at("image_generation").at("canvas").at("joint_sequence").at("counts")
+                    .get<std::string>().find("(W/16)x(H/16)") != std::string::npos,
+        "the capability names the joint sequence ceiling and how a canvas is counted against it");
     // Steering needs TWO fields and the document used to name only one of them: a client that read
     // nothing else could ask for true_cfg_scale 3.5 and get a 400 it had no way to predict. The
     // refusal's own code travels here so the pair is discoverable, not just the bound.
