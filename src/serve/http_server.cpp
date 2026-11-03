@@ -876,8 +876,9 @@ std::string make_capabilities_json(const ServeOptions& options, std::string_view
                            {"why", "a client can say which picture failed and why without taking the "
                                    "model's word for it. The same facts per picture also reach the "
                                    "operator's requests.jsonl as an image_job event, refused draws "
-                                   "included, so a failure a client never reports is still readable "
-                                   "afterwards"}}},
+                                   "included, with the SAME outcome word for the same draw -- a 503 "
+                                   "reads as refused in both, so a failure a client never reports is "
+                                   "still readable afterwards, and never as a server that broke"}}},
                      // A chat edit goes through the very same parser as the routes, so its refusals ARE
                      // image_generation.refusals -- the tool hands the model back the route's own code, and
                      // the model retries smaller or waits. Only these two names come from the tool itself

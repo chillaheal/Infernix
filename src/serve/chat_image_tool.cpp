@@ -215,6 +215,14 @@ const char* prompt_enhance_word(PromptEnhanceMode mode) noexcept {
     return "off";
 }
 
+const char* image_outcome_word(int http_status) noexcept {
+    // A 500 is the only status that says the machine itself broke. Everything else the image routes
+    // answer with is the admission gate saying no to THIS ask -- which the caller can act on by
+    // changing the ask -- so it is a refusal, at every reader, including the operator's. See the
+    // declaration in chat_image_tool.h for why the two witnesses must not disagree.
+    return http_status == 500 ? "failed" : "refused";
+}
+
 ToolDefinition make_chat_image_tool_definition() {
     return ToolDefinition{
         .name        = std::string(kChatImageToolName),
@@ -435,8 +443,9 @@ ChatImageToolRound run_chat_image_tool_round(GenerationRequest& request,
                 // reads as a refusal. A 500 is the draw falling over after nobody objected to anything:
                 // nothing to change, only to retry or report a broken server. Status alone would have
                 // called the VRAM refusal a failure, which is how a client is talked into blaming the
-                // machine for a size it chose.
-                attempt.outcome      = exception.error().status == 500 ? "failed" : "refused";
+                // machine for a size it chose. The operator's image_job line asks for the same word from
+                // the same status, so both come out of image_outcome_word.
+                attempt.outcome      = image_outcome_word(exception.error().status);
                 attempt.tool_call_id = call_id;
             } catch (const std::exception& exception) {
                 is_error = true;

@@ -9,7 +9,8 @@
 // rule cannot exist on one wire shape and be missing from the other.
 #include "serve/http_server.h"
 
-#include "serve/chat_image_tool.h" // prompt_enhance_word: the same word the client-facing attempt uses
+#include "serve/chat_image_tool.h" // prompt_enhance_word + image_outcome_word: the same words the
+                                   // client-facing attempts use, so the two readers cannot disagree
 #include "serve/http_transport.h"
 #include "serve/image_generation_service.h"
 #include "serve/openai_common.h"
@@ -180,7 +181,10 @@ RequestJson HttpServer::run_image_job(const OpenAIImagesRequest& request,
         record.code        = exception.error().code;
         record.message     = exception.error().message;
         record.http_status = exception.error().status;
-        record.outcome     = exception.error().status >= 500 ? "failed" : "refused";
+        // The same word the client's attempt carries for this same exception: a 503 from the admission
+        // gate is a refusal the caller can change, not a broken server. A >= 500 rule here used to
+        // write "failed" for image_vram_insufficient while image_tool_attempts said "refused".
+        record.outcome     = image_outcome_word(exception.error().status);
         record.stage       = "service";
         request_jsonl_.write_image_job(record);
         throw;
@@ -232,7 +236,7 @@ void HttpServer::handle_images(const httplib::Request& req, httplib::Response& r
         ImageJobLogRecord record;
         record.source   = "images_route";
         record.protocol = std::string(route);
-        record.outcome  = exception.error().status >= 500 ? "failed" : "refused";
+        record.outcome  = image_outcome_word(exception.error().status);
         record.stage    = "parse";
         record.code     = exception.error().code;
         record.message  = exception.error().message;

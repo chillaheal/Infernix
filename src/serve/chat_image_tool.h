@@ -55,6 +55,17 @@ using ChatImageGenerator = std::function<RequestJson(const OpenAIImagesRequest&)
 // reads -- and an operator comparing them is entitled to assume a difference is a bug.
 [[nodiscard]] const char* prompt_enhance_word(PromptEnhanceMode mode) noexcept;
 
+// The word for what became of a picture, for BOTH witnesses: the attempt a client reads in
+// image_tool_attempts and the image_job line the operator reads in requests.jsonl. One definition
+// because the two answer one question about one draw, and a `status >= 500` rule at the log side used
+// to call a 503 VRAM refusal "failed" while the client was told "refused" for the very same attempt --
+// the operator saw a broken server and the client saw an ask to change. "failed" is a 500 only: the
+// draw fell over after nobody objected to anything, so only a retry helps. Every answer the admission
+// gates give is a refusal (400 joint sequence too long, 409 another draw in flight, 429 queue
+// pressure, 503 no room for this canvas): the caller can change the ask, and capabilities documents
+// them that way.
+[[nodiscard]] const char* image_outcome_word(int http_status) noexcept;
+
 // What one picture attempt the server made on the client's behalf, in the form the CLIENT is
 // allowed to read. The model already sees every refusal (it is the tool's own error result), and the
 // header above is right that the client never sees the round -- but that invisibility was total, and

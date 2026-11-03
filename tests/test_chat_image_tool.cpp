@@ -615,6 +615,21 @@ void test_attempts_are_reported() {
               "a draw that broke inside the server is reported as failed, not refused");
     }
     {
+        // The same word, on the operator's side. Both witnesses answer one question about one draw, and
+        // they used to answer it differently: the image_job line mapped any 5xx to "failed", so a 503
+        // image_vram_insufficient -- a refusal the client was correctly told is a refusal -- read
+        // afterwards as a broken server to whoever opened requests.jsonl. One function now, over every
+        // status an image route answers with.
+        check(std::string(image_outcome_word(500)) == "failed" &&
+                  std::string(image_outcome_word(400)) == "refused" &&
+                  std::string(image_outcome_word(409)) == "refused" &&
+                  std::string(image_outcome_word(429)) == "refused" &&
+                  std::string(image_outcome_word(503)) == "refused",
+              "a 500 is the only failed answer; the admission gates' 400, 409, 429 and 503 are refusals "
+              "in requests.jsonl too, so the operator's line and the client's attempt cannot disagree "
+              "about the same draw");
+    }
+    {
         // The per-request cap and unparseable arguments are refusals too, with the status a client
         // would have seen on the route. The cap refuses before the arguments are read, so it has no
         // ask to report -- and says so by leaving the field out rather than inventing one.
