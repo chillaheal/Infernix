@@ -239,6 +239,7 @@ struct Attempt {
     int status   = 0;
     std::string code;
     std::string param;   // which field the refusal blames
+    std::string message; // what it tells the caller to do about it
     RequestJson response;
 };
 
@@ -251,6 +252,7 @@ Attempt attempt(const std::function<RequestJson()>& call) {
         outcome.status = exception.error().status;
         outcome.code   = exception.error().code;
         outcome.param    = exception.error().param;
+        outcome.message  = exception.error().message;
     }
     return outcome;
 }
@@ -1423,6 +1425,30 @@ int main() {
               "one row past the ceiling is a 400 image_prompt_too_long");
         check(over_runner.probes == 0 && refused_store.size() == 0U,
               "the refusal never probes the device and stores no job");
+
+        // Naming the numbers is not enough to act on. Measured on the deployed engine: an edit asked
+        // for 2048x2048, was refused five rounds running with a message quoting both counts and no
+        // size, and only on the sixth did the model settle on 1536 by itself. The ceiling less this
+        // request's fixed 4097 rows leaves 16383 target tokens -- one short of the 16384 a 2048x2048
+        // costs -- so the honest answer is the asked canvas with its longer side stepped down one 32
+        // grid step, and the message has to say that instead of "a smaller size".
+        check(outcome.message.find("2016x2048 fits") != std::string::npos,
+              "the refusal names the largest canvas that fits this prompt");
+        check(outcome.message.find("2048x2048") == std::string::npos,
+              "and never offers back the canvas it just refused");
+
+        // When the rows alone overflow the ceiling, no canvas helps and "a smaller size" is a lie that
+        // costs the caller another round. 20477 rows leave 3 tokens for the target, and the smallest
+        // canvas there is -- 32x32 -- costs 4.
+        ImageJobStore hopeless_store(8, 1 << 20);
+        ImageGenerationService hopeless(std::make_unique<FakeRunner>(), hopeless_store,
+                                        rows_renderer(20477), fixed_provider(), fixed_dims(),
+                                        fixed_executor());
+        const auto hopeless_outcome = attempt([&] { return hopeless.generate(big_canvas(), 1000); });
+        check(hopeless_outcome.threw && hopeless_outcome.code == "image_prompt_too_long" &&
+                  hopeless_outcome.message.find("no canvas fits") != std::string::npos &&
+                  hopeless_outcome.message.find("only a shorter prompt works") != std::string::npos,
+              "a prompt no canvas can carry is refused as one only shortening fixes");
     }
 
     // The four-channel composition the reference does: alpha is the VAE's fourth decoded plane, not a

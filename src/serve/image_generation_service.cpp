@@ -128,6 +128,35 @@ std::uint64_t image_need_bytes(std::int64_t width, std::int64_t height, std::siz
 // The one refusal the request can be told about in its own words: what the job needs, what the model
 // could give, and what was already free. A retry with a smaller size or without true CFG is the fix,
 // so this is 503 (the answer changes with the device's state), not 400 (the size is never forbidden).
+// The canvas a too-long prompt WOULD have fitted on, so the refusal can name one.
+//
+// joint_token_count is `rows + 3 * vision + target` (models/qwen_image/joint_layout.h, its agreement with
+// build_joint_layout pinned by a host test), and of those three terms only the target is the canvas: the
+// rendered rows and the reference's vision tokens are fixed by this request. So the ask minus the target
+// is what the canvas has to leave room for, and the largest canvas that fits is the asked one shrunk
+// until its token count does -- longer side first, one 32 grid step at a time, never below one step,
+// which keeps the aspect the client chose instead of trading it for a square.
+//
+// This exists because a refusal that says only "too long" sends the caller away to guess. Measured on
+// the deployed engine: an edit asked for 2048x2048, was refused five rounds running with a message that
+// named both numbers and no size, and only on the sixth did the model find 1536 by itself. Naming the
+// size is the difference between one round and six.
+[[nodiscard]] std::pair<std::uint32_t, std::uint32_t> largest_fitting_canvas(
+    std::uint32_t width_px, std::uint32_t height_px, const long long target_budget) noexcept
+{
+    constexpr std::uint32_t step = qi::ImageGeometry::multiple_of();
+    const auto tokens = [](const std::uint32_t w, const std::uint32_t h) {
+        return static_cast<long long>(qi::ImageGeometry::derive(h, w).tokens);
+    };
+    std::uint32_t w = std::max(step, width_px);
+    std::uint32_t h = std::max(step, height_px);
+    while ((w > step || h > step) && tokens(w, h) > target_budget) {
+        if (w >= h) { w = w > 2U * step ? w - step : step; }
+        else        { h = h > 2U * step ? h - step : step; }
+    }
+    return {w, h};
+}
+
 [[noreturn]] void throw_vram_insufficient(std::uint64_t need, const ImageInterludeRunner::Fit& fit) {
     throw ApiException{ApiError{503, "server_error",
                                 "the image job needs " + std::to_string(need / kMiB) +
@@ -1078,12 +1107,30 @@ RequestJson ImageGenerationService::generate(const OpenAIImagesRequest& request,
                                                       static_cast<long long>(vision_tokens),
                                                       static_cast<long long>(canvas.tokens));
         if (joint > ops::kAttnDitJointMaxTokens) {
+            // What the canvas may cost is the ceiling minus everything the request already fixed: the
+            // joint count without the target term, taken from the same call that produced `joint` so the
+            // two can never drift apart. Then name the biggest canvas that fits -- or, when not even the
+            // smallest does, say plainly that no size helps and only a shorter lane does, rather than
+            // sending the caller to shrink a canvas that was never the problem.
+            const long long overhead = joint - static_cast<long long>(canvas.tokens);
+            const auto [fit_w, fit_h] =
+                largest_fitting_canvas(effective.width, effective.height,
+                                       ops::kAttnDitJointMaxTokens - overhead);
+            const std::string advice =
+                qi::joint_token_count(static_cast<long long>(rows),
+                                      static_cast<long long>(vision_tokens),
+                                      static_cast<long long>(
+                                          qi::ImageGeometry::derive(fit_h, fit_w).tokens)) <=
+                        ops::kAttnDitJointMaxTokens
+                    ? "a smaller size or a shorter " + std::string(lane) + " both work: " +
+                          std::to_string(fit_w) + "x" + std::to_string(fit_h) + " fits"
+                    : "no canvas fits this many " + std::string(lane) +
+                          " rows, so only a shorter " + std::string(lane) + " works";
             throw ApiException{ApiError{
                 400, "invalid_request_error",
                 std::string("the ") + lane + " is too long for this canvas: it makes a joint sequence of " +
                     std::to_string(joint) + " tokens, and the model serves at most " +
-                    std::to_string(ops::kAttnDitJointMaxTokens) + " (a smaller size or a shorter " +
-                    std::string(lane) + " both work)",
+                    std::to_string(ops::kAttnDitJointMaxTokens) + " (" + advice + ")",
                 "prompt", "image_prompt_too_long"}};
         }
     }

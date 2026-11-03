@@ -726,12 +726,14 @@ std::string make_capabilities_json(const ServeOptions& options, std::string_view
                      // What a prompt may be. The byte bound is what one request may carry; the whole
                      // text reaches the model, nothing is truncated, and the model's own limit is the
                      // joint sequence -- which depends on the canvas, so it is answered per request (400
-                     // image_prompt_too_long names both numbers). A client that reads only this document
+                     // image_prompt_too_long names both numbers and the largest canvas that fits). A
+                     // client that reads only this document
                      // can therefore write a long instruction without guessing whether it will survive.
                      {"prompt", Json{{"max_bytes", kMaximumImagePromptBytes},
                                      {"truncated", false},
                                      {"too_long", "HTTP 400 image_prompt_too_long, naming the joint "
-                                                  "sequence and its ceiling"}}},
+                                                  "sequence, its ceiling and the largest canvas that "
+                                                  "fits this prompt -- ask that one instead of guessing"}}},
                      // The rest of the refusals one of these two routes can answer, split the only way a
                      // client can act on: the 400s are the client's own request to fix, the 429 is worth
                      // retrying as it stands, and the 503 is a card that cannot hold this canvas -- which
