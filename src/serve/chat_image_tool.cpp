@@ -164,7 +164,56 @@ constexpr std::string_view kChatImageToolSchema = R"JSON({
     return base64_encode_bytes(png);
 }
 
+// What the model asked for, read off its own arguments BEFORE the reference names below are replaced
+// by picture bytes. The order is the whole point: the same object carries base64 a moment later, and an
+// attempt that leaked a picture would put the user's photo into a response body and a log line.
+void fill_attempt_from_arguments(ChatImageAttempt& attempt, const RequestJson& body) {
+    attempt.canvas_set = true;
+    if (const auto field = body.find("size"); field != body.end() && field->is_string()) {
+        attempt.size = field->get<std::string>();
+    }
+    if (const auto field = body.find("steps"); field != body.end() && field->is_number_unsigned()) {
+        attempt.steps = field->get<std::uint32_t>();
+    }
+    if (const auto field = body.find("seed"); field != body.end() && field->is_number_unsigned()) {
+        attempt.has_seed = true;
+        attempt.seed     = field->get<std::uint64_t>();
+    }
+    if (const auto field = body.find("image"); field != body.end()) {
+        if (field->is_string()) {
+            attempt.image_count = field->get_ref<const std::string&>().empty() ? 0U : 1U;
+        } else if (field->is_array()) {
+            attempt.image_count = field->size();
+        }
+    }
+    if (const auto field = body.find("prompt_enhance"); field != body.end()) {
+        if (field->is_boolean()) { attempt.prompt_enhance = field->get<bool>() ? "true" : "off"; }
+        else if (field->is_string()) { attempt.prompt_enhance = field->get<std::string>(); }
+    }
+}
+
+// The canvas the route's parser settled on, once its defaults are in: what actually ran, which is what
+// a client comparing two attempts needs. `images` is counted, never copied.
+void fill_attempt_from_request(ChatImageAttempt& attempt, const OpenAIImagesRequest& image_request) {
+    attempt.canvas_set     = true;
+    attempt.size           = std::to_string(image_request.width) + "x" + std::to_string(image_request.height);
+    attempt.steps          = image_request.steps;
+    attempt.has_seed       = image_request.seed.has_value();
+    attempt.seed           = image_request.seed.value_or(0);
+    attempt.image_count    = image_request.images.size();
+    attempt.prompt_enhance = prompt_enhance_word(image_request.prompt_enhance);
+}
+
 } // namespace
+
+const char* prompt_enhance_word(PromptEnhanceMode mode) noexcept {
+    switch (mode) {
+        case PromptEnhanceMode::On:   return "true";
+        case PromptEnhanceMode::Auto: return "auto";
+        case PromptEnhanceMode::Off:  break;
+    }
+    return "off";
+}
 
 ToolDefinition make_chat_image_tool_definition() {
     return ToolDefinition{
@@ -202,6 +251,52 @@ bool outcome_is_chat_image_tool_round(const GenerationOutcome& outcome) noexcept
     return true;
 }
 
+RequestJson chat_image_attempts_json(const std::vector<ChatImageAttempt>& attempts) {
+    // One entry per picture this request asked for, even several calls inside one round. `request` is
+    // what was asked and `error` or `result` what came of it, kept apart so a client can print the
+    // first and the second without guessing which half a flat record was holding.
+    RequestJson out = RequestJson::array();
+    for (const ChatImageAttempt& attempt : attempts) {
+        RequestJson item = {{"round", attempt.round}, {"outcome", attempt.outcome}};
+        if (!attempt.tool_call_id.empty()) { item["tool_call_id"] = attempt.tool_call_id; }
+        if (attempt.canvas_set) {
+            // What the call actually said, and nothing else: a 0 here would read as "it asked for zero
+            // steps" when it means the call never named a number and the server's default took over.
+            RequestJson asked = RequestJson::object();
+            if (!attempt.size.empty()) { asked["size"] = attempt.size; }
+            if (attempt.steps != 0)    { asked["steps"] = attempt.steps; }
+            asked["image_count"] = attempt.image_count;
+            if (attempt.has_seed) { asked["seed"] = attempt.seed; }
+            if (!attempt.prompt_enhance.empty()) { asked["prompt_enhance"] = attempt.prompt_enhance; }
+            item["request"] = std::move(asked);
+        }
+        if (attempt.outcome == "succeeded") {
+            RequestJson result = RequestJson::object();
+            if (!attempt.id.empty())  { result["id"]  = attempt.id; }
+            if (!attempt.url.empty()) { result["url"] = attempt.url; }
+            if (!attempt.enhancer_outcome.empty()) {
+                result["prompt_enhance_outcome"] = attempt.enhancer_outcome;
+            }
+            item["result"] = std::move(result);
+        } else {
+            RequestJson error = RequestJson::object();
+            if (!attempt.code.empty())    { error["code"]    = attempt.code; }
+            if (!attempt.message.empty()) { error["message"] = attempt.message; }
+            if (attempt.http_status != 0) { error["http_status"] = attempt.http_status; }
+            item["error"] = std::move(error);
+        }
+        out.push_back(std::move(item));
+    }
+    return out;
+}
+
+RequestJson chat_image_attempts_for_response(const GenerationOutcome& outcome) {
+    if (!outcome.image_tool_attempts_json) { return RequestJson(); }
+    RequestJson parsed = RequestJson::parse(*outcome.image_tool_attempts_json, nullptr, false);
+    if (parsed.is_discarded()) { return RequestJson(); }
+    return parsed;
+}
+
 ChatImageToolRound run_chat_image_tool_round(GenerationRequest& request,
                                             const GenerationOutcome& outcome,
                                             std::string_view image_model_id,
@@ -233,6 +328,9 @@ ChatImageToolRound run_chat_image_tool_round(GenerationRequest& request,
 
         std::string result;
         bool is_error = false;
+        // The client's view of this one call, filled on every path below and pushed once. It starts
+        // empty rather than at "error" so a path cannot report a code it never got.
+        ChatImageAttempt attempt;
         if (already_generated + round.executed >= kMaximumChatImageGenerations) {
             is_error = true;
             ++round.rejected;
@@ -240,10 +338,19 @@ ChatImageToolRound run_chat_image_tool_round(GenerationRequest& request,
                 "image_generation_limit_reached",
                 "one chat request may generate at most " + std::to_string(kMaximumChatImageGenerations) +
                     " pictures");
+            attempt.outcome    = "refused";
+            attempt.code       = "image_generation_limit_reached";
+            attempt.http_status = 429;
+            attempt.message    = "one chat request may generate at most " +
+                                 std::to_string(kMaximumChatImageGenerations) + " pictures";
+            attempt.tool_call_id = call_id;
         } else {
             try {
                 RequestJson body = RequestJson::parse(call.arguments_json);
                 if (!body.is_object()) { throw std::runtime_error("arguments are not an object"); }
+                // Read the ask while it is still names and numbers: the reference resolution below
+                // writes base64 into this same object, and nothing after that point is safe to echo.
+                fill_attempt_from_arguments(attempt, body);
                 // Whatever the model asked for is validated by the images contract itself; only the
                 // delivery fields are the server's, because the answer carries a URL.
                 body["model"]             = image_model_id;
@@ -298,6 +405,17 @@ ChatImageToolRound run_chat_image_tool_round(GenerationRequest& request,
                 round.urls.push_back(url);
                 ++round.executed;
                 result = RequestJson{{"id", id}, {"url", url}}.dump();
+                fill_attempt_from_request(attempt, image_request);
+                attempt.outcome      = "succeeded";
+                attempt.id           = id;
+                attempt.url          = url;
+                attempt.tool_call_id = call_id;
+                // The route already reports which of the enhancer's outcomes this was; carrying it to
+                // the client is free, and it is the one fact a picture cannot testify to.
+                if (const auto field = response.find("prompt_enhance_outcome");
+                    field != response.end() && field->is_string()) {
+                    attempt.enhancer_outcome = field->get<std::string>();
+                }
             } catch (const ApiException& exception) {
                 // EVERY image failure comes back to the model as the tool's error result, including the
                 // ones that used to be rethrown (no VRAM for this size, another draw in flight, a failed
@@ -308,11 +426,29 @@ ChatImageToolRound run_chat_image_tool_round(GenerationRequest& request,
                 result   = json_error_result(exception.error().code.empty() ? "image_arguments_invalid"
                                                                             : exception.error().code,
                                              exception.error().message);
+                attempt.code         = exception.error().code.empty() ? "image_arguments_invalid"
+                                                                      : exception.error().code;
+                attempt.message      = exception.error().message;
+                attempt.http_status  = exception.error().status;
+                // A 503 is the admission gate saying no to THIS ask -- no room for this canvas, another
+                // draw already on the card, no rewriter to be had. The caller can change the ask, so it
+                // reads as a refusal. A 500 is the draw falling over after nobody objected to anything:
+                // nothing to change, only to retry or report a broken server. Status alone would have
+                // called the VRAM refusal a failure, which is how a client is talked into blaming the
+                // machine for a size it chose.
+                attempt.outcome      = exception.error().status == 500 ? "failed" : "refused";
+                attempt.tool_call_id = call_id;
             } catch (const std::exception& exception) {
                 is_error = true;
                 result   = json_error_result("image_arguments_invalid", exception.what());
+                attempt.outcome      = "refused";
+                attempt.code         = "image_arguments_invalid";
+                attempt.message      = exception.what();
+                attempt.http_status  = 400;
+                attempt.tool_call_id = call_id;
             }
         }
+        round.attempts.push_back(std::move(attempt));
 
         ChatTurn tool;
         tool.role                        = ChatRole::Tool;
@@ -371,6 +507,13 @@ ChatImageRounds run_chat_image_rounds(GenerationRequest& request, GenerationOutc
                                       loop.generations, make_picture);
         loop.generations += round.executed;
         loop.urls.insert(loop.urls.end(), round.urls.begin(), round.urls.end());
+        // The round number is the loop's, not the call's: one call knows what it asked for, only the
+        // loop knows it was the third try. A client reading "attempt 3 of 3 refused" can tell a model
+        // that gave up early from one that looped, and the cap is a refusal like any other.
+        for (ChatImageAttempt attempt : round.attempts) {
+            attempt.round = loop.rounds;
+            loop.attempts.push_back(std::move(attempt));
+        }
 
         loop.answer = run_next_answer();
         spoken_text += loop.answer.text;
@@ -389,6 +532,13 @@ ChatImageRounds run_chat_image_rounds(GenerationRequest& request, GenerationOutc
     loop.answer.prompt_tokens += prompt_tokens;
     loop.answer.completion_tokens += completion_tokens;
     loop.answer.reasoning_tokens += reasoning_tokens;
+    // The attempts ride out on the answer, serialized once here rather than rebuilt in six response
+    // writers. Nothing asked for it: a request that drew no picture gets no field, because an empty
+    // vector leaves this unset rather than an empty array -- and a client that never touched the image
+    // tool must not see its response change shape at all.
+    if (!loop.attempts.empty()) {
+        loop.answer.image_tool_attempts_json = chat_image_attempts_json(loop.attempts).dump();
+    }
     return loop;
 }
 

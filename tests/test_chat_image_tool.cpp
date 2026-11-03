@@ -87,6 +87,27 @@ struct FakeGenerator {
 // and lose every record of what it was asked to draw.
 [[nodiscard]] ChatImageGenerator observer_of(FakeGenerator& generator) { return std::ref(generator); }
 
+// A request carrying `pictures` inline attachments, in the shape the protocols parse one. Hoisted out
+// of the argument-forms test because the attempt report needs a request with a picture to name, too.
+[[nodiscard]] GenerationRequest request_with_attachments(std::size_t pictures,
+                                                         const std::string& data_uri) {
+    using MediaSource = infernix::product::media_acquire::Source;
+    using MediaKind   = infernix::product::media_acquire::SourceKind;
+
+    GenerationRequest request;
+    ChatTurn user;
+    user.role = infernix::ChatRole::User;
+    user.content.push_back(ContentPart{.kind = ContentKind::Text, .text = "look at this"});
+    for (std::size_t index = 0; index < pictures; ++index) {
+        user.content.push_back(ContentPart{
+            .kind   = ContentKind::Image,
+            .source = MediaSource{.kind = MediaKind::Data, .value = data_uri},
+        });
+    }
+    request.messages.push_back(std::move(user));
+    return request;
+}
+
 [[nodiscard]] std::string tool_result_text(const GenerationRequest& request, std::size_t index) {
     const ChatTurn& turn = request.messages[index];
     return turn.content.empty() ? std::string() : turn.content.front().text;
@@ -321,19 +342,8 @@ void test_image_argument_forms() {
 
     // A request carrying one inline attachment, as the protocols parse one.
     const std::string data_uri = "data:image/png;base64,iVBORw0KGgo=";
-    auto with_attachment       = [&](std::size_t pictures) {
-        GenerationRequest request;
-        ChatTurn user;
-        user.role = infernix::ChatRole::User;
-        user.content.push_back(ContentPart{.kind = ContentKind::Text, .text = "look at this"});
-        for (std::size_t index = 0; index < pictures; ++index) {
-            user.content.push_back(ContentPart{
-                .kind   = ContentKind::Image,
-                .source = MediaSource{.kind = MediaKind::Data, .value = data_uri},
-            });
-        }
-        request.messages.push_back(std::move(user));
-        return request;
+    const auto with_attachment = [&](std::size_t pictures) {
+        return request_with_attachments(pictures, data_uri);
     };
 
     {
@@ -533,6 +543,134 @@ void test_image_argument_forms() {
     }
 }
 
+// The client's own witness of every picture this request asked for. The rounds were invisible by
+// construction: the tool result went back to the model, which had seen the refusal and told the user
+// something else (2026-11-02, a face swap refused by the model itself, then reported as a VRAM
+// shortage of a figure nobody had read from anywhere). These are the facts the response now carries
+// beside the answer -- the ask as the call named it, and which half of it the server answered.
+void test_attempts_are_reported() {
+    {
+        // A picture that came: both halves, ask and result, and no error half.
+        GenerationRequest request =
+            request_with_attachments(1, "data:image/png;base64,iVBORw0KGgo=");
+        FakeGenerator generator;
+        const ChatImageToolRound round = run_chat_image_tool_round(
+            request,
+            image_call_outcome({R"({"prompt":"a","size":"768x768","steps":20,"seed":7,)"
+                               R"("image":"attachment:0","prompt_enhance":"auto"})"}),
+            kImageModel, kUrlBase, 0, 0, observer_of(generator));
+        const RequestJson attempts = chat_image_attempts_json(round.attempts);
+        check(round.attempts.size() == 1 && attempts.size() == 1,
+              "one tool call is one attempt");
+        const RequestJson& item = attempts.at(0);
+        check(item.at("outcome") == "succeeded" && item.at("tool_call_id") == "infernix_img_0",
+              "a drawn picture is reported as succeeded, tied to the call that asked for it");
+        const RequestJson& asked = item.at("request");
+        check(asked.at("size") == "768x768" && asked.at("steps") == 20 &&
+                  asked.at("image_count") == 1 && asked.at("seed") == 7 &&
+                  asked.at("prompt_enhance") == "auto",
+              "the attempt reports the size, steps, reference count, seed and rewrite the call asked "
+              "for -- read before the reference was replaced by base64");
+        const RequestJson& result = item.at("result");
+        check(result.at("url") == round.urls.front() && result.at("id") == round.ids.front(),
+              "and the artifact the server actually handed back");
+        check(!item.contains("error"), "a picture that came carries no error half");
+    }
+    {
+        // A refusal keeps the ask: the client needs the size that was refused to know what to retry.
+        GenerationRequest request;
+        FakeGenerator generator;
+        generator.fail_status = 503;
+        generator.fail_code   = "image_vram_insufficient";
+        const ChatImageToolRound round = run_chat_image_tool_round(
+            request, image_call_outcome({R"({"prompt":"a","size":"2048x2048"})"}), kImageModel,
+            kUrlBase, 0, 0, observer_of(generator));
+        const RequestJson item = chat_image_attempts_json(round.attempts).at(0);
+        check(item.at("outcome") == "refused" &&
+                  item.at("error").at("code") == "image_vram_insufficient" &&
+                  item.at("error").at("http_status") == 503,
+              "a route refusal is reported as refused with the route's own code and status");
+        check(item.at("request").at("size") == "2048x2048" && !item.contains("result"),
+              "and the size that was refused travels with it, without a result half");
+    }
+    {
+        // A 5xx is not an argument: the same record, a different outcome, so a client retries the
+        // request instead of rewriting it.
+        GenerationRequest request;
+        FakeGenerator generator;
+        generator.fail_status = 500;
+        generator.fail_code   = "image_generation_failed";
+        const ChatImageToolRound round = run_chat_image_tool_round(
+            request, image_call_outcome({R"({"prompt":"a"})"}), kImageModel, kUrlBase, 0, 0,
+            observer_of(generator));
+        const RequestJson item = chat_image_attempts_json(round.attempts).at(0);
+        check(item.at("outcome") == "failed" &&
+                  item.at("error").at("code") == "image_generation_failed",
+              "a draw that broke inside the server is reported as failed, not refused");
+    }
+    {
+        // The per-request cap and unparseable arguments are refusals too, with the status a client
+        // would have seen on the route. The cap refuses before the arguments are read, so it has no
+        // ask to report -- and says so by leaving the field out rather than inventing one.
+        GenerationRequest capped;
+        FakeGenerator generator;
+        const ChatImageToolRound over_cap = run_chat_image_tool_round(
+            capped, image_call_outcome({R"({"prompt":"a","size":"512x512"})"}), kImageModel, kUrlBase,
+            0, kMaximumChatImageGenerations, observer_of(generator));
+        const RequestJson limited = chat_image_attempts_json(over_cap.attempts).at(0);
+        check(limited.at("outcome") == "refused" &&
+                  limited.at("error").at("code") == "image_generation_limit_reached" &&
+                  limited.at("error").at("http_status") == 429 && !limited.contains("request"),
+              "the picture cap is reported as a refusal with its status, and with no ask it never read");
+
+        GenerationRequest malformed;
+        const ChatImageToolRound bad_json = run_chat_image_tool_round(
+            malformed, image_call_outcome({"this is not json"}), kImageModel, kUrlBase, 0, 0,
+            observer_of(generator));
+        const RequestJson bad = chat_image_attempts_json(bad_json.attempts).at(0);
+        check(bad.at("outcome") == "refused" &&
+                  bad.at("error").at("code") == "image_arguments_invalid" &&
+                  bad.at("error").at("http_status") == 400,
+              "arguments that never were a request are reported as the 400 the route would have said");
+    }
+
+    {
+        // Through the loop: the round number is the loop's, so a client can tell three tries from one,
+        // and the whole array rides to the response on the answer itself.
+        GenerationRequest request;
+        FakeGenerator generator;
+        GenerationOutcome first  = image_call_outcome({R"({"prompt":"one"})"});
+        GenerationOutcome second = image_call_outcome({R"({"prompt":"two"})"});
+        std::vector<GenerationOutcome> pending{std::move(second),
+                                               prose_outcome("both drawn")};
+        const ChatImageRounds loop = run_chat_image_rounds(
+            request, std::move(first), kImageModel, kUrlBase, 0, observer_of(generator), [&] {
+                GenerationOutcome next = std::move(pending.front());
+                pending.erase(pending.begin());
+                return next;
+            });
+        const RequestJson attempts = chat_image_attempts_for_response(loop.answer);
+        check(attempts.is_array() && attempts.size() == 2 && loop.attempts.size() == 2,
+              "both rounds' attempts reach the answer as one array");
+        check(attempts.at(0).at("round") == 1 && attempts.at(1).at("round") == 2,
+              "each is numbered by the round it ran in, not by its own call");
+        check(loop.answer.image_tool_attempts_json.has_value(),
+              "the answer carries the serialized form the response writers emit");
+    }
+    {
+        // The byte-identity rule: a request that drew nothing has no field at all -- not an empty
+        // array, which a client would read as "it tried and produced nothing".
+        GenerationRequest request;
+        FakeGenerator generator;
+        const ChatImageRounds loop = run_chat_image_rounds(
+            request, prose_outcome("just an answer"), kImageModel, kUrlBase, 0,
+            observer_of(generator), [] { return prose_outcome("unreachable"); });
+        check(!loop.answer.image_tool_attempts_json.has_value() &&
+                  loop.attempts.empty() && chat_image_attempts_for_response(loop.answer).is_null(),
+              "a plain chat answer asks for no picture and gains no field");
+    }
+}
+
 } // namespace
 
 // The rewriter's switch on the chat path. The tool's arguments are parsed by the images route's own
@@ -606,6 +744,7 @@ int main() {
     test_prompt_enhance_passes_through();
     test_cap_and_bad_arguments();
     test_pipeline_failure_becomes_a_tool_result();
+    test_attempts_are_reported();
     test_url_suffix();
     test_round_loop();
     test_round_bound_and_cancellation();

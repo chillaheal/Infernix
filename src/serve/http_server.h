@@ -9,6 +9,7 @@
 #include "serve/operational_log.h"
 #include "serve/openai_responses_store.h"
 #include "serve/reasoning_store.h"
+#include "serve/openai_images.h" // OpenAIImagesRequest and RequestJson: the image route's own types
 #include "serve/request_log.h"
 #include "serve/serve_options.h"
 
@@ -127,6 +128,16 @@ private:
     // The two image routes, which differ only in require_reference -- everything else (parse order,
     // the model gate, the 503 until attach_images, the response) is shared by construction.
     void handle_images(const httplib::Request& req, httplib::Response& res, bool require_reference);
+    // THE door to a picture, and the one place one is written down. Both callers come through it -- the
+    // images route, and the hidden chat tool each protocol runs through its own generator -- so a draw
+    // is recorded exactly once whoever paid for it, and the line says which door it came in by. Before
+    // this existed an operator could not look up a refused draw at all: the request log recorded chat
+    // generations only, so the client's model was the only witness left, and it invented a cause.
+    // Throws whatever the service threw, after recording it: this is a witness, not a gatekeeper.
+    [[nodiscard]] RequestJson run_image_job(const OpenAIImagesRequest& request,
+                                            std::string_view artifact_url_base,
+                                            std::string_view source, std::string_view protocol,
+                                            std::string correlation = {});
     void handle_messages(const httplib::Request& req, httplib::Response& res);
     void handle_count_tokens(const httplib::Request& req, httplib::Response& res);
     void handle_decide(const httplib::Request& req, httplib::Response& res);

@@ -1,6 +1,7 @@
 #include "serve/anthropic_messages.h"
 #include "product/constraint_observation.h"
 
+#include "serve/chat_image_tool.h" // chat_image_attempts_for_response
 #include "serve/completion_timings.h"
 #include "serve/generation_service.h"
 
@@ -316,6 +317,21 @@ std::vector<ToolCall> identify_anthropic_tool_calls(const GenerationOutcome& out
     return result;
 }
 
+namespace {
+
+// What the server-executed image tool tried, in the field every protocol carries under the same name.
+// The string is this process's own writing (serve/chat_image_tool.cpp), never socket input, so a parse
+// that fails is a bug -- and the answer to a bug here is no field, not a failed response. Absent when
+// this request drew no picture, which is what keeps a plain answer's bytes unchanged.
+[[nodiscard]] Json image_tool_attempts_json(const GenerationOutcome& outcome) {
+    if (!outcome.image_tool_attempts_json) { return nullptr; }
+    Json parsed = Json::parse(*outcome.image_tool_attempts_json, nullptr, false);
+    if (parsed.is_discarded()) { return nullptr; }
+    return parsed;
+}
+
+} // namespace
+
 std::string make_anthropic_messages_response(const AnthropicResponseIdentity& identity,
                                              const GenerationOutcome& outcome, bool hide_thinking) {
     const AnthropicResponseSegment segment = client_segment(outcome);
@@ -361,6 +377,10 @@ std::string make_anthropic_messages_response(const AnthropicResponseIdentity& id
                          {"usage", final_usage(totals)}};
     if (final_outcome.constraint)
         response["constraint"] = product::constraint_observation_json(final_outcome.constraint);
+    // A sibling of usage, not a content block: the picture's fate is a fact about this request, and a
+    // client must be able to read it without believing anything the model said about it.
+    if (Json attempts = image_tool_attempts_json(final_outcome); !attempts.is_null())
+        response["image_tool_attempts"] = std::move(attempts);
     response["timings"] = timings_json(outcome_timings(totals));
     return response.dump();
 }
@@ -627,6 +647,10 @@ std::vector<std::string> AnthropicMessagesStream::finish(const AnthropicResponse
                   {"usage", final_usage(totals)}};
     if (outcome.constraint)
         terminal["constraint"] = product::constraint_observation_json(outcome.constraint);
+    // Beside usage and stop_reason, in the one event that closes the message: content blocks are
+    // already on the wire and indexed, and this is not content -- it is what the server did.
+    if (Json attempts = image_tool_attempts_json(outcome); !attempts.is_null())
+        terminal["image_tool_attempts"] = std::move(attempts);
     terminal["timings"] = timings_json(outcome_timings(totals));
     events.push_back(event("message_delta", std::move(terminal)));
     events.push_back(event("message_stop", Json{{"type", "message_stop"}}));

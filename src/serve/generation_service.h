@@ -64,6 +64,14 @@ struct GenerationOutcome {
     std::optional<std::uint64_t> output_4grams_in_prompt;
     // With the request JSONL: why a large re-prefill missed the prefix cache (prefix_miss.h).
     std::optional<PrefixMiss> prefix_miss;
+    // What the server-executed image tool did on the client's behalf: one entry per picture it tried
+    // to draw, with the route's own code and message when it could not. Carried already serialized
+    // because this header owns no JSON type, and carried HERE because -- like `constraint` above -- it
+    // is the serve's own observation that every protocol's response writer has to reach: the hidden
+    // tool's rounds run inside the request and are not part of the conversation, so this outcome is the
+    // only object that meets all three protocols in both its streaming and its aggregate form. Absent
+    // when no image tool ran, which is what keeps a text answer byte-for-byte what it was.
+    std::optional<std::string> image_tool_attempts_json;
 };
 
 // A transport may report an interrupted stream through a callback or is_cancelled().

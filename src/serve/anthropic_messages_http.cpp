@@ -204,12 +204,15 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
     const std::string image_url_base =
         images_configured ? artifact_url_base(req, options_) : std::string();
     const std::string image_model = image_model_id();
-    const ChatImageGenerator make_picture = [this, url_base = image_url_base](
-                                                const OpenAIImagesRequest& image_request) {
-        return images_->generate(image_request, unix_time_now(), url_base);
-    };
-
     const std::uint64_t req_id = ++request_seq_;
+    // The tool's pictures go through the same witness the images route uses -- one door, one record --
+    // and they carry the chat request that asked for them, so one log line names both halves of what
+    // the client experiences as one call. Built after `req_id` for exactly that reason.
+    const ChatImageGenerator make_picture = [this, url_base = image_url_base, req_id](
+                                                const OpenAIImagesRequest& image_request) {
+        return run_image_job(image_request, url_base, "chat_tool", "anthropic_messages",
+                             std::to_string(req_id));
+    };
     RequestLogMetadata metadata{.http_request_id        = request_id,
                                 .model                  = request.model,
                                 .stream                 = request.stream,

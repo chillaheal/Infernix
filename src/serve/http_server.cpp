@@ -826,6 +826,38 @@ std::string make_capabilities_json(const ServeOptions& options, std::string_view
                      {"chat_picture_detail",
                       "a picture part may ask for detail \"auto\" or \"high\"; anything else is HTTP 400 "
                       "image_detail_not_supported"},
+                     // What became of each picture a chat request asked for, in the server's own words
+                     // rather than the model's account of it. The model is shown the tool error and still
+                     // answers the user in prose -- and invented a cause for it here (a VRAM figure, an
+                     // unload it never attempted). This is the half a client could not get at all: the
+                     // refusals left no trace in a log and none on the wire.
+                     {"chat_tool_attempts",
+                      Json{{"field", "image_tool_attempts"},
+                           {"on", Json::array({"the chat.completion body of POST /v1/chat/completions",
+                                               "the terminal chunk of a streamed chat completion, or its "
+                                               "usage chunk when stream_options.include_usage is set",
+                                               "the Anthropic message object, and the streamed message_delta",
+                                               "the Responses response body, including the streamed "
+                                               "response.completed"})},
+                           {"present_when", "this request asked for at least one picture, and absent "
+                                            "otherwise -- a plain chat answer stays the exact bytes it was "
+                                            "before the field existed, so a client must not expect it"},
+                           {"entries", "one per picture asked for, even when several tool calls shared a "
+                                       "round: {round, outcome, tool_call_id, request, result|error}"},
+                           {"outcome", Json{{"succeeded", "result carries id, url and "
+                                                          "prompt_enhance_outcome",
+                                             "refused", "the request never reached the model: error carries "
+                                                       "the route's own code, message and http_status, which "
+                                                       "is what to show the user",
+                                             "failed", "the draw itself broke inside the server (HTTP 500 "
+                                                       "from the pipeline), which a retry may clear"}}},
+                           {"request", "what the tool call asked for: size, steps, image_count, and seed "
+                                       "and prompt_enhance when the call set them"},
+                           {"why", "a client can say which picture failed and why without taking the "
+                                   "model's word for it. The same facts per picture also reach the "
+                                   "operator's requests.jsonl as an image_job event, refused draws "
+                                   "included, so a failure a client never reports is still readable "
+                                   "afterwards"}}},
                      // A chat edit goes through the very same parser as the routes, so its refusals ARE
                      // image_generation.refusals -- the tool hands the model back the route's own code, and
                      // the model retries smaller or waits. Only these two names come from the tool itself

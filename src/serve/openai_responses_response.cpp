@@ -1,6 +1,7 @@
 #include "serve/openai_responses.h"
 #include "product/constraint_observation.h"
 
+#include "serve/chat_image_tool.h" // chat_image_attempts_for_response
 #include "serve/generation_service.h"
 #include "serve/openai_common.h"
 
@@ -380,6 +381,10 @@ BuiltOpenAIResponse build_response(const std::string& id, std::int64_t created_a
     built.body = std::move(response);
     if (final_outcome.constraint)
         built.body["constraint"] = product::constraint_observation_json(final_outcome.constraint);
+    // Inside the response object, which is where the Responses protocol puts everything about the
+    // response: the streaming terminal event ships this same body, so one write covers both shapes.
+    if (Json attempts = chat_image_attempts_for_response(final_outcome); !attempts.is_null())
+        built.body["image_tool_attempts"] = std::move(attempts);
     return built;
 }
 

@@ -1055,6 +1055,98 @@ int main() {
     input.close();
     std::filesystem::remove(log_path);
 
+    // One picture, from either door, however it ended. Before this the file remembered chat
+    // generations only, so a draw refused at 22:41 left the process with no witness at all and the
+    // client's own model supplied the cause -- which is how a refusal nobody had read from anywhere
+    // ("7.9 GB", "load the chat model out") reached a user as fact.
+    {
+        ImageJobLogRecord asked;
+        asked.source           = "images_route";
+        asked.protocol         = "/v1/images/edits";
+        asked.correlation      = "resp-1";
+        asked.model            = "infernix-image";
+        asked.size             = "1024x1152";
+        asked.steps            = 40;
+        asked.seed             = 7;
+        asked.image_count      = 2;
+        asked.image_bytes      = {1234, 5678};
+        asked.prompt_enhance   = "auto";
+        asked.prompt_bytes     = 210;
+        asked.outcome          = "succeeded";
+        asked.job_id           = "img-100-1";
+        asked.enhancer_outcome = "applied";
+        asked.duration_ms      = 170000;
+        const Json drawn       = Json::parse(format_image_job_json("serve-test", 6000, asked));
+        failures += check(drawn.at("event") == "image_job" &&
+                              drawn.at("artifact_type") == started.at("artifact_type") &&
+                              drawn.at("schema_version") == started.at("schema_version"),
+                          "an image_job line is an event of this file's own artifact type, so every "
+                          "existing reader still parses it");
+        failures += check(drawn.at("source") == "images_route" &&
+                              drawn.at("protocol") == "/v1/images/edits" &&
+                              drawn.at("correlation") == "resp-1",
+                          "it says which door asked and ties back to the request that paid for it");
+        failures += check(drawn.at("params").at("size") == "1024x1152" &&
+                              drawn.at("params").at("steps") == 40 &&
+                              drawn.at("params").at("seed") == 7 &&
+                              drawn.at("params").at("image_count") == 2 &&
+                              drawn.at("params").at("prompt_bytes") == 210 &&
+                              drawn.at("params").at("prompt_enhance") == "auto",
+                          "the ask travels with the verdict: a code without the canvas that earned it "
+                          "is a code nobody can reproduce");
+        failures += check(drawn.at("references_bytes") == Json({1234, 5678}),
+                          "each reference is recorded as its size, in order");
+        failures += check(drawn.at("outcome") == "succeeded" &&
+                              drawn.at("job_id") == "img-100-1" &&
+                              drawn.at("prompt_enhance_outcome") == "applied" &&
+                              drawn.at("duration_ms") == 170000 && !drawn.contains("error"),
+                          "a draw that came records the job, the rewriter's own answer and the time, "
+                          "and carries no error half");
+
+        ImageJobLogRecord refused = asked;
+        refused.outcome           = "refused";
+        refused.stage             = "service";
+        refused.code              = "image_vram_insufficient";
+        refused.message           = "this canvas does not fit alongside the chat model";
+        refused.http_status       = 503;
+        refused.seed              = std::nullopt;
+        refused.prompt_enhance.clear();
+        refused.job_id.clear();
+        refused.enhancer_outcome.clear();
+        refused.duration_ms       = -1;
+        const std::string refused_line = format_image_job_json("serve-test", 6001, refused);
+        const Json refusal             = Json::parse(refused_line);
+        failures += check(refusal.at("outcome") == "refused" && refusal.at("stage") == "service" &&
+                              refusal.at("error").at("code") == "image_vram_insufficient" &&
+                              refusal.at("error").at("status") == 503 &&
+                              !refusal.at("error").at("message").is_null(),
+                          "the refused draw keeps its code, the server's own message and the status the "
+                          "caller was given -- the record that did not exist at all before");
+        failures += check(refusal.at("params").at("seed").is_null() &&
+                              !refusal.at("params").contains("prompt_enhance") &&
+                              !refusal.contains("job_id") && !refusal.contains("duration_ms"),
+                          "what the request did not say is left out rather than invented");
+        failures += check(refused_line.find("\"image\"") == std::string::npos &&
+                              refused_line.find("iVBOR") == std::string::npos,
+                          "no reference payload ever reaches the file, only its size");
+
+        const std::filesystem::path image_log_path =
+            std::filesystem::temp_directory_path() /
+            ("infernix-image-job-log-test-" + std::to_string(test_process_id()) + ".jsonl");
+        std::filesystem::remove(image_log_path);
+        {
+            JsonlRequestLog writer(image_log_path.string());
+            writer.write_image_job(asked);
+            writer.write_image_job(refused);
+        }
+        const std::vector<Json> picture_lines = read_records(image_log_path);
+        failures += check(picture_lines.size() == 2 &&
+                              picture_lines[0].at("event") == "image_job" &&
+                              picture_lines[1].at("error").at("status") == 503,
+                          "write_image_job appends exactly one flushed line per picture asked for");
+        std::filesystem::remove(image_log_path);
+    }
+
     // Size-based rotation keeps the newest files, each starting with the server's start record.
     const std::filesystem::path rotation_dir =
         std::filesystem::temp_directory_path() /

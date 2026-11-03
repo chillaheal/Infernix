@@ -13,6 +13,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace spdlog {
 class logger;
@@ -64,6 +65,40 @@ std::string format_request_error_json(const std::string& server_instance_id,
 std::string format_throughput_json(const std::string& server_instance_id,
                                    std::uint64_t timestamp_unix_ms, const ThroughputReport& report);
 
+// One picture, however it ended and whoever asked for it. The image route was the one piece of this
+// server an operator could not look up afterwards: `requests.jsonl` recorded chat generations only, so
+// when a client's draw was refused at 22:41 nothing in the process remembered the refusal, and the
+// client's own model filled the gap with an invented cause. This record shares the file's artifact type
+// so every existing reader still parses the file, and is named by `event` so it can be filtered alone.
+//
+// It carries what was asked and what was decided -- never the pictures: a reference is up to
+// kMaximumImageInputBytes of base64 and is the user's photograph, so only its byte SIZE is recorded,
+// and the prompt is recorded as its length for the same reason a chat request's prompt tokens are.
+struct ImageJobLogRecord {
+    std::string source;      // "images_route" or "chat_tool": who asked the service to draw
+    std::string protocol;    // the endpoint that served it, for filtering
+    std::string correlation; // the outer request/response id, when the caller has one
+    std::string model;
+    std::string size;        // "WIDTHxHEIGHT" as the parser settled it
+    std::uint32_t steps       = 0;
+    std::optional<std::uint64_t> seed;
+    std::size_t image_count = 0;
+    std::vector<std::size_t> image_bytes;  // one entry per reference, sizes only
+    std::string prompt_enhance;            // "off", "true" or "auto" as asked
+    std::size_t prompt_bytes = 0;
+    std::string outcome;     // "succeeded", "refused", "failed" or "not_configured"
+    std::string stage;       // where it ended, when the site knows: "parse", "configured", "service"
+    std::string code;        // the route's own error code on any failure
+    std::string message;     // and its message, which is this server's own text
+    int http_status     = 0; // the status the caller was given, 0 when none applied
+    std::string job_id;      // the stored job id, once one exists
+    std::string enhancer_outcome; // the rewriter's own reported outcome on a success
+    std::int64_t duration_ms = -1; // wall clock of the attempt; -1 when not measured
+};
+
+std::string format_image_job_json(const std::string& server_instance_id, std::uint64_t timestamp,
+                                  const ImageJobLogRecord& record);
+
 ServerLogEnvironment query_server_log_environment(int device);
 
 // Opens in append mode so one campaign file can contain multiple independently started MTP/model
@@ -98,6 +133,9 @@ public:
     void write_request_rejected(const RequestRejectionLogContext& context);
     void write_request_done(const RequestLogContext& context, const GenerationOutcome& outcome);
     void write_request_error(const RequestLogContext& context, const std::string& message);
+    // One line per picture this process was asked to draw, from either door. Like every writer here it
+    // is a no-op when the log is off, and it can never fail the draw it is describing.
+    void write_image_job(const ImageJobLogRecord& record);
     void write_throughput(const ThroughputReport& report);
 
 private:

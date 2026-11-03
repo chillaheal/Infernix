@@ -1,6 +1,7 @@
 #include "serve/openai_chat.h"
 #include "product/constraint_observation.h"
 
+#include "serve/chat_image_tool.h" // chat_image_attempts_for_response
 #include "serve/completion_timings.h"
 #include "serve/generation_service.h"
 #include "serve/openai_common.h"
@@ -126,23 +127,41 @@ Json stream_choice(Json delta, Json finish_reason = nullptr) {
 std::string event(Json payload) { return "data: " + payload.dump() + "\n\n"; }
 
 std::string chunk(const OpenAIChatResponseIdentity& identity, Json delta, Json finish_reason,
-                  bool include_usage, Json timings = nullptr, Json constraint = nullptr) {
+                  bool include_usage, Json timings = nullptr, Json constraint = nullptr,
+                  Json image_tool_attempts = nullptr) {
     Json payload       = base_payload(identity, "chat.completion.chunk");
     payload["choices"] = Json::array({stream_choice(std::move(delta), std::move(finish_reason))});
     if (include_usage) { payload["usage"] = nullptr; }
     if (!timings.is_null()) { payload["timings"] = std::move(timings); }
     if (!constraint.is_null()) payload["constraint"] = std::move(constraint);
+    // The hidden tool's attempts belong on the terminal chunk only, beside usage and timings: they
+    // describe work that is finished, and a client accumulating deltas should read them once.
+    if (!image_tool_attempts.is_null()) {
+        payload["image_tool_attempts"] = std::move(image_tool_attempts);
+    }
     return event(std::move(payload));
 }
 
 std::string usage_chunk(const OpenAIChatResponseIdentity& identity, const CompletionUsage& usage,
-                        Json timings, Json constraint, bool with_choice) {
+                        Json timings, Json constraint, bool with_choice,
+                        Json image_tool_attempts = nullptr) {
     Json payload       = base_payload(identity, "chat.completion.chunk");
     payload["choices"] = with_choice ? Json::array({stream_choice(Json::object())}) : Json::array();
     payload["usage"]   = usage_json(usage);
     payload["timings"] = std::move(timings);
     if (!constraint.is_null()) payload["constraint"] = std::move(constraint);
+    if (!image_tool_attempts.is_null()) {
+        payload["image_tool_attempts"] = std::move(image_tool_attempts);
+    }
     return event(std::move(payload));
+}
+
+// The attempt array, or null when this request drew no picture -- and null means the field is not
+// emitted at all, which is the whole reason a plain chat answer is the same bytes it was before the
+// field existed. The reading itself belongs to the tool that writes the string: see
+// chat_image_attempts_for_response.
+[[nodiscard]] Json image_tool_attempts_json(const GenerationOutcome& outcome) {
+    return chat_image_attempts_for_response(outcome);
 }
 
 void require_prefix(std::string_view complete, std::string_view streamed, const char* channel) {
@@ -186,6 +205,11 @@ std::string make_chat_completion_response(const OpenAIChatResponseIdentity& iden
     payload["timings"] = timings_json(outcome_timings(outcome));
     if (outcome.constraint)
         payload["constraint"] = product::constraint_observation_json(outcome.constraint);
+    // Additive, and absent whenever this request drew no picture: the picture's fate is the server's
+    // own record, and the client is not left to take the model's word for it.
+    if (Json attempts = image_tool_attempts_json(outcome); !attempts.is_null()) {
+        payload["image_tool_attempts"] = std::move(attempts);
+    }
     return payload.dump();
 }
 
@@ -328,6 +352,9 @@ std::vector<std::string> OpenAIChatStream::finish(const GenerationOutcome& outco
     const Json constraint     = product::constraint_observation_json(outcome.constraint);
     const Json final_timings  = timings_json(outcome_timings(outcome));
     const Json output_timings = timings_per_token_ ? final_timings : Json(nullptr);
+    // Once, on whichever chunk closes the stream: the usage chunk when the client asked for usage,
+    // the finish-reason chunk otherwise. A client that reads both still sees the field exactly once.
+    const Json attempts       = image_tool_attempts_json(outcome);
     std::vector<std::string> events;
     const std::string reasoning_suffix = outcome.reasoning.substr(reasoning_.size());
     if (!reasoning_suffix.empty()) {
@@ -355,15 +382,17 @@ std::vector<std::string> OpenAIChatStream::finish(const GenerationOutcome& outco
         }
         events.push_back(chunk(identity_, Json::object(), finish_reason(outcome), include_usage_,
                                include_usage_ ? Json(nullptr) : final_timings,
-                               include_usage_ ? Json(nullptr) : constraint));
+                               include_usage_ ? Json(nullptr) : constraint,
+                               include_usage_ ? Json(nullptr) : attempts));
     } else {
         events.push_back(chunk(identity_, Json::object(), finish_reason(outcome.finish_reason),
                                include_usage_, include_usage_ ? Json(nullptr) : final_timings,
-                               include_usage_ ? Json(nullptr) : constraint));
+                               include_usage_ ? Json(nullptr) : constraint,
+                               include_usage_ ? Json(nullptr) : attempts));
     }
     if (include_usage_) {
         events.push_back(usage_chunk(identity_, usage_from(outcome), final_timings, constraint,
-                                     usage_chunk_choice_));
+                                     usage_chunk_choice_, attempts));
     }
     events.emplace_back("data: [DONE]\n\n");
     return events;

@@ -950,6 +950,39 @@ ServerLogEnvironment query_server_log_environment(int device) {
     return environment;
 }
 
+std::string format_image_job_json(const std::string& server_instance_id, std::uint64_t timestamp,
+                                  const ImageJobLogRecord& record) {
+    // The file's one artifact type, so a reader that filters by it still sees this line; `event` is what
+    // separates a picture from a generation. An operator asks "what did the 22:41 draw ask for and what
+    // did it get", and both halves have to be in the line: a refusal code without the canvas that earned
+    // it is a code nobody can reproduce.
+    Json out = event_base(server_instance_id, timestamp, "image_job");
+    out["source"]      = record.source;
+    out["protocol"]    = record.protocol;
+    if (!record.correlation.empty()) { out["correlation"] = record.correlation; }
+    out["model"]  = record.model;
+    out["params"] = Json{{"size", record.size},
+                         {"steps", record.steps},
+                         {"seed", record.seed.has_value() ? Json(*record.seed) : Json(nullptr)},
+                         {"image_count", record.image_count},
+                         {"prompt_bytes", record.prompt_bytes}};
+    if (!record.prompt_enhance.empty()) { out["params"]["prompt_enhance"] = record.prompt_enhance; }
+    // Sizes, never contents: the reference is the user's photograph and up to 16 MB of base64, and a
+    // log line that carried it would put that photo in a file that outlives the request.
+    if (!record.image_bytes.empty()) { out["references_bytes"] = record.image_bytes; }
+    out["outcome"] = record.outcome;
+    if (!record.stage.empty()) { out["stage"] = record.stage; }
+    if (!record.job_id.empty()) { out["job_id"] = record.job_id; }
+    if (!record.enhancer_outcome.empty()) { out["prompt_enhance_outcome"] = record.enhancer_outcome; }
+    if (record.duration_ms >= 0) { out["duration_ms"] = record.duration_ms; }
+    if (!record.code.empty() || record.http_status != 0) {
+        out["error"] = Json{{"code", record.code.empty() ? Json(nullptr) : Json(record.code)},
+                            {"status", record.http_status},
+                            {"message", record.message}};
+    }
+    return out.dump();
+}
+
 JsonlRequestLog::JsonlRequestLog(const std::string& path,
                                  const std::string& protected_artifact_path,
                                  std::shared_ptr<spdlog::logger> logger,
@@ -1042,6 +1075,11 @@ void JsonlRequestLog::write_request_error(const RequestLogContext& context,
                                           const std::string& message) {
     if (!enabled()) { return; }
     append(format_request_error_json(server_instance_id_, unix_time_ms(), context, message));
+}
+
+void JsonlRequestLog::write_image_job(const ImageJobLogRecord& record) {
+    if (!enabled()) { return; }
+    append(format_image_job_json(server_instance_id_, unix_time_ms(), record));
 }
 
 void JsonlRequestLog::write_throughput(const ThroughputReport& report) {
