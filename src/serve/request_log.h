@@ -80,6 +80,12 @@ struct ImageJobLogRecord {
     std::string correlation; // the outer request/response id, when the caller has one
     std::string model;
     std::string size;        // "WIDTHxHEIGHT" as the parser settled it
+    // The canvas the caller asked for, filled ONLY when the server drew a different one. The admission
+    // need is a function of the canvas, so a card that cannot hold the asked size is a size away from
+    // holding the job, and the service then draws the largest that fits (image_generation_service.cpp).
+    // A line that showed only the drawn canvas would make that swap invisible -- the same reason this
+    // record carries `prompt_enhance` next to `prompt_enhance_outcome`.
+    std::string size_asked;
     std::uint32_t steps       = 0;
     std::optional<std::uint64_t> seed;
     std::size_t image_count = 0;

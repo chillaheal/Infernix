@@ -1096,6 +1096,19 @@ int main() {
                           "is a code nobody can reproduce");
         failures += check(drawn.at("references_bytes") == Json({1234, 5678}),
                           "each reference is recorded as its size, in order");
+        // The canvas the serve DREW may differ from the one that was sent: a canvas this process cannot
+        // hold is walked down to the largest it can rather than refused, and the line has to carry both
+        // numbers or a reader cannot tell a traded draw from one drawn exactly as asked. Absent is the
+        // other half of that promise -- it means nothing was ever traded.
+        ImageJobLogRecord traded = asked;
+        traded.size       = "704x704";
+        traded.size_asked = "768x768";
+        const Json trade  = Json::parse(format_image_job_json("serve-test", 6004, traded));
+        failures += check(trade.at("params").at("size") == "704x704" &&
+                              trade.at("params").at("size_asked") == "768x768",
+                          "a draw the card made smaller records BOTH canvases: the one sent and the one drawn");
+        failures += check(!drawn.at("params").contains("size_asked"),
+                          "a draw that got the canvas it asked for says so by naming no second one");
         failures += check(drawn.at("outcome") == "succeeded" &&
                               drawn.at("job_id") == "img-100-1" &&
                               drawn.at("prompt_enhance_outcome") == "applied" &&

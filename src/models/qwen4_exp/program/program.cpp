@@ -229,7 +229,7 @@ std::uint64_t Program::run_image_interlude(std::uint64_t target_bytes, std::uint
         throw std::runtime_error("image interlude: the image stream could not be created; " +
                                  (restoration.empty() ? std::string("the LLM pools were restored") : restoration));
     }
-    ImageInterludeContext context{lease.freed_bytes, image_stream};
+    ImageInterludeContext context{lease.freed_bytes, lease.device_free_bytes, image_stream};
     try {
         job(context);
     } catch (...) {

@@ -967,6 +967,9 @@ std::string format_image_job_json(const std::string& server_instance_id, std::ui
                          {"image_count", record.image_count},
                          {"prompt_bytes", record.prompt_bytes}};
     if (!record.prompt_enhance.empty()) { out["params"]["prompt_enhance"] = record.prompt_enhance; }
+    // Present only when it differs from `size`: an operator comparing two draws has to be able to tell
+    // a card that was tight from a request that asked for a canvas nobody could hold.
+    if (!record.size_asked.empty()) { out["params"]["size_asked"] = record.size_asked; }
     // Sizes, never contents: the reference is the user's photograph and up to 16 MB of base64, and a
     // log line that carried it would put that photo in a file that outlives the request.
     if (!record.image_bytes.empty()) { out["references_bytes"] = record.image_bytes; }

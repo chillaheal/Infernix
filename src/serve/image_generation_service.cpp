@@ -169,6 +169,25 @@ std::uint64_t image_need_bytes(std::int64_t width, std::int64_t height, std::siz
                                 "size", "image_vram_insufficient"}};
 }
 
+// The smallest canvas the server will trade a refused request for (see the walk in generate()). The
+// admission need is dominated by a term that does NOT shrink with the picture -- kImageWeightResidentBytes
+// and the resident block slots -- so a card that can hold the job at all converges above this line, and
+// below it the documented 503 with its two numbers is the honest answer rather than a thumbnail. It is a
+// multiple of the geometry's own grid, so a canvas that reaches it is still a legal request.
+inline constexpr std::uint32_t kVramCanvasFloorPx = 256U;
+
+// How much the walk wants the probe's PROMISE to beat the need by before it is satisfied -- on top of
+// the margin and the headroom the gate itself compares. The reason it is not enough to stop at the first
+// promise that clears the gate: probe() is not exclusive. A draw already inside its interlude has the
+// frame and KV pools unmapped, so a promise read at that instant can be gigabytes better than what THIS
+// job's own yield delivers once the other one restores them -- and the net inside the interlude, which
+// compares the delivered bytes against the same gate, refuses. Measured on the deployed engine: a
+// 2016x2016 edit walked down to a canvas needing 15540 MiB, was promised enough, then delivered 15040
+// with 855 MiB free and was refused by that net -- the walk found a size the card could not actually pay
+// for. Uncontended a real promise beats the need by tens of GiB, so this slack costs nothing; it bites
+// only in the band where a concurrent draw could push the job over.
+inline constexpr std::uint64_t kVramWalkSlackBytes = 2048ULL * 1024ULL * 1024ULL;
+
 std::uint16_t to_bf16(float value) {
     std::uint32_t x;
     std::memcpy(&x, &value, sizeof(x));
@@ -1135,11 +1154,69 @@ RequestJson ImageGenerationService::generate(const OpenAIImagesRequest& request,
         }
     }
 
-    const std::uint64_t need =
-        image_need_bytes(effective.width, effective.height, prompt.tokens(), negative_prompt.tokens(),
-                         ref_tokens, dit_dims_(), vision_tokens, vision);
-    const auto fit = runner_->probe(need, kInterludeMarginBytes);
-    if (!fit.fits) { throw_vram_insufficient(need, fit); }
+    // What the card can hold is a function of the canvas, and the probe that answers for it is PURE --
+    // no quiesce, no drain, no unmap, just the yield plan over the live pools -- so a refusal at this
+    // canvas is an invitation to ask again one 32-px step smaller rather than the end of the request.
+    // Measured on the deployed engine: an edit refused here for 768x768 was 508 MiB short of the gate,
+    // and its own client redrew it at 512x512 one model round later (142 s lost, then 157 s drawn) and
+    // got its picture. The server can make that judgement inside the round it already has, on the same
+    // numbers it would have printed, and the walk is the one largest_fitting_canvas uses -- longer side
+    // first, so the aspect the client chose survives. It does not stop at the FIRST promise that clears
+    // the gate: a promise can be bought from a card another draw has temporarily yielded, and the net
+    // inside this job's own interlude is what refuses then, so it wants kVramWalkSlackBytes of play and
+    // remembers the largest canvas that merely cleared the gate for a card that never has it. It stops at
+    // kVramCanvasFloorPx, below which the documented 503 with its two numbers is the honest answer. `effective` is what the job is submitted
+    // as, so a canvas settled here is the canvas that is drawn.
+    const std::uint32_t asked_width  = effective.width;
+    const std::uint32_t asked_height = effective.height;
+    const std::uint32_t canvas_step  = qi::ImageGeometry::multiple_of();
+    std::uint64_t need = 0;
+    ImageInterludeRunner::Fit fit{};
+    // The largest canvas whose PLAIN gate held, remembered in case nothing on the way down clears the
+    // bar above: drawing at it is what this code did before the slack existed, and it is a better answer
+    // than a refusal when the card was never contended.
+    bool have_plain_fit = false;
+    std::uint32_t plain_w = 0U, plain_h = 0U;
+    std::uint64_t plain_need = 0U;
+    ImageInterludeRunner::Fit plain_fit{};
+    // The need and the one step of the walk, named ONCE: the shortfall net inside the interlude below
+    // makes this same walk again, on the bytes the yield actually delivered, and two copies of this
+    // arithmetic is exactly how a canvas and a need would learn to disagree.
+    const auto need_at = [&](std::uint32_t w, std::uint32_t h) {
+        return image_need_bytes(w, h, prompt.tokens(), negative_prompt.tokens(), ref_tokens,
+                                dit_dims_(), vision_tokens, vision);
+    };
+    const auto step_down = [canvas_step](std::uint32_t& side) {
+        side = side > kVramCanvasFloorPx + canvas_step ? side - canvas_step : kVramCanvasFloorPx;
+    };
+    for (;;) {
+        need = need_at(effective.width, effective.height);
+        fit  = runner_->probe(need, kInterludeMarginBytes);
+        if (fit.fits) {
+            const std::uint64_t promise = fit.freed_bytes_expected + fit.device_free_bytes;
+            const std::uint64_t gate    = need + kInterludeMarginBytes + fit.headroom_bytes;
+            if (promise >= gate + kVramWalkSlackBytes) { break; } // the card can pay for this and spare
+            if (!have_plain_fit) {                                // the largest canvas that cleared the gate
+                have_plain_fit = true;
+                plain_w        = effective.width;
+                plain_h        = effective.height;
+                plain_need     = need;
+                plain_fit      = fit;
+            }
+        }
+        if (effective.width <= kVramCanvasFloorPx && effective.height <= kVramCanvasFloorPx) {
+            if (have_plain_fit) { // nothing ever beat the gate by the slack: take the biggest that cleared it
+                effective.width  = plain_w;
+                effective.height = plain_h;
+                need             = plain_need;
+                fit              = plain_fit;
+                break;
+            }
+            throw_vram_insufficient(need, fit);
+        }
+        if (effective.width >= effective.height) { step_down(effective.width); }
+        else                                      { step_down(effective.height); }
+    }
 
     StoredImageJob record;
     record.id       = next_job_id(now);
@@ -1169,19 +1246,39 @@ RequestJson ImageGenerationService::generate(const OpenAIImagesRequest& request,
         store_.advance(record.id, JobUpdate{.to = ImageJobState::WaitingForFrontier, .now = now});
         runner_->run(need, kInterludeMarginBytes,
                      [&](const infernix::ImageInterludeContext& context) -> bool {
-                         // What the yield actually unmapped, against the same number the probe was
-                         // asked about. A shortfall here stops the job BEFORE its first allocation:
-                         // the LLM restores through the ordinary failed-job path and stays healthy,
-                         // instead of the job discovering the shortage in a kernel.
-                         if (context.freed_bytes + fit.device_free_bytes <
-                             need + kInterludeMarginBytes + fit.headroom_bytes) {
-                             throw_vram_insufficient(
-                                 need, ImageInterludeRunner::Fit{.fits = false,
-                                                                  .freed_bytes_expected =
-                                                                      context.freed_bytes,
-                                                                  .device_free_bytes =
-                                                                      fit.device_free_bytes,
-                                                                  .headroom_bytes = fit.headroom_bytes});
+                         // What the yield ACTUALLY gave this job, both terms measured after its pools
+                         // moved -- not the number the probe above promised. The probe is a guess read off
+                         // the live pools while some OTHER draw may be holding those pools yielded, and its
+                         // promise can then be gigabytes better than what this job's own yield delivers.
+                         // Measured on the deployed engine: a walk that stopped at 2016x2016 on a promise
+                         // of 18092 MiB, was handed 14400 MiB plus 479 free, and printed a 503 for a
+                         // picture this machine can paint.
+                         //
+                         // A shortfall is therefore not the end of the request. The card is yielded HERE,
+                         // the ceiling is these bytes, and this job has allocated nothing yet -- so the
+                         // canvas walks down to the largest one the delivered bytes hold and is DRAWN in
+                         // this same interlude, rather than refused so the client can ask again one model
+                         // round later. Only a canvas already at the floor the card still cannot pay for is
+                         // a refusal, and what it names are the bytes the yield delivered. A shortfall that
+                         // the walk cannot answer stops the job BEFORE its first allocation: the LLM
+                         // restores through the ordinary failed-job path and stays healthy, instead of the
+                         // job discovering the shortage in a kernel.
+                         const std::uint64_t available = context.freed_bytes + context.device_free_bytes;
+                         for (;;) {
+                             if (available >= need + kInterludeMarginBytes + fit.headroom_bytes) { break; }
+                             if (effective.width <= kVramCanvasFloorPx &&
+                                 effective.height <= kVramCanvasFloorPx) {
+                                 throw_vram_insufficient(
+                                     need, ImageInterludeRunner::Fit{.fits = false,
+                                                                      .freed_bytes_expected =
+                                                                          context.freed_bytes,
+                                                                      .device_free_bytes =
+                                                                          context.device_free_bytes,
+                                                                      .headroom_bytes = fit.headroom_bytes});
+                             }
+                             if (effective.width >= effective.height) { step_down(effective.width); }
+                             else                                      { step_down(effective.height); }
+                             need = need_at(effective.width, effective.height);
                          }
                          store_.advance(record.id, JobUpdate{.to = ImageJobState::Running, .now = now});
                          job_started = true;
@@ -1228,6 +1325,15 @@ RequestJson ImageGenerationService::generate(const OpenAIImagesRequest& request,
         // only what the artifact route serves while no picture file exists. Advertised in
         // /v1/capabilities image_edit.prompt_enhancer.reported_as, so nobody has to know it exists.
         response["prompt_enhance_outcome"] = to_string(enhancer_outcome);
+        // The canvas the picture IS, named only when the card made it differ from the canvas the request
+        // named -- so the ordinary answer stays the byte-exact OpenAI object, and a swapped one cannot be
+        // mistaken for it. `finished` is the truth the pipeline handed back, not what was asked of it.
+        // Advertised in /v1/capabilities image_generation.canvas.vram_downgrade.
+        if (const std::string drawn = std::to_string(finished.width) + "x" + std::to_string(finished.height);
+            drawn != std::to_string(asked_width) + "x" + std::to_string(asked_height)) {
+            response["data"][0]["size"]       = drawn;
+            response["data"][0]["size_asked"] = std::to_string(asked_width) + "x" + std::to_string(asked_height);
+        }
         store_.advance(record.id,
                        JobUpdate{.to = ImageJobState::Succeeded, .now = now,
                                  .response = nlohmann::json::parse(response.dump())});

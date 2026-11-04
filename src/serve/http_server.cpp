@@ -704,6 +704,20 @@ std::string make_capabilities_json(const ServeOptions& options, std::string_view
                      // canvas is the thing a fixed square default used to get wrong.
                      {"canvas", Json{{"keys", Json::array({"size", "wh_ratio", "ratio_follow"})},
                                      {"give_at_most_one", true},
+                                     // What the card gets to decide about a canvas the client named. The
+                                     // admission need is a function of the canvas, so the 503 that used to
+                                     // answer "this size does not fit today" was a smaller picture away
+                                     // from fitting -- and the client's own model found that size one round
+                                     // and two minutes later. The server now walks its own 32-px grid down
+                                     // (longer side first, so the chosen aspect survives) and draws the
+                                     // largest canvas the card can hold, saying which one it drew. Only
+                                     // when not even the floor fits does the 503 reach a client, with the
+                                     // same two numbers it always carried.
+                                     {"vram_downgrade",
+                                      "a canvas this process cannot hold is drawn at the largest size that "
+                                      "fits instead of refused; the answer then names both, in data[0].size "
+                                      "(drawn) and data[0].size_asked (sent), and the same pair rides on "
+                                      "image_tool_attempts[].result"},
                                      {"size", "WIDTHxHEIGHT, multiples of 32 in [32,2048]"},
                                      {"wh_ratio", "\"W:H\" held at the working area, e.g. \"16:9\""},
                                      {"ratio_follow", "\"<image1>\": the canvas keeps the reference's aspect"},

@@ -103,6 +103,10 @@ struct ChatImageAttempt {
     // "skipped_no_device", ...). It is the difference between a picture drawn from the client's words
     // and one drawn from a rewrite, and a client cannot tell them apart from the pixels.
     std::string enhancer_outcome;
+    // The canvas the picture came out at when it is NOT the one `size` asked for: the card could not
+    // hold the asked canvas, so the server drew the largest that fits. Empty in the ordinary case where
+    // they agree. Without it a model announces "here is your 1024x1024" over a 704x704 picture.
+    std::string drawn_size;
 };
 
 // The same records in the wire form every protocol puts under `image_tool_attempts`. An empty vector

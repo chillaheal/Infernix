@@ -1878,14 +1878,21 @@ struct ScoreResult {
     std::vector<float> logits;
 };
 
-// What a running image interlude hands its job: the physical VRAM bytes the yield freed, and the
+// What a running image interlude hands its job: the physical VRAM bytes the yield freed, the free
+// bytes the device itself had at the instant those pools landed where the yield put them, and the
 // image's dedicated CUDA stream, carried as a void* because the public header has no CUDA include
 // (it is a cudaStream_t created for the interlude and destroyed when the job returns). The stream
 // is blocking, so the legacy default stream orders against it: image work submitted on either
 // route stays correctly sequenced without the job owning cross-stream synchronization.
+//
+// The second field is here because the FIRST one is not enough and a pre-yield probe is worse. What a
+// job can actually allocate is what the card gave it, measured inside its own interlude; a probe read
+// before the quiesce measures a card that may be somebody else's yielded one. Measured on the deployed
+// engine: a job probed at a promise of 18092 MiB and its own yield delivered 14400.
 struct ImageInterludeContext {
-    std::uint64_t freed_bytes = 0;
-    void* image_stream        = nullptr;
+    std::uint64_t freed_bytes       = 0;
+    std::uint64_t device_free_bytes = 0; // free at the yield, AFTER the pools moved
+    void* image_stream              = nullptr;
 };
 
 // The answer to "would an image job wanting this much VRAM fit?", computed before anything is

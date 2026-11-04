@@ -173,6 +173,15 @@ RequestJson HttpServer::run_image_job(const OpenAIImagesRequest& request,
                 const auto slash        = value.find_last_of('/');
                 if (slash != std::string::npos) { record.job_id = value.substr(slash + 1); }
             }
+            // The route names a canvas only when the card made it differ from the one that was sent, so
+            // finding one here means this draw was the largest the card could hold. `size` becomes what
+            // was drawn and `size_asked` keeps what was sent: a line that showed only one of the two
+            // would leave an operator asking whether the client ever asked for 768.
+            if (const auto size = data->front().find("size");
+                size != data->front().end() && size->is_string()) {
+                record.size_asked = record.size;
+                record.size       = size->get<std::string>();
+            }
         }
         request_jsonl_.write_image_job(record);
         return response;

@@ -285,6 +285,9 @@ RequestJson chat_image_attempts_json(const std::vector<ChatImageAttempt>& attemp
             if (!attempt.enhancer_outcome.empty()) {
                 result["prompt_enhance_outcome"] = attempt.enhancer_outcome;
             }
+            // Only there when the card could not hold what the call asked for: the size the picture came
+            // out at, beside the `request` block's own size above.
+            if (!attempt.drawn_size.empty()) { result["size"] = attempt.drawn_size; }
             item["result"] = std::move(result);
         } else {
             RequestJson error = RequestJson::object();
@@ -423,6 +426,16 @@ ChatImageToolRound run_chat_image_tool_round(GenerationRequest& request,
                 if (const auto field = response.find("prompt_enhance_outcome");
                     field != response.end() && field->is_string()) {
                     attempt.enhancer_outcome = field->get<std::string>();
+                }
+                // And the canvas it really drew. The route only names one when it is not the canvas this
+                // call asked for, so the field's presence IS the downgrade -- and a model that cannot see
+                // it tells the user about a picture that does not exist at that size.
+                if (const auto data = response.find("data");
+                    data != response.end() && data->is_array() && !data->empty()) {
+                    if (const auto size = data->front().find("size");
+                        size != data->front().end() && size->is_string()) {
+                        attempt.drawn_size = size->get<std::string>();
+                    }
                 }
             } catch (const ApiException& exception) {
                 // EVERY image failure comes back to the model as the tool's error result, including the

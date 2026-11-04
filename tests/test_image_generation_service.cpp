@@ -66,7 +66,8 @@ public:
         // A case that needs the yield to fall short for ONE of the two asks -- the rewriter's reserve --
         // and to hold for the other, the picture's own need, says so by target instead of by guesswork.
         const std::uint64_t delivered = freed_for ? freed_for(target_bytes) : freed;
-        job(infernix::ImageInterludeContext{.freed_bytes = delivered, .image_stream = nullptr});
+        job(infernix::ImageInterludeContext{.freed_bytes = delivered, .device_free_bytes = device_free,
+                                            .image_stream = nullptr});
         if (mode_ == Mode::RestorationFault) {
             available = false;
             throw std::runtime_error("image interlude: pool restoration was not confirmed");
@@ -80,6 +81,11 @@ public:
     // admission compares these against its own computed need plus the margin.
     static constexpr std::uint64_t kGiB = 1024ULL * 1024ULL * 1024ULL;
     std::uint64_t freed      = 24ULL * kGiB;
+    // The OTHER half of what the interlude reports, and the half that made the live engine refuse a
+    // drawable picture: the free bytes on the card at the instant its own pools moved. The probe's
+    // device_free_bytes is a reading of a DIFFERENT instant -- possibly of a card another draw had
+    // yielded -- so a case that means to be contended sets this one and leaves the probe's generous.
+    std::uint64_t device_free = 0;
     // When set, answers what the yield actually unmapped per requested target (see run()).
     std::function<std::uint64_t(std::uint64_t)> freed_for = {};
     // The same per-target seam on the OTHER side: a case that needs the admission to refuse the
@@ -1107,8 +1113,255 @@ int main() {
             check(outcome.threw && outcome.status == 503 &&
                       outcome.code == "image_vram_insufficient",
                   "a reference whose ledger row does not fit -> 503 image_vram_insufficient");
-            check(eyes->probes == 1 && eyes->runs == 0 && !executor_ran && store.size() == 0U,
-                  "the refused reference yields nothing, runs nothing and stores nothing");
+            // The refusal is now REACHED by walking the canvas down to the floor, so more than one ask
+            // happened. What still has to hold -- and what this case exists to pin -- is that none of
+            // them yielded, ran or stored: a probe is pure arithmetic over the live pools, the yield is
+            // what costs the resident model, and the door stayed shut.
+            check(eyes->probes > 1 && eyes->runs == 0 && !executor_ran && store.size() == 0U,
+                  "a reference the card cannot hold walks the canvas down at the probe alone: it yields "
+                  "nothing, runs nothing and stores nothing");
+        }
+        // A canvas the card cannot hold is no longer the end of an edit. The same pure probe is asked
+        // again one 32-px step smaller on the longer side until the plan fits, and the picture is DRAWN
+        // at that canvas with both numbers reported. Measured reason: an edit refused at 768x768 on the
+        // live engine was 508 MiB short of the gate while a draw of that size really holds about 2 GB,
+        // and its own client redrew it at 512x512 one model round later. The server makes that call in
+        // the round it already has, on the numbers it would have printed.
+        {
+            // What the walk has to be judged against is the service's OWN arithmetic, not a byte count
+            // written down here: the admission need is image_device_need's certified-conservative sum, and
+            // a constant chosen once would silently stop meaning "the card cannot hold 768" the day that
+            // sum changes. So the need is READ from two runs against a generous fake -- one at the ask,
+            // one at a canvas part-way down -- and the third run refuses everything above the smaller of
+            // the two. The walk must then DRAW there instead of answering 503.
+            auto need_at = [&](std::uint32_t side) {
+                ImageJobStore measure_store(8, 8ULL << 20);
+                auto measure_runner = std::make_unique<FakeRunner>(); // generous: every ask fits
+                FakeRunner* measure_eyes = measure_runner.get();
+                ImageGenerationService measure(std::move(measure_runner), measure_store, fixed_renderer(),
+                                               fixed_provider(), fixed_dims(), fixed_executor(),
+                                               fixed_vision(), fixed_reference_renderer());
+                OpenAIImagesRequest r = sample_request();
+                r.images         = {payload};
+                r.size_requested = true;
+                r.width          = side;
+                r.height         = side;
+                (void)measure.generate(r, 1900U + side);
+                return measure_eyes->probed_target;
+            };
+            const std::uint32_t small_side   = 512U;
+            const std::uint64_t need_asked   = need_at(768U);
+            const std::uint64_t need_smaller = need_at(small_side);
+            check(need_smaller < need_asked,
+                  "the admission need shrinks with the canvas, which is the only reason a walk can work");
+
+            ImageJobStore store(8, 8ULL << 20);
+            auto runner = std::make_unique<FakeRunner>();
+            FakeRunner* eyes = runner.get();
+            const std::uint64_t budget = need_smaller; // admits 512x512, refuses everything above it
+            eyes->probe_for = [budget](std::uint64_t target) {
+                return FakeRunner::Fit{.fits = target <= budget, .freed_bytes_expected = budget};
+            };
+            std::uint32_t drew_w = 0;
+            std::uint32_t drew_h = 0;
+            ImageJobExecutor watch = [&](const OpenAIImagesRequest& request, std::uint64_t,
+                                         std::span<const std::uint16_t>, std::span<const std::uint16_t>,
+                                         std::span<const ReferencePlanes>, void*,
+                                         const std::shared_ptr<ImageJobProgress>&,
+                                         const EditConditioning*) {
+                drew_w = request.width;
+                drew_h = request.height;
+                FinishedPicture picture; // the size the job was SUBMITTED at, as the real executor returns
+                picture.width  = request.width;
+                picture.height = request.height;
+                picture.rgba.assign(4ULL * request.width * request.height, 0x02U);
+                for (std::size_t i = 0; i < picture.rgba.size(); i += 4U) { picture.rgba[i + 3] = 255U; }
+                return picture;
+            };
+            ImageGenerationService service(std::move(runner), store, fixed_renderer(), fixed_provider(),
+                                           fixed_dims(), watch, fixed_vision(),
+                                           fixed_reference_renderer());
+            OpenAIImagesRequest request = sample_request();
+            request.images         = {payload};
+            request.size_requested = true; // the ask is 768x768, and nothing else decides it
+            request.width          = 768;
+            request.height         = 768;
+            const auto outcome = attempt([&] { return service.generate(request, 1931); });
+            check(!outcome.threw, "a canvas the card cannot hold is drawn rather than refused");
+            check(eyes->runs == 1 && store.size() == 1U,
+                  "the downgraded draw pays exactly the one interlude any other draw pays");
+            check(drew_w != 0U && drew_w < 768U && drew_w >= 256U && drew_w == drew_h,
+                  "the job is submitted at the largest square the card will take, never below the floor");
+            // Walking to the floor would also be "drawn, not refused". What makes it the LARGEST that
+            // fits is that the last ask the probe answered is exactly the card's whole budget: one step
+            // more and the need is over it, which is the step the walk already took and was refused.
+            check(eyes->probed_target == budget,
+                  "the walk stopped at the largest canvas the card will take, not short of it");
+            const auto data = outcome.response.find("data");
+            check(data != outcome.response.end() && data->is_array() && !data->empty() &&
+                      data->front().value("size_asked", std::string()) == "768x768" &&
+                      data->front().value("size", std::string()) ==
+                          std::to_string(drew_w) + "x" + std::to_string(drew_h),
+                  "the answer names the canvas asked AND the canvas it drew, so nothing was traded in "
+                  "silence");
+            check(eyes->probes > 1U, "the size that fits was found by asking the probe again, not guessed");
+
+            // The other half of the walk, and the half the live engine found on its own: probe() is NOT
+            // exclusive. A draw already inside its interlude has the frame and KV pools unmapped, so a
+            // promise read at that instant can be gigabytes better than what this job's own yield delivers
+            // once the other one restores them -- and the net inside the interlude, which compares the
+            // DELIVERED bytes against the same gate, refuses. Measured: a 2016x2016 edit walked down to a
+            // canvas needing 15540 MiB, was promised enough, delivered 15040 with 855 free and was refused.
+            // So stopping at the first promise that merely CLEARS the gate is not enough: the walk keeps
+            // going while the promise does not beat it by kVramWalkSlackBytes, and remembers the largest
+            // that did clear it so a tight-but-true card still gets the canvas it asked for.
+            struct Seen {
+                std::uint32_t w = 0U, h = 0U;
+                int  probes        = 0;
+                bool named_second  = false;
+            };
+            auto draw_with = [&](std::function<FakeRunner::Fit(std::uint64_t)> answer) {
+                ImageJobStore s(8, 8ULL << 20);
+                auto r      = std::make_unique<FakeRunner>();
+                FakeRunner* eyes2 = r.get();
+                eyes2->probe_for  = std::move(answer);
+                Seen seen;
+                ImageJobExecutor note = [&](const OpenAIImagesRequest& request, std::uint64_t,
+                                            std::span<const std::uint16_t>, std::span<const std::uint16_t>,
+                                            std::span<const ReferencePlanes>, void*,
+                                            const std::shared_ptr<ImageJobProgress>&,
+                                            const EditConditioning*) {
+                    seen.w = request.width;
+                    seen.h = request.height;
+                    FinishedPicture picture;
+                    picture.width  = request.width;
+                    picture.height = request.height;
+                    picture.rgba.assign(4ULL * request.width * request.height, 0x02U);
+                    for (std::size_t i = 0; i < picture.rgba.size(); i += 4U) { picture.rgba[i + 3] = 255U; }
+                    return picture;
+                };
+                ImageGenerationService service(std::move(r), s, fixed_renderer(), fixed_provider(),
+                                               fixed_dims(), note, fixed_vision(),
+                                               fixed_reference_renderer());
+                OpenAIImagesRequest request = sample_request();
+                request.images              = {payload};
+                request.size_requested      = true;
+                request.width               = 768U;
+                request.height              = 768U;
+                const auto out  = attempt([&] { return service.generate(request, 1932); });
+                seen.probes     = eyes2->probes;
+                const auto data = out.response.find("data");
+                seen.named_second = data != out.response.end() && data->is_array() && !data->empty() &&
+                                    data->front().contains("size_asked");
+                return seen;
+            };
+            // The gate's own margin. Named here because the fake answers the promise the real probe would
+            // have made; the run's own margin is pinned to this number by the run_margin check above.
+            const std::uint64_t margin = 512ULL * 1024ULL * 1024ULL;
+            const Seen barely = draw_with([margin](std::uint64_t target) {
+                return FakeRunner::Fit{.fits = true, .freed_bytes_expected = target + margin};
+            });
+            check(barely.w == 768U && barely.h == 768U && barely.probes > 1 && !barely.named_second,
+                  "a card that promises EXACTLY what the job needs still gets the canvas it asked for: the "
+                  "walk keeps looking for room and falls back to the largest that cleared the gate");
+            const Seen roomy_small = draw_with([margin, budget](std::uint64_t target) {
+                // Room to spare only once the ask is small enough: that is the walk's cue to stop.
+                const std::uint64_t spare = target <= budget ? 8ULL * FakeRunner::kGiB : 0ULL;
+                return FakeRunner::Fit{.fits = true, .freed_bytes_expected = target + margin + spare};
+            });
+            check(roomy_small.w == small_side && roomy_small.h == small_side &&
+                      roomy_small.probes > 1 && roomy_small.named_second,
+                  "where the promise only equals the need the walk goes on down, and stops at the largest "
+                  "canvas the card can both pay for and spare");
+
+            // The refusal the live engine actually printed, and the one no pre-yield walk can prevent:
+            // probe() is not exclusive, so the promise was read off a card another draw had yielded. The
+            // walk therefore stopped at the ask, and the yield then handed over far less than it promised.
+            // What the net inside the interlude decides on is what it was GIVEN -- and the largest canvas
+            // those bytes hold is drawn THERE, in the interlude the job already opened. Measured: an edit
+            // at 2016x2016 promised 18092 MiB, delivered 14400 plus 479 free, and answered 503 for a
+            // picture this machine can paint.
+            const std::uint64_t delivered = need_smaller + margin; // exactly what small_side costs
+            const auto lier = [margin](std::uint64_t target) {
+                return FakeRunner::Fit{.fits = true,
+                                       .freed_bytes_expected = target + margin + 8ULL * FakeRunner::kGiB,
+                                       .device_free_bytes    = 8ULL * FakeRunner::kGiB};
+            };
+            {
+                ImageJobStore gave_store(8, 8ULL << 20);
+                auto        gave_runner = std::make_unique<FakeRunner>();
+                FakeRunner* gave        = gave_runner.get();
+                gave->probe_for  = lier;
+                gave->freed_for  = [delivered](std::uint64_t) { return delivered; };
+                gave->device_free = 0ULL; // the other draw restored its pools; the card is not free at all
+                std::uint32_t gave_w = 0, gave_h = 0;
+                ImageJobExecutor gave_watch = [&](const OpenAIImagesRequest& request, std::uint64_t,
+                                                  std::span<const std::uint16_t>,
+                                                  std::span<const std::uint16_t>,
+                                                  std::span<const ReferencePlanes>, void*,
+                                                  const std::shared_ptr<ImageJobProgress>&,
+                                                  const EditConditioning*) {
+                    gave_w = request.width;
+                    gave_h = request.height;
+                    FinishedPicture picture;
+                    picture.width  = request.width;
+                    picture.height = request.height;
+                    picture.rgba.assign(4ULL * request.width * request.height, 0x02U);
+                    for (std::size_t i = 0; i < picture.rgba.size(); i += 4U) { picture.rgba[i + 3] = 255U; }
+                    return picture;
+                };
+                ImageGenerationService gave_service(std::move(gave_runner), gave_store, fixed_renderer(),
+                                                    fixed_provider(), fixed_dims(), gave_watch,
+                                                    fixed_vision(), fixed_reference_renderer());
+                OpenAIImagesRequest gave_request = sample_request();
+                gave_request.images         = {payload};
+                gave_request.size_requested = true;
+                gave_request.width          = 768U;
+                gave_request.height         = 768U;
+                const auto gave_out = attempt([&] { return gave_service.generate(gave_request, 1933); });
+                check(!gave_out.threw,
+                      "a yield that delivers a fraction of what the probe promised is not a refusal");
+                check(gave->probes == 1 && gave->runs == 1,
+                      "the walk took the promise at its word and the shrinking happened inside the ONE "
+                      "interlude the job opened: no second yield, no retry round");
+                check(gave_w == small_side && gave_h == small_side,
+                      "the picture is drawn at the largest canvas the DELIVERED bytes hold, not at the "
+                      "canvas a borrowed promise looked good for");
+                const auto gave_data = gave_out.response.find("data");
+                check(gave_data != gave_out.response.end() && gave_data->is_array() &&
+                          !gave_data->empty() &&
+                          gave_data->front().value("size_asked", std::string()) == "768x768" &&
+                          gave_data->front().value("size", std::string()) ==
+                              std::to_string(gave_w) + "x" + std::to_string(gave_h),
+                      "and the answer still names both canvases: a traded picture is never traded in silence");
+            }
+            {
+                // What the walk inside the interlude bottoms out at is still a refusal, and the honest one:
+                // it quotes the bytes the yield DELIVERED, because those are the ones the client's canvas
+                // was measured against. A refusal that printed the promise would send a reader to fix a
+                // number that was never the problem.
+                ImageJobStore tight_store(8, 8ULL << 20);
+                auto        tight_runner = std::make_unique<FakeRunner>();
+                FakeRunner* tight        = tight_runner.get();
+                tight->probe_for  = lier;
+                tight->freed_for  = [](std::uint64_t) { return 1ULL << 30; }; // 1 GiB: nothing is drawable
+                const auto tight_out = attempt([&] {
+                    ImageGenerationService tight_service(std::move(tight_runner), tight_store,
+                                                         fixed_renderer(), fixed_provider(), fixed_dims(),
+                                                         fixed_executor(), fixed_vision(),
+                                                         fixed_reference_renderer());
+                    OpenAIImagesRequest tight_request = sample_request();
+                    tight_request.images         = {payload};
+                    tight_request.size_requested = true;
+                    tight_request.width          = 768U;
+                    tight_request.height         = 768U;
+                    return tight_service.generate(tight_request, 1934);
+                });
+                check(tight_out.threw && tight_out.code == "image_vram_insufficient",
+                      "a card that cannot hold even the floor canvas is still refused, not looped on");
+                check(tight_out.message.find("can yield 1024 MiB") != std::string::npos,
+                      "the refusal names the DELIVERED bytes (1 GiB), not the 24 GiB the probe promised");
+            }
         }
     }
 
