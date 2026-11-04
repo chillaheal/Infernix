@@ -183,10 +183,16 @@ struct ImageDeviceNeed {
     // The widest decoder stage: `planes` full planes at the stage's working side. Each up-stage
     // doubles the side before its widest planes exist, so the late low-channel stages dominate.
     std::uint64_t hl = req.geometry.hl, wl = req.geometry.wl;
+    // The widest simultaneous planes of a stage are its OUTPUT-channel buffers: `dup_up` holds the
+    // upsampled input, the duplicated shortcut and the conv output -- all `channels_out` wide -- at the
+    // doubled side (image_pipeline.cu:335,339,343), which is the stage's high-water and the largest
+    // vae term on a big canvas. The previous max(channels_in, channels_out) charged the up-projection's
+    // INPUT width to those planes, so on the {576,288} stage it doubled the peak: the measured ledger
+    // high-water at 2016 (12295 MiB, image_device_bytes_peak()) sits under the max() figure's vae term
+    // alone (13395), and the corrected channels_out figure keeps the total above the measured peak plus
+    // the 512 MiB reservation floor on every certified row (min clearance 1217 MiB at 2048).
     const auto stage_bytes = [](const VaeStage& stage, std::uint64_t sh, std::uint64_t sw) {
-        const std::uint64_t channels =
-            stage.channels_in > stage.channels_out ? stage.channels_in : stage.channels_out;
-        return static_cast<std::uint64_t>(stage.planes) * channels * sh * sw * kImageElementBytes;
+        return static_cast<std::uint64_t>(stage.planes) * stage.channels_out * sh * sw * kImageElementBytes;
     };
     need.vae_peak = stage_bytes(kVaeMidStage, hl, wl);
     for (const auto& stage : kVaeUpStages) {
