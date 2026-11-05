@@ -310,25 +310,74 @@ std::string OpenAIChatStream::content_delta(const std::string& text) {
     return chunk(identity_, Json{{"content", text}}, nullptr, include_usage_, live_timings_json());
 }
 
-std::string OpenAIChatStream::tool_call_delta(const infernix::ToolCallDelta& delta) {
-    const bool opens = delta.index == calls_.size();
-    if (!started_ || finished_ || (opens && delta.name.empty()) ||
-        (!opens && (delta.index + 1U != calls_.size() || calls_.back().complete || !delta.name.empty()))) {
-        throw std::logic_error("invalid OpenAI Chat tool-call delta state");
+const char* describe_openai_chat_protocol_error(OpenAIChatProtocolError error) noexcept {
+    switch (error) {
+    case OpenAIChatProtocolError::None:
+        return "accepted";
+    case OpenAIChatProtocolError::NotStarted:
+        return "a tool-call delta arrived before the message started";
+    case OpenAIChatProtocolError::AlreadyFinished:
+        return "a tool-call delta arrived after the message finished";
+    case OpenAIChatProtocolError::MissingToolName:
+        return "a tool call was opened without a tool name";
+    case OpenAIChatProtocolError::DeltaAfterComplete:
+        return "a tool-call delta reached a call that was already complete";
+    case OpenAIChatProtocolError::ToolChangedMidCall:
+        return "a tool call changed its name while it streamed";
     }
-    Json call{{"index", delta.index}};
+    return "invalid OpenAI Chat tool-call delta";
+}
+
+OpenAIChatToolCallChunk OpenAIChatStream::tool_call_delta(const infernix::ToolCallDelta& delta) {
+    // Decided before anything is mutated, and never thrown: a delta the adapter cannot use is model
+    // output on a trust boundary, and only ever costs the request that carried it.
+    if (!started_) { return {{}, OpenAIChatProtocolError::NotStarted}; }
+    if (finished_) { return {{}, OpenAIChatProtocolError::AlreadyFinished}; }
+
+    // The call the Engine means, by the number the Engine gave it -- not this list's size, which a
+    // call the server hides never advanced, and which the Engine's own numbering has never followed.
+    std::size_t position = calls_.size();
+    for (std::size_t index = 0; index < calls_.size(); ++index) {
+        if (calls_[index].engine_index == delta.index) { position = index; break; }
+    }
+    const bool opens = position == calls_.size();
     if (opens) {
-        calls_.push_back(StreamedCall{.id = new_openai_chat_tool_call_id(), .name = delta.name});
-        call["id"]       = calls_.back().id;
-        call["type"]     = "function";
-        call["function"] = Json{{"name", delta.name}, {"arguments", delta.arguments}};
-    } else {
-        call["function"] = Json{{"arguments", delta.arguments}};
+        if (delta.name.empty()) { return {{}, OpenAIChatProtocolError::MissingToolName}; }
+    } else if (calls_[position].complete) {
+        return {{}, OpenAIChatProtocolError::DeltaAfterComplete};
+    } else if (!delta.name.empty() && delta.name != calls_[position].name) {
+        return {{}, OpenAIChatProtocolError::ToolChangedMidCall};
     }
-    calls_.back().arguments += delta.arguments;
-    calls_.back().complete = delta.complete;
-    return chunk(identity_, Json{{"tool_calls", Json::array({std::move(call)})}}, nullptr,
-                 include_usage_, live_timings_json());
+
+    if (opens) {
+        calls_.push_back(StreamedCall{.engine_index    = delta.index,
+                                      .published_index = 0,
+                                      .hidden          = delta.name == kChatImageToolName,
+                                      .id              = new_openai_chat_tool_call_id(),
+                                      .name            = delta.name});
+        position = calls_.size() - 1U;
+        if (!calls_[position].hidden) { calls_[position].published_index = next_published_index_++; }
+    }
+    // Each call extends its own arguments: the calls of a turn may interleave.
+    StreamedCall& call = calls_[position];
+    call.arguments += delta.arguments;
+    call.complete = delta.complete;
+    if (call.hidden) {
+        // The server runs this call itself, so it is absent from the message the client reads --
+        // while staying in this list, which the turn's result is matched against by position.
+        return {{}, OpenAIChatProtocolError::None};
+    }
+    Json body{{"index", call.published_index}};
+    if (opens) {
+        body["id"]       = call.id;
+        body["type"]     = "function";
+        body["function"] = Json{{"name", delta.name}, {"arguments", delta.arguments}};
+    } else {
+        body["function"] = Json{{"arguments", delta.arguments}};
+    }
+    return {chunk(identity_, Json{{"tool_calls", Json::array({std::move(body)})}}, nullptr,
+                  include_usage_, live_timings_json()),
+            OpenAIChatProtocolError::None};
 }
 
 std::vector<std::string> OpenAIChatStream::finish(const GenerationOutcome& outcome) {

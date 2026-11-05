@@ -510,19 +510,74 @@ std::vector<std::string> AnthropicMessagesStream::close_generation(const Generat
     return events;
 }
 
-std::vector<std::string> AnthropicMessagesStream::tool_call_delta(const infernix::ToolCallDelta& delta) {
-    const bool opens = delta.index == calls_.size();
-    if (!started_ || finished_ || (opens && delta.name.empty()) ||
-        (!opens && (delta.index + 1U != calls_.size() || calls_.back().complete || !delta.name.empty()))) {
-        throw std::logic_error("invalid Anthropic tool-call delta state");
+const char* describe_anthropic_protocol_error(AnthropicProtocolError error) noexcept {
+    switch (error) {
+    case AnthropicProtocolError::None:
+        return "accepted";
+    case AnthropicProtocolError::NotStarted:
+        return "a tool-call delta arrived before the message started";
+    case AnthropicProtocolError::AlreadyFinished:
+        return "a tool-call delta arrived after the message finished";
+    case AnthropicProtocolError::MissingToolName:
+        return "a tool call was opened without a tool name";
+    case AnthropicProtocolError::DeltaAfterComplete:
+        return "a tool-call delta reached a call whose block was already closed";
+    case AnthropicProtocolError::ToolChangedMidCall:
+        return "a tool call changed its name while it streamed";
     }
+    return "invalid Anthropic tool-call delta";
+}
+
+AnthropicToolCallEvents AnthropicMessagesStream::tool_call_delta(
+    const infernix::ToolCallDelta& delta) {
+    // Everything a delta can be refused for is decided before one byte of state changes, so a
+    // refusal never leaves a block half open, and nothing here throws: a delta the adapter cannot
+    // use is model output on a trust boundary, and a request that carries it fails on its own.
+    if (!started_) { return {{}, AnthropicProtocolError::NotStarted}; }
+    if (finished_) { return {{}, AnthropicProtocolError::AlreadyFinished}; }
+
+    // The call the Engine means, found by the number the Engine gave it. It is not this list's size:
+    // a call the server runs for itself never enters the published message, and the Engine restarts
+    // its numbering every continuation round, so the two have never been the same sequence.
+    std::size_t position = calls_.size();
+    for (std::size_t index = 0; index < calls_.size(); ++index) {
+        if (calls_[index].engine_index == delta.index) { position = index; break; }
+    }
+    const bool opens = position == calls_.size();
+    if (opens) {
+        if (delta.name.empty()) { return {{}, AnthropicProtocolError::MissingToolName}; }
+    } else {
+        if (calls_[position].complete) { return {{}, AnthropicProtocolError::DeltaAfterComplete}; }
+        // A name belongs to the delta that opens a call. Repeating it changes nothing; changing it
+        // would pour one tool's arguments into another tool's block.
+        if (!delta.name.empty() && delta.name != calls_[position].call.name) {
+            return {{}, AnthropicProtocolError::ToolChangedMidCall};
+        }
+    }
+
     std::vector<std::string> events;
     if (opens) {
-        append(events, close_thinking());
-        append(events, close_text());
+        const bool hidden = delta.name == kChatImageToolName;
+        if (!hidden) {
+            // A block the client never sees must not close the text block either: the visible call
+            // that follows, or the end of the generation, does that with the blocks it owns.
+            append(events, close_thinking());
+            append(events, close_text());
+        }
         calls_.push_back(StreamedCall{
-            .call  = ToolCall{.id = anthropic_call_id(searches_, delta.name), .name = delta.name},
-            .index = next_index_++});
+            .call         = ToolCall{.id = anthropic_call_id(searches_, delta.name), .name = delta.name},
+            .engine_index = delta.index,
+            .index        = hidden ? -1 : next_index_++,
+            .hidden       = hidden});
+        position = calls_.size() - 1U;
+        if (hidden) {
+            // The server runs this call itself: it earns no content block, and the blocks around it
+            // keep their published positions.
+            StreamedCall& silent = calls_[position];
+            silent.call.arguments_json += delta.arguments;
+            silent.complete           = delta.complete;
+            return {std::move(events), AnthropicProtocolError::None};
+        }
         const char* type = is_search_tool(searches_, delta.name) ? "server_tool_use" : "tool_use";
         events.push_back(event("content_block_start",
                                Json{{"type", "content_block_start"},
@@ -532,8 +587,13 @@ std::vector<std::string> AnthropicMessagesStream::tool_call_delta(const infernix
                                                            {"name", delta.name},
                                                            {"input", Json::object()}}}}));
     }
-    StreamedCall& call = calls_.back();
+    // Not necessarily the last call opened: two calls of one turn may interleave, and each extends
+    // its own block.
+    StreamedCall& call = calls_[position];
     call.call.arguments_json += delta.arguments;
+    if (call.hidden) {
+        return {std::move(events), AnthropicProtocolError::None};
+    }
     if (!delta.arguments.empty()) {
         events.push_back(event("content_block_delta",
                                Json{{"type", "content_block_delta"},
@@ -546,7 +606,7 @@ std::vector<std::string> AnthropicMessagesStream::tool_call_delta(const infernix
         events.push_back(event("content_block_stop",
                                Json{{"type", "content_block_stop"}, {"index", call.index}}));
     }
-    return events;
+    return {std::move(events), AnthropicProtocolError::None};
 }
 
 std::vector<ToolCall> AnthropicMessagesStream::identify_calls(const GenerationOutcome& outcome) const {
@@ -572,7 +632,7 @@ std::vector<std::string> AnthropicMessagesStream::call_blocks(const AnthropicRes
                       calls_[position].call.arguments_json == call.arguments_json;
         }
         if (!matches) { throw std::logic_error("streamed Anthropic tool calls do not match terminal output"); }
-        if (!calls_.back().complete) {
+        if (!calls_.back().complete && calls_.back().index >= 0) {
             events.push_back(event("content_block_stop",
                                    Json{{"type", "content_block_stop"}, {"index", calls_.back().index}}));
         }

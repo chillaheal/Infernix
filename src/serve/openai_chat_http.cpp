@@ -228,6 +228,10 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                         lifecycle->response_failure(make_internal_request_failure(
                             RequestFailurePhase::ResponseRender, exception.what()));
                         return false;
+                    } catch (...) {
+                        lifecycle->response_failure(make_internal_request_failure(
+                            RequestFailurePhase::ResponseRender, "the error event could not be written"));
+                        return false;
                     }
                 };
                 try {
@@ -246,9 +250,11 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                     return send_error(error);
                 }
 
-                // A hidden image call stays hidden on the stream too: its first delta names it,
-                // and its index then silences the rest.
-                std::vector<std::uint32_t> hidden_calls;
+                // A tool-call this adapter cannot render ends the request's stream, not the server:
+                // the Engine is asked to stop this generation and one terminal error event closes the
+                // stream once the round unwinds.
+                bool protocol_failed = false;
+                std::string protocol_failure_detail;
                 // `live` is whether this round's events reach the client. A round that only asked
                 // for a picture carries nothing: its prose is not part of the answer, and its start,
                 // prompt-progress and per-token timing would open a second generation inside the one
@@ -283,25 +289,44 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                             render_and_write(transport,
                                              [&] { return encoder->reasoning_delta(text); });
                         };
+                        // Every delta reaches the encoder, including the server's own picture call:
+                        // the turn's result counts that call, and the encoder matches its streamed
+                        // calls against the result by position. The encoder is what keeps it off the
+                        // wire, and what gives the calls that do reach the client their indices.
                         output.on_tool_call = [&](const infernix::ToolCallDelta& delta) {
-                            if (!delta.name.empty() && delta.name == kChatImageToolName) {
-                                hidden_calls.push_back(delta.index);
-                            }
-                            if (std::find(hidden_calls.begin(), hidden_calls.end(), delta.index) !=
-                                hidden_calls.end()) {
+                            const OpenAIChatToolCallChunk rendered = encoder->tool_call_delta(delta);
+                            if (!rendered.ok()) {
+                                protocol_failed         = true;
+                                protocol_failure_detail = describe_openai_chat_protocol_error(
+                                    rendered.error);
                                 return;
                             }
-                            render_and_write(transport,
-                                             [&] { return encoder->tool_call_delta(delta); });
+                            render_and_write(transport, [&] { return rendered.chunk; });
                         };
                     }
-                    output.is_cancelled = [&] { return transport.poll(); };
+                    // A refused tool-call cancels this request's generation only.
+                    output.is_cancelled = [&] { return transport.poll() || protocol_failed; };
                     return service_->run(slot, &output);
                 };
 
                 GenerationOutcome outcome;
                 try {
                     outcome = run_stream_round(stream->prepared, true);
+                    if (protocol_failed) {
+                        // The stream is committed, so it ends the way OpenAI ends a failed stream: one
+                        // error event and the connection closes. No fabricated finish chunk for a
+                        // message that can no longer be valid, and no picture round after it.
+                        lifecycle->failure(make_internal_request_failure(
+                            RequestFailurePhase::Generation,
+                            "invalid tool-call sequence: " + protocol_failure_detail));
+                        ApiError error;
+                        error.status  = 500;
+                        error.type    = "api_error";
+                        error.message = "the response stream was terminated because the server could "
+                                        "not produce a valid tool-call sequence: " +
+                                        protocol_failure_detail;
+                        return send_error(error);
+                    }
                     if (images_configured && outcome_is_chat_image_tool_round(outcome)) {
                         // The picture draws with the Engine loop stopped: this ticker is the
                         // stream's only traffic while it runs, and it carries the job's real
@@ -353,31 +378,24 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                     return send_error(error);
                 }
 
+                // The tail of a committed stream runs on the HTTP worker with no handler above it, so
+                // everything from the lifecycle record to the last byte is one guarded block: a throw
+                // here -- an aggregate that will not serialize, a chunk that will not encode, a socket
+                // that closes on the final write -- ends this request's stream, never the process.
                 lifecycle->done(outcome);
-                if (outcome.finish_reason == infernix::FinishReason::Cancelled ||
-                    stream->cancelled.load(std::memory_order_acquire)) {
-                    lifecycle->response_failure(
-                        make_client_disconnected_failure(RequestFailurePhase::Transport));
-                    return false;
-                }
-                std::vector<std::string> terminal;
                 try {
-                    terminal = encoder->finish(outcome);
+                    if (outcome.finish_reason == infernix::FinishReason::Cancelled ||
+                        stream->cancelled.load(std::memory_order_acquire)) {
+                        lifecycle->response_failure(
+                            make_client_disconnected_failure(RequestFailurePhase::Transport));
+                        return false;
+                    }
+                    std::vector<std::string> terminal = encoder->finish(outcome);
                     remember_reasoning(outcome, encoder->tool_call_ids());
                     if (auto comment = ngram_generation_comment(outcome.ngram_archive);
                         !comment.empty()) {
                         terminal.insert(terminal.begin(), std::move(comment));
                     }
-                } catch (const std::exception& exception) {
-                    lifecycle->response_failure(make_internal_request_failure(
-                        RequestFailurePhase::ResponseRender, exception.what()));
-                    ApiError error;
-                    error.status  = 500;
-                    error.type    = "internal_error";
-                    error.message = exception.what();
-                    return send_error(error);
-                }
-                try {
                     transport.write(terminal);
                     sink.done();
                     return true;
@@ -385,6 +403,23 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                     lifecycle->response_failure(
                         make_client_disconnected_failure(RequestFailurePhase::Transport));
                     return false;
+                } catch (const std::exception& exception) {
+                    lifecycle->response_failure(make_internal_request_failure(
+                        RequestFailurePhase::ResponseRender, exception.what()));
+                    ApiError error;
+                    error.status  = 500;
+                    error.type    = "api_error";
+                    error.message = "the response stream failed while it was being written: " +
+                                    std::string(exception.what());
+                    return send_error(error);
+                } catch (...) {
+                    lifecycle->response_failure(make_internal_request_failure(
+                        RequestFailurePhase::ResponseRender, "the response stream failed unexpectedly"));
+                    ApiError error;
+                    error.status  = 500;
+                    error.type    = "api_error";
+                    error.message = "the response stream failed unexpectedly while it was being written";
+                    return send_error(error);
                 }
             },
             [stream, lifecycle](bool successful) {

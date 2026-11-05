@@ -168,6 +168,29 @@ struct OpenAIResponsesStreamFinish {
     std::vector<std::string> events_before_terminal;
 };
 
+// Why one tool-call delta could not be rendered. Those deltas are the model's constrained decoding,
+// so an unusable one is output arriving on a trust boundary: it fails the request that carried it,
+// and it is never an exception -- an exception that leaves the SSE content provider reaches a worker
+// thread that has no handler, and the whole server dies with the request.
+enum class OpenAIResponsesProtocolError : std::uint8_t {
+    None,
+    NotStarted,
+    AlreadyFinished,
+    MissingToolName,
+    DeltaAfterComplete,
+    ToolChangedMidCall,
+    IndexGap,
+};
+
+const char* describe_openai_responses_protocol_error(OpenAIResponsesProtocolError error) noexcept;
+
+// What one tool-call delta produced: the events it earned, or the reason it was refused.
+struct OpenAIResponsesToolCallEvents {
+    std::vector<std::string> events;
+    OpenAIResponsesProtocolError error = OpenAIResponsesProtocolError::None;
+    [[nodiscard]] bool ok() const noexcept { return error == OpenAIResponsesProtocolError::None; }
+};
+
 class OpenAIResponsesEventStream {
 public:
     OpenAIResponsesEventStream(std::string response_id, std::int64_t created_at,
@@ -184,8 +207,10 @@ public:
     std::vector<std::string> reasoning_delta(const std::string& text);
     std::vector<std::string> content_delta(const std::string& text);
     // A constrained call's step: its first adds the call's Item; a function call streams its
-    // arguments and completes with its last step, other calls complete when their round ends.
-    std::vector<std::string> tool_call_delta(const infernix::ToolCallDelta& delta);
+    // arguments and completes with its last step, other calls complete when their round ends. Total:
+    // a delta this adapter cannot use is refused with `error`, never thrown. A call the server runs
+    // for itself is recorded (its round's result counts it) and publishes nothing.
+    OpenAIResponsesToolCallEvents tool_call_delta(const infernix::ToolCallDelta& delta);
     // The identifier of the current generation's call `index` when it is a hosted search: the Item id
     // it streamed with, or a new one.
     [[nodiscard]] std::string hosted_search_id(std::size_t index) const;

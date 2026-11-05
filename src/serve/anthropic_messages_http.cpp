@@ -399,14 +399,23 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                         lifecycle->response_failure(make_internal_request_failure(
                             RequestFailurePhase::ResponseRender, exception.what()));
                         return false;
+                    } catch (...) {
+                        // The error event is the last thing this stream can say, so saying it must
+                        // not be able to throw: an exception leaving here leaves the content
+                        // provider, and above the provider there is no handler.
+                        lifecycle->response_failure(make_internal_request_failure(
+                            RequestFailurePhase::ResponseRender, "the Anthropic error event failed"));
+                        return false;
                     }
                 };
 
+                // A tool-call the adapter cannot render ends this request's stream and nothing else.
+                // The Engine is asked to stop this generation, and the terminal error event goes out
+                // once run_anthropic_response has unwound itself.
+                bool protocol_failed = false;
+                std::string protocol_failure_detail;
                 try {
                     StreamSink output;
-                    // A hidden image call stays hidden on the stream too: its first delta names
-                    // it, and its index then silences the rest.
-                    std::vector<std::uint32_t> hidden_calls;
                     // Only the first generation starts the message; later ones continue it.
                     output.on_start = [&](const infernix::GenerationStart& start) {
                         if (!encoder->started()) {
@@ -419,18 +428,24 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                     output.on_content = [&](const std::string& text) {
                         render_and_write(transport, [&] { return encoder->content_delta(text); });
                     };
+                    // Every delta reaches the encoder, the server's own picture call included: the
+                    // generation's result counts that call, and the encoder matches its streamed
+                    // calls against the result by position. Keeping it off the wire, and numbering
+                    // the blocks that do reach the client, is the encoder's job.
                     output.on_tool_call = [&](const infernix::ToolCallDelta& delta) {
-                        if (!delta.name.empty() && delta.name == kChatImageToolName) {
-                            hidden_calls.push_back(delta.index);
-                        }
-                        if (std::find(hidden_calls.begin(), hidden_calls.end(), delta.index) !=
-                            hidden_calls.end()) {
+                        const AnthropicToolCallEvents rendered = encoder->tool_call_delta(delta);
+                        if (!rendered.ok()) {
+                            protocol_failed       = true;
+                            protocol_failure_detail = describe_anthropic_protocol_error(rendered.error);
                             return;
                         }
-                        render_and_write(transport, [&] { return encoder->tool_call_delta(delta); });
+                        render_and_write(transport, [&] { return rendered.events; });
                     };
-                    output.is_cancelled = [&] { return transport.poll(); };
-                    const std::function<bool()> cancelled = [&] { return transport.poll(); };
+                    // A refused tool-call fails its own request: the Engine sees the cancellation and
+                    // stops generating, and the client gets one terminal error event, not a stream
+                    // that hangs on a block nobody will close.
+                    output.is_cancelled = [&] { return transport.poll() || protocol_failed; };
+                    const std::function<bool()> cancelled = [&] { return transport.poll() || protocol_failed; };
 
                     run_anthropic_response(
                         *service_, *state, stream->prepared, &output, {},
@@ -439,6 +454,23 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                             render_and_write(transport, [&] { return encoder->segment(segment); });
                         },
                         [&](const GenerationOutcome& outcome) { return encoder->identify_calls(outcome); });
+                    if (protocol_failed) {
+                        // The stream is already committed, so the only honest ending is Anthropic's
+                        // own terminal error event: no fabricated content_block_stop, no message_stop
+                        // for a message that will never be valid, and no picture round after it.
+                        // Every SDK treats `error` as the failure of the whole stream, which is what
+                        // it is.
+                        lifecycle->failure(make_internal_request_failure(
+                            RequestFailurePhase::Generation,
+                            "invalid tool-call sequence: " + protocol_failure_detail));
+                        ApiError error;
+                        error.status  = 500;
+                        error.type    = "api_error";
+                        error.message = "the response stream was terminated because the server could "
+                                        "not produce a valid tool-use sequence: " +
+                                        protocol_failure_detail;
+                        return send_error(error);
+                    }
                     if (images_configured && outcome_is_chat_image_tool_round(state->final_outcome)) {
                         // The picture draws with the Engine loop stopped: this ticker is the
                         // stream's only traffic while it runs, and it carries the job's real
@@ -498,30 +530,30 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                     return send_error(error);
                 }
 
-                const GenerationOutcome totals = state->totals();
-                lifecycle->done(totals);
-                if (state->final_outcome.finish_reason == infernix::FinishReason::Cancelled ||
-                    stream->cancelled.load(std::memory_order_acquire)) {
-                    lifecycle->response_failure(
-                        make_client_disconnected_failure(RequestFailurePhase::Transport));
-                    return false;
-                }
-                std::vector<std::string> terminal;
+                // One guard for everything still to happen on this stream. The Engine catches what a
+                // callback throws, but nothing above this line does, and above the content provider
+                // there is no handler at all: an exception that leaves here leaves a worker thread
+                // with nothing to unwind into, and the process ends with the request -- taking the
+                // resident model, the picture pipeline and every other request on the card with it.
+                // Whatever it is, it is this request's failure now.
                 try {
-                    terminal = encoder->finish(state->final_segment(), totals, state->stop_reason);
-                    if (auto comment = ngram_generation_comment(state->final_outcome.ngram_archive);
-                        !comment.empty()) {
-                        terminal.insert(terminal.begin(), std::move(comment));
+                    const GenerationOutcome totals = state->totals();
+                    lifecycle->done(totals);
+                    if (state->final_outcome.finish_reason == infernix::FinishReason::Cancelled ||
+                        stream->cancelled.load(std::memory_order_acquire)) {
+                        lifecycle->response_failure(
+                            make_client_disconnected_failure(RequestFailurePhase::Transport));
+                        return false;
                     }
-                } catch (const std::exception& exception) {
-                    lifecycle->response_failure(make_internal_request_failure(
-                        RequestFailurePhase::ResponseRender, exception.what()));
-                    ApiError error;
-                    error.status  = 500;
-                    error.message = exception.what();
-                    return send_error(error);
-                }
-                try {
+                    const std::vector<std::string> terminal = [&] {
+                        std::vector<std::string> events =
+                            encoder->finish(state->final_segment(), totals, state->stop_reason);
+                        if (auto comment = ngram_generation_comment(state->final_outcome.ngram_archive);
+                            !comment.empty()) {
+                            events.insert(events.begin(), std::move(comment));
+                        }
+                        return events;
+                    }();
                     transport.write(terminal);
                     sink.done();
                     return true;
@@ -529,6 +561,23 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                     lifecycle->response_failure(
                         make_client_disconnected_failure(RequestFailurePhase::Transport));
                     return false;
+                } catch (const std::exception& exception) {
+                    lifecycle->response_failure(make_internal_request_failure(
+                        RequestFailurePhase::ResponseRender, exception.what()));
+                    ApiError error;
+                    error.status  = 500;
+                    error.type    = "api_error";
+                    error.message = exception.what();
+                    return send_error(error);
+                } catch (...) {
+                    lifecycle->response_failure(make_internal_request_failure(
+                        RequestFailurePhase::ResponseRender,
+                        "unhandled exception ending the Anthropic Messages stream"));
+                    ApiError error;
+                    error.status  = 500;
+                    error.type    = "api_error";
+                    error.message = "the response stream failed unexpectedly";
+                    return send_error(error);
                 }
             },
             [stream, lifecycle](bool successful) {

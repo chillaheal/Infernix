@@ -650,13 +650,23 @@ public:
                       std::make_move_iterator(message.end()));
         const CallKind kind     = streamed_kind(delta.name);
         const std::size_t index = delta.index;
+        const bool hidden       = delta.name == kChatImageToolName;
         ids.function_calls.resize(index + 1U);
         ids.call_ids.resize(index + 1U);
         ids.search_outputs.resize(index + 1U);
         ids.function_calls[index] = new_openai_response_item_id(call_item_prefix(kind));
         ids.call_ids[index] =
             kind == CallKind::HostedSearch ? ids.function_calls[index] : new_openai_response_item_id("call");
-        calls.push_back(StreamedCall{.name = delta.name, .kind = kind, .output_index = next_output_index++});
+        calls.push_back(StreamedCall{.name         = delta.name,
+                                     .kind         = kind,
+                                     .output_index = hidden ? -1 : next_output_index++,
+                                     .engine_index = delta.index,
+                                     .hidden       = hidden});
+        if (hidden) {
+            // The server runs this call itself: it is recorded, it is never an Item, and the Items
+            // around it do not notice it exists.
+            return events;
+        }
         events.push_back(sse(event("response.output_item.added",
                                    Json{{"output_index", calls.back().output_index},
                                         {"item", streamed_item(index, "in_progress", true)}})));
@@ -690,7 +700,7 @@ public:
                           calls[position].kind == call_kind(request, round, position);
             }
             if (!matches) { throw std::logic_error("streamed tool calls do not match terminal output"); }
-            if (calls.size() > count) {
+            if (calls.size() > count && !calls[count].hidden) {
                 const std::size_t cut = count;
                 if (calls[cut].kind == CallKind::Function) {
                     std::vector<std::string> done = complete_function(cut, "incomplete");
@@ -711,6 +721,9 @@ public:
             const CallKind kind                     = call_kind(request, round, position);
             const std::string& item_id              = ids.function_calls[position];
             const bool streamed                     = position < calls.size();
+            // A call the server ran for itself is in `calls` so the match above holds; it is not an
+            // Item, and it never becomes one here.
+            if (streamed && calls[position].hidden) { continue; }
             if (streamed && kind == CallKind::Function) { continue; }
             const int output_index = streamed ? calls[position].output_index : next_output_index++;
             if (!streamed) {
@@ -777,9 +790,16 @@ public:
     struct StreamedCall {
         std::string name;
         std::string arguments;
-        CallKind kind    = CallKind::Function;
-        int output_index = 0;
-        bool complete    = false;
+        CallKind kind = CallKind::Function;
+        // The Item's position in the response's output. A hidden call is never an Item, so it takes
+        // no position: the Items around it keep the numbering a client reads.
+        int output_index = -1;
+        // The Engine's number for this call, which is what a delta is matched by and what indexes
+        // `ids`. Every call of the round sits in `calls`, in that order: the round's result counts
+        // the calls the server hides, and its calls are matched against this list by position.
+        std::uint32_t engine_index = 0;
+        bool hidden                = false;
+        bool complete              = false;
     };
 
     std::string id;
@@ -860,32 +880,75 @@ std::vector<std::string> OpenAIResponsesEventStream::content_delta(const std::st
     return events;
 }
 
-std::vector<std::string> OpenAIResponsesEventStream::tool_call_delta(const infernix::ToolCallDelta& delta) {
-    Impl& s          = *impl_;
-    const bool opens = delta.index == s.calls.size();
-    if (!s.started || s.finish_built || (opens && delta.name.empty()) ||
-        (!opens && (delta.index + 1U != s.calls.size() || s.calls.back().complete || !delta.name.empty()))) {
-        throw std::logic_error("invalid Responses tool-call delta state");
+const char* describe_openai_responses_protocol_error(OpenAIResponsesProtocolError error) noexcept {
+    switch (error) {
+    case OpenAIResponsesProtocolError::None:
+        return "accepted";
+    case OpenAIResponsesProtocolError::NotStarted:
+        return "a tool-call delta arrived before the response started";
+    case OpenAIResponsesProtocolError::AlreadyFinished:
+        return "a tool-call delta arrived after the response finished";
+    case OpenAIResponsesProtocolError::MissingToolName:
+        return "a tool call was opened without a tool name";
+    case OpenAIResponsesProtocolError::DeltaAfterComplete:
+        return "a tool-call delta reached a call that was already complete";
+    case OpenAIResponsesProtocolError::ToolChangedMidCall:
+        return "a tool call changed its name while it streamed";
+    case OpenAIResponsesProtocolError::IndexGap:
+        return "a tool call was opened at an index the Engine had not reached";
     }
+    return "invalid Responses tool-call delta";
+}
+
+OpenAIResponsesToolCallEvents
+OpenAIResponsesEventStream::tool_call_delta(const infernix::ToolCallDelta& delta) {
+    Impl& s = *impl_;
+    // Decided before anything is mutated, and never thrown: a delta the adapter cannot use is model
+    // output on a trust boundary, and only ever costs the request that carried it.
+    if (!s.started) { return {{}, OpenAIResponsesProtocolError::NotStarted}; }
+    if (s.finish_built) { return {{}, OpenAIResponsesProtocolError::AlreadyFinished}; }
+
+    // The call the Engine means, by the number the Engine gave it -- not this list's size, which the
+    // Engine's numbering has never steered, and which a hidden call still advances.
+    std::size_t position = s.calls.size();
+    for (std::size_t index = 0; index < s.calls.size(); ++index) {
+        if (s.calls[index].engine_index == delta.index) { position = index; break; }
+    }
+    const bool opens = position == s.calls.size();
+    if (opens) {
+        if (delta.name.empty()) { return {{}, OpenAIResponsesProtocolError::MissingToolName}; }
+        // The Engine numbers a round's calls from zero without gaps, and every one of them reaches
+        // this encoder. An index past the end would leave `calls` and the round's ids out of step.
+        if (delta.index != s.calls.size()) { return {{}, OpenAIResponsesProtocolError::IndexGap}; }
+    } else {
+        if (s.calls[position].complete) { return {{}, OpenAIResponsesProtocolError::DeltaAfterComplete}; }
+        if (!delta.name.empty() && delta.name != s.calls[position].name) {
+            return {{}, OpenAIResponsesProtocolError::ToolChangedMidCall};
+        }
+    }
+
     std::vector<std::string> events;
     if (opens) { events = s.open_call(delta); }
-    auto& call = s.calls.back();
+    // Not necessarily the last call opened: the calls of a round may interleave.
+    Impl::StreamedCall& call = s.calls[position];
     call.arguments += delta.arguments;
+    call.complete  = delta.complete;
+    if (call.hidden) {
+        // Recorded, and silent: the round's result counts it, the client never sees it.
+        return {std::move(events), OpenAIResponsesProtocolError::None};
+    }
     if (call.kind == CallKind::Function && !delta.arguments.empty()) {
         events.push_back(sse(s.event("response.function_call_arguments.delta",
                                      Json{{"item_id", s.ids.function_calls[delta.index]},
                                           {"output_index", call.output_index},
                                           {"delta", delta.arguments}})));
     }
-    if (delta.complete) {
-        call.complete = true;
-        if (call.kind == CallKind::Function) {
-            std::vector<std::string> done = s.complete_function(delta.index, "completed");
-            events.insert(events.end(), std::make_move_iterator(done.begin()),
-                          std::make_move_iterator(done.end()));
-        }
+    if (call.complete && call.kind == CallKind::Function) {
+        std::vector<std::string> done = s.complete_function(position, "completed");
+        events.insert(events.end(), std::make_move_iterator(done.begin()),
+                      std::make_move_iterator(done.end()));
     }
-    return events;
+    return {std::move(events), OpenAIResponsesProtocolError::None};
 }
 
 std::string OpenAIResponsesEventStream::hosted_search_id(std::size_t index) const {
