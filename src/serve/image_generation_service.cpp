@@ -157,7 +157,13 @@ std::uint64_t image_need_bytes(std::int64_t width, std::int64_t height, std::siz
     return {w, h};
 }
 
-[[noreturn]] void throw_vram_insufficient(std::uint64_t need, const ImageInterludeRunner::Fit& fit) {
+// The 503 a client can act on. `canvas_is_the_lever` says whether shrinking the picture could have lowered
+// the need at all: below roughly 1024 the need is dominated by a term that does not move with the canvas,
+// and a refusal that then tells the client to ask for a smaller size sends it shrinking into the same
+// refusal -- measured as five refusals in fifteen seconds while a model edited its own canvas down. The
+// sentence is chosen from the arithmetic that decided it, never from a guess about the request.
+[[noreturn]] void throw_vram_insufficient(std::uint64_t need, const ImageInterludeRunner::Fit& fit,
+                                         bool canvas_is_the_lever) {
     throw ApiException{ApiError{503, "server_error",
                                 "the image job needs " + std::to_string(need / kMiB) +
                                     " MiB; the model can yield " +
@@ -165,7 +171,11 @@ std::uint64_t image_need_bytes(std::int64_t width, std::int64_t height, std::siz
                                     std::to_string(fit.device_free_bytes / kMiB) +
                                     " MiB already free and " +
                                     std::to_string(fit.headroom_bytes / kMiB) +
-                                    " MiB reserved below the headroom",
+                                    " MiB reserved below the headroom; " +
+                                    (canvas_is_the_lever
+                                         ? "a smaller canvas lowers this need"
+                                         : "this need does not fall with the canvas, so a smaller size "
+                                           "will not help"),
                                 "size", "image_vram_insufficient"}};
 }
 
@@ -214,6 +224,7 @@ public:
     [[nodiscard]] Fit probe(std::uint64_t target_bytes, std::uint64_t margin_bytes) override {
         const infernix::ImageYieldProbe probe = engine_.probe_image_yield(target_bytes, margin_bytes);
         return Fit{.fits = probe.fits,
+                   .expert_pool_frozen_by_lease = probe.expert_pool_frozen_by_lease,
                    .freed_bytes_expected = probe.freed_bytes_expected,
                    .device_free_bytes    = probe.device_free_bytes,
                    .headroom_bytes       = probe.headroom_bytes};
@@ -227,8 +238,15 @@ public:
         try {
             return engine_.run_image_interlude(target_bytes, margin_bytes, job);
         } catch (const std::runtime_error& error) {
-            if (std::string_view(error.what()).find("already in flight") != std::string_view::npos) {
+            const std::string_view words = error.what();
+            if (words.find("already in flight") != std::string_view::npos) {
                 throw ImageInterludeInFlight{};
+            }
+            // The other soft-fail: the LLM never reached a safe point inside the drain deadline and the
+            // quiesce unwound itself. Nothing is broken and nothing moved, so this is a retry, not a
+            // failure -- and the retry must be of THIS request, at the canvas that was asked for.
+            if (words.find("no yieldable LLM frontier") != std::string_view::npos) {
+                throw ImageInterludeBusy{};
             }
             throw;
         }
@@ -927,7 +945,10 @@ RequestJson ImageGenerationService::generate(const OpenAIImagesRequest& request,
                                      ImageInterludeRunner::Fit{.fits = false,
                                                                .freed_bytes_expected = context.freed_bytes,
                                                                .device_free_bytes = fit.device_free_bytes,
-                                                               .headroom_bytes = fit.headroom_bytes});
+                                                               .headroom_bytes = fit.headroom_bytes},
+                                     // The rewriter's reserve is a fixed amount the picture's size does not
+                                     // touch, so a smaller canvas was never the answer here either.
+                                     /*canvas_is_the_lever*/ false);
                              }
                              // Nothing was allocated, so nothing has to be released: leave before the
                              // Releaser is even constructed, and before the sidecar is asked for anything.
@@ -964,15 +985,28 @@ RequestJson ImageGenerationService::generate(const OpenAIImagesRequest& request,
         // A request the client wrote itself if this probe declines auto: `effective` is replaced only
         // inside run_rewrite, so a declined rewrite leaves it exactly as the client spelled it.
         const auto fit = runner_->probe(kEnhancerReserveBytes, kInterludeMarginBytes);
-        if (!fit.fits && !auto_mode) { throw_vram_insufficient(kEnhancerReserveBytes, fit); }
-        if (!fit.fits && auto_mode) {
+        // The same blindness as the picture's own walk: while the chat holds the residency lease the
+        // promise is KV-only, and the interlude would take the ring back before loading the rewriter. So a
+        // blind no here admits the attempt and lets the net over the DELIVERED bytes decline it (a skip for
+        // auto, the documented refusal for a client that named prompt_enhance: true) rather than refusing
+        // over a yield this job never asked for.
+        const bool enhancer_probe_blind = fit.expert_pool_frozen_by_lease;
+        if (!fit.fits && !enhancer_probe_blind) {
+            if (!auto_mode) {
+                // The rewriter's reserve does not shrink with the canvas: never send this client shrinking.
+                throw_vram_insufficient(kEnhancerReserveBytes, fit, /*canvas_is_the_lever*/ false);
+            }
             // The same judgement the interlude applies below, one level earlier: the pre-probe already
-            // said the card cannot hold the rewriter, so auto skips it and says WHICH reason. Left as
-            // Off it reported "the client asked for no rewrite", which is what a client reading the
-            // answer would retry forever over.
+            // said the card cannot hold the rewriter, so auto skips it and says WHICH reason -- and a
+            // client that named prompt_enhance: true keeps the documented refusal, because handing it its
+            // own words back would be the lie the document above forbids. Left as Off, auto would report
+            // "the client asked for no rewrite", which is what a client reading the answer would retry
+            // forever over.
             enhancer_outcome = EnhancerOutcome::SkippedNoDevice;
         }
-        if (fit.fits) {
+        // A blind no goes in too: the interlude is where the ring comes back, and the net inside it is the
+        // one that knows what the yield delivered.
+        if (fit.fits || enhancer_probe_blind) {
             try {
                 run_rewrite(fit);
             } catch (const ApiException& exception) {
@@ -1189,6 +1223,14 @@ RequestJson ImageGenerationService::generate(const OpenAIImagesRequest& request,
     const auto step_down = [canvas_step](std::uint32_t& side) {
         side = side > kVramCanvasFloorPx + canvas_step ? side - canvas_step : kVramCanvasFloorPx;
     };
+    // Whether trading canvas for bytes is a real trade at this size. The need is dominated by a resident
+    // term that does not move with the picture, so under roughly 1024 a smaller canvas asks for the same
+    // memory: walking there costs a probe per step and finds the same number every time, and until
+    // 2026-11-05 the refusal at the end of it advised exactly that walk. Measured: 768x768 and 640x640
+    // both need 3701 MiB.
+    const std::uint32_t asked_w = effective.width, asked_h = effective.height;
+    const bool canvas_is_the_lever =
+        need_at(kVramCanvasFloorPx, kVramCanvasFloorPx) < need_at(asked_w, asked_h);
     for (;;) {
         need = need_at(effective.width, effective.height);
         fit  = runner_->probe(need, kInterludeMarginBytes);
@@ -1203,8 +1245,24 @@ RequestJson ImageGenerationService::generate(const OpenAIImagesRequest& request,
                 plain_need     = need;
                 plain_fit      = fit;
             }
+        } else if (fit.expert_pool_frozen_by_lease && !have_plain_fit) {
+            // The only "no" that is not evidence. The yield plan keeps the frame pool whole while the LLM
+            // holds a residency lease, so this promise is KV-only and the shortfall is measured against a
+            // yield this job would never ask for: an interlude begins by taking the ring back
+            // (begin_image_quiesce) and yields the frames after that. Refusing here threw away pictures the
+            // same server draws in 44 s once the chat is quiet -- measured, 18 refusals against 26
+            // successes in one instance, every one of them 1-32 ms and none of them ever reaching the
+            // quiesce that would have answered. So submit at the canvas that was ASKED and let the net
+            // inside the interlude decide on the bytes the yield ACTUALLY delivered: it refuses, before the
+            // first allocation, when even the floor is unpayable. It is the authority precisely because it
+            // is not a snapshot of somebody else's yielded card.
+            effective.width  = asked_w;
+            effective.height = asked_h;
+            need             = need_at(asked_w, asked_h);
+            break;
         }
-        if (effective.width <= kVramCanvasFloorPx && effective.height <= kVramCanvasFloorPx) {
+        if ((effective.width <= kVramCanvasFloorPx && effective.height <= kVramCanvasFloorPx) ||
+            !canvas_is_the_lever) { // nothing left to trade: decide here, once
             if (have_plain_fit) { // nothing ever beat the gate by the slack: take the biggest that cleared it
                 effective.width  = plain_w;
                 effective.height = plain_h;
@@ -1212,7 +1270,7 @@ RequestJson ImageGenerationService::generate(const OpenAIImagesRequest& request,
                 fit              = plain_fit;
                 break;
             }
-            throw_vram_insufficient(need, fit);
+            throw_vram_insufficient(need, fit, canvas_is_the_lever);
         }
         if (effective.width >= effective.height) { step_down(effective.width); }
         else                                      { step_down(effective.height); }
@@ -1274,7 +1332,8 @@ RequestJson ImageGenerationService::generate(const OpenAIImagesRequest& request,
                                                                           context.freed_bytes,
                                                                       .device_free_bytes =
                                                                           context.device_free_bytes,
-                                                                      .headroom_bytes = fit.headroom_bytes});
+                                                                      .headroom_bytes = fit.headroom_bytes},
+                                     canvas_is_the_lever);
                              }
                              if (effective.width >= effective.height) { step_down(effective.width); }
                              else                                      { step_down(effective.height); }
@@ -1355,8 +1414,12 @@ RequestJson ImageGenerationService::generate(const OpenAIImagesRequest& request,
             throw;
         }
         const bool in_flight_claim = dynamic_cast<const ImageInterludeInFlight*>(&error) != nullptr;
+        // A third party to the same contract: the card was never handed over because the LLM did not reach
+        // a safe point in time. Nothing began, so nothing failed -- and a 500 here told the model the draw
+        // was broken, which is how it ended up redrawing its own prompt instead of asking again.
+        const bool busy_claim = dynamic_cast<const ImageInterludeBusy*>(&error) != nullptr;
         try {
-            if (in_flight_claim) {
+            if (in_flight_claim || busy_claim) {
                 store_.advance(record.id, JobUpdate{.to = ImageJobState::Failed, .now = now,
                                                     .error = failure});
             } else if (degraded) {
@@ -1372,6 +1435,9 @@ RequestJson ImageGenerationService::generate(const OpenAIImagesRequest& request,
         }
         if (in_flight_claim) {
             throw ApiException{ApiError{429, "rate_limit_error", message, "", "image_interlude_in_flight"}};
+        }
+        if (busy_claim) {
+            throw ApiException{ApiError{429, "rate_limit_error", message, "", "image_interlude_busy"}};
         }
         if (degraded) {
             throw ApiException{ApiError{503, "server_error", message, "", "image_engine_degraded"}};

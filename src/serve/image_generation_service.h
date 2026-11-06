@@ -87,6 +87,17 @@ struct ImageInterludeInFlight : std::runtime_error {
     ImageInterludeInFlight() : std::runtime_error("image interlude: another interlude is already in flight") {}
 };
 
+// Thrown when the Program could not reach a yieldable frontier in time: it closed the submit door, the LLM
+// did not come to a safe point inside the deadline, and begin_image_quiesce cleanly unwound -- nothing moved,
+// the LLM kept serving, and only this image job was rejected. That is contention, not a malfunction: a
+// client told "failed" retries a draw that never began, while a client told "busy" retries the SAME request
+// and gets the picture. A type for the same reason as above -- the HTTP contract must not read the Program's
+// prose.
+struct ImageInterludeBusy : std::runtime_error {
+    ImageInterludeBusy()
+        : std::runtime_error("image interlude: no yieldable LLM frontier within the deadline") {}
+};
+
 // The finished picture as the device job leaves it: RGBA8 bytes on the host, exactly what the PNG
 // encoder consumes. This is the boundary the LLM's pause ends at -- the encode, the base64 and the
 // disk write are host work that costs the resident model nothing and therefore happen after the
@@ -156,6 +167,9 @@ public:
     // check what the yield actually delivered against what the plan promised.
     struct Fit {
         bool fits = false;
+        // Copied from ImageYieldProbe: the no was produced by a frame pool the LLM is holding, so it is a
+        // blind no and the walk must not shrink the canvas on it. See the walk in generate().
+        bool expert_pool_frozen_by_lease = false;
         std::uint64_t freed_bytes_expected = 0;
         std::uint64_t device_free_bytes    = 0;
         std::uint64_t headroom_bytes       = 0;

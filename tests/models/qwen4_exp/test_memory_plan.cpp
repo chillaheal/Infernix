@@ -492,6 +492,21 @@ void test_image_yield() {
                 "the freed bytes equal resize()'s whole-chunk release to frames_after");
     }
 
+    // The premise of ImageYieldProbe::expert_pool_frozen_by_lease, pinned so the reason bit can never be
+    // set by a plan that did free frames: while the LLM holds a residency lease the frame pool is kept
+    // WHOLE, so everything this plan promises is elastic KV. A serve that refuses an image job on that
+    // promise is refusing on a yield the job would never ask for -- an interlude takes the ring back
+    // (begin_image_quiesce) before the yield that follows it. Measured on the deployed engine 2026-11-05:
+    // 768x768 refused at 138 MiB short of the gate, 18 times, while the chat was serving.
+    {
+        const auto p = plan_image_yield(req(100, 10, 40, 10, /*lease*/ true, 30 * chunk));
+        require(p.frames_freed == 0, "a held lease frees no expert frames at all");
+        require(static_cast<std::uint64_t>(p.frames_after) == full_frames,
+                "the frame pool is kept whole under a lease");
+        require(p.total_freed == p.kv_freed, "so the promise this plan makes is a KV-only number");
+        require(p.kv_mapped_after >= 10 * kvChunk, "and the KV it offers stays above its own floor");
+    }
+
     // Frames to their floor, then the KV pool on its own grid: both drained, KV left above its floor.
     {
         const auto p = plan_image_yield(req(100, 0, 500, 10, false, 110 * chunk));

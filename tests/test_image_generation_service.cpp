@@ -32,7 +32,7 @@ void check(bool ok, const std::string& what) {
 
 class FakeRunner final : public ImageInterludeRunner {
 public:
-    enum class Mode { Run, InFlight, DrainFail, RestorationFault };
+    enum class Mode { Run, InFlight, Busy, DrainFail, RestorationFault };
 
     explicit FakeRunner(Mode mode = Mode::Run) noexcept : mode_(mode) {}
 
@@ -59,6 +59,11 @@ public:
             // The seam's contract: the runner translates the Program's single-flight refusal into a
             // type, so the HTTP mapping cannot depend on the words the Program chose.
             throw ImageInterludeInFlight{};
+        }
+        if (mode_ == Mode::Busy) {
+            // The seam again: the Program's soft-fail (the LLM never reached a safe point and the quiesce
+            // unwound) must reach the HTTP layer as a TYPE, so a busy card answers 429 and never 500.
+            throw ImageInterludeBusy{};
         }
         if (mode_ == Mode::DrainFail) {
             throw std::runtime_error("image interlude: the LLM frontier did not drain in time");
@@ -439,6 +444,104 @@ int main() {
                   refusal.code == "image_vram_insufficient",
               "a yield that cannot cover the need refuses the request");
         check(eyes->probes == 1 && eyes->runs == 0, "the refusal happens before anything is yielded");
+    }
+
+    // The blind no, measured on the deployed engine on 2026-11-05: 18 refusals of 768x768 in one instance,
+    // every one 1-32 ms, every one while the chat held the residency lease, and the same canvas drawn in
+    // 44 s once the chat was quiet. The probe had compared a KV-only promise against the gate because the
+    // plan keeps the frame pool whole while a lease is out -- and the quiesce that takes the ring back was
+    // never reached, because the refusal is what prevented it.
+    {
+        ImageJobStore store(8, 8ULL << 20);
+        auto          runner = std::make_unique<FakeRunner>();
+        FakeRunner*   eyes   = runner.get();
+        eyes->probe_answer   = FakeRunner::Fit{.fits = false,
+                                               .expert_pool_frozen_by_lease = true,
+                                               .freed_bytes_expected = 1ULL << 30};
+        ImageGenerationService service(std::move(runner), store, fixed_renderer(), fixed_provider(),
+                                       fixed_dims(), fixed_executor());
+        const auto outcome = attempt([&] { return service.generate(sample_request(), 1750); });
+        check(!outcome.threw, "a no from a frame pool the chat is holding admits the job");
+        check(eyes->probes == 1 && eyes->runs == 1,
+              "a blind no is not traded for canvas: one probe, then the interlude decides");
+    }
+
+    // The same blind no still ends in the honest refusal when the yield cannot pay even the floor: letting
+    // the job in moved the decision, not the risk -- and the stop is still before the first allocation.
+    {
+        ImageJobStore store(8, 8ULL << 20);
+        auto          runner = std::make_unique<FakeRunner>();
+        FakeRunner*   eyes   = runner.get();
+        eyes->probe_answer   = FakeRunner::Fit{.fits = false,
+                                               .expert_pool_frozen_by_lease = true,
+                                               .freed_bytes_expected = 1ULL << 30};
+        eyes->freed          = 1ULL << 20;
+        bool executor_ran    = false;
+        ImageJobExecutor watch =
+            [&executor_ran](const OpenAIImagesRequest&, std::uint64_t, std::span<const std::uint16_t>,
+                            std::span<const std::uint16_t>, std::span<const ReferencePlanes>, void*,
+                            const std::shared_ptr<ImageJobProgress>&, const EditConditioning*) {
+                executor_ran = true;
+                return fake_picture(0x01U);
+            };
+        ImageGenerationService service(std::move(runner), store, fixed_renderer(), fixed_provider(),
+                                       fixed_dims(), watch);
+        const auto refusal = attempt([&] { return service.generate(sample_request(), 1760); });
+        check(refusal.threw && refusal.code == "image_vram_insufficient",
+              "a blind no whose yield cannot pay the floor is still refused");
+        check(eyes->runs == 1 && !executor_ran, "on the delivered bytes, before the first allocation");
+        check(refusal.message.find("1 MiB already free") != std::string::npos ||
+                  refusal.message.find("MiB already free") != std::string::npos,
+              "the refusal names the bytes the yield delivered");
+    }
+
+    // A card that could not be handed over is contention, not a malfunction: the same request retried is
+    // the fix, and a 500 tells the model to change something that was never the problem.
+    {
+        ImageJobStore store(8, 8ULL << 20);
+        ImageGenerationService service(std::make_unique<FakeRunner>(FakeRunner::Mode::Busy), store,
+                                       fixed_renderer(), fixed_provider(), fixed_dims(), fixed_executor());
+        const auto outcome = attempt([&] { return service.generate(sample_request(), 1770); });
+        check(outcome.threw && outcome.status == 429 && outcome.code == "image_interlude_busy",
+              "no yieldable frontier -> 429 image_interlude_busy, never 500");
+    }
+
+    // What the 503 may tell the client to do, decided by the arithmetic and not by a habit: a canvas whose
+    // need genuinely falls may be traded, and one whose need does not must not be walked into the same
+    // refusal a step at a time.
+    {
+        ImageJobStore store(8, 8ULL << 20);
+        auto          runner = std::make_unique<FakeRunner>();
+        FakeRunner*   eyes   = runner.get();
+        eyes->probe_answer   = FakeRunner::Fit{.fits = false, .freed_bytes_expected = 1ULL << 30};
+        ImageGenerationService service(std::move(runner), store, fixed_renderer(), fixed_provider(),
+                                       fixed_dims(), fixed_executor());
+        OpenAIImagesRequest big    = sample_request();
+        big.width    = 1024;
+        big.height   = 1024;
+        const auto refusal = attempt([&] { return service.generate(big, 1780); });
+        check(refusal.threw && refusal.code == "image_vram_insufficient",
+              "a big canvas that never fits is refused");
+        check(refusal.message.find("a smaller canvas lowers this need") != std::string::npos,
+              "when the need does fall with the canvas, the refusal says so");
+        check(eyes->probes > 1, "and the walk really walked its canvas down");
+    }
+    {
+        ImageJobStore store(8, 8ULL << 20);
+        auto          runner = std::make_unique<FakeRunner>();
+        FakeRunner*   eyes   = runner.get();
+        eyes->probe_answer   = FakeRunner::Fit{.fits = false, .freed_bytes_expected = 1ULL << 30};
+        ImageGenerationService service(std::move(runner), store, fixed_renderer(), fixed_provider(),
+                                       fixed_dims(), fixed_executor());
+        OpenAIImagesRequest tiny  = sample_request();
+        tiny.width   = 256;
+        tiny.height  = 256;
+        const auto refusal = attempt([&] { return service.generate(tiny, 1790); });
+        check(refusal.threw && refusal.code == "image_vram_insufficient",
+              "a floor canvas that does not fit is refused");
+        check(refusal.message.find("will not help") != std::string::npos,
+              "and the refusal stops advising a shrink that cannot lower the need");
+        check(eyes->probes == 1, "with nothing to trade, the walk asks the probe once");
     }
 
     // What the yield actually unmapped is what the job trusts: a grant short of the computed need

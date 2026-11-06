@@ -6037,6 +6037,13 @@ public:
         out.freed_bytes_expected = plan.total_freed;
         out.fits                 = out.freed_bytes_expected + out.device_free_bytes >=
                                    target_bytes + margin_bytes + out.headroom_bytes;
+        // The three conditions together say the promise above is not the frontier this job would get: a
+        // lease is out (the chat is holding frames), the plan therefore freed NO frames at all, and the
+        // pool was not merely down to its never-lent quarter. An interlude takes the ring back first, so
+        // this no is a blind one and the caller must not refuse on it. Fits, and every byte above, are
+        // untouched: this explains the verdict, it never changes it.
+        out.expert_pool_frozen_by_lease = req.lease_held && plan.frames_freed == 0 &&
+                                          residency_->any_lease_out();
         return out;
     }
 

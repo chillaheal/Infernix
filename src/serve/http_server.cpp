@@ -795,9 +795,16 @@ std::string make_capabilities_json(const ServeOptions& options, std::string_view
                             "HTTP 400 image_unsupported_file_field"},
                            {"another_draw_holds_the_card",
                             "HTTP 429 image_interlude_in_flight: retry the same request"},
+                           {"the_llm_never_reached_a_safe_point",
+                            "HTTP 429 image_interlude_busy: the card was never handed over because the chat "
+                            "was still running when the handoff was attempted; nothing moved and nothing "
+                            "began, so retry the SAME request at the same canvas rather than editing it"},
                            {"the_yield_cannot_cover_this_canvas",
                             "HTTP 503 image_vram_insufficient: the message names the bytes needed and the "
-                            "bytes the model can yield, and a smaller size is the fix"},
+                            "bytes the model can yield, and says in its own words whether a smaller canvas "
+                            "would have lowered that need -- below roughly 1024 it does not, because the "
+                            "need is then dominated by what the pipeline keeps resident whatever the "
+                            "picture's size, and shrinking into it costs a request per step"},
                            // Three answers that come from outside the request, so nothing the client sent
                            // predicts them -- which is exactly when a name pays: an unknown id is final, an
                            // unconfigured pipeline is the operator's to fix, and a rewriter that answered
