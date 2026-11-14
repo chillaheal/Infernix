@@ -1294,8 +1294,10 @@ RequestJson ImageGenerationService::generate(const OpenAIImagesRequest& request,
     record.progress = std::make_shared<ImageJobProgress>();
     // The canvas the HOST walk settled on, written by put() here -- before the interlude, whose own net
     // (below) can still step it down on the bytes the yield actually delivers. So this is not yet the
-    // picture the client gets back; the terminal advance rewrites width/height to the canvas that was
-    // really drawn, so a stored record never advertises a canvas that only went out on the wire.
+    // picture the client gets back; the one terminal advance on the way to Succeeded rewrites
+    // width/height to the canvas that was really drawn, so a served record never advertises a canvas
+    // that never went out on the wire. A job that never reaches Succeeded keeps the canvas the host
+    // walk settled on: it served no picture, so its record is the ask a replay would resend.
     // `prompt_enhance_outcome` is the reason, not the request field: the field would say what the client
     // asked and leave the four legitimate auto skips identical in the log.
     record.request  = nlohmann::json{{"prompt", effective.prompt},
