@@ -1,9 +1,11 @@
 """Qwen-Image (diffusers pipeline) adapter: DiT + Qwen3-VL text tower to logical parameters.
 
 Qwen-Image is not a causal LM. A pipeline root holds subfolders transformer/,
-text_text/, vae/ (model_index.json _class_name QwenImage21Pipeline). This
-adapter opens the transformer and text-tower roots directly and maps every
-source tensor to a logical Parameter. It does NOT reuse the text build_model
+text_text/, vae/, scheduler/ (model_index.json _class_name QwenImage21Pipeline).
+This adapter opens the transformer and text-tower roots directly and maps every
+source tensor to a logical Parameter. scheduler/scheduler_config.json is not a
+weight source: it is packed verbatim as the artifact's scheduler component, and
+a root without it does not convert. It does NOT reuse the text build_model
 (no tokens/frontend/RoPE path). VAE maps every source tensor as a direct BF16
 parameter with its conv/norm rank preserved as-is from the source header.
 
@@ -267,6 +269,19 @@ def build_model(base: SafetensorsSource, *, components=("dit", "text"),
         # The vision tower lives in the text encoder's shards, and its geometry (and the merger's
         # output width) is read from that component's config, so it is never converted alone.
         raise ValueError("vision requires the text component")
+
+    # The artifact is the single source of truth for the diffusion schedule: the shipped
+    # scheduler document is packed verbatim, with no field added, dropped, renamed or coerced,
+    # and `_class_name` and `_diffusers_version` are kept for provenance only. It comes after the
+    # guards above so the metadata-only component is never the artifact's only content.
+    scheduler = root / "scheduler" / "scheduler_config.json"
+    if not scheduler.is_file():
+        raise FileNotFoundError(
+            f"{scheduler}: the pipeline root has no scheduler/scheduler_config.json. It is "
+            "required: the artifact packs it verbatim as its scheduler component, and nothing "
+            "is synthesized for it."
+        )
+    records["scheduler"] = {"config": _load_config(scheduler)}
 
     model = Model(components=records)
     if "dit" in components:
