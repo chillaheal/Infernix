@@ -127,4 +127,16 @@ JointLayout build_joint_layout(std::span<const std::uint8_t> image_pad_mask,
     return out;
 }
 
+long long joint_token_count(long long prompt_rows, long long vision_tokens,
+                            long long target_tokens) {
+    // Refuse the negative rather than let it make a smaller count look admissible: a count below zero
+    // is a caller bug, and the caller's decision is a boolean on this number.
+    if (prompt_rows < 0 || vision_tokens < 0 || target_tokens < 0 ||
+        (target_tokens & 3LL) != 0) {
+        fail("a joint token count needs a non-negative prompt/vision size and a target token count "
+             "that is a whole number of 2x2 packed slots");
+    }
+    return prompt_rows + 3LL * vision_tokens + target_tokens;
+}
+
 } // namespace infernix::models::qwen_image

@@ -37,6 +37,7 @@ constexpr std::uint32_t kSteps      = 2; // the peak is per step: fewer steps me
 
 struct Case {
     std::uint32_t side;
+    std::uint32_t side_h = 0; // 0 = square (== side); else the height, with `side` as the width
     std::uint32_t ref_side; // 0 = no reference image
     std::uint32_t neg_tokens; // 0 = single forward (no true CFG)
     const char*   what;
@@ -96,15 +97,25 @@ int main() {
         };
 
         const std::vector<Case> cases = {
-            {512, 0, 0, "the certified route"},
-            {768, 0, 0, "the chat default"},
-            {768, 128, 0, "the review's case: same target plus a reference"},
-            {768, 0, 24, "true CFG (a second, differently sized pass)"},
-            {1024, 0, 0, "one megapixel"},
+            {512, 0, 0, 0, "the certified route"},
+            {768, 0, 0, 0, "the chat default"},
+            {768, 0, 128, 0, "the review's case: same target plus a reference"},
+            {768, 0, 0, 24, "true CFG (a second, differently sized pass)"},
+            {1024, 0, 0, 0, "one megapixel"},
             // M7's own row: a reference on the 1024^2 area cap (4096 latent tokens == 4 * 1024 vision
             // tokens) whose pad rows are the whole prompt, with the ViT encode measured in the same
             // window. This is the edit route the serving layer admits on this number.
-            {768, 1024, 0, "the edit route: a 1024^2 reference, the ViT lane and the joint sequence", true},
+            {768, 0, 1024, 0, "the edit route: a 1024^2 reference, the ViT lane and the joint sequence", true},
+            // The canvas-scaled sweep: every certified square the serving layer can be asked for, so
+            // the prediction-vs-measured row exists for the exact canvases the walk and the net decide
+            // on. Pure geometry (no reference, no CFG, no vision): the four canvas-scaled terms are all
+            // that change across these rows, which is what makes the comparison attributable to them.
+            {1024, 1152, 0, 0, "the trained edit canvas 1024x1152"},
+            {1280, 0, 0, 0, "certified 1280"},
+            {1536, 0, 0, 0, "certified 1536"},
+            {1792, 0, 0, 0, "certified 1792"},
+            {2016, 0, 0, 0, "certified 2016"},
+            {2048, 0, 0, 0, "certified 2048"},
         };
 
         cudaStream_t stream = nullptr;
@@ -113,7 +124,8 @@ int main() {
         int failures = 0;
         require(image_device_bytes_live() == 0, "the ledger holds bytes before any job");
         for (const auto& c : cases) {
-            const ImageGeometry geom = ImageGeometry::derive(c.side, c.side);
+            const ImageGeometry geom =
+                ImageGeometry::derive(c.side_h != 0 ? c.side_h : c.side, c.side);
             ImageJobInputs      inputs;
             inputs.prompt_embeds = zero_bits(static_cast<std::size_t>(kTextTokens) * dit.dims.hidden);
             inputs.latents_mean  = denorm.mean;
@@ -168,7 +180,8 @@ int main() {
                 req.vision_tokens            = static_cast<std::uint32_t>(merged);
                 req.vision                   = lane_of(vision.dims);
             }
-            const std::uint64_t predicted = image_device_need(req).total();
+            const ImageDeviceNeed need = image_device_need(req);
+            const std::uint64_t   predicted = need.total();
 
             reset_image_device_peak();
             if (c.vit) {
@@ -182,11 +195,17 @@ int main() {
             (void)run_image_job(reader, dit, vae, inputs, stream);
             const std::uint64_t measured = image_device_bytes_peak();
             const std::uint64_t mib      = 1024ULL * 1024ULL;
-            std::cout << c.what << ": " << c.side << "x" << c.side << " ref=" << c.ref_side
+            const std::uint32_t print_h = c.side_h != 0 ? c.side_h : c.side;
+            std::cout << c.what << ": " << c.side << "x" << print_h << " ref=" << c.ref_side
                       << " neg=" << c.neg_tokens << (c.vit ? " vit=yes" : "")
                       << " predicted " << predicted / mib
-                      << " MiB (vision lane " << image_device_need(req).vision_peak / mib
-                      << " MiB), measured peak " << measured / mib << " MiB\n";
+                      << " MiB [dit " << need.dit_activations / mib
+                      << " lat " << need.latent_and_velocity / mib
+                      << " vae " << need.vae_peak / mib
+                      << " rope " << need.rope_and_tables / mib
+                      << " res " << need.resident_weights / mib
+                      << " vision " << need.vision_peak / mib
+                      << "], measured peak " << measured / mib << " MiB\n";
             if (measured > predicted) {
                 std::cout << "FAIL: the measured peak exceeds the predicted need by "
                           << (measured - predicted) / mib << " MiB\n";

@@ -3002,6 +3002,13 @@ public:
             expert_cache::warm_start_load(options_.expert_state, options_.expert_cache,
                                           options_.expert_state_identity, keys, options_.expert_profile);
         SeedSource source = !load.state ? SeedSource::None : load.shipped ? SeedSource::Shipped : SeedSource::Saved;
+        if (load.shipped) {
+            // Both reasons are readable now that they are separate fields: what seeded the frames,
+            // and what the sidecar said when it gave way.
+            diagnostic("expert cache: seeded from " + load.profile_message +
+                           "; the saved state said: " + load.message,
+                       DiagnosticLevel::Debug);
+        }
         if (!load.state && options_.expert_cache && !options_.expert_state.empty() && has_calibrated_order()) {
             diagnostic("expert cache: no saved state used: " + load.message, DiagnosticLevel::Debug);
             load.state = calibrated_expert_order();
@@ -5980,6 +5987,11 @@ public:
         std::uint32_t frames_before   = 0; // expert frames resident when the yield began
         std::uint32_t kv_pages_before = 0; // elastic KV backed pages when the yield began
         std::uint64_t freed_bytes     = 0; // the physical bytes the yield actually released
+        // The device's OWN free bytes, read at the instant the pools landed where this yield put them.
+        // The serve's shortfall net adds this to freed_bytes; it must not reuse the free bytes its
+        // pre-yield probe carried, because a probe may have read the card while ANOTHER draw had it
+        // yielded. Delivered-vs-promised on the deployed engine: 14400 MiB against a 18092 MiB promise.
+        std::uint64_t device_free_bytes = 0;
         bool active = false;               // something was freed and must be given back
         // The execution-state snapshot taken at the yield, so release_from_yield can reject a lease the
         // Program has moved past (a stale yield from a superseded interlude must not restore these pools).
@@ -6025,6 +6037,13 @@ public:
         out.freed_bytes_expected = plan.total_freed;
         out.fits                 = out.freed_bytes_expected + out.device_free_bytes >=
                                    target_bytes + margin_bytes + out.headroom_bytes;
+        // The three conditions together say the promise above is not the frontier this job would get: a
+        // lease is out (the chat is holding frames), the plan therefore freed NO frames at all, and the
+        // pool was not merely down to its never-lent quarter. An interlude takes the ring back first, so
+        // this no is a blind one and the caller must not refuse on it. Fits, and every byte above, are
+        // untouched: this explains the verdict, it never changes it.
+        out.expert_pool_frozen_by_lease = req.lease_held && plan.frames_freed == 0 &&
+                                          residency_->any_lease_out();
         return out;
     }
 
@@ -6118,6 +6137,9 @@ public:
 
         const std::uint64_t after = residency_->pool_bytes() + (kv_vmm_ ? kv_vmm_->mapped_bytes() : 0);
         lease.freed_bytes = before > after ? before - after : 0;
+        // Read HERE, under vram_mutex_ and after every pool movement above, so it is the card this job
+        // actually has and not the card some other draw was holding when the probe ran.
+        lease.device_free_bytes = vram_ ? vram_->query().device_free : 0;
         lease.active      = lease.freed_bytes != 0;
         diagnostic("yielded " + std::to_string(lease.freed_bytes >> 20) + " MiB to the image job: expert cache " +
                        std::to_string(lease.frames_before) + " -> " + std::to_string(residency_->frames()) +

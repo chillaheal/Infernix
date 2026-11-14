@@ -71,4 +71,23 @@ struct JointLayout {
 [[nodiscard]] JointLayout build_joint_layout(std::span<const std::uint8_t> image_pad_mask,
                                              std::span<const ImageShape> img_shapes);
 
+// The length build_joint_layout would report in expanded_len, from the three counts the serve layer
+// already holds before any device work: the rendered prompt's rows, the reference's vision rows, and
+// the target's latent tokens (ImageGeometry::tokens). Every text row is one position and every image
+// slot four, so with mask length prompt_rows + target_slots and (vision_tokens + target_slots) of its
+// ones carrying a quarter of the block tokens each:
+//
+//   expanded = prompt_rows + 3 * vision_tokens + target_tokens
+//
+// `prompt_rows` is the RENDERED prompt's rows, which on the edit route already include the expanded
+// <|image_pad|> rows -- `vision_tokens` is how many of them carry the picture, not an extra block. The
+// three arguments are exactly what serve/image_generation_service.cpp holds before the probe.
+//
+// This exists so the joint sequence can be admitted BEFORE the LLM's VRAM is yielded -- the joint
+// attention Op refuses S above ops::kAttnDitJointMaxTokens, and a job that dies on that throw inside
+// the interlude is a 500 the client could have been told about as a 400. Its agreement with
+// build_joint_layout is pinned by a host test, which is what makes quoting it here safe.
+[[nodiscard]] long long joint_token_count(long long prompt_rows, long long vision_tokens,
+                                         long long target_tokens);
+
 } // namespace infernix::models::qwen_image

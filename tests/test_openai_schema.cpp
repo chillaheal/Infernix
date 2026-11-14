@@ -1123,9 +1123,13 @@ int test_stream_response() {
     // ones carry argument fragments by index, and finish does not repeat it.
     OpenAIChatStream streamed(identity(), false);
     (void)streamed.start();
-    const Json opened = parse_sse(streamed.tool_call_delta({.index = 0, .name = "Edit", .arguments = R"({"file_)"}));
-    const Json extended =
-        parse_sse(streamed.tool_call_delta({.index = 0, .arguments = R"(path":"/tmp/probe.cpp"})", .complete = true}));
+    const Json opened =
+        parse_sse(streamed.tool_call_delta({.index = 0, .name = "Edit", .arguments = R"({"file_)"}).chunk);
+    const Json extended = parse_sse(streamed
+                                        .tool_call_delta({.index = 0,
+                                                          .arguments = R"(path":"/tmp/probe.cpp"})",
+                                                          .complete  = true})
+                                        .chunk);
     const Json& open_call = opened["choices"][0]["delta"]["tool_calls"][0];
     const Json& next_call = extended["choices"][0]["delta"]["tool_calls"][0];
     failures += check(open_call["index"] == 0 && open_call["id"].get<std::string>().starts_with("call_") &&
@@ -1142,18 +1146,51 @@ int test_stream_response() {
     // A call the output limit cut keeps what it streamed; a streamed call must match the result's.
     OpenAIChatStream cut(identity(), false);
     (void)cut.start();
-    (void)cut.tool_call_delta({.index = 0, .name = "Edit", .arguments = R"({"file_path":"/tmp/probe.cpp"})", .complete = true});
-    (void)cut.tool_call_delta({.index = 1, .name = "Edit", .arguments = R"({"file_pa)"});
+    (void)cut.tool_call_delta({.index = 0, .name = "Edit", .arguments = R"({"file_path":"/tmp/probe.cpp"})", .complete = true})
+        .chunk;
+    (void)cut.tool_call_delta({.index = 1, .name = "Edit", .arguments = R"({"file_pa)"}).chunk;
     tool_outcome.finish_reason = infernix::FinishReason::OutputLimit;
     const auto cut_events      = cut.finish(tool_outcome);
     failures += check(parse_sse(cut_events[0])["choices"][0]["finish_reason"] == "length",
                       "a cut streamed call changed the finish reason");
     OpenAIChatStream diverged(identity(), false);
     (void)diverged.start();
-    (void)diverged.tool_call_delta({.index = 0, .name = "Edit", .arguments = "{}", .complete = true});
-    failures += check(throws_logic([&] { (void)diverged.finish(tool_outcome); }) &&
-                          throws_logic([&] { (void)streamed.tool_call_delta({.index = 3, .name = "Edit"}); }),
+    (void)diverged.tool_call_delta({.index = 0, .name = "Edit", .arguments = "{}", .complete = true})
+        .chunk;
+    failures += check(throws_logic([&] { (void)diverged.finish(tool_outcome); }),
                       "stream encoder accepted streamed calls that differ from the result");
+    // A delta this adapter cannot use is refused with a reason, never thrown: an exception that
+    // reaches the chunked content provider has no handler above it, and it takes the whole server
+    // down with the one request that carried it.
+    OpenAIChatStream refused(identity(), false);
+    failures += check(!refused.tool_call_delta({.index = 0, .name = "Edit"}).ok() &&
+                          refused.tool_call_delta({.index = 0, .name = "Edit"}).error ==
+                              OpenAIChatProtocolError::NotStarted,
+                      "a delta before the message started was not refused");
+    (void)refused.start();
+    (void)refused.tool_call_delta({.index = 4, .name = "Edit", .arguments = "{}", .complete = true})
+        .chunk;
+    const OpenAIChatToolCallChunk late = refused.tool_call_delta({.index = 4, .arguments = "x"});
+    failures += check(!late.ok() && late.error == OpenAIChatProtocolError::DeltaAfterComplete,
+                      "a second delta to a complete call was not refused");
+    (void)refused.tool_call_delta({.index = 5, .name = "Edit", .arguments = R"({"a")"}).chunk;
+    const OpenAIChatToolCallChunk renamed = refused.tool_call_delta({.index = 5, .name = "Write"});
+    failures += check(!renamed.ok() && renamed.error == OpenAIChatProtocolError::ToolChangedMidCall,
+                      "a call that changed its name mid-stream was not refused");
+    const OpenAIChatToolCallChunk nameless = refused.tool_call_delta({.index = 7, .arguments = "x"});
+    failures += check(!nameless.ok() && nameless.error == OpenAIChatProtocolError::MissingToolName,
+                      "a call opened without a name was not refused");
+    // The Engine's number is not the client's: a call the server runs for itself earns no chunk and
+    // no index, and the calls around it are numbered as if it had never been there.
+    OpenAIChatStream hidden(identity(), false);
+    (void)hidden.start();
+    const OpenAIChatToolCallChunk silent =
+        hidden.tool_call_delta({.index = 0, .name = "generate_image", .arguments = R"({"prompt":"x"})"});
+    const OpenAIChatToolCallChunk visible =
+        hidden.tool_call_delta({.index = 1, .name = "Edit", .arguments = R"({"file")"});
+    failures += check(silent.ok() && silent.chunk.empty() && visible.ok() &&
+                          parse_sse(visible.chunk)["choices"][0]["delta"]["tool_calls"][0]["index"] == 0,
+                      "a server-run call reached the wire, or cost a published index");
     return failures;
 }
 

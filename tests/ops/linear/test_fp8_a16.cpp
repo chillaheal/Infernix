@@ -30,6 +30,22 @@ std::vector<Invocation> a16_capacity_calls() {
     return calls;
 }
 
+// The schedule ladder of the four shapes that came over from the pre-merge tree (the Qwen3-VL text
+// tower's k/v and the DiT's 4096-dense projections) never existed in the deployed binary, so no
+// measurement had reached the Fp8A16Ring* routes they dispatch on. The widths below are that ladder's
+// own boundaries -- gemv at 1, simt to 8, sliced-K to 16, the 32x64 and 64x128 TMA ring tiles at
+// <=32/<=64, the 32x64 tile again at <=256, 64x128 again at <=4096 and the 128x128 tile beyond it --
+// each taken at the boundary and one past it, so a schedule that is picked one token too early or too
+// late cannot pass.
+std::vector<Invocation> a16_ladder_calls() {
+    std::vector<Invocation> calls;
+    for (const int t : {1, 2, 8, 9, 16, 17, 32, 33, 64, 65, 256, 257, 4096, 4097})
+        calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only});
+    for (const int t : {1, 8, 33, 257, 4097})
+        calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only, true});
+    return calls;
+}
+
 int run_fp8_a16() {
     const auto attn_invocations = a16_capacity_calls();
     int failures                = run_shape("FP8_A16", ActivationCompute::A16, make_fp8_weight,
@@ -103,6 +119,17 @@ int run_fp8_a16() {
     failures +=
         run_shape("FP8_A16", ActivationCompute::A16, make_fp8_weight,
                   {5120, 17408, 829U, Comparison::Sampled, true, residual17408_invocations});
+
+    // The four shapes whose Fp8A16Ring* schedule ladder no deployed binary had ever exercised.
+    const auto ladder_invocations = a16_ladder_calls();
+    failures += run_shape("FP8_A16", ActivationCompute::A16, make_fp8_weight,
+                          {1024, 4096, 901U, Comparison::Sampled, true, ladder_invocations});
+    failures += run_shape("FP8_A16", ActivationCompute::A16, make_fp8_weight,
+                          {4096, 4096, 907U, Comparison::Sampled, true, ladder_invocations});
+    failures += run_shape("FP8_A16", ActivationCompute::A16, make_fp8_weight,
+                          {4096, 12288, 911U, Comparison::Sampled, true, ladder_invocations});
+    failures += run_shape("FP8_A16", ActivationCompute::A16, make_fp8_weight,
+                          {12288, 4096, 913U, Comparison::Sampled, true, ladder_invocations});
 
     auto packed = make_fp8_weight(14336, 5120, 831U);
     try {

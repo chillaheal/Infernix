@@ -83,13 +83,12 @@ ExpertProfileLoad parse_expert_profile(std::span<const std::byte> bytes, std::ui
 
 bool apply_shipped_profile(ExpertStateLoad& loaded, const std::optional<SavedState>& profile) {
     if (loaded.state || !profile) { return false; }
-    loaded.state   = *profile;
-    loaded.shipped = true;
-    // The source is the profile, but the reason the sidecar gave way stays readable.
-    const std::string reason = std::move(loaded.message);
-    loaded.message = reason.empty()
-                         ? "the artifact's shipped expert profile"
-                         : "the artifact's shipped expert profile, after: " + reason;
+    loaded.state           = *profile;
+    loaded.shipped         = true;
+    // Two sources, two reasons. Folding them into one sentence ("..., after: ...") left a reader to
+    // unpick which source said what, so the sidecar's refusal stays in `message` and the profile's
+    // own source note goes to `profile_message`.
+    loaded.profile_message = "the artifact's shipped expert profile";
     return true;
 }
 

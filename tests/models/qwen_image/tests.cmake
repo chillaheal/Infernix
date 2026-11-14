@@ -303,6 +303,18 @@ infernix_add_op_test(infernix_image_edit_template_test
   LIBRARIES infernix_serve infernix_engine infernix_core infernix::json)
 set_tests_properties(infernix_image_edit_template_test PROPERTIES SKIP_RETURN_CODE 77)
 
+# P1: the condition-image resize gated against Pillow itself. Each synthetic fixture in
+# oracle_resize.json (regenerate: python -I tests/models/qwen_image/gen_oracle_resize.py) is decoded
+# with the SHIPPED PNG decoder and must resize to exactly what
+# PIL.Image.resize(..., resample=LANCZOS, reducing_gap=None) produced -- the call VaeImageProcessor
+# makes for this pipeline. Exact bytes, no tolerance; one case additionally asserts that a naive 2x2
+# bilinear DISAGREES, so the gate cannot be satisfied by a degenerate kernel. Host-only, no GPU, so it
+# runs with serve.exe alive.
+infernix_add_op_test(infernix_image_resize_test
+  NEEDS_SOURCE_DIR
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_image_resize.cpp"
+  LIBRARIES infernix_serve infernix_media_decode infernix_core infernix::json)
+
 # Step 8 (8D): the PRODUCTION raw-prompt tower route (serve provider: compiled chat template +
 # genuine tokenizer + FP8-v2 streamed weights + one-time FP8 embed dequant) on device; its
 # pre-final-RMSNorm rows gated vs pre_norm_hidden[drop_idx,S) at the qualified tower test's a-priori

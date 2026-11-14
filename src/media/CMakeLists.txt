@@ -15,7 +15,8 @@ target_link_libraries(infernix_media_decode PRIVATE ${INFERNIX_FFMPEG_TARGET} JP
 if(WIN32)
   add_library(infernix_zlib INTERFACE)
   set_target_properties(infernix_zlib PROPERTIES
-    INTERFACE_LINK_LIBRARIES "${FFMPEG_VCPKG_TREE}/lib/z.lib")
+    INTERFACE_LINK_LIBRARIES "${FFMPEG_VCPKG_TREE}/lib/z.lib"
+    INTERFACE_INCLUDE_DIRECTORIES "${FFMPEG_VCPKG_TREE}/include")
   target_link_libraries(infernix_media_decode PRIVATE infernix_zlib)
   target_compile_definitions(infernix_media_decode PUBLIC INFERNIX_MEDIA_NATIVE_PNG)
 endif()
@@ -24,3 +25,10 @@ add_library(infernix_media_encode STATIC
   encode/png_encode.cpp
 )
 infernix_internal_includes(infernix_media_encode)
+if(WIN32)
+  # The encoder compresses IDAT with the same zlib the decoder inflates with; without it the
+  # encoder still emits a valid PNG through stored DEFLATE blocks. PUBLIC because the encoder
+  # test asserts on the compressed size and must be able to ask whether this build compresses.
+  target_link_libraries(infernix_media_encode PRIVATE infernix_zlib)
+  target_compile_definitions(infernix_media_encode PUBLIC INFERNIX_MEDIA_ZLIB_ENCODER)
+endif()

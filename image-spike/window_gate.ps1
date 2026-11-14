@@ -8,6 +8,11 @@ param(
     [string]$MarkerFile = 'C:\Users\Micke\Desktop\Infernix FlashNext\infernix-window.json',
     [string]$Shield     = 'C:\Users\Micke\Documents\Kodprojekt\Qwen Flash Next\Infernix\image-spike\window_shield.ps1',
     [string]$ShieldBat  = 'C:\Users\Micke\Documents\Kodprojekt\Qwen Flash Next\Infernix\image-spike\_shield.bat',
+    # The keepalive watchdog (_serve_watch.py --watch) heals a down :8888 on its own poll interval,
+    # which would put a server back under a window that just took the card. It already honours this
+    # pause file (report, do not heal) for the probes; a window writes the same file, with an
+    # announced end so a window that dies cannot strand the card unwatched.
+    [string]$WatchPause = 'C:\Users\Micke\Documents\Kodprojekt\Qwen Flash Next\image-edit\_serve_watch.pause',
     [string]$Reason     = '',
     [int]$ShieldMaxMinutes = 90,
     [switch]$NoShield,               # marker + lock but no 503 stub: for a window that binds the port itself
@@ -57,6 +62,17 @@ function Verdict($v) { Write-Host ('GATE_VERDICT ' + $v) }
 function Listener-Pid {
     $c = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($c) { return [int]$c.OwningProcess }
+    # A zero from Get-NetTCPConnection does NOT mean the port is down on this machine: measured here
+    # on 2026-11-01 it reported no listener while the server's own request log showed a request 1.2 s
+    # old (the same unreliability that made a swap script always conclude "no :8888 listener"). Treating
+    # that as "serve is already down" lets a window skip the busy check and take the card out from
+    # under sessions mid-turn. Ask the port itself; -1 = listening, owner unknown.
+    try {
+        $client = New-Object System.Net.Sockets.TcpClient
+        try {
+            if ($client.ConnectAsync('127.0.0.1', $Port).Wait(1500) -and $client.Connected) { return -1 }
+        } finally { $client.Close() }
+    } catch {}
     return 0
 }
 
@@ -309,8 +325,47 @@ function Stop-Shield {
     Remove-Item -LiteralPath $MarkerFile -Force -ErrorAction SilentlyContinue
 }
 
+function Set-WatchPause($ownerName) {
+    # Written while the lock is held, so the keepalive reports the down port instead of relaunching
+    # through the user's bat underneath the window. ends_unix_ms lets an abandoned window expire.
+    $obj = @{ owner = $ownerName; reason = $Reason; port = $Port;
+              started_unix_ms = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds();
+              ends_unix_ms    = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() +
+                                ([long]($ExpectedMinutes + $StaleGraceSec / 60) * 1000L);
+              started_local   = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss') } | ConvertTo-Json -Compress
+    if (Test-Path -LiteralPath $WatchPause) {
+        $existing = ''
+        try { $existing = [string]((Get-Content -LiteralPath $WatchPause -Raw | ConvertFrom-Json).owner) } catch {}
+        Say ('watchdog already paused by=' + $existing + ', leaving that pause as its owner wrote it')
+        return
+    }
+    try {
+        [System.IO.File]::WriteAllText($WatchPause, $obj, (New-Object System.Text.UTF8Encoding($false)))
+        Say ('watchdog paused for the window (announced end +' + ($ExpectedMinutes + [int]($StaleGraceSec / 60)) +
+             ' min): ' + $WatchPause)
+    } catch { Say ('watchdog pause write failed: ' + $_.Exception.Message) }
+}
+
+function Clear-WatchPause($ownerName) {
+    if (-not (Test-Path -LiteralPath $WatchPause)) { return }
+    $owner = ''
+    try { $owner = [string]((Get-Content -LiteralPath $WatchPause -Raw | ConvertFrom-Json).owner) } catch {}
+    # Only take down the pause this window wrote. A probe measuring the card owns the same file, and
+    # clearing it early would let the keepalive heal right underneath that measurement.
+    if ($owner -ne $ownerName) { Say ('watchdog pause owned by=' + $owner + ', not ours to clear'); return }
+    Remove-Item -LiteralPath $WatchPause -Force -ErrorAction SilentlyContinue
+    Say ('watchdog pause cleared: ' + $WatchPause)
+}
+
+function Get-LockOwnerName {
+    if (-not (Test-Path -LiteralPath $LockFile)) { return '' }
+    try { return [string]((Get-Content -LiteralPath $LockFile -Raw | ConvertFrom-Json).owner) } catch { return '' }
+}
+
 if ($Action -eq 'EndWindow') {
+    $held = Get-LockOwnerName
     Stop-Shield
+    Clear-WatchPause $held
     if (Test-Path -LiteralPath $LockFile) {
         Remove-Item -LiteralPath $LockFile -Force -ErrorAction SilentlyContinue
         Say ('released ' + $LockFile)
@@ -320,6 +375,8 @@ if ($Action -eq 'EndWindow') {
 }
 
 if ($Action -eq 'Release') {
+    $held = Get-LockOwnerName
+    Clear-WatchPause $held
     if (Test-Path -LiteralPath $LockFile) {
         Remove-Item -LiteralPath $LockFile -Force -ErrorAction SilentlyContinue
         Say ('released ' + $LockFile)
@@ -375,6 +432,9 @@ if (-not (Set-Lock $Owner)) {
 }
 Say ('ACQUIRED owner=' + $Owner + ' pid=' + $PID + ' expected_minutes=' + $ExpectedMinutes +
      ' announced_end=' + (Get-Date).AddMinutes($ExpectedMinutes).ToString($fmtIso) + ' lock=' + $LockFile)
+# The pause goes down with the lock, not with the shield: a -NoShield window binds the port itself
+# and the keepalive must still stay off it.
+Set-WatchPause $Owner
 if ($Action -eq 'StartWindow') { Start-Shield $Owner }
 Verdict 'ACQUIRED'
 exit 0

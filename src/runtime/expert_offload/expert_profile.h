@@ -33,9 +33,10 @@ struct ExpertProfileLoad {
 [[nodiscard]] ExpertProfileLoad parse_expert_profile(std::span<const std::byte> bytes, std::uint32_t keys);
 
 // Warm-start source choice: the runtime-learned sidecar state wins; the shipped profile seeds only
-// when `loaded` carries no state (missing or refused file), and then records its source, keeping the
-// sidecar's refusal reason. Returns whether the profile became the seed. Callers gate this on the
-// warm start being enabled at all (--expert-state off seeds nothing).
+// when `loaded` carries no state (missing or refused file), and then records its own source in
+// `profile_message` while the sidecar's refusal reason stays in `message`. Returns whether the
+// profile became the seed. Callers gate this on the warm start being enabled at all
+// (--expert-state off seeds nothing).
 bool apply_shipped_profile(ExpertStateLoad& loaded, const std::optional<SavedState>& profile);
 
 // The S4b warm start's source decision, exactly as Program::warm_start_experts applies it: with the

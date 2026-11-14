@@ -68,6 +68,13 @@ infernix_add_test(infernix_image_generation_service_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_image_generation_service.cpp"
   LIBRARIES infernix_serve)
 
+# The prompt enhancer's answer contract and the refusal a client gets when no sidecar is running: the
+# rules the shipped edit system prompt puts on its own answer, and the codes that keep a bad rewrite
+# from reaching the pipeline as if it were the client's instruction.
+infernix_add_test(infernix_prompt_enhancer_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_prompt_enhancer.cpp"
+  LIBRARIES infernix_serve)
+
 # The image job's computed device-memory need: the number the serving layer refuses on before the LLM
 # yields anything, qualified here against the certified route's measured peak.
 infernix_add_test(infernix_image_device_need_test

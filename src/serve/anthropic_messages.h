@@ -131,6 +131,28 @@ struct AnthropicResponseSegment {
     std::vector<std::optional<RequestJson>> search_results;
 };
 
+// Why one tool-call delta could not be accepted. Those deltas travel from the model's constrained
+// decoding through the Engine, so an unusable one is model output arriving on a trust boundary: it
+// makes the request fail, and it is never an exception -- an exception that leaves the SSE content
+// provider reaches a thread with no handler, and the whole server dies with the request.
+enum class AnthropicProtocolError : std::uint8_t {
+    None,
+    NotStarted,          // a delta before the message's start event
+    AlreadyFinished,     // a delta after the message was completed
+    MissingToolName,     // opens a call no call has been opened for, without naming it
+    DeltaAfterComplete,  // extends or completes a call whose block is already closed
+    ToolChangedMidCall,  // a call whose name changes while it streams
+};
+
+const char* describe_anthropic_protocol_error(AnthropicProtocolError error) noexcept;
+
+// What one tool-call delta produced: the events it earned, or the reason it was refused.
+struct AnthropicToolCallEvents {
+    std::vector<std::string> events;
+    AnthropicProtocolError error = AnthropicProtocolError::None;
+    [[nodiscard]] bool ok() const noexcept { return error == AnthropicProtocolError::None; }
+};
+
 ApiError normalize_anthropic_error(ApiError error);
 std::string make_anthropic_error_body(const ApiError& error, const std::string& request_id);
 std::string make_anthropic_sse_error(const ApiError& error, const std::string& request_id);
@@ -164,8 +186,9 @@ public:
     std::vector<std::string> reasoning_delta(const std::string& text);
     std::vector<std::string> content_delta(const std::string& text);
     // A constrained call's step: its first opens the call's block, every one extends its input, the
-    // complete one closes the block.
-    std::vector<std::string> tool_call_delta(const infernix::ToolCallDelta& delta);
+    // complete one closes the block. Total: a delta this adapter cannot accept is refused with
+    // `error` set, never thrown.
+    AnthropicToolCallEvents tool_call_delta(const infernix::ToolCallDelta& delta);
     // The current generation's calls with wire identifiers: those it streamed keep theirs. A
     // segment of the generation carries them.
     [[nodiscard]] std::vector<ToolCall> identify_calls(const GenerationOutcome& outcome) const;
@@ -188,8 +211,16 @@ private:
 
     struct StreamedCall {
         ToolCall call;
-        int index     = 0;
-        bool complete = false;
+        // The Engine's own number for this call, kept so a delta finds the call it belongs to. It is
+        // NOT `index`: the Engine numbers the calls of a turn and restarts that numbering every
+        // continuation round, while `index` is the block's position in the published Message
+        // content. Every call of the turn is in this list -- the generation's result counts the
+        // calls the server hides, and its calls are matched against this list by position -- so a
+        // hidden call sits here with `hidden` set and an `index` no event ever names.
+        std::uint32_t engine_index = 0;
+        int index                  = -1;
+        bool hidden                = false;
+        bool complete              = false;
     };
 
     AnthropicResponseIdentity identity_;

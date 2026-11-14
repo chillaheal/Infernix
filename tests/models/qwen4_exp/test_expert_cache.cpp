@@ -825,9 +825,12 @@ void test_shipped_profile() {
     ExpertStateLoad cold;
     cold.message = "no saved expert state at ... yet";
     check(apply_shipped_profile(cold, prior) && cold.state->ranked == ranked && cold.shipped &&
-              cold.message.find("no saved expert state") != std::string::npos &&
-              cold.message.find("shipped expert profile") != std::string::npos,
-          "a refused sidecar load seeds from the shipped profile, keeping the refusal reason");
+              cold.message == "no saved expert state at ... yet" &&
+              cold.profile_message == "the artifact's shipped expert profile",
+          "a refused sidecar load seeds from the profile, each source keeping its own reason");
+    check(cold.message.find("shipped expert profile") == std::string::npos &&
+              cold.profile_message.find("no saved expert state") == std::string::npos,
+          "the sidecar's refusal and the profile's source note are not merged into one message");
     ExpertStateLoad none;
     check(!apply_shipped_profile(none, std::nullopt) && !none.state && !none.shipped,
           "without a shipped profile, a cold start stays cold");
@@ -847,11 +850,15 @@ void test_shipped_profile() {
     check(by_sidecar.state && by_sidecar.state->counts == warm.counts && !by_sidecar.shipped,
           "the seam: the runtime-learned sidecar wins over the shipped profile");
     const auto by_profile = warm_start_load(missing, true, "artifact A", 8, prior);
-    check(seeds(by_profile) && by_profile.message.find("shipped expert profile") != std::string::npos,
+    check(seeds(by_profile) &&
+              by_profile.profile_message.find("shipped expert profile") != std::string::npos,
           "the seam: a missing sidecar seeds the warm start from the shipped profile");
     const auto by_identity = warm_start_load(path, true, "artifact B", 8, prior);
-    check(seeds(by_identity) && by_identity.message.find("saved expert state") != std::string::npos,
-          "the seam: a refused sidecar seeds from the profile and still says why it gave way");
+    check(seeds(by_identity) && by_identity.message.find("saved expert state") != std::string::npos &&
+              by_identity.message.find("another artifact") != std::string::npos &&
+              by_identity.profile_message.find("shipped expert profile") != std::string::npos,
+          "the seam: a refused sidecar seeds from the profile and still says, in its own field, why "
+          "it gave way");
     check(!warm_start_load(path, false, "artifact A", 8, prior).state &&
               !warm_start_load(std::filesystem::path{}, true, "artifact A", 8, prior).state,
           "the seam: an off warm start takes neither source (--expert-cache off or --expert-state off)");

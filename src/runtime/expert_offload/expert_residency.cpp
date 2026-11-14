@@ -813,6 +813,17 @@ std::uint64_t ExpertResidency::lendable_bytes() const noexcept {
     return static_cast<std::uint64_t>(pool_lendable(pool)) * pool.pitch;
 }
 
+bool ExpertResidency::any_lease_out() const noexcept {
+    // What lendable_bytes() == 0 cannot tell on its own: a pool that lends nothing because the LLM is
+    // holding frames, and one that has simply reached the quarter that is never lent, look identical
+    // there. This is the difference, and it is what makes a frozen pool an explanation rather than a
+    // verdict (see ImageYieldProbe::expert_pool_frozen_by_lease).
+    for (const Pool& pool : pools_) {
+        if (pool.controller->loaned_frames() != 0) { return true; }
+    }
+    return false;
+}
+
 std::uint64_t ExpertResidency::lend_pitch() const noexcept { return pools_[lend_pool()].pitch; }
 
 std::uint64_t ExpertResidency::lend_capacity_bytes() const noexcept {

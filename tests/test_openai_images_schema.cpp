@@ -4,8 +4,10 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cmath>
 #include <cstdint>
 #include <iostream>
+#include <utility>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -214,16 +216,16 @@ int test_steps() {
 int test_reference_image_field() {
     int failures = 0;
     const OpenAIImagesRequest absent = parse(base_request());
-    failures += check(absent.image.empty(), "image absent by default");
+    failures += check(absent.images.empty(), "image absent by default");
 
     const OpenAIImagesRequest bare =
         parse(Json{{"model", "qwen-image"}, {"prompt", "x"}, {"image", "aGVsbG8="}});
-    failures += check(bare.image == "aGVsbG8=", "bare base64 captured");
+    failures += check(bare.images.size() == 1ULL && bare.images[0] == "aGVsbG8=", "bare base64 captured");
 
     const OpenAIImagesRequest uri = parse(Json{{"model", "qwen-image"},
                                                {"prompt", "x"},
                                                {"image", "data:image/png;base64,aGVsbG8="}});
-    failures += check(uri.image == "aGVsbG8=", "data: URI prefix stripped");
+    failures += check(uri.images.size() == 1ULL && uri.images[0] == "aGVsbG8=", "data: URI prefix stripped");
 
     // The family's LIST form, accepted at this build's cap of one (openai_images.h
     // kMaximumImageReferences): the shape is legal upstream, so it parses here; what the route can
@@ -231,13 +233,13 @@ int test_reference_image_field() {
     // than a silently dropped picture. Every content rule below the shape is the string's own.
     const OpenAIImagesRequest one =
         parse(Json{{"model", "qwen-image"}, {"prompt", "x"}, {"image", Json::array({"aGVsbG8="})}});
-    failures += check(one.image == "aGVsbG8=", "array of one captured like the string form");
+    failures += check(one.images.size() == 1ULL && one.images[0] == "aGVsbG8=", "array of one captured like the string form");
 
     const OpenAIImagesRequest one_uri =
         parse(Json{{"model", "qwen-image"},
                    {"prompt", "x"},
                    {"image", Json::array({"data:image/png;base64,aGVsbG8="})}});
-    failures += check(one_uri.image == "aGVsbG8=", "array of one strips the data: URI prefix");
+    failures += check(one_uri.images.size() == 1ULL && one_uri.images[0] == "aGVsbG8=", "array of one strips the data: URI prefix");
 
     Json too_many = Json::array();
     for (std::size_t i = 0; i <= kMaximumImageReferences; ++i) too_many.push_back("aGVsbG8=");
@@ -246,6 +248,48 @@ int test_reference_image_field() {
     });
     failures += check(over.status == 400 && over.code == "image_count_invalid" && over.param == "image",
                       "a reference past the cap is refused, never silently dropped");
+
+    // More than one reference is what the family is for -- every one of them conditions the same
+    // forward -- so the parse keeps them ALL, in the order the client sent them, and strips each
+    // one's own data: URI prefix. Dropping or merging here would be the quietest kind of wrong.
+    const OpenAIImagesRequest pair =
+        parse(Json{{"model", "qwen-image"},
+                   {"prompt", "x"},
+                   {"image", Json::array({"YWJj", "data:image/png;base64,ZGVm"})}});
+    failures += check(pair.images.size() == 2ULL && pair.images[0] == "YWJj" &&
+                          pair.images[1] == "ZGVm",
+                      "two references are both kept, in the order they were sent");
+
+    // `ratio_follow` is a 1-based name for one of the pictures this request carries. Naming a fourth
+    // in a two-picture request is a client mistake; following "whichever one we have" instead would
+    // answer a request nobody made, so it is refused rather than clamped.
+    const OpenAIImagesRequest follows_second =
+        parse(Json{{"model", "qwen-image"},
+                   {"prompt", "x"},
+                   {"image", Json::array({"YWJj", "ZGVm"})},
+                   {"ratio_follow", "<image2>"}});
+    failures += check(follows_second.ratio_follow &&
+                          *follows_second.ratio_follow == "<image2>",
+                      "ratio_follow may name any reference the request carries");
+
+    const ApiError past = api_error([&] {
+        parse(Json{{"model", "qwen-image"},
+                   {"prompt", "x"},
+                   {"image", Json::array({"YWJj", "ZGVm"})},
+                   {"ratio_follow", "<image3>"}});
+    });
+    failures += check(past.status == 400 && past.code == "image_ratio_follow_unsupported" &&
+                          past.param == "ratio_follow",
+                      "a ratio_follow naming a picture nobody sent is refused, not clamped");
+
+    const ApiError no_brackets = api_error([&] {
+        parse(Json{{"model", "qwen-image"},
+                   {"prompt", "x"},
+                   {"image", "YWJj"},
+                   {"ratio_follow", "image1"}});
+    });
+    failures += check(no_brackets.code == "image_ratio_follow_unsupported",
+                      "a tag without its angle brackets is the same refusal");
 
     const ApiError none = api_error([&] {
         parse(Json{{"model", "qwen-image"}, {"prompt", "x"}, {"image", Json::array()}});
@@ -272,7 +316,7 @@ int test_reference_image_field() {
 
     Json null_image = base_request();
     null_image["image"] = nullptr;
-    failures += check(parse(null_image).image.empty(), "null image falls back to text-to-image");
+    failures += check(parse(null_image).images.empty(), "null image falls back to text-to-image");
 
     const ApiError not_string =
         api_error([&] { parse(Json{{"model", "qwen-image"}, {"prompt", "x"}, {"image", 7}}); });
@@ -307,7 +351,7 @@ int test_reference_image_field() {
 
     const OpenAIImagesRequest edge = parse(
         Json{{"model", "qwen-image"}, {"prompt", "x"}, {"image", std::string(limit, 'A')}});
-    failures += check(edge.image.size() == limit, "base64 at the pre-gate boundary accepted");
+    failures += check(edge.images.size() == 1ULL && edge.images[0].size() == limit, "base64 at the pre-gate boundary accepted");
     return failures;
 }
 
@@ -445,7 +489,333 @@ int test_url_response_and_artifact_id() {
     return failures;
 }
 
+int test_prompt_enhance_field() {
+    int failures = 0;
+
+    // The enhancer switch is a real parameter of the family, so the parse accepts it and the
+    // SERVICE decides whether it can honor it. Refusing the key at the parse would tell a client
+    // that the parameter does not exist, which is a different (and less true) answer than
+    // "this build has no rewriter installed" -- and the route's whole whitelist exists so a
+    // dropped parameter is never mistaken for an honored one.
+    const OpenAIImagesRequest absent = parse(base_request());
+    failures += check(absent.prompt_enhance == PromptEnhanceMode::Off,
+                      "prompt_enhance is off unless asked for");
+
+    const OpenAIImagesRequest on =
+        parse(Json{{"model", "qwen-image"}, {"prompt", "x"}, {"prompt_enhance", true}});
+    failures += check(on.prompt_enhance == PromptEnhanceMode::On,
+                      "prompt_enhance true is captured, not refused at the parse");
+
+    const OpenAIImagesRequest off =
+        parse(Json{{"model", "qwen-image"}, {"prompt", "x"}, {"prompt_enhance", false}});
+    failures += check(off.prompt_enhance == PromptEnhanceMode::Off,
+                      "prompt_enhance false is captured");
+
+    // The third value is a string, not another boolean: a client that would rather not decide per
+    // request sends "auto" and lets the server's rule answer (image_generation_service.cpp
+    // wants_prompt_enhancement). The parse accepts it without looking at the instruction, because
+    // what auto runs on is a property of the whole request and of what the card can yield.
+    const OpenAIImagesRequest automatic =
+        parse(Json{{"model", "qwen-image"}, {"prompt", "x"}, {"prompt_enhance", "auto"}});
+    failures += check(automatic.prompt_enhance == PromptEnhanceMode::Auto,
+                      "prompt_enhance \"auto\" is captured, not refused at the parse");
+
+    const ApiError not_bool = api_error([&] {
+        parse(Json{{"model", "qwen-image"}, {"prompt", "x"}, {"prompt_enhance", "yes"}});
+    });
+    failures += check(not_bool.status == 400 && not_bool.param == "prompt_enhance",
+                      "prompt_enhance has to be a boolean or \"auto\"");
+
+    const ApiError not_a_switch = api_error([&] {
+        parse(Json{{"model", "qwen-image"}, {"prompt", "x"}, {"prompt_enhance", 1}});
+    });
+    failures += check(not_a_switch.status == 400 && not_a_switch.param == "prompt_enhance",
+                      "a number is not a switch either");
+    return failures;
+}
+
+
+int test_canvas_keys() {
+    int failures = 0;
+
+    const OpenAIImagesRequest none = parse(base_request());
+    failures += check(!none.size_requested && !none.wh_ratio && !none.ratio_follow &&
+                          none.width == 768 && none.height == 768,
+                      "no canvas key: the 768x768 default stands");
+
+    const OpenAIImagesRequest size =
+        parse(Json{{"model", "qwen-image"}, {"prompt", "x"}, {"size", "544x608"}});
+    failures += check(size.size_requested && size.width == 544 && size.height == 608,
+                      "an explicit size is recorded as the canvas");
+
+    const OpenAIImagesRequest ratio =
+        parse(Json{{"model", "qwen-image"}, {"prompt", "x"}, {"wh_ratio", "16:9"}});
+    failures += check(ratio.wh_ratio == "16:9" && !ratio.size_requested, "wh_ratio captured");
+
+    const OpenAIImagesRequest follow = parse(Json{{"model", "qwen-image"},
+                                                 {"prompt", "x"},
+                                                 {"image", "YWJj"},
+                                                 {"ratio_follow", "<image1>"}});
+    failures += check(follow.ratio_follow == "<image1>",
+                      "ratio_follow <image1> names the one reference and is accepted");
+
+    // Exactly one of the three. A precedence would let a client that sent two believe the one it
+    // cared about was honored, which is worse than a refusal.
+    const ApiError size_and_ratio = api_error([&] {
+        parse(Json{{"model", "qwen-image"}, {"prompt", "x"}, {"size", "544x608"}, {"wh_ratio", "16:9"}});
+    });
+    failures += check(size_and_ratio.status == 400 && size_and_ratio.code == "image_size_conflict",
+                      "size plus wh_ratio is refused, not ordered");
+
+    const ApiError size_and_follow = api_error([&] {
+        parse(Json{{"model", "qwen-image"}, {"prompt", "x"}, {"size", "544x608"},
+                   {"ratio_follow", "<image1>"}});
+    });
+    failures += check(size_and_follow.code == "image_size_conflict", "size plus ratio_follow refused");
+
+    const ApiError ratio_and_follow = api_error([&] {
+        parse(Json{{"model", "qwen-image"}, {"prompt", "x"}, {"wh_ratio", "16:9"},
+                   {"ratio_follow", "<image1>"}});
+    });
+    failures += check(ratio_and_follow.code == "image_size_conflict",
+                      "wh_ratio plus ratio_follow refused");
+
+    const ApiError wrong_separator = api_error([&] {
+        parse(Json{{"model", "qwen-image"}, {"prompt", "x"}, {"wh_ratio", "16x9"}});
+    });
+    failures += check(wrong_separator.code == "image_ratio_invalid" &&
+                          wrong_separator.param == "wh_ratio",
+                      "wh_ratio needs a colon");
+
+    const ApiError zero_side = api_error([&] {
+        parse(Json{{"model", "qwen-image"}, {"prompt", "x"}, {"wh_ratio", "0:16"}});
+    });
+    failures += check(zero_side.code == "image_ratio_invalid", "a zero ratio side is refused");
+
+    const ApiError extreme = api_error([&] {
+        parse(Json{{"model", "qwen-image"}, {"prompt", "x"}, {"wh_ratio", "1:200"}});
+    });
+    failures += check(extreme.code == "image_ratio_invalid", "an aspect past 1:64 is refused");
+
+    // A tag is a NAME, and a name has to resolve: the index is checked against the references the
+    // request actually carries. Naming a second picture in a one-picture request, or naming any
+    // picture in a request with none, both answer a request nobody made -- and a ratio_follow that
+    // is silently ignored is the dropped-parameter failure this module's key whitelist exists to
+    // prevent, so neither is a fallback to "follow whatever we have".
+    const ApiError second = api_error([&] {
+        parse(Json{{"model", "qwen-image"}, {"prompt", "x"}, {"image", "YWJj"},
+                   {"ratio_follow", "<image2>"}});
+    });
+    failures += check(second.code == "image_ratio_follow_unsupported",
+                      "ratio_follow naming a picture the request does not carry is refused");
+
+    const ApiError orphan = api_error([&] {
+        parse(Json{{"model", "qwen-image"}, {"prompt", "x"},
+                   {"ratio_follow", "<image1>"}});
+    });
+    failures += check(orphan.code == "image_ratio_follow_unsupported",
+                      "ratio_follow with no reference at all is refused, not ignored");
+
+    const ApiError untagged = api_error([&] {
+        parse(Json{{"model", "qwen-image"}, {"prompt", "x"}, {"ratio_follow", "image1"}});
+    });
+    failures += check(untagged.code == "image_ratio_follow_unsupported",
+                      "ratio_follow needs the engine's own <image1> tag");
+    return failures;
+}
+
+int test_canvas_geometry() {
+    int failures = 0;
+    auto divisible = [](std::uint32_t v) { return v % 32 == 0 && v >= kMinimumImageDimension; };
+
+    // width/height are in/out, exactly as the service calls it: the request's own fields go in and the
+    // canvas comes back out, so "an explicit size is honored" is the early return rather than a branch
+    // every caller has to remember.
+    const auto canvas = [](OpenAIImagesRequest request, std::uint32_t ref_w, std::uint32_t ref_h) {
+        resolve_canvas_geometry(request, ref_w, ref_h, request.width, request.height);
+        return std::pair<std::uint32_t, std::uint32_t>{request.width, request.height};
+    };
+
+    // A portrait reference must produce a portrait canvas. This is the whole point of the package: the
+    // square default conditioned the model on an aspect its target grid did not have.
+    const auto [w, h] = canvas(parse(base_request()), 1000, 1500);
+    failures += check(h > w && divisible(w) && divisible(h),
+                      "a portrait reference gets a portrait canvas");
+    const double area = static_cast<double>(w) * static_cast<double>(h);
+    failures += check(area > kCanvasTargetArea * 0.8 && area < kCanvasTargetArea * 1.25,
+                      "the aspect is filled to the configured area, not grown by it");
+    failures += check(std::abs(static_cast<double>(w) / static_cast<double>(h) - 1000.0 / 1500.0) < 0.05,
+                      "the reference aspect is preserved to within one snap");
+
+    const auto [lw, lh] = canvas(parse(base_request()), 1600, 900);
+    failures += check(lw > lh && divisible(lw) && divisible(lh),
+                      "a landscape reference gets a landscape canvas");
+
+    // The same picture, drawn at a size on request, keeps that size: the reference never overrides an
+    // order.
+    {
+        OpenAIImagesRequest ordered  = parse(base_request());
+        ordered.width               = 544;
+        ordered.height              = 608;
+        ordered.size_requested      = true;
+        const auto [ow, oh] = canvas(ordered, 1000, 1500);
+        failures += check(ow == 544 && oh == 608, "an explicit size is not touched by the reference");
+    }
+
+    {
+        OpenAIImagesRequest named = parse(base_request());
+        named.wh_ratio            = "2:1";
+        const auto [nw, nh] = canvas(named, 0, 0);
+        failures += check(std::abs(static_cast<double>(nw) / static_cast<double>(nh) - 2.0) < 0.06 &&
+                              divisible(nw) && divisible(nh),
+                          "wh_ratio holds its ratio at the working area");
+    }
+
+    {
+        const auto [pw, ph] = canvas(parse(base_request()), 0, 0);
+        failures += check(pw == 768 && ph == 768, "text-to-image with no aspect keeps 768x768");
+    }
+
+    // An extreme aspect is clamped into the drawable band rather than emitting a degenerate grid.
+    const auto [xw, xh] = canvas(parse(base_request()), 4000, 32);
+    failures += check(xw <= kMaximumImageDimension && xh >= kMinimumImageDimension && divisible(xw) &&
+                          divisible(xh),
+                      "an extreme reference aspect stays inside the dimension limits");
+    return failures;
+}
+
 } // namespace
+
+// The edit route: the generations validation, plus the one rule that a reference must be
+// there, plus the multipart form an OpenAI SDK posts translated into the same document.
+int test_edit_route() {
+    int failures = 0;
+    const auto edit_parse = [](Json body) { return parse_openai_images_edit_request(body); };
+
+    const ApiError none = api_error([&] { edit_parse(base_request()); });
+    failures += check(none.status == 400 && none.param == "image" &&
+                          none.code == "image_reference_required",
+                      "an edit with no reference is refused, not drawn from text");
+    const ApiError blank = api_error([&] {
+        edit_parse(Json{{"model", "qwen-image"}, {"prompt", "x"}, {"image", ""}});
+    });
+    failures += check(blank.status == 400 && blank.code == "image_count_invalid",
+                      "an empty payload is the generations count error, before the edit rule");
+
+    const OpenAIImagesRequest edited =
+        edit_parse(Json{{"model", "qwen-image"}, {"prompt", "make it an owl"},
+                        {"image", "YWJj"}});
+    failures += check(edited.images.size() == 1ULL && edited.images[0] == "YWJj", "the reference survives the edit parse");
+    failures += check(edited.prompt == "make it an owl", "the instruction survives it too");
+
+    const OpenAIImagesRequest wrapped = edit_parse(Json{{"model", "qwen-image"},
+                                                     {"prompt", "x"},
+                                                     {"image", Json::array({"YWJj"})}});
+    failures += check(wrapped.images.size() == 1ULL && wrapped.images[0] == "YWJj", "the family's array-of-one form edits too");
+
+    // A reference does not make a client's other mistakes legal: the canvas rules still apply.
+    const ApiError bad_size = api_error([&] {
+        edit_parse(Json{{"model", "qwen-image"}, {"prompt", "x"}, {"image", "YWJj"},
+                        {"size", "777x777"}});
+    });
+    failures += check(bad_size.status == 400 && bad_size.code == "image_size_invalid",
+                      "an edit validates its canvas exactly like a generation does");
+
+    // ---- the multipart form an OpenAI SDK posts ----------------------------------------
+    MultipartEditParts parts;
+    parts.fields.emplace_back("model", "qwen-image");
+    parts.fields.emplace_back("prompt", "tan the face");
+    parts.fields.emplace_back("negative_prompt", "blurry");
+    parts.fields.emplace_back("steps", "30");
+    parts.fields.emplace_back("seed", "7");
+    parts.fields.emplace_back("true_cfg_scale", "1.5");
+    parts.files.emplace_back("image", std::string("abc"));
+    const Json built = edit_body_from_multipart(parts);
+    failures += check(built.at("image") == "YWJj", "the file part becomes the base64 reference");
+    failures += check(built.at("steps").is_number() && built.at("steps") == 30 &&
+                          built.at("seed").is_number() && built.at("seed") == 7 &&
+                          built.at("true_cfg_scale").is_number(),
+                      "numeric text parts stay numbers, so the ordinary range checks apply");
+    const OpenAIImagesRequest from_form = edit_parse(built);
+    failures += check(from_form.steps == 30U && from_form.images.size() == 1ULL && from_form.images[0] == "YWJj" &&
+                          from_form.seed.has_value() && *from_form.seed == 7ULL &&
+                          from_form.true_cfg_scale > 1.0,
+                      "the multipart document parses as an edit request through the shared path");
+
+    // Two pictures in the form are BOTH references -- the family's point, and the opposite of
+    // the quiet drop a route that only had one slot used to perform. Past the cap it is a count error
+    // that says so, again rather than a picture nobody asked to be discarded.
+    MultipartEditParts two;
+    two.files.emplace_back("image", std::string("a"));
+    two.fields.emplace_back("model", "qwen-image");
+    two.fields.emplace_back("prompt", "x");
+    two.files.emplace_back("image", std::string("b"));
+    const Json both_images = edit_body_from_multipart(two);
+    failures += check(both_images.at("image").is_array() &&
+                          both_images.at("image").size() == 2ULL &&
+                          both_images.at("image")[0] == "YQ==" &&
+                          both_images.at("image")[1] == "Yg==",
+                      "two file parts are two references, not one that won");
+    failures += check(edit_parse(both_images).images.size() == 2ULL,
+                      "and both survive the shared parse");
+
+    MultipartEditParts mixed;
+    mixed.fields.emplace_back("image", "YWJj");
+    mixed.fields.emplace_back("model", "qwen-image");
+    mixed.fields.emplace_back("prompt", "x");
+    mixed.files.emplace_back("image", std::string("abc"));
+    failures += check(edit_parse(edit_body_from_multipart(mixed)).images.size() == 2ULL,
+                      "a text reference and a file reference are both references");
+
+    MultipartEditParts over;
+    over.fields.emplace_back("model", "qwen-image");
+    over.fields.emplace_back("prompt", "x");
+    for (std::size_t i = 0; i <= kMaximumImageReferences; ++i) {
+        over.files.emplace_back("image", std::string("a"));
+    }
+    const ApiError too_many = api_error([&] { (void)edit_body_from_multipart(over); });
+    failures += check(too_many.status == 400 && too_many.code == "image_count_invalid" &&
+                          too_many.param == "image",
+                      "a form past the cap is refused, never trimmed");
+    MultipartEditParts masked;
+    masked.files.emplace_back("mask", std::string("abc"));
+    const ApiError mask = api_error([&] { (void)edit_body_from_multipart(masked); });
+    failures += check(mask.code == "image_mask_not_supported" && mask.param == "mask",
+                      "a mask is refused by name, never ignored");
+
+    MultipartEditParts odd;
+    odd.files.emplace_back("picture", std::string("abc"));
+    const ApiError other = api_error([&] { (void)edit_body_from_multipart(odd); });
+    failures += check(other.code == "image_unsupported_file_field",
+                      "an unknown file part is refused, not silently dropped");
+
+    MultipartEditParts text_ref;
+    text_ref.fields.emplace_back("image", "YWJj");
+    failures += check(edit_body_from_multipart(text_ref).at("image") == "YWJj",
+                      "a base64 text part named image is the reference too");
+
+    MultipartEditParts dup;
+    dup.fields.emplace_back("prompt", "first");
+    dup.fields.emplace_back("prompt", "second");
+    failures += check(edit_body_from_multipart(dup).at("prompt") == "first",
+                      "a repeated text part is the client's ambiguity, and the first wins");
+
+    MultipartEditParts bad_steps;
+    bad_steps.fields.emplace_back("model", "qwen-image");
+    bad_steps.fields.emplace_back("prompt", "x");
+    bad_steps.fields.emplace_back("steps", "abc");
+    const ApiError steps = api_error([&] { edit_parse(edit_body_from_multipart(bad_steps)); });
+    failures += check(steps.status == 400 && steps.param == "steps",
+                      "a non-numeric steps is the value error, not a type error");
+
+    MultipartEditParts empty;
+    empty.fields.emplace_back("model", "qwen-image");
+    empty.fields.emplace_back("prompt", "x");
+    const ApiError no_ref = api_error([&] { edit_parse(edit_body_from_multipart(empty)); });
+    failures += check(no_ref.code == "image_reference_required",
+                      "a form with no reference at all is the edit route's own refusal");
+    return failures;
+}
 
 int main() {
     int failures = 0;
@@ -456,6 +826,10 @@ int main() {
     failures += test_seed_and_unknown_keys();
     failures += test_steps();
     failures += test_reference_image_field();
+    failures += test_edit_route();
+    failures += test_prompt_enhance_field();
+    failures += test_canvas_keys();
+    failures += test_canvas_geometry();
     failures += test_true_cfg_fields();
     failures += test_response_builder();
     failures += test_url_response_and_artifact_id();

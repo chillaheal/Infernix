@@ -1578,8 +1578,8 @@ int test_streamed_function_calls() {
     std::vector<std::string> wire = stream.start();
     const auto append = [&](const std::vector<std::string>& next) { wire.insert(wire.end(), next.begin(), next.end()); };
     append(stream.content_delta("Checking."));
-    append(stream.tool_call_delta({.index = 0, .name = "weather", .arguments = R"({"city":"Pa)"}));
-    append(stream.tool_call_delta({.index = 0, .arguments = R"(ris"})", .complete = true}));
+    append(stream.tool_call_delta({.index = 0, .name = "weather", .arguments = R"JSON({"city":"Pa)JSON"}).events);
+    append(stream.tool_call_delta({.index = 0, .arguments = R"JSON(ris"})JSON", .complete = true}).events);
     GenerationOutcome outcome;
     outcome.text          = "Checking.";
     outcome.finish_reason = infernix::FinishReason::StopToken;
@@ -1630,7 +1630,7 @@ int test_streamed_function_calls() {
 
     OpenAIResponsesEventStream cut("resp_cut_call", 1, request, {});
     (void)cut.start();
-    (void)cut.tool_call_delta({.index = 0, .name = "weather", .arguments = R"({"city":"Pa)"});
+    (void)cut.tool_call_delta({.index = 0, .name = "weather", .arguments = R"JSON({"city":"Pa)JSON"}).events;
     GenerationOutcome cut_outcome;
     cut_outcome.finish_reason             = infernix::FinishReason::OutputLimit;
     const OpenAIResponsesStreamFinish cut_finish = cut.finish(cut_outcome);
@@ -1641,6 +1641,47 @@ int test_streamed_function_calls() {
                           cut_finish.response.output_history.empty() &&
                           parse_event(cut_finish.events_before_terminal.back()).at("item").at("status") == "incomplete",
                       "a cut streamed call was dropped, completed or stored");
+
+    // The server's own picture call: the round's result counts it, so it belongs in this list of
+    // calls -- but it earns no Item, and the Items beside it keep the numbering a client reads. It
+    // is what used to bring the server down: the list and the result fell out of step, and the
+    // mismatch was thrown at a caller that had no handler for it.
+    OpenAIResponsesEventStream mixed("resp_hidden_call", 1, request, {});
+    std::vector<std::string> mixed_wire = mixed.start();
+    const auto append_mixed = [&](const std::vector<std::string>& next) {
+        mixed_wire.insert(mixed_wire.end(), next.begin(), next.end());
+    };
+    const OpenAIResponsesToolCallEvents hidden = mixed.tool_call_delta(
+        {.index = 0, .name = "generate_image", .arguments = R"JSON({"prompt":"x"})JSON", .complete = true});
+    const OpenAIResponsesToolCallEvents late = mixed.tool_call_delta({.index = 0, .arguments = "x"});
+    const OpenAIResponsesToolCallEvents nameless = mixed.tool_call_delta({.index = 9, .arguments = "x"});
+    append_mixed(mixed.tool_call_delta({.index = 1, .name = "weather", .arguments = R"JSON({"city":"Pa)JSON"}).events);
+    append_mixed(
+        mixed.tool_call_delta({.index = 1, .arguments = R"JSON(ris"})JSON", .complete = true}).events);
+    GenerationOutcome mixed_outcome;
+    mixed_outcome.finish_reason = infernix::FinishReason::StopToken;
+    mixed_outcome.tool_calls    = {{.name = "generate_image", .arguments_json = R"JSON({"prompt":"x"})JSON"},
+                                   {.name = "weather", .arguments_json = R"JSON({"city":"Paris"})JSON"}};
+    const OpenAIResponsesStreamFinish mixed_finish = mixed.finish(mixed_outcome);
+    append_mixed(mixed_finish.events_before_terminal);
+    int items                       = 0;
+    bool named_picture              = false;
+    std::vector<int> positions;
+    for (const std::string& event_wire : mixed_wire) {
+        const Json event = parse_event(event_wire);
+        if (event.at("type") == "response.output_item.added") {
+            ++items;
+            positions.push_back(event.at("output_index").get<int>());
+            if (event.at("item").value("name", "") == "generate_image") { named_picture = true; }
+        }
+    }
+    failures += check(hidden.ok() && hidden.events.empty() && !late.ok() &&
+                          late.error == OpenAIResponsesProtocolError::DeltaAfterComplete &&
+                          !nameless.ok() && nameless.error == OpenAIResponsesProtocolError::MissingToolName,
+                      "the server's own picture call, or an unusable delta, was not handled as it should "
+                      "be (a refusal is returned, never thrown)");
+    failures += check(items == 1 && positions == std::vector<int>{0} && !named_picture,
+                      "a hidden picture call changed the published Items");
     return failures;
 }
 

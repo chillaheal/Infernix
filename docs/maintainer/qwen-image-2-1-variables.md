@@ -246,7 +246,7 @@ enforced in code and what tests it.
 | `kMinimumImageSteps` / `kMaximumImageSteps` | `[2, 100]`; floor because the schedule divides by `steps - 1`, ceiling bounds how long one request holds the yielded VRAM | [`openai_images.h:67-68`](../../src/serve/openai_images.h) | same schema test |
 | `kMinimumImageCFGScale` / `kMaximumImageCFGScale` | guidance in `[1, 20]`; above 1 doubles the per-step DiT forward | [`openai_images.h:50-51`](../../src/serve/openai_images.h) | same schema test |
 | `kMaximumImagePromptBytes` | 4096 bytes per prompt | [`openai_images.h:57`](../../src/serve/openai_images.h) | same schema test |
-| `kMaximumImageInputBytes` | a reference image's decoded payload at most 16 MiB | [`openai_images.h:56`](../../src/serve/openai_images.h) | the schema test's oversized-payload case (`infernix_openai_images_schema_test`) |
+| `kMaximumImageInputBytes` | a reference image's decoded payload at most 16 MiB | [`openai_images.h:54`](../../src/serve/openai_images.h) | same schema test, plus the chat tool's refusal of an oversized attachment (`infernix_chat_image_tool_test`) |
 | `kImageArtifactRoutePrefix` | `/v1/images/`, the only route that serves a finished picture | [`openai_images.h:45`](../../src/serve/openai_images.h) | the artifact route's id-shape gate (`infernix_http_routes_test`, `infernix_image_generation_service_test`) |
 | `kMaximumChatImageGenerations` | 4 pictures per chat request; each costs a full interlude | [`chat_image_tool.h:35`](../../src/serve/chat_image_tool.h) | `infernix_chat_image_tool_test` |
 | `kMaximumChatImageRounds` | 8 internal rounds per chat request, so bad arguments end as an ordinary answer | [`chat_image_tool.h:85`](../../src/serve/chat_image_tool.h) | `infernix_chat_image_tool_test` |

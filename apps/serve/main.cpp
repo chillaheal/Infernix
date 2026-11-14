@@ -334,21 +334,45 @@ int main(int argc, char** argv) {
         if (!options.image_artifact_path.empty()) {
             infernix::serve::PromptRendererProvider prompt_renderer;
             infernix::serve::PromptEmbedsProvider prompt_embeds;
+            infernix::serve::ReferencePromptRendererProvider reference_prompt_renderer;
             if (!options.image_text_processor_path.empty()) {
                 // Two halves of one route: rendering the prompt is host work the service does before it
-                // probes the yield; the tower forward needs the yielded VRAM.
+                // probes the yield; the tower forward needs the yielded VRAM. The edit route's renderer
+                // is the same host half for the RAW ti2i template: the admission sizes on the ids the
+                // conditioned tower will actually forward, pads included.
                 prompt_renderer = infernix::serve::make_tower_prompt_renderer(
                     options.image_text_processor_path);
                 prompt_embeds   = infernix::serve::make_tower_prompt_embeds_provider(
                     options.image_artifact_path);
+                reference_prompt_renderer = infernix::serve::make_tower_reference_prompt_renderer(
+                    options.image_text_processor_path);
             }
             image_jobs = std::make_unique<infernix::serve::ImageJobStore>(64, 256ULL << 20);
+            // The family's prompt enhancer is a separate checkpoint in a separate process (it wants
+            // about 20 GB of the card the LLM and the DiT also live on), and this is the handle on it.
+            // A configured sidecar that is not answering is deliberately NOT a startup failure: the
+            // route answers its documented 503 for prompt_enhance and every other request keeps
+            // serving, so an operator who starts the worker late -- or not at all -- loses one field.
+            std::shared_ptr<infernix::serve::PromptEnhancer> enhancer;
+            if (!options.image_prompt_enhancer_url.empty()) {
+                enhancer = std::make_shared<infernix::serve::PromptEnhancer>(
+                    options.image_prompt_enhancer_url, std::chrono::minutes(15));
+                logger->info("image prompt enhancer configured at {} ({})",
+                             options.image_prompt_enhancer_url,
+                             enhancer->healthy() ? "answering" : "not answering now");
+            }
             images     = std::make_unique<infernix::serve::ImageGenerationService>(
                 infernix::serve::make_engine_interlude_runner(service.engine()), *image_jobs,
                 std::move(prompt_renderer), std::move(prompt_embeds),
                 infernix::serve::make_artifact_dit_dims_provider(options.image_artifact_path),
                 infernix::serve::make_artifact_image_job_executor(options.image_artifact_path,
-                                                                  logger));
+                                                                  logger),
+                // The edit route's two remaining providers. The ViT lane's shape comes from the
+                // artifact's own component config so the ledger can reserve for an encode it has not
+                // run yet; without it a reference request is refused rather than guessed, because an
+                // under-reserved interlude takes the resident LLM down with it.
+                infernix::serve::make_artifact_vision_dims_provider(options.image_artifact_path),
+                std::move(reference_prompt_renderer), std::move(enhancer));
             server.attach_images(*images);
             // A picture's URL is the only handle a chat reply hands out, so the file behind it is kept
             // for a stated number of days and then swept; 0 switches the cleanup off, and the server

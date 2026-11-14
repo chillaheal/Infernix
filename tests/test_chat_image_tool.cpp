@@ -5,14 +5,19 @@
 // of a draw. The round loop ends in one answer that carries every URL.
 // CHAT_IMAGE_TOOL_TEST: PASS
 #include "serve/chat_image_tool.h"
+#include "product/media_acquire/source.h"
+#include "serve/image_generation_service.h"
 
 #include <infernix/types.h>
 
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -82,6 +87,27 @@ struct FakeGenerator {
 // and lose every record of what it was asked to draw.
 [[nodiscard]] ChatImageGenerator observer_of(FakeGenerator& generator) { return std::ref(generator); }
 
+// A request carrying `pictures` inline attachments, in the shape the protocols parse one. Hoisted out
+// of the argument-forms test because the attempt report needs a request with a picture to name, too.
+[[nodiscard]] GenerationRequest request_with_attachments(std::size_t pictures,
+                                                         const std::string& data_uri) {
+    using MediaSource = infernix::product::media_acquire::Source;
+    using MediaKind   = infernix::product::media_acquire::SourceKind;
+
+    GenerationRequest request;
+    ChatTurn user;
+    user.role = infernix::ChatRole::User;
+    user.content.push_back(ContentPart{.kind = ContentKind::Text, .text = "look at this"});
+    for (std::size_t index = 0; index < pictures; ++index) {
+        user.content.push_back(ContentPart{
+            .kind   = ContentKind::Image,
+            .source = MediaSource{.kind = MediaKind::Data, .value = data_uri},
+        });
+    }
+    request.messages.push_back(std::move(user));
+    return request;
+}
+
 [[nodiscard]] std::string tool_result_text(const GenerationRequest& request, std::size_t index) {
     const ChatTurn& turn = request.messages[index];
     return turn.content.empty() ? std::string() : turn.content.front().text;
@@ -96,6 +122,12 @@ void test_injection() {
     const ToolDefinition definition = make_chat_image_tool_definition();
     check(RequestJson::parse(definition.input_schema_json).contains("required"),
           "the hidden tool carries a parseable input schema with a required prompt");
+    // The schema is the only place the model reads its limits, so the joint-sequence ceiling belongs in
+    // its text: a model that learns the ceiling only from a 400 spends a round per guess to find it,
+    // which is the five wasted rounds the refusal was measured costing.
+    check(definition.input_schema_json.find("20480") != std::string::npos &&
+              definition.input_schema_json.find("(W/16)x(H/16)") != std::string::npos,
+          "the schema states the ceiling the canvas and the words share and how a canvas is counted");
 
     GenerationRequest disabled;
     disabled.tool_choice.mode = ToolChoiceMode::None;
@@ -296,14 +328,444 @@ void test_round_bound_and_cancellation() {
           "a cancelled generation draws nothing and is reported as it is");
 }
 
+// The chat `image` argument: three forms are resolved into the route's own base64 reference, and
+// every other shape -- including the base64 a model cannot type -- is refused with the accepted forms
+// in the text, because the model is the one that has to retry.
+void test_image_argument_forms() {
+    using MediaSource = infernix::product::media_acquire::Source;
+    using MediaKind   = infernix::product::media_acquire::SourceKind;
+
+    const ToolDefinition definition = make_chat_image_tool_definition();
+    const RequestJson schema        = RequestJson::parse(definition.input_schema_json);
+    const std::string described     = schema.at("properties").at("image").dump();
+    check(schema.at("properties").at("image").at("type") == "string",
+          "the hidden tool advertises an optional string image argument");
+    check(described.find("img-") != std::string::npos &&
+              described.find("attachment:N") != std::string::npos &&
+              described.find("base64") != std::string::npos &&
+              described.find("another machine") != std::string::npos,
+          "its description names exactly the forms that resolve, and the two that do not");
+
+    // A request carrying one inline attachment, as the protocols parse one.
+    const std::string data_uri = "data:image/png;base64,iVBORw0KGgo=";
+    const auto with_attachment = [&](std::size_t pictures) {
+        return request_with_attachments(pictures, data_uri);
+    };
+
+    {
+        // The file a picture this server drew leaves on disk, named by the id it came back with.
+        std::error_code ignored;
+        std::filesystem::create_directories("images", ignored);
+        const std::vector<std::uint8_t> png{0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a};
+        {
+            std::ofstream file("images/img-100-1.png", std::ios::binary | std::ios::trunc);
+            file.write(reinterpret_cast<const char*>(png.data()),
+                       static_cast<std::streamsize>(png.size()));
+        }
+        const std::string expected = base64_encode_bytes(png);
+
+        for (const std::string name : {std::string("img-100-1"), std::string(kUrlBase) + "img-100-1",
+                                       std::string("/v1/images/img-100-1")}) {
+            GenerationRequest request;
+            FakeGenerator generator;
+            const ChatImageToolRound round = run_chat_image_tool_round(
+                request, image_call_outcome({R"({"prompt":"again","image":")" + name + R"("})"}),
+                kImageModel, kUrlBase, 0, 0, observer_of(generator));
+            check(round.executed == 1 && generator.requests.size() == 1 &&
+                      generator.requests[0].images == std::vector<std::string>{expected},
+                  "the picture named \"" + (name.size() > 40 ? name.substr(0, 40) : name) +
+                      "\" is read back off disk as the route's reference");
+        }
+
+        // The list form. The route takes up to kMaximumImageReferences pictures and the chat argument
+        // has the same two shapes, each element resolved by its own rule -- which is what lets an
+        // instruction address <image1> and <image2> instead of one picture flattened in by hand. Before
+        // this, a list was left exactly as the model typed it and every element died as an undecodable
+        // reference, so the capability the route has was invisible to the chat path.
+        {
+            GenerationRequest request = with_attachment(1);
+            FakeGenerator generator;
+            const ChatImageToolRound round = run_chat_image_tool_round(
+                request,
+                image_call_outcome(
+                    {R"({"prompt":"keep the pose","image":["attachment:0","img-100-1"]})"}),
+                kImageModel, kUrlBase, 0, 0, observer_of(generator));
+            check(round.executed == 1 && generator.requests.size() == 1 &&
+                      generator.requests[0].images.size() == 2 &&
+                      generator.requests[0].images[0] ==
+                          data_uri.substr(data_uri.find(',') + 1) &&
+                      generator.requests[0].images[1] == expected,
+                  "a list of two forms reaches the route as two references, the attachment's own "
+                  "payload first and the drawn picture's bytes second");
+        }
+        {
+            // The same list, typed as a STRING. The schema declares `image` as a string, and a model
+            // that obeys that type while still passing the list embeds it as text -- which is exactly
+            // what /v1/chat/completions sent on 2026-11-02 for a two-reference instruction. It must
+            // resolve like the array it holds, not come back as an unusable job id.
+            GenerationRequest request = with_attachment(1);
+            FakeGenerator generator;
+            const ChatImageToolRound round = run_chat_image_tool_round(
+                request,
+                image_call_outcome({
+                    R"({"prompt":"keep the pose","image":"[\"attachment:0\",\"img-100-1\"]"})"}),
+                kImageModel, kUrlBase, 0, 0, observer_of(generator));
+            check(round.executed == 1 && generator.requests.size() == 1 &&
+                      generator.requests[0].images.size() == 2 &&
+                      generator.requests[0].images[0] ==
+                          data_uri.substr(data_uri.find(',') + 1) &&
+                      generator.requests[0].images[1] == expected,
+                  "a list typed as one string is still the list form: both entries resolve and the "
+                  "route gets two references");
+        }
+        {
+            // A bracket that is not a JSON array is not the list form either: it stays the string the
+            // model typed and comes back refused with the accepted forms, so nothing new is accepted.
+            GenerationRequest request = with_attachment(1);
+            FakeGenerator generator;
+            const ChatImageToolRound round = run_chat_image_tool_round(
+                request, image_call_outcome({R"({"prompt":"a","image":"[not json]"})"}),
+                kImageModel, kUrlBase, 0, 0, observer_of(generator));
+            check(round.executed == 0 && generator.calls == 0,
+                  "a string that only looks like a list draws nothing");
+            check(tool_result_text(request, request.messages.size() - 1)
+                      .find("attachment:N") != std::string::npos,
+                  "and it is refused with the forms the model may type instead");
+        }
+        {
+            // Past the cap the refusal is the ROUTE's, not one this layer invents: the elements are
+            // resolved first and the count is still refused, so the model gets the code and the wording
+            // the capability document promises for that mistake.
+            GenerationRequest request = with_attachment(1);
+            FakeGenerator generator;
+            const std::string five =
+                R"({"prompt":"a","image":["img-100-1","img-100-1","img-100-1","img-100-1","img-100-1"]})";
+            const ChatImageToolRound round = run_chat_image_tool_round(
+                request, image_call_outcome({five}), kImageModel, kUrlBase, 0, 0,
+                observer_of(generator));
+            check(round.executed == 0 && generator.calls == 0,
+                  "five references in one list draw nothing");
+            check(tool_result_text(request, request.messages.size() - 1)
+                      .find("reference images") != std::string::npos,
+                  "and the refusal that reaches the model is the route's count error in its own words");
+        }
+
+        // Every refusal: no draw, an error result, and the accepted forms in its text.
+        struct Refusal {
+            std::string argument;
+            std::string why;
+        };
+        const std::vector<Refusal> refusals{
+            {"img-7-7", "a drawn picture that is not on disk"},
+            {"http://elsewhere.example/v1/images/img-100-1", "a picture on another machine"},
+            {"iVBORw0KGgoAAAANSUhEUg", "raw base64 the model cannot have typed"},
+            {"data:image/png;base64,iVBORw0KGgo=", "a data URI in the argument"},
+            {"attachment:1", "an attachment index past what the request carries"},
+            {"attachment:x", "a non-numeric attachment index"},
+        };
+        for (const Refusal& refusal : refusals) {
+            GenerationRequest request = with_attachment(1);
+            FakeGenerator generator;
+            const ChatImageToolRound round = run_chat_image_tool_round(
+                request, image_call_outcome({R"({"prompt":"again","image":")" + refusal.argument +
+                                                       R"("})"}),
+                kImageModel, kUrlBase, 0, 0, observer_of(generator));
+            const std::string result = tool_result_text(request, request.messages.size() - 1);
+            check(round.executed == 0 && generator.calls == 0,
+                  "the refused form (" + refusal.why + ") never reaches the pipeline");
+            check(result.find("image_arguments_invalid") != std::string::npos &&
+                      result.find("attachment:N") != std::string::npos &&
+                      result.find(refusal.argument) != std::string::npos,
+                  "and comes back naming the argument, the reason and the forms that would work");
+            check(request.messages.back().tool_result_is_error,
+                  "the refusal is marked as an error result for the model to act on");
+        }
+
+        // attachment:N is the user's own picture, in the shape the route already takes.
+        for (const std::string argument : {"attachment:0", "attachment:1"}) {
+            GenerationRequest request = with_attachment(1);
+            FakeGenerator generator;
+            const ChatImageToolRound round = run_chat_image_tool_round(
+                request, image_call_outcome({R"({"prompt":"again","image":")" + argument + R"("})"}),
+                kImageModel, kUrlBase, 0, 0, observer_of(generator));
+            const bool accepted = argument == "attachment:0";
+            check(generator.calls == (accepted ? 1 : 0) && round.executed == (accepted ? 1 : 0) &&
+                      round.rejected == 0,
+                  std::string(accepted ? "attachment:0 resolves to " : "the index in ") + argument +
+                      (accepted ? " the request's own attachment" : " that this request lacks"));
+            if (accepted) {
+                // The route's own parser keeps the base64 of a data: URI and drops the prefix, so
+                // "unchanged" here means the same payload bytes, not the same string.
+                check(generator.requests[0].images ==
+                          std::vector<std::string>{data_uri.substr(data_uri.find(',') + 1)},
+                      "an inline attachment travels to the route as its own payload, not decoded "
+                      "and re-typed");
+            }
+        }
+
+        // Bytes, the shape a server-internal caller can carry.
+        {
+            GenerationRequest request;
+            ChatTurn user;
+            user.role = infernix::ChatRole::User;
+            const std::vector<std::uint8_t> bytes{1, 2, 3, 4, 5};
+            user.content.push_back(ContentPart{
+                .kind = ContentKind::Image,
+                .source = MediaSource{.kind = MediaKind::Bytes, .bytes = bytes},
+            });
+            request.messages.push_back(std::move(user));
+            FakeGenerator generator;
+            const ChatImageToolRound round = run_chat_image_tool_round(
+                request, image_call_outcome({R"({"prompt":"again","image":"attachment:0"})"}),
+                kImageModel, kUrlBase, 0, 0, observer_of(generator));
+            check(generator.calls == 1 && round.executed == 1 &&
+                      generator.requests[0].images ==
+                          std::vector<std::string>{base64_encode_bytes(bytes)},
+                  "an attachment carried as bytes is encoded into the route's reference");
+        }
+
+        // Over the reference limit: refused here rather than decoded and failed deeper down.
+        {
+            GenerationRequest request;
+            ChatTurn user;
+            user.role = infernix::ChatRole::User;
+            std::vector<std::uint8_t> huge(kMaximumImageInputBytes + 1, 0x20);
+            user.content.push_back(ContentPart{
+                .kind   = ContentKind::Image,
+                .source = MediaSource{.kind = MediaKind::Bytes, .bytes = std::move(huge)},
+            });
+            request.messages.push_back(std::move(user));
+            FakeGenerator generator;
+            const ChatImageToolRound round = run_chat_image_tool_round(
+                request, image_call_outcome({R"({"prompt":"again","image":"attachment:0"})"}),
+                kImageModel, kUrlBase, 0, 0, observer_of(generator));
+            check(generator.calls == 0 && round.executed == 0 &&
+                      request.messages.back().tool_result_is_error,
+                  "an attachment larger than a reference may be is refused before any work");
+        }
+
+        std::filesystem::remove("images/img-100-1.png", ignored);
+        std::filesystem::remove("images", ignored);
+    }
+}
+
+// The client's own witness of every picture this request asked for. The rounds were invisible by
+// construction: the tool result went back to the model, which had seen the refusal and told the user
+// something else (2026-11-02, a face swap refused by the model itself, then reported as a VRAM
+// shortage of a figure nobody had read from anywhere). These are the facts the response now carries
+// beside the answer -- the ask as the call named it, and which half of it the server answered.
+void test_attempts_are_reported() {
+    {
+        // A picture that came: both halves, ask and result, and no error half.
+        GenerationRequest request =
+            request_with_attachments(1, "data:image/png;base64,iVBORw0KGgo=");
+        FakeGenerator generator;
+        const ChatImageToolRound round = run_chat_image_tool_round(
+            request,
+            image_call_outcome({R"({"prompt":"a","size":"768x768","steps":20,"seed":7,)"
+                               R"("image":"attachment:0","prompt_enhance":"auto"})"}),
+            kImageModel, kUrlBase, 0, 0, observer_of(generator));
+        const RequestJson attempts = chat_image_attempts_json(round.attempts);
+        check(round.attempts.size() == 1 && attempts.size() == 1,
+              "one tool call is one attempt");
+        const RequestJson& item = attempts.at(0);
+        check(item.at("outcome") == "succeeded" && item.at("tool_call_id") == "infernix_img_0",
+              "a drawn picture is reported as succeeded, tied to the call that asked for it");
+        const RequestJson& asked = item.at("request");
+        check(asked.at("size") == "768x768" && asked.at("steps") == 20 &&
+                  asked.at("image_count") == 1 && asked.at("seed") == 7 &&
+                  asked.at("prompt_enhance") == "auto",
+              "the attempt reports the size, steps, reference count, seed and rewrite the call asked "
+              "for -- read before the reference was replaced by base64");
+        const RequestJson& result = item.at("result");
+        check(result.at("url") == round.urls.front() && result.at("id") == round.ids.front(),
+              "and the artifact the server actually handed back");
+        check(!item.contains("error"), "a picture that came carries no error half");
+    }
+    {
+        // A refusal keeps the ask: the client needs the size that was refused to know what to retry.
+        GenerationRequest request;
+        FakeGenerator generator;
+        generator.fail_status = 503;
+        generator.fail_code   = "image_vram_insufficient";
+        const ChatImageToolRound round = run_chat_image_tool_round(
+            request, image_call_outcome({R"({"prompt":"a","size":"2048x2048"})"}), kImageModel,
+            kUrlBase, 0, 0, observer_of(generator));
+        const RequestJson item = chat_image_attempts_json(round.attempts).at(0);
+        check(item.at("outcome") == "refused" &&
+                  item.at("error").at("code") == "image_vram_insufficient" &&
+                  item.at("error").at("http_status") == 503,
+              "a route refusal is reported as refused with the route's own code and status");
+        check(item.at("request").at("size") == "2048x2048" && !item.contains("result"),
+              "and the size that was refused travels with it, without a result half");
+    }
+    {
+        // A 5xx is not an argument: the same record, a different outcome, so a client retries the
+        // request instead of rewriting it.
+        GenerationRequest request;
+        FakeGenerator generator;
+        generator.fail_status = 500;
+        generator.fail_code   = "image_generation_failed";
+        const ChatImageToolRound round = run_chat_image_tool_round(
+            request, image_call_outcome({R"({"prompt":"a"})"}), kImageModel, kUrlBase, 0, 0,
+            observer_of(generator));
+        const RequestJson item = chat_image_attempts_json(round.attempts).at(0);
+        check(item.at("outcome") == "failed" &&
+                  item.at("error").at("code") == "image_generation_failed",
+              "a draw that broke inside the server is reported as failed, not refused");
+    }
+    {
+        // The same word, on the operator's side. Both witnesses answer one question about one draw, and
+        // they used to answer it differently: the image_job line mapped any 5xx to "failed", so a 503
+        // image_vram_insufficient -- a refusal the client was correctly told is a refusal -- read
+        // afterwards as a broken server to whoever opened requests.jsonl. One function now, over every
+        // status an image route answers with.
+        check(std::string(image_outcome_word(500)) == "failed" &&
+                  std::string(image_outcome_word(400)) == "refused" &&
+                  std::string(image_outcome_word(409)) == "refused" &&
+                  std::string(image_outcome_word(429)) == "refused" &&
+                  std::string(image_outcome_word(503)) == "refused",
+              "a 500 is the only failed answer; the admission gates' 400, 409, 429 and 503 are refusals "
+              "in requests.jsonl too, so the operator's line and the client's attempt cannot disagree "
+              "about the same draw");
+    }
+    {
+        // The per-request cap and unparseable arguments are refusals too, with the status a client
+        // would have seen on the route. The cap refuses before the arguments are read, so it has no
+        // ask to report -- and says so by leaving the field out rather than inventing one.
+        GenerationRequest capped;
+        FakeGenerator generator;
+        const ChatImageToolRound over_cap = run_chat_image_tool_round(
+            capped, image_call_outcome({R"({"prompt":"a","size":"512x512"})"}), kImageModel, kUrlBase,
+            0, kMaximumChatImageGenerations, observer_of(generator));
+        const RequestJson limited = chat_image_attempts_json(over_cap.attempts).at(0);
+        check(limited.at("outcome") == "refused" &&
+                  limited.at("error").at("code") == "image_generation_limit_reached" &&
+                  limited.at("error").at("http_status") == 429 && !limited.contains("request"),
+              "the picture cap is reported as a refusal with its status, and with no ask it never read");
+
+        GenerationRequest malformed;
+        const ChatImageToolRound bad_json = run_chat_image_tool_round(
+            malformed, image_call_outcome({"this is not json"}), kImageModel, kUrlBase, 0, 0,
+            observer_of(generator));
+        const RequestJson bad = chat_image_attempts_json(bad_json.attempts).at(0);
+        check(bad.at("outcome") == "refused" &&
+                  bad.at("error").at("code") == "image_arguments_invalid" &&
+                  bad.at("error").at("http_status") == 400,
+              "arguments that never were a request are reported as the 400 the route would have said");
+    }
+
+    {
+        // Through the loop: the round number is the loop's, so a client can tell three tries from one,
+        // and the whole array rides to the response on the answer itself.
+        GenerationRequest request;
+        FakeGenerator generator;
+        GenerationOutcome first  = image_call_outcome({R"({"prompt":"one"})"});
+        GenerationOutcome second = image_call_outcome({R"({"prompt":"two"})"});
+        std::vector<GenerationOutcome> pending{std::move(second),
+                                               prose_outcome("both drawn")};
+        const ChatImageRounds loop = run_chat_image_rounds(
+            request, std::move(first), kImageModel, kUrlBase, 0, observer_of(generator), [&] {
+                GenerationOutcome next = std::move(pending.front());
+                pending.erase(pending.begin());
+                return next;
+            });
+        const RequestJson attempts = chat_image_attempts_for_response(loop.answer);
+        check(attempts.is_array() && attempts.size() == 2 && loop.attempts.size() == 2,
+              "both rounds' attempts reach the answer as one array");
+        check(attempts.at(0).at("round") == 1 && attempts.at(1).at("round") == 2,
+              "each is numbered by the round it ran in, not by its own call");
+        check(loop.answer.image_tool_attempts_json.has_value(),
+              "the answer carries the serialized form the response writers emit");
+    }
+    {
+        // The byte-identity rule: a request that drew nothing has no field at all -- not an empty
+        // array, which a client would read as "it tried and produced nothing".
+        GenerationRequest request;
+        FakeGenerator generator;
+        const ChatImageRounds loop = run_chat_image_rounds(
+            request, prose_outcome("just an answer"), kImageModel, kUrlBase, 0,
+            observer_of(generator), [] { return prose_outcome("unreachable"); });
+        check(!loop.answer.image_tool_attempts_json.has_value() &&
+                  loop.attempts.empty() && chat_image_attempts_for_response(loop.answer).is_null(),
+              "a plain chat answer asks for no picture and gains no field");
+    }
+}
+
 } // namespace
+
+// The rewriter's switch on the chat path. The tool's arguments are parsed by the images route's own
+// parser (run_chat_image_tool_round), so prompt_enhance is not a field this layer has to learn about --
+// what has to be proven is that it SURVIVES into the request the pipeline is handed, in both spellings
+// the parser takes, that a call which did not ask still gets no rewrite, and that a value the contract
+// refuses becomes a correctable tool error rather than a silent no-rewrite. The schema itself is held
+// to the capability document by the http routes test, not here.
+void test_prompt_enhance_passes_through() {
+    struct Case {
+        const char* arguments;
+        PromptEnhanceMode expected;
+        const char* what;
+    };
+    const Case cases[] = {
+        {R"({"prompt":"a","prompt_enhance":"auto"})", PromptEnhanceMode::Auto,
+         "auto reaches the images request as auto"},
+        {R"({"prompt":"a","prompt_enhance":true})", PromptEnhanceMode::On,
+         "the boolean true reaches it as on"},
+        {R"({"prompt":"a","prompt_enhance":false})", PromptEnhanceMode::Off,
+         "the boolean false reaches it as off"},
+        {R"({"prompt":"a"})", PromptEnhanceMode::Off,
+         "a call that never asked is left with no rewrite"},
+    };
+    for (const Case& item : cases) {
+        GenerationRequest request;
+        FakeGenerator generator;
+        const ChatImageToolRound round = run_chat_image_tool_round(
+            request, image_call_outcome({item.arguments}), kImageModel, kUrlBase, 0, 0,
+            observer_of(generator));
+        check(round.executed == 1 && generator.requests.size() == 1 &&
+                  generator.requests[0].prompt_enhance == item.expected,
+              item.what);
+    }
+
+    GenerationRequest request;
+    FakeGenerator generator;
+    const ChatImageToolRound refused = run_chat_image_tool_round(
+        request, image_call_outcome({R"({"prompt":"a","prompt_enhance":"yes"})"}), kImageModel,
+        kUrlBase, 0, 0, observer_of(generator));
+    check(refused.executed == 0 && generator.calls == 0 &&
+              tool_result_text(request, 1).find("prompt_enhance") != std::string::npos,
+          "a prompt_enhance that is neither a boolean nor \"auto\" never reaches the pipeline and "
+          "comes back naming the field the model has to fix");
+
+    // The promise the schema text makes to a client that never read a document: asking for a rewrite on
+    // a build with no rewriter is the documented refusal INSIDE the tool result, which the model can
+    // work around by answering in words -- not a chat request that dies with a 503 the caller cannot
+    // act on. This is the difference between offering the switch on the chat path and advertising a
+    // route that takes the user's question down with it.
+    GenerationRequest asked;
+    FakeGenerator no_rewriter;
+    no_rewriter.fail_status = 503;
+    no_rewriter.fail_code   = "image_prompt_enhancer_unavailable";
+    const ChatImageToolRound refused_hard = run_chat_image_tool_round(
+        asked, image_call_outcome({R"({"prompt":"a","prompt_enhance":true})"}), kImageModel, kUrlBase,
+        0, 0, observer_of(no_rewriter));
+    const std::string said = tool_result_text(asked, 1);
+    check(refused_hard.executed == 0 && refused_hard.urls.empty() &&
+              asked.messages.size() == 2 && asked.messages[1].tool_result_is_error &&
+              said.find("image_prompt_enhancer_unavailable") != std::string::npos,
+          "a true on a build without a rewriter settles as that documented refusal in the tool result, "
+          "so the picture is not drawn and the answer still reaches the user");
+}
 
 int main() {
     test_injection();
+    test_image_argument_forms();
     test_round_detection();
     test_single_round();
+    test_prompt_enhance_passes_through();
     test_cap_and_bad_arguments();
     test_pipeline_failure_becomes_a_tool_result();
+    test_attempts_are_reported();
     test_url_suffix();
     test_round_loop();
     test_round_bound_and_cancellation();

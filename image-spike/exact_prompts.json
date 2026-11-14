@@ -1,0 +1,24 @@
+[
+    {
+        "name":  "rebase-a",
+        "max_tokens":  96,
+        "thinking":  false,
+        "messages":  [
+                         {
+                             "role":  "user",
+                             "content":  "Describe in one short paragraph what a CUDA graph captures."
+                         }
+                     ]
+    },
+    {
+        "name":  "rebase-b",
+        "max_tokens":  96,
+        "thinking":  false,
+        "messages":  [
+                         {
+                             "role":  "user",
+                             "content":  "List three reasons an expert cache misses on a routed MoE."
+                         }
+                     ]
+    }
+]

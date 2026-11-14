@@ -1,6 +1,7 @@
 #include "serve/openai_chat.h"
 #include "product/constraint_observation.h"
 
+#include "serve/chat_image_tool.h" // chat_image_attempts_for_response
 #include "serve/completion_timings.h"
 #include "serve/generation_service.h"
 #include "serve/openai_common.h"
@@ -126,23 +127,41 @@ Json stream_choice(Json delta, Json finish_reason = nullptr) {
 std::string event(Json payload) { return "data: " + payload.dump() + "\n\n"; }
 
 std::string chunk(const OpenAIChatResponseIdentity& identity, Json delta, Json finish_reason,
-                  bool include_usage, Json timings = nullptr, Json constraint = nullptr) {
+                  bool include_usage, Json timings = nullptr, Json constraint = nullptr,
+                  Json image_tool_attempts = nullptr) {
     Json payload       = base_payload(identity, "chat.completion.chunk");
     payload["choices"] = Json::array({stream_choice(std::move(delta), std::move(finish_reason))});
     if (include_usage) { payload["usage"] = nullptr; }
     if (!timings.is_null()) { payload["timings"] = std::move(timings); }
     if (!constraint.is_null()) payload["constraint"] = std::move(constraint);
+    // The hidden tool's attempts belong on the terminal chunk only, beside usage and timings: they
+    // describe work that is finished, and a client accumulating deltas should read them once.
+    if (!image_tool_attempts.is_null()) {
+        payload["image_tool_attempts"] = std::move(image_tool_attempts);
+    }
     return event(std::move(payload));
 }
 
 std::string usage_chunk(const OpenAIChatResponseIdentity& identity, const CompletionUsage& usage,
-                        Json timings, Json constraint, bool with_choice) {
+                        Json timings, Json constraint, bool with_choice,
+                        Json image_tool_attempts = nullptr) {
     Json payload       = base_payload(identity, "chat.completion.chunk");
     payload["choices"] = with_choice ? Json::array({stream_choice(Json::object())}) : Json::array();
     payload["usage"]   = usage_json(usage);
     payload["timings"] = std::move(timings);
     if (!constraint.is_null()) payload["constraint"] = std::move(constraint);
+    if (!image_tool_attempts.is_null()) {
+        payload["image_tool_attempts"] = std::move(image_tool_attempts);
+    }
     return event(std::move(payload));
+}
+
+// The attempt array, or null when this request drew no picture -- and null means the field is not
+// emitted at all, which is the whole reason a plain chat answer is the same bytes it was before the
+// field existed. The reading itself belongs to the tool that writes the string: see
+// chat_image_attempts_for_response.
+[[nodiscard]] Json image_tool_attempts_json(const GenerationOutcome& outcome) {
+    return chat_image_attempts_for_response(outcome);
 }
 
 void require_prefix(std::string_view complete, std::string_view streamed, const char* channel) {
@@ -186,6 +205,11 @@ std::string make_chat_completion_response(const OpenAIChatResponseIdentity& iden
     payload["timings"] = timings_json(outcome_timings(outcome));
     if (outcome.constraint)
         payload["constraint"] = product::constraint_observation_json(outcome.constraint);
+    // Additive, and absent whenever this request drew no picture: the picture's fate is the server's
+    // own record, and the client is not left to take the model's word for it.
+    if (Json attempts = image_tool_attempts_json(outcome); !attempts.is_null()) {
+        payload["image_tool_attempts"] = std::move(attempts);
+    }
     return payload.dump();
 }
 
@@ -286,25 +310,74 @@ std::string OpenAIChatStream::content_delta(const std::string& text) {
     return chunk(identity_, Json{{"content", text}}, nullptr, include_usage_, live_timings_json());
 }
 
-std::string OpenAIChatStream::tool_call_delta(const infernix::ToolCallDelta& delta) {
-    const bool opens = delta.index == calls_.size();
-    if (!started_ || finished_ || (opens && delta.name.empty()) ||
-        (!opens && (delta.index + 1U != calls_.size() || calls_.back().complete || !delta.name.empty()))) {
-        throw std::logic_error("invalid OpenAI Chat tool-call delta state");
+const char* describe_openai_chat_protocol_error(OpenAIChatProtocolError error) noexcept {
+    switch (error) {
+    case OpenAIChatProtocolError::None:
+        return "accepted";
+    case OpenAIChatProtocolError::NotStarted:
+        return "a tool-call delta arrived before the message started";
+    case OpenAIChatProtocolError::AlreadyFinished:
+        return "a tool-call delta arrived after the message finished";
+    case OpenAIChatProtocolError::MissingToolName:
+        return "a tool call was opened without a tool name";
+    case OpenAIChatProtocolError::DeltaAfterComplete:
+        return "a tool-call delta reached a call that was already complete";
+    case OpenAIChatProtocolError::ToolChangedMidCall:
+        return "a tool call changed its name while it streamed";
     }
-    Json call{{"index", delta.index}};
+    return "invalid OpenAI Chat tool-call delta";
+}
+
+OpenAIChatToolCallChunk OpenAIChatStream::tool_call_delta(const infernix::ToolCallDelta& delta) {
+    // Decided before anything is mutated, and never thrown: a delta the adapter cannot use is model
+    // output on a trust boundary, and only ever costs the request that carried it.
+    if (!started_) { return {{}, OpenAIChatProtocolError::NotStarted}; }
+    if (finished_) { return {{}, OpenAIChatProtocolError::AlreadyFinished}; }
+
+    // The call the Engine means, by the number the Engine gave it -- not this list's size, which a
+    // call the server hides never advanced, and which the Engine's own numbering has never followed.
+    std::size_t position = calls_.size();
+    for (std::size_t index = 0; index < calls_.size(); ++index) {
+        if (calls_[index].engine_index == delta.index) { position = index; break; }
+    }
+    const bool opens = position == calls_.size();
     if (opens) {
-        calls_.push_back(StreamedCall{.id = new_openai_chat_tool_call_id(), .name = delta.name});
-        call["id"]       = calls_.back().id;
-        call["type"]     = "function";
-        call["function"] = Json{{"name", delta.name}, {"arguments", delta.arguments}};
-    } else {
-        call["function"] = Json{{"arguments", delta.arguments}};
+        if (delta.name.empty()) { return {{}, OpenAIChatProtocolError::MissingToolName}; }
+    } else if (calls_[position].complete) {
+        return {{}, OpenAIChatProtocolError::DeltaAfterComplete};
+    } else if (!delta.name.empty() && delta.name != calls_[position].name) {
+        return {{}, OpenAIChatProtocolError::ToolChangedMidCall};
     }
-    calls_.back().arguments += delta.arguments;
-    calls_.back().complete = delta.complete;
-    return chunk(identity_, Json{{"tool_calls", Json::array({std::move(call)})}}, nullptr,
-                 include_usage_, live_timings_json());
+
+    if (opens) {
+        calls_.push_back(StreamedCall{.engine_index    = delta.index,
+                                      .published_index = 0,
+                                      .hidden          = delta.name == kChatImageToolName,
+                                      .id              = new_openai_chat_tool_call_id(),
+                                      .name            = delta.name});
+        position = calls_.size() - 1U;
+        if (!calls_[position].hidden) { calls_[position].published_index = next_published_index_++; }
+    }
+    // Each call extends its own arguments: the calls of a turn may interleave.
+    StreamedCall& call = calls_[position];
+    call.arguments += delta.arguments;
+    call.complete = delta.complete;
+    if (call.hidden) {
+        // The server runs this call itself, so it is absent from the message the client reads --
+        // while staying in this list, which the turn's result is matched against by position.
+        return {{}, OpenAIChatProtocolError::None};
+    }
+    Json body{{"index", call.published_index}};
+    if (opens) {
+        body["id"]       = call.id;
+        body["type"]     = "function";
+        body["function"] = Json{{"name", delta.name}, {"arguments", delta.arguments}};
+    } else {
+        body["function"] = Json{{"arguments", delta.arguments}};
+    }
+    return {chunk(identity_, Json{{"tool_calls", Json::array({std::move(body)})}}, nullptr,
+                  include_usage_, live_timings_json()),
+            OpenAIChatProtocolError::None};
 }
 
 std::vector<std::string> OpenAIChatStream::finish(const GenerationOutcome& outcome) {
@@ -328,6 +401,9 @@ std::vector<std::string> OpenAIChatStream::finish(const GenerationOutcome& outco
     const Json constraint     = product::constraint_observation_json(outcome.constraint);
     const Json final_timings  = timings_json(outcome_timings(outcome));
     const Json output_timings = timings_per_token_ ? final_timings : Json(nullptr);
+    // Once, on whichever chunk closes the stream: the usage chunk when the client asked for usage,
+    // the finish-reason chunk otherwise. A client that reads both still sees the field exactly once.
+    const Json attempts       = image_tool_attempts_json(outcome);
     std::vector<std::string> events;
     const std::string reasoning_suffix = outcome.reasoning.substr(reasoning_.size());
     if (!reasoning_suffix.empty()) {
@@ -355,15 +431,17 @@ std::vector<std::string> OpenAIChatStream::finish(const GenerationOutcome& outco
         }
         events.push_back(chunk(identity_, Json::object(), finish_reason(outcome), include_usage_,
                                include_usage_ ? Json(nullptr) : final_timings,
-                               include_usage_ ? Json(nullptr) : constraint));
+                               include_usage_ ? Json(nullptr) : constraint,
+                               include_usage_ ? Json(nullptr) : attempts));
     } else {
         events.push_back(chunk(identity_, Json::object(), finish_reason(outcome.finish_reason),
                                include_usage_, include_usage_ ? Json(nullptr) : final_timings,
-                               include_usage_ ? Json(nullptr) : constraint));
+                               include_usage_ ? Json(nullptr) : constraint,
+                               include_usage_ ? Json(nullptr) : attempts));
     }
     if (include_usage_) {
         events.push_back(usage_chunk(identity_, usage_from(outcome), final_timings, constraint,
-                                     usage_chunk_choice_));
+                                     usage_chunk_choice_, attempts));
     }
     events.emplace_back("data: [DONE]\n\n");
     return events;

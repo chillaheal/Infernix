@@ -1001,10 +1001,11 @@ int test_streamed_tool_calls() {
         events.insert(events.end(), std::make_move_iterator(values.begin()), std::make_move_iterator(values.end()));
     };
     append(stream.content_delta("Checking."));
-    append(stream.tool_call_delta({.index = 0, .name = "Edit", .arguments = R"({"zeta":)"}));
-    append(stream.tool_call_delta({.index = 0, .arguments = R"("last"})", .complete = true}));
+    append(stream.tool_call_delta({.index = 0, .name = "Edit", .arguments = R"({"zeta":)"}).events);
+    append(stream.tool_call_delta({.index = 0, .arguments = R"("last"})", .complete = true}).events);
     append(stream.tool_call_delta({.index = 1, .name = "tool_search_tool_regex", .arguments = R"({"pattern":"x"})",
-                                   .complete = true}));
+                                   .complete = true})
+               .events);
     GenerationOutcome outcome;
     outcome.text          = "Checking.";
     outcome.finish_reason = infernix::FinishReason::StopToken;
@@ -1046,13 +1047,62 @@ int test_streamed_tool_calls() {
     // A call the output limit cut closes its block before message_delta with what it streamed.
     AnthropicMessagesStream cut(identity, 10);
     (void)cut.start();
-    (void)cut.tool_call_delta({.index = 0, .name = "Edit", .arguments = R"({"ze)"});
+    (void)cut.tool_call_delta({.index = 0, .name = "Edit", .arguments = R"({"ze)"}).events;
     GenerationOutcome cut_outcome;
     cut_outcome.finish_reason = infernix::FinishReason::OutputLimit;
     const std::vector<std::string> cut_events = cut.finish(cut_outcome);
     failures += check(cut_events.size() == 3 && parse_event(cut_events[0]).at("type") == "content_block_stop" &&
                           parse_event(cut_events[1]).at("delta").at("stop_reason") == "max_tokens",
                       "a cut streamed call did not close before the terminal message_delta");
+
+    // The server's own picture call: it is part of the generation's result, so it belongs in the
+    // stream's list of calls -- and it earns no content block, while the client's call beside it is
+    // numbered as if it had never been there. (It is what used to bring the server down: the list
+    // and the result fell out of step, and the mismatch was thrown at a caller that could not
+    // catch it.)
+    AnthropicMessagesStream mixed(identity, 0, false, searches);
+    std::vector<std::string> mixed_events{mixed.start()};
+    const auto append_mixed = [&](std::vector<std::string> values) {
+        mixed_events.insert(mixed_events.end(), std::make_move_iterator(values.begin()),
+                            std::make_move_iterator(values.end()));
+    };
+    append_mixed(mixed.content_delta("One moment."));
+    const AnthropicToolCallEvents hidden = mixed.tool_call_delta(
+        {.index = 0, .name = "generate_image", .arguments = R"JSON({"prompt":"x"})JSON", .complete = true});
+    const AnthropicToolCallEvents late   = mixed.tool_call_delta({.index = 0, .arguments = "x"});
+    const AnthropicToolCallEvents nameless = mixed.tool_call_delta({.index = 9, .arguments = "x"});
+    append_mixed(mixed.tool_call_delta({.index = 1, .name = "Edit", .arguments = R"X({"file_)X"}).events);
+    append_mixed(mixed.tool_call_delta({.index = 1, .arguments = R"X(path":"/tmp/a"})X",
+                                        .complete  = true})
+                     .events);
+    GenerationOutcome mixed_outcome;
+    mixed_outcome.text          = "One moment.";
+    mixed_outcome.finish_reason = infernix::FinishReason::StopToken;
+    mixed_outcome.tool_calls    = {{.name = "generate_image", .arguments_json = R"JSON({"prompt":"x"})JSON"},
+                                   {.name = "Edit", .arguments_json = R"JSON({"file_path":"/tmp/a"})JSON"}};
+    const std::vector<ToolCall> mixed_calls = mixed.identify_calls(mixed_outcome);
+    AnthropicResponseSegment mixed_segment{
+        .outcome = &mixed_outcome, .calls = mixed_calls, .search_results = {}};
+    mixed_segment.search_results.resize(mixed_calls.size());
+    append_mixed(mixed.finish(mixed_segment, mixed_outcome, std::nullopt));
+    int mixed_blocks  = 0;
+    int mixed_indices = -1;
+    bool picture_named = false;
+    failures += check(hidden.ok() && hidden.events.empty() && !late.ok() &&
+                          late.error == AnthropicProtocolError::DeltaAfterComplete && !nameless.ok() &&
+                          nameless.error == AnthropicProtocolError::MissingToolName,
+                      "the server's own picture call, or an unusable delta, was not handled as it "
+                      "should be (a refusal is returned, never thrown)");
+    for (const std::string& wire : mixed_events) {
+        const Json event = parse_event(wire);
+        if (event.at("type") == "content_block_start") {
+            ++mixed_blocks;
+            mixed_indices = event.at("index").get<int>();
+            if (event.at("content_block").value("name", "") == "generate_image") { picture_named = true; }
+        }
+    }
+    failures += check(mixed_blocks == 2 && mixed_indices == 1 && !picture_named,
+                      "a hidden picture call changed the published blocks");
     return failures;
 }
 
