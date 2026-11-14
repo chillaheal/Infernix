@@ -1,6 +1,6 @@
 // One joint-sequence ceiling, observable from the three places that must never disagree: the image
-// ops' refusal, /v1/capabilities, and the chat tool schema the model reads. Public behaviour only --
-// no mirror of the validation code.
+// ops' own ceiling check (it must refuse above the shared number and admit up to it), /v1/capabilities,
+// and the chat tool schema the model reads. Public behaviour only -- no mirror of the validation code.
 // IMAGE_JOINT_LIMITS_TEST: PASS
 #include "infernix/ops/image_joint_limits.h"
 #include "infernix/ops/attn_dit_joint.h"
@@ -35,6 +35,29 @@ bool refuses_with(const Fn& fn, const std::string& op) {
         fn();
     } catch (const std::invalid_argument& error) {
         return std::string(error.what()) == infernix::ops::image_joint_range_message(op);
+    } catch (...) {
+        return false;
+    }
+    return false;
+}
+
+// The other half of the boundary. An entry handed a token count the shared ceiling admits must get PAST
+// the joint-range gate: with the null data pointer these operands keep, it then stops one step later on
+// a different validation with its own text. Requiring exactly that text is what makes the check able to
+// fail -- it proves the entry was really reached and that the shared gate, not a private bound, is what
+// let S through. An entry that quietly kept (or reintroduced) its own lower ceiling answers here with the
+// shared refusal text, which is the failure this suite exists to prevent: serve admits the job, the op
+// refuses, the client gets a 500 instead of a 400. Throwing nothing would mean a launch, so that counts
+// as a failure too -- this suite must never reach a device.
+template <typename Fn>
+bool accepts_past_the_ceiling_check(const Fn& fn, const std::string& op,
+                                    const std::string& expected_next_refusal) {
+    try {
+        fn();
+    } catch (const std::invalid_argument& error) {
+        const std::string text = error.what();
+        return text == expected_next_refusal &&
+               text != infernix::ops::image_joint_range_message(op);
     } catch (...) {
         return false;
     }
@@ -120,21 +143,27 @@ void entry_adaln_gate_add_masked(std::int32_t tokens) {
     infernix::ops::adaln_gate_add_masked(residual, branch, mod, 0, target_mask, out, nullptr);
 }
 
-struct refusal_case {
-    const char* entry;   // the public entry point, named in the check line
-    const char* prefix;  // the op prefix every refusal of this domain carries
+struct boundary_case {
+    const char* entry;           // the public entry point, named in the check line
+    const char* prefix;          // the op prefix every refusal of this domain carries
     void (*run)(std::int32_t tokens);
+    const char* next_refusal;    // what the SAME entry must refuse with once the joint gate lets S
+                                 // through: the first validation after it, which the null data pointer
+                                 // alone makes refuse
 };
 
-const refusal_case kCases[] = {
-    {"attn_dit_joint", "attn_dit_joint", &entry_attn},
-    {"attn_dit_joint_block_causal", "attn_dit_joint", &entry_attn_block_causal},
-    {"rope_c64(rot, q, k)", "rope_c64", &entry_rope_pair},
-    {"rope_c64(rot, x)", "rope_c64", &entry_rope_single},
-    {"adaln_scale", "dit_adaln", &entry_adaln_scale},
-    {"adaln_gate_add", "dit_adaln", &entry_adaln_gate_add},
-    {"adaln_scale_masked", "dit_adaln", &entry_adaln_scale_masked},
-    {"adaln_gate_add_masked", "dit_adaln", &entry_adaln_gate_add_masked},
+const boundary_case kCases[] = {
+    {"attn_dit_joint", "attn_dit_joint", &entry_attn, "attn_dit_joint: invalid q"},
+    {"attn_dit_joint_block_causal", "attn_dit_joint", &entry_attn_block_causal,
+     "attn_dit_joint: invalid image_ids [S,1,1,1] I32"},
+    {"rope_c64(rot, q, k)", "rope_c64", &entry_rope_pair, "rope_c64: invalid rot"},
+    {"rope_c64(rot, x)", "rope_c64", &entry_rope_single, "rope_c64: invalid rot"},
+    {"adaln_scale", "dit_adaln", &entry_adaln_scale, "dit_adaln: invalid activation x"},
+    {"adaln_gate_add", "dit_adaln", &entry_adaln_gate_add, "dit_adaln: invalid activation residual"},
+    {"adaln_scale_masked", "dit_adaln", &entry_adaln_scale_masked,
+     "dit_adaln: invalid activation x"},
+    {"adaln_gate_add_masked", "dit_adaln", &entry_adaln_gate_add_masked,
+     "dit_adaln: invalid activation residual"},
 };
 
 } // namespace
@@ -150,13 +179,21 @@ int main() {
               !infernix::ops::image_joint_tokens_ok(kCeiling + 1),
           "an empty or over-long sequence is rejected");
 
-    // b-1 and b+1 on the upper and lower bound, for every public entry, through one helper.
-    for (const refusal_case& c : kCases) {
+    // Both sides of the boundary for every public entry, through one table: refusing at ceiling+1 and
+    // at 0 is only half the invariant -- an entry that kept its own private bound would refuse nowhere
+    // near the shared number and still satisfy those two checks while the serve admitted the job. So
+    // each entry must also let an admitted token count past the joint check, at the ceiling itself and
+    // one under it, landing on the validation that follows.
+    for (const boundary_case& c : kCases) {
         const std::string name = std::string(c.entry) + " [" + c.prefix + "]";
         check(refuses_with([&] { c.run(kCeiling + 1); }, c.prefix),
               name + " refuses one over the ceiling naming the shared number");
         check(refuses_with([&] { c.run(0); }, c.prefix),
               name + " refuses an empty sequence naming the same number");
+        check(accepts_past_the_ceiling_check([&] { c.run(kCeiling); }, c.prefix, c.next_refusal),
+              name + " admits a sequence at the ceiling, refusing only past the joint check");
+        check(accepts_past_the_ceiling_check([&] { c.run(kCeiling - 1); }, c.prefix, c.next_refusal),
+              name + " admits a sequence one under the ceiling, refusing only past the joint check");
     }
 
     const std::string ceiling = std::to_string(kCeiling);
