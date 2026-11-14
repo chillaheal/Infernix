@@ -7,6 +7,11 @@
 
 #ifdef INFERNIX_IMAGE_READS_ARTIFACT_CONSTANTS
 
+// kQwenImageRopeTheta: the pipeline implementation default that an artifact-declared "rope_theta" has to
+// agree with. The emitter in rope.cpp is the only thing that ROTATES, and it always rotates with that
+// constant -- reading it here is a check on what the artifact CLAIMS, never a value the code adopts.
+#include "models/qwen_image/rope.h"
+
 #include <cmath>
 #include <string>
 #include <string_view>
@@ -102,6 +107,84 @@ bool known_key(std::string_view key) {
         if (candidate == key) { return true; }
     }
     return false;
+}
+
+// --- the "dit" component document -------------------------------------------------------------
+//
+// The dit config is the checkpoint's own transformer/config.json and carries the whole transformer
+// architecture, so these helpers differ from the scheduler ones in one deliberate way: no key allowlist
+// (the recipe's parameter contract owns the rest) and a prefix naming the document the operator can
+// match against --image-artifact. The strictness that does apply is the same: no coercion, no defaults.
+constexpr std::string_view kDitDocument    = "the dit config ";
+constexpr std::string_view kRopeAxesKey    = "axes_dims_rope";
+constexpr std::string_view kRopeHeadDimKey = "attention_head_dim";
+constexpr std::string_view kRopeThetaKey   = "rope_theta";
+
+std::string dit_absent_key(std::string_view key) {
+    return std::string(kDitDocument) + "has no " + quoted_key(key) +
+           ", which the DiT rope rotation reads from the artifact";
+}
+
+std::string dit_wrong_type(std::string_view key, const Json& value, std::string_view wanted) {
+    return std::string(kDitDocument) + quoted_key(key) + " is " + value.dump() + " but must be " +
+           std::string(wanted) + "; the reader does not coerce a JSON type";
+}
+
+std::expected<std::int64_t, std::string> dit_required_integer(const Json& config, std::string_view key) {
+    if (!config.contains(key)) { return std::unexpected(dit_absent_key(key)); }
+    const Json& value = config.at(key);
+    if (!value.is_number_integer()) { return std::unexpected(dit_wrong_type(key, value, "a JSON integer")); }
+    return value.get<std::int64_t>();
+}
+
+// A refusal about the axes list always names the key (the operator greps for it), prints the document's
+// own declaration, and says which axis is the problem.
+std::string dit_axes_refusal(const Json& axes, std::string_view what) {
+    return std::string(kDitDocument) + quoted_key(kRopeAxesKey) + " is " + axes.dump() + " but the DiT "
+           "rope rotation requires " + std::string(what);
+}
+
+std::string theta_authority() {
+    return "the supported Diffusers Qwen-Image pipeline's implementation default " +
+           std::to_string(static_cast<double>(kQwenImageRopeTheta)) +
+           " (src/models/qwen_image/rope.h, kQwenImageRopeTheta)";
+}
+
+// Theta is this build's pipeline implementation default and the artifact is never ASKED to declare one --
+// the shipped transformer/config.json carries no "rope_theta" key at all (verified against the live
+// artifact's own "dit" component), and no key was invented so the artifact would look like the source of a
+// value it never declared. But an artifact that DOES declare one is stating which rotary scheme its weights
+// were trained under, and the emitter would rotate them at the code's base regardless: that is a silent
+// numerical divergence between the artifact's declaration and the code's behaviour, the same class of hole
+// this task exists to close (the scheduler side refuses a foreign "_class_name" or an unverified mode flag
+// for exactly this reason, and this lane's text tower requires its rope_theta from the artifact and refuses
+// without it, image_weights.cpp). So a declared theta is VERIFIED, never ADOPTED: absent is the normal
+// case, present must be a JSON float equal to the code's value, and anything else refuses by key and value
+// and names whose value it is compared against.
+std::expected<void, std::string> dit_theta_agrees(const Json& config) {
+    if (!config.contains(kRopeThetaKey)) { return {}; }
+    const Json& value = config.at(kRopeThetaKey);
+    if (!value.is_number_float()) {
+        return std::unexpected(
+            dit_wrong_type(kRopeThetaKey, value, "a JSON float equal to " + theta_authority()));
+    }
+    const double declared = value.get<double>();
+    // Before any dump(): nlohmann's dump() THROWS on a non-finite number, so a NaN or inf declaration must
+    // not reach it. Non-finite declares no rotary scheme either way.
+    if (!std::isfinite(declared)) {
+        return std::unexpected(std::string(kDitDocument) + quoted_key(kRopeThetaKey) +
+                               " is not a finite number, so it declares no rotary scheme this build could "
+                               "compare with " + theta_authority());
+    }
+    if (declared != static_cast<double>(kQwenImageRopeTheta)) {
+        return std::unexpected(std::string(kDitDocument) + quoted_key(kRopeThetaKey) + " is " +
+                               value.dump() + " but this build rotates the DiT with " + theta_authority() +
+                               ": those weights were trained under a different rotary scheme, so the "
+                               "artifact is refused rather than drawn at a base it does not declare. "
+                               "Changing theta is a deliberate change of the supported pipeline "
+                               "implementation, not an artifact field.");
+    }
+    return {};
 }
 
 } // namespace
@@ -201,6 +284,88 @@ std::expected<SchedulerConstants, std::string> read_scheduler_config(const nlohm
     if (!(out.shift_terminal >= 0.0 && out.shift_terminal < 1.0)) {
         return std::unexpected(out_of_supported_range("shift_terminal", config.at("shift_terminal"),
                                             "a value in [0, 1): the stretch divides by 1 - shift_terminal"));
+    }
+    return out;
+}
+
+std::expected<DitRopeAxes, std::string> read_dit_rope_axes(const nlohmann::json& config) {
+    if (!config.is_object()) {
+        return std::unexpected(std::string(kDitDocument) +
+                               "is not a JSON object, so the DiT rope axes cannot be read from the artifact");
+    }
+    // The rotary scheme first, the arithmetic after -- the same order the scheduler reader uses, where a
+    // foreign "_class_name" or an unverified mode flag refuses before any number is read. A declared theta
+    // this build does not implement is a different scheme, so nothing about the axes can rescue it.
+    if (auto verdict = dit_theta_agrees(config); !verdict.has_value()) {
+        return std::unexpected(verdict.error());
+    }
+    std::int64_t head_dim = 0;
+    if (auto value = dit_required_integer(config, kRopeHeadDimKey); !value.has_value()) {
+        return std::unexpected(value.error());
+    } else {
+        head_dim = *value;
+    }
+    if (!config.contains(kRopeAxesKey)) { return std::unexpected(dit_absent_key(kRopeAxesKey)); }
+    const Json& axes = config.at(kRopeAxesKey);
+    if (!axes.is_array() || axes.size() != 3) {
+        return std::unexpected(dit_axes_refusal(
+            axes, "a JSON array of exactly the three axes the DiT rotates on (frame, height, width)"));
+    }
+
+    // The three values are read as the JSON integers they promise to be before any arithmetic: an axis
+    // written 16.0 or "16" is a different promise than the channel count the rotation divides by, and the
+    // reader coerces nothing.
+    std::int64_t value[3] = {0, 0, 0};
+    std::int64_t sum      = 0;
+    for (std::size_t i = 0; i < 3; ++i) {
+        const Json& axis = axes[i];
+        if (!axis.is_number_integer()) {
+            return std::unexpected(
+                dit_axes_refusal(axes, "three JSON integers, but axis " + std::to_string(i) + " is " +
+                                       axis.dump() + " and the reader does not coerce a JSON type"));
+        }
+        value[i] = axis.get<std::int64_t>();
+        // An absurd channel count could overflow the sum below and turn the refusal into a nonsense
+        // number, so it is refused outright -- by name and value. No DiT head is remotely this wide, and
+        // three values under this bound cannot overflow an int64 between them.
+        constexpr std::int64_t kLargestPlausibleHead = 1LL << 32;
+        if (value[i] >= kLargestPlausibleHead || value[i] <= -kLargestPlausibleHead) {
+            return std::unexpected(dit_axes_refusal(
+                axes, "each axis below " + std::to_string(kLargestPlausibleHead) + " channels, but axis " +
+                      std::to_string(i) + " is " + std::to_string(value[i])));
+        }
+        sum += value[i];
+    }
+
+    // The three axes together rotate the whole head: that is the arithmetic fact the rope table rests on
+    // (its width is sum / 2 == attention_head_dim / 2 interleaved (cos, sin) pairs, which is what
+    // ops::rope_c64 uploads), so a document that adds up to anything else is refused by both keys and
+    // both numbers. A head that is not a positive even channel count cannot be rotated either.
+    if (head_dim <= 0 || (head_dim % 2) != 0) {
+        return std::unexpected(std::string(kDitDocument) + quoted_key(kRopeHeadDimKey) + " is " +
+                               std::to_string(head_dim) + " but the DiT head must be a positive even count "
+                               "of channels for " + quoted_key(kRopeAxesKey) + " = " + axes.dump() +
+                               " to rotate it");
+    }
+    if (sum != head_dim) {
+        return std::unexpected(std::string(kDitDocument) + quoted_key(kRopeAxesKey) + " = " + axes.dump() +
+                               " sums to " + std::to_string(sum) + " but " + quoted_key(kRopeHeadDimKey) +
+                               " is " + std::to_string(head_dim) + ": the three axes have to add up to the "
+                               "head they rotate, so the rope table is attention_head_dim / 2 interleaved "
+                               "(cos, sin) pairs wide");
+    }
+
+    // Each axis is a count of head channels it rotates, so it must be positive and even: the emitter
+    // writes one interleaved (cos, sin) pair per two channels, and a zero, a negative or an odd axis
+    // would silently truncate the row. Checked after the sum so a document that cannot describe this
+    // architecture is refused for the arithmetic reason first, naming both keys.
+    DitRopeAxes out;
+    for (std::size_t i = 0; i < 3; ++i) {
+        if (value[i] <= 0 || (value[i] % 2) != 0) {
+            return std::unexpected(dit_axes_refusal(axes,
+                "positive even channel counts, but axis " + std::to_string(i) + " is " + std::to_string(value[i])));
+        }
+        out.axes[i] = static_cast<std::uint32_t>(value[i]);
     }
     return out;
 }

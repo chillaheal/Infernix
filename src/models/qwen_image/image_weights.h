@@ -72,6 +72,15 @@ struct DiTWeights {
     // supported FlowMatchEulerDiscrete scheme never gets here: bind_dit refuses it, so a zero set
     // (NEVER READ) cannot reach a job. docs/maintainer/qwen-image-2-1-variables.md.
     SchedulerConstants scheduler;
+    // The three rope axes the joint sequence is rotated on, read from the artifact's own "dit"
+    // component config by read_dit_rope_axes: the checkpoint's transformer/config.json declares them
+    // (the shipped architecture {16, 56, 56} over a 128-wide head) and the rope emitter sizes every row
+    // from them. An artifact whose axes do not describe a scheme this build rotates never gets here --
+    // bind_dit refuses it -- so a zero set (NEVER READ) cannot reach a job. The rotary BASE is not here:
+    // rope.h's kQwenImageRopeTheta is a pipeline implementation default the artifact is never asked to
+    // declare, and an artifact that does declare a "rope_theta" is refused by the same reader unless it
+    // agrees with that constant (verified, never adopted).
+    DitRopeAxes rope{};
     artifact::ParameterReference img_in, proj_out, modulation, norm_out;
     artifact::ParameterReference txt_in_in, txt_in_out, txt_in_norm;
     artifact::ParameterReference time_linear_1, time_linear_2;

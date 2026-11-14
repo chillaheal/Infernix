@@ -10,7 +10,18 @@
 //   | parameter                       | authority                              |
 //   |---------------------------------|----------------------------------------|
 //   | scheduler values and mode flags | the artifact                           |
+//   | DiT rope axes                   | the artifact                           |
+//   | DiT rope theta                  | the pipeline implementation (code)     |
 //   | CUDA launch configuration       | the runtime implementation             |
+//
+// The rope row is deliberately the odd one out: the shipped checkpoint declares no rope theta in
+// transformer/config.json at all (verified against the live artifact's own "dit" component), yet the
+// supported Diffusers Qwen-Image pipeline rotates with 10000, so naming it an artifact field would be
+// an invention. rope.h carries it as kQwenImageRopeTheta, a named implementation default that changes
+// only when the supported pipeline implementation is deliberately changed. An artifact that declares a
+// "rope_theta" of its own is therefore not a source of the value but a claim about the scheme its weights
+// were trained under: read_dit_rope_axes verifies such a claim against kQwenImageRopeTheta and refuses the
+// artifact when it disagrees, instead of silently rotating those weights at 10000.
 //
 // The scheduler document is the converter's verbatim copy of the checkpoint's own
 // scheduler/scheduler_config.json (tools/convert/qwen_image.py), packed as the artifact's "scheduler"
@@ -37,6 +48,16 @@ struct SchedulerConstants {
     double       max_shift          = 0.0;
     std::int64_t num_train_timesteps = 0;
     double       shift_terminal     = 0.0;
+};
+
+// The three axes the DiT rotates the joint sequence on (frame / height / width), exactly as the
+// artifact's "dit" component declares them: positive even channel counts summing to attention_head_dim,
+// so the emitted table is attention_head_dim / 2 interleaved (cos, sin) pairs wide. Nothing here is
+// pinned at the shipped {16, 56, 56} -- the emitter's row width comes from these numbers. Zero here
+// means NEVER READ: the only producer is read_dit_rope_axes, and the image execution refuses an unread
+// set before it allocates anything. Theta is NOT a member, because the artifact does not declare one.
+struct DitRopeAxes {
+    std::uint32_t axes[3] = {0, 0, 0};
 };
 
 } // namespace infernix::models::qwen_image
@@ -72,6 +93,21 @@ namespace infernix::models::qwen_image {
 // stochastic_sampling == false. A key the supported path has not verified is an unhandled scheme and is
 // refused, because the schedule it would produce is not this schedule.
 [[nodiscard]] std::expected<SchedulerConstants, std::string> read_scheduler_config(const nlohmann::json& config);
+
+// Read and verify the DiT rope axes from the artifact's "dit" component config -- the checkpoint's own
+// transformer/config.json, which the converter packed verbatim. "attention_head_dim" must be a JSON
+// integer and "axes_dims_rope" a JSON array of exactly three positive EVEN JSON integers whose sum is
+// that head width; anything else is a refusal naming the key, the offending value, and both numbers.
+// Unlike the scheduler document, this one carries the whole transformer architecture, so keys the rope
+// rotation does not read are the recipe's parameter contract's business and are not judged here. ONE
+// exception, and it is a fail-closed check rather than a source of values: if the artifact DOES declare a
+// "rope_theta", it must be a JSON float equal to this build's implementation default (rope.h,
+// kQwenImageRopeTheta) or the artifact is refused naming the key, the declared value and the authority it
+// was compared against. Absent is the shipped case and stays absent -- theta is never read FROM the
+// artifact (the emitter always rotates with the code's constant), but an artifact that declares another
+// base describes weights trained under a different rotary scheme, and drawing them at the code's base in
+// silence is the divergence this lane refuses everywhere else.
+[[nodiscard]] std::expected<DitRopeAxes, std::string> read_dit_rope_axes(const nlohmann::json& config);
 
 } // namespace infernix::models::qwen_image
 #endif // INFERNIX_IMAGE_READS_ARTIFACT_CONSTANTS

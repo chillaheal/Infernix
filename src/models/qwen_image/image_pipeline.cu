@@ -376,6 +376,14 @@ std::uint64_t host_block_cache_bytes(const artifact::Reader& reader, const DiTWe
     return one_block * dit.blocks.size();
 }
 
+// The rope width this build's Op rotates: ops::rope_c64 fixes the DiT head at 128 channels -- 64
+// interleaved (cos, sin) pairs -- and dit_block.cpp builds every head, q/k and rope view at exactly that
+// width (include/infernix/ops/rope_c64.h, src/models/qwen_image/dit_block.cpp). RUNTIME IMPLEMENTATION
+// FACT, not an artifact declaration: the artifact's own numbers are the axes, which read_dit_rope_axes
+// reads and the emitter sizes every row from. The gate below refuses an artifact whose axes do not
+// describe the head this kernel can rotate, instead of uploading a table the Op would misread.
+constexpr std::size_t kRopeC64HeadRowFloats = 128;
+
 GeneratedImage run_image_job(artifact::Reader& reader, const DiTWeights& dit, const VaeWeights& vae,
                              const ImageJobInputs& inputs, cudaStream_t stream,
                              ImageJobProgressView* progress,
@@ -391,6 +399,18 @@ GeneratedImage run_image_job(artifact::Reader& reader, const DiTWeights& dit, co
         throw std::runtime_error(
             "image job: the artifact's scheduler constants were never read, so this build would draw the "
             "job with a denoise schedule the artifact did not declare");
+    }
+    // The rope gate, same statement and same reason: the three axes are the artifact's own and only
+    // bind_dit produces them, so a zero axis is an artifact that said nothing about the rotary scheme,
+    // and a set that does not add up to this build's head (kRopeC64HeadRowFloats above) is an
+    // architecture ops::rope_c64 cannot rotate. Refused before the first ledger query, before any
+    // quiesce or yield, and before any CUDA allocation -- no joint sequence is assembled from guessed
+    // positions.
+    if (dit.rope.axes[0] == 0 || dit.rope.axes[1] == 0 || dit.rope.axes[2] == 0 ||
+        rope_row_floats(dit.rope) != kRopeC64HeadRowFloats) {
+        throw std::runtime_error(
+            "image job: the artifact's DiT rope axes were never read, or they describe a head this "
+            "build's rope Op cannot rotate");
     }
     // The stage telemetry goes through the caller's sink (the serving route's logger, serialized
     // against the console's stats panel); with no sink the certified route prints nothing.
@@ -513,7 +533,7 @@ GeneratedImage run_image_job(artifact::Reader& reader, const DiTWeights& dit, co
         edit_route = true;
         const std::vector<ImageShape> shapes    = joint_shapes();
         const std::vector<std::uint8_t> mask    = joint_mask(inputs.prompt_image_pad_mask, tp, "prompt");
-        layout   = build_joint_layout(mask, shapes);
+        layout   = build_joint_layout(dit.rope, mask, shapes);
         neg_edit = use_cfg;
         // The negative pass is the same references with its OWN prompt rows, so it carries its own mask:
         // a CFG run without one cannot be assembled (its image slots and its text rows are both unknown),
@@ -521,7 +541,7 @@ GeneratedImage run_image_job(artifact::Reader& reader, const DiTWeights& dit, co
         if (neg_edit) {
             const std::vector<std::uint8_t> mask_neg =
                 joint_mask(inputs.negative_prompt_image_pad_mask, tp_neg, "negative prompt");
-            layout_neg = build_joint_layout(mask_neg, shapes);
+            layout_neg = build_joint_layout(dit.rope, mask_neg, shapes);
         }
         // What the job already summed from its own inputs and what the layout derived from the mask
         // have to be the same numbers: they disagree only when the reference plane and the prompt were
@@ -622,26 +642,30 @@ GeneratedImage run_image_job(artifact::Reader& reader, const DiTWeights& dit, co
     std::vector<std::pair<int, int>> ref_grids_i;
     for (const auto& g : inputs.ref_grids) ref_grids_i.emplace_back(static_cast<int>(g.first), static_cast<int>(g.second));
     // The joint rope table. The text-to-image route asks the host rope module for it; the edit route
-    // already holds the [expanded_len,64,2] (cos,sin)-interleaved table that build_joint_layout walked
-    // with rope.{h,cpp}'s own emitter -- the very layout ops::rope_c64 uploads -- so it hands that
-    // straight over and adds no rope walk of its own.
+    // already holds the [expanded_len, rope_row/2, 2] (cos,sin)-interleaved table that build_joint_layout
+    // walked with rope.{h,cpp}'s own emitter -- the very layout ops::rope_c64 uploads -- so it hands that
+    // straight over and adds no rope walk of its own. Both routes get their rows from the SAME source:
+    // the artifact's own DiTWeights::rope, which the gate at the top of this job already proved was read
+    // and is exactly as wide as this build's Op rotates, so this module names no rope width of its own.
+    const std::size_t rope_row = rope_row_floats(dit.rope);
     if (edit_route) {
-        if (layout.rope.size() != static_cast<std::size_t>(layout.expanded_len) * 64 * 2) {
+        if (layout.rope.size() != static_cast<std::size_t>(layout.expanded_len) * rope_row) {
             throw std::runtime_error("image job: edit rope table size differs from the expanded sequence");
         }
         const auto bits = bits_of(layout.rope);
         drot.alloc(bits.size() * 2);
         h2d(drot.d, bits.data(), bits.size() * 2);
     } else {
-        const std::vector<float> rot = build_joint_rope_blocks(tp_i, ref_grids_i, static_cast<int>(Hl), static_cast<int>(Wl));
-        if (rot.size() != S * 64 * 2) { throw std::runtime_error("image job: rope table size differs from S"); }
+        const std::vector<float> rot =
+            build_joint_rope_blocks(dit.rope, tp_i, ref_grids_i, static_cast<int>(Hl), static_cast<int>(Wl));
+        if (rot.size() != S * rope_row) { throw std::runtime_error("image job: rope table size differs from S"); }
         const auto bits = bits_of(rot);
         drot.alloc(bits.size() * 2);
         h2d(drot.d, bits.data(), bits.size() * 2);
     }
     Buf drot_neg;
     if (neg_edit) {
-        if (layout_neg.rope.size() != static_cast<std::size_t>(layout_neg.expanded_len) * 64 * 2) {
+        if (layout_neg.rope.size() != static_cast<std::size_t>(layout_neg.expanded_len) * rope_row) {
             throw std::runtime_error("image job: negative edit rope table size differs from the sequence");
         }
         const auto bits = bits_of(layout_neg.rope);
@@ -649,9 +673,9 @@ GeneratedImage run_image_job(artifact::Reader& reader, const DiTWeights& dit, co
         h2d(drot_neg.d, bits.data(), bits.size() * 2);
     } else if (use_cfg) {
         const std::vector<float> rot_neg =
-            build_joint_rope_blocks(static_cast<int>(tp_neg), ref_grids_i, static_cast<int>(Hl),
+            build_joint_rope_blocks(dit.rope, static_cast<int>(tp_neg), ref_grids_i, static_cast<int>(Hl),
                                     static_cast<int>(Wl));
-        if (rot_neg.size() != S_neg * 64 * 2) {
+        if (rot_neg.size() != S_neg * rope_row) {
             throw std::runtime_error("image job: negative rope table size differs from the sequence");
         }
         const auto bits = bits_of(rot_neg);

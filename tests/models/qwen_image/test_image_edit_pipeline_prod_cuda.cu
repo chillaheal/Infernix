@@ -360,8 +360,10 @@ int main() {
         const std::vector<ImageShape> shapes{
             ImageShape{1, static_cast<long long>(kRefHl), static_cast<long long>(kRefWl)},
             ImageShape{1, static_cast<long long>(kTargetHl), static_cast<long long>(kTargetWl)}};
-        const JointLayout layout = build_joint_layout(std::span<const std::uint8_t>(joint_mask),
-                                                      std::span<const ImageShape>(shapes));
+        // The artifact's own rope axes (DiTWeights::rope, read_dit_rope_axes) -- the same set the route
+        // under test hands build_joint_layout, so this probe assembles the sequence the job assembles.
+        const JointLayout layout = build_joint_layout(dit.rope, std::span<const std::uint8_t>(joint_mask),
+                                                     std::span<const ImageShape>(shapes));
         require(layout.base_len == static_cast<long long>(kKept + kTargetTokens / 4),
                 "the joint layout's base length is not the prompt rows plus the target slots");
         require(layout.expanded_len == static_cast<long long>(kExpanded),

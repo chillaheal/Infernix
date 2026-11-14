@@ -450,7 +450,14 @@ int main() {
         // WIRED (variable-input #37): the DiT rotary comes from the production build_joint_rope module
         // (identical 3-axis formula to the oracle-ref build_rope); verified equal so the assembled pipeline
         // consumes the module, and resolution enters through (Hl,Wl) rather than a per-geometry .npy.
-        const std::vector<float> rot = qi::build_joint_rope((int)tp, (int)Hl, (int)Wl);
+        // The DiT rope axes come from the artifact's own "dit" component (16 / 56 / 56 over the 128-wide
+        // head), written out here for the same reason as the six schedule values above: this is a CUDA
+        // translation unit at C++20, where the artifact-facing reader (std::expected) is not compiled.
+        // tests/models/qwen_image/test_image_artifact_constants.cpp pins these three through
+        // read_dit_rope_axes against the live artifact's own dit config, and the rope module takes its
+        // base from rope.h's kQwenImageRopeTheta, so neither can drift without that gate failing.
+        const qi::DitRopeAxes rope_axes{{16, 56, 56}};
+        const std::vector<float> rot = qi::build_joint_rope(rope_axes, (int)tp, (int)Hl, (int)Wl);
         {
             const std::vector<float> rot_oracle = qo::build_rope(tp, Hl, Wl);
             const double r_par = qo::rel_fro(rot, rot_oracle);

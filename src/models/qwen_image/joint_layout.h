@@ -26,6 +26,8 @@
 // zero, and advances the position by max(h, w) after itself. Two images with no text between them stay
 // two blocks with two frame advances (img_shapes, not mask runs, define blocks).
 
+#include "models/qwen_image/artifact_constants.h"
+
 #include <cstdint>
 #include <span>
 #include <vector>
@@ -56,8 +58,9 @@ struct JointLayout {
     std::vector<long long> scatter_row;        // packed img_in row for that position, -1 on text rows
     std::vector<std::uint8_t> target_token_mask;        // 1 on the last block only (the modulation split)
     std::vector<long long> image_block_ids;    // index into img_shapes, -1 on text rows
-    std::vector<float> rope;                   // expanded_len * 64 * 2, (cos,sin) interleaved -- the
-                                               // same [S,64,2] layout ops::rope_c64 uploads today
+    std::vector<float> rope;                   // expanded_len * rope_row_floats(axes), (cos,sin)
+                                               // interleaved -- the same [S,axes/2,2] layout ops::rope_c64
+                                               // uploads today, with the widths the artifact declares
 };
 
 // Build the map. image_pad_mask is ONE row of build_img_mask's output (base + target_slots ones, uint8
@@ -68,7 +71,11 @@ struct JointLayout {
 // That invariant is the M1 geometry gate re-asserted at runtime; a mismatch means the reference plane
 // was resized differently by the vision and VAE paths, and the caller must fail the request (host-side,
 // before any VRAM yield) rather than assemble a sequence whose slots cannot all be filled.
-[[nodiscard]] JointLayout build_joint_layout(std::span<const std::uint8_t> image_pad_mask,
+// `axes` are the artifact's own DiT rope axes (DiTWeights::rope, produced by read_dit_rope_axes): they
+// are handed straight to rope.{h,cpp}'s shared emitter, which sizes every row from them, so the edit
+// route's table has the width the artifact declares and this module never names a rope number.
+[[nodiscard]] JointLayout build_joint_layout(const DitRopeAxes& axes,
+                                             std::span<const std::uint8_t> image_pad_mask,
                                              std::span<const ImageShape> img_shapes);
 
 // The length build_joint_layout would report in expanded_len, from the three counts the serve layer

@@ -81,20 +81,53 @@ per job (the oracle reads them from dumped `.npy`/`.json`):
 
 Identical for every Qwen-Image-2.1 image; read once from the artifact, never a per-job input.
 
-- DiT: `D = 4096`, 32 heads, `head_dim = 128`, time-dim 256, MLP 12288, 32 transformer blocks,
-  `in_channels` (latent `z_dim`) 64.
+### Who owns each constant (fail-closed)
+
+"Not variable" does not mean "compiled in". The image lane reads the model constants FROM the `.infernix`
+artifact's metadata and REFUSES to bind when the artifact cannot express the scheme the code implements --
+there is no compiled fallback and no transition branch. The readers are `read_scheduler_config` and
+`read_dit_rope_axes` (`src/models/qwen_image/artifact_constants.{h,cpp}`), both called by `bind_dit`
+(`src/models/qwen_image/image_weights.cpp`) before any parameter is resolved and before any CUDA allocation,
+and `run_image_job` (`src/models/qwen_image/image_pipeline.cu`) refuses a set that was never read as its
+first statement. The gate that holds all of this is `tests/models/qwen_image/test_image_artifact_constants.cpp`;
+the authority table is mirrored in the header comment of `src/models/qwen_image/artifact_constants.h`.
+
+| parameter | authority |
+|---|---|
+| scheduler values and mode flags (`base_image_seq_len`, `max_image_seq_len`, `base_shift`, `max_shift`, `num_train_timesteps`, `shift_terminal`, `shift`, `use_dynamic_shifting`, `time_shift_type`, the karras/beta/exponential-sigma flags, `invert_sigmas`, `stochastic_sampling`) | **the artifact**: the converter's verbatim copy of the checkpoint's own `scheduler/scheduler_config.json`, packed as the artifact's `scheduler` component. Only `FlowMatchEulerDiscreteScheduler`; every mode flag verified, not just the six numbers; an unverified key, or no `scheduler` component at all, refuses the artifact. JSON types are never coerced (`256` ok, `256.0` refused; `true` ok, `1` refused). |
+| DiT rope axes (`axes_dims_rope`, with `attention_head_dim`) | **the artifact**: the `dit` component's own `transformer/config.json`. Exactly three positive even JSON integers summing to `attention_head_dim`, so the emitted table is `attention_head_dim / 2` interleaved (cos, sin) pairs wide. The shipped artifact declares `[16, 56, 56]` over a 128-wide head. |
+| DiT rope theta (`kQwenImageRopeTheta`, `src/models/qwen_image/rope.h`) | **the pipeline implementation (code)**: the supported Diffusers Qwen-Image pipeline rotates with 10000, and the shipped `transformer/config.json` declares no theta anywhere the lane can see it, so no theta key was invented just to make the artifact look like the source. It changes only when the supported pipeline implementation is deliberately changed. An artifact that DOES declare a `rope_theta` is verified against the code's constant and **refused** when it disagrees -- verified, never adopted: the emitter only ever rotates with the code's value, so a foreign declaration cannot bend the table, only refuse the binding. (The text tower keeps the stricter form of the same contract: its `rope_theta` is required from the artifact.) |
+| CUDA launch configuration, and the 128-wide head `ops::rope_c64` rotates (`kRopeC64HeadRowFloats`, `src/models/qwen_image/image_pipeline.cu`; `view(..., 128, ...)` in `src/ops/dit_block.cpp`) | **the runtime implementation**: an artifact whose axes do not describe this build's head is refused at the job gate, not silently uploaded. |
+
+Anything in the list below that is marked "from the artifact" is the artifact's declaration, not a value a
+reader may copy into code: the numbers are written down here so the certified guards' expectations can be
+read against what ships, and `infernix_image_artifact_constants_test` pins the equality.
+
+- DiT (from the artifact's `dit` component, the checkpoint's own `transformer/config.json`): `D = 4096`,
+  32 heads, `head_dim = 128`, time-dim 256, MLP 12288, 32 transformer blocks, `in_channels` (latent
+  `z_dim`) 64, and the rope axes `axes_dims_rope = [16, 56, 56]` -- the three axes the joint sequence is
+  rotated on, which add up to the 128-wide head. The heads/`head_dim`/layers/context dimensions are read by
+  `bind_dit` through the recipe's parameter contract; the axes are read and verified by `read_dit_rope_axes`
+  (a document whose axes do not add up to the head, or that declares a `rope_theta` other than the code's
+  base, is refused).
 - VAE: `vae_scale_factor = 16` (latent 16× downscale); `multiple_of = vae_scale_factor * 2` (32) is
   the reference's snap keeping the latent grid even so the `img_mask`/rope 2×2 **target-slot
   grouping** divides it — the latent itself is not 2×2-packed (64 channels throughout, token count
   `tokens`, `patch_size = 1`; the VAE's actual 2×2 spatial op is the AvgDown3D shortcut — a
   channel-group average over 2×2 with a temporal front zero pad, which never changes the latent
   grid), per-channel `latents_mean` / `latents_std` `[64]`.
-- Scheduler config (`FlowMatchEulerDiscreteScheduler`, from `artifact/scheduler/scheduler_config.json`):
-  `base_image_seq_len 256`, `max_image_seq_len 8192`, `base_shift 0.5`, `max_shift 0.9`,
+- Scheduler config -- **the artifact's, not the code's** (`FlowMatchEulerDiscreteScheduler`, packed verbatim
+  by the converter as the artifact's `scheduler` component from `artifact/scheduler/scheduler_config.json`,
+  and committed as `tests/convert/fixtures/qwen_image_scheduler_config.json` so the guards read the real
+  document through the production reader instead of carrying their own copy): what the shipped artifact
+  declares is `base_image_seq_len 256`, `max_image_seq_len 8192`, `base_shift 0.5`, `max_shift 0.9`,
   `num_train_timesteps 1000`, `shift 1.0`, `shift_terminal 0.02`, `use_dynamic_shifting true`,
   `time_shift_type exponential`, `use_karras/exponential/beta_sigmas false`, `invert_sigmas false`,
   `stochastic_sampling false`. (`shift 1.0` is the fixed-shift path and is not used because
-  `use_dynamic_shifting` is on.)
+  `use_dynamic_shifting` is on.) Every one of these is read and verified at bind time by
+  `read_scheduler_config`; an artifact with no `scheduler` component, with another `_class_name`, with a
+  mode flag this path does not implement, or with a key the supported path has never verified is refused
+  before any CUDA allocation -- there is no compiled default behind them.
 
 ## Engine gaps this spec drives (for variable-input generation)
 
@@ -152,8 +185,12 @@ engine must additionally build:
    (`calculate_shift` mu from `tokens` + `build_schedule`) is a verified production host module
    (`infernix_qwen_image::scheduler`, gated bitwise vs the 512×512 pipeline oracle and across a resolution
    grid). The resolution-dependent **joint-sequence rope** for the text-only case is now the same:
-   `qwen_image::build_joint_rope(text_len, Hl, Wl)` (`src/models/qwen_image/rope.{h,cpp}`) emits the DiT
-   3-axis (frame/height/width) rotary `[S,64,2]` for `S = text_len + Hl*Wl` at any geometry, reproducing
+   `qwen_image::build_joint_rope(axes, text_len, Hl, Wl)` (`src/models/qwen_image/rope.{h,cpp}`) -- whose
+   first parameter is the artifact's `const DitRopeAxes&`, read and verified by `read_dit_rope_axes`, and
+   which sizes every row itself with `rope_row_floats(axes)` -- emits the DiT 3-axis (frame/height/width)
+   rotary table `[S, rope_row_floats(axes)]` with the (cos, sin) pairs interleaved (for the shipped
+   `[16, 56, 56]` that is 64 pairs in 128 floats, the width the certified oracle dumps have), for
+   `S = text_len + Hl*Wl` at any geometry, reproducing
    `QwenImage21Rope.forward` so resolution is a parameter rather than a per-geometry `.npy`. It is verified
    **bitwise (rel_fro 0.0)** against the diffusers `block_rotary.npy` at (8,8,8) and by grid invariants
    (unit modulus, text height/width-axis identity, shared image frame, two closed-form spots, determinism)

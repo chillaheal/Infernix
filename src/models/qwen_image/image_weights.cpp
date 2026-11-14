@@ -143,6 +143,15 @@ DiTWeights bind_dit(Binder& binder) {
     // Refuse the artifact before a single parameter is resolved: the schedule is read first so an
     // unhandled scheme costs no bindings, no device work and no partially initialised state.
     out.scheduler = read_scheduler_constants(binder);
+    // The rope axes come from the same "dit" document the dimensions are derived from, and are refused
+    // the same way: the reader names the key and the value it refused, this names the artifact the
+    // operator passed. An artifact that does not declare the axes this build rotates on is never bound,
+    // so the emitter never sees a set it guessed -- and no parameter is resolved before the refusal.
+    if (const auto axes = read_dit_rope_axes(config); !axes.has_value()) {
+        throw ArtifactError(binder.reader().file_path(0).string() + ": " + axes.error());
+    } else {
+        out.rope = *axes;
+    }
     out.dims.heads      = static_cast<std::uint32_t>(cfg_integer(config, "num_attention_heads", component));
     out.dims.head_dim   = static_cast<std::uint32_t>(cfg_integer(config, "attention_head_dim", component));
     out.dims.layers     = static_cast<std::uint32_t>(cfg_integer(config, "num_layers", component));

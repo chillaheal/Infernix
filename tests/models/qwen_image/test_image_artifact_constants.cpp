@@ -14,6 +14,7 @@
 // artifact, read-only through the production reader) and SKIPs when it is absent.
 
 #include "models/qwen_image/artifact_constants.h"
+#include "models/qwen_image/rope.h"
 #include "models/qwen_image/scheduler.h"
 
 #include "artifact/reader.h"
@@ -260,6 +261,178 @@ void gate_mode_flags() {
     expect_refuses(nlohmann::json::array(), "a non-object scheduler document is refused", {"scheduler"});
 }
 
+// ---- the DiT rope axes the artifact declares ----
+
+// A dit document that declares the shipped architecture: the axes the checkpoint's
+// transformer/config.json carries (verified against the live artifact's own dit component below, and
+// against two independent diffusers-dumped rotary tables in infernix_image_rope_prod_test) and the head
+// width those axes have to add up to. The deviations below are hand-written against THIS document
+// because the strictness is what is under test; the shipped values themselves are gated twice, once
+// here through the production reader and once by the rope oracle's bitwise comparison.
+nlohmann::json supported_dit_config() {
+    return nlohmann::json{{"_class_name", "QwenImage2Transformer2DModel"},
+                          {"attention_head_dim", 128},
+                          {"axes_dims_rope", {16, 56, 56}}};
+}
+
+void expect_rope_axes(const nlohmann::json& config, const std::string& name,
+                      const std::uint32_t a, const std::uint32_t b, const std::uint32_t c) {
+    const auto axes = qi::read_dit_rope_axes(config);
+    if (!axes.has_value()) {
+        check_detail(false, name, axes.error());
+        return;
+    }
+    const bool ok = axes->axes[0] == a && axes->axes[1] == b && axes->axes[2] == c;
+    check_detail(ok, name, "axes=" + std::to_string(axes->axes[0]) + "," +
+                               std::to_string(axes->axes[1]) + "," + std::to_string(axes->axes[2]));
+}
+
+void expect_rope_refuses(const nlohmann::json& config, const std::string& name,
+                         const std::vector<std::string>& needles) {
+    const auto result = qi::read_dit_rope_axes(config);
+    if (result.has_value()) {
+        check(false, name + " (refused)");
+        return;
+    }
+    bool all = true;
+    for (const std::string& needle : needles) {
+        if (result.error().find(needle) == std::string::npos) all = false;
+    }
+    check_detail(all, name, describe(needles.empty() ? "?" : needles[0], result.error()));
+}
+
+void gate_rope_axes() {
+    expect_rope_axes(supported_dit_config(), "the artifact's rope axes are accepted", 16, 56, 56);
+
+    // An axis the JSON writes as a float or a string is a different promise: 16 ok, 16.0 refused.
+    for (const char* bad : {"16.0", "\"16\""}) {
+        nlohmann::json j = supported_dit_config();
+        j["axes_dims_rope"] = nlohmann::json::parse(
+            std::string("[") + bad + ", 56, 56]");
+        expect_rope_refuses(j, std::string("a rope axis written as ") + bad + " is refused",
+                            {"axes_dims_rope"});
+    }
+    // Not an array at all, or not exactly the three axes the DiT rotates on.
+    {
+        nlohmann::json j = supported_dit_config();
+        j["axes_dims_rope"] = 128;
+        expect_rope_refuses(j, "rope axes that are not an array are refused", {"axes_dims_rope"});
+    }
+    for (const char* document : {"[16, 56]", "[16, 56, 56, 8]"}) {
+        nlohmann::json j = supported_dit_config();
+        j["axes_dims_rope"] = nlohmann::json::parse(document);
+        expect_rope_refuses(j, std::string("a rope axis list of ") + std::string(document) +
+                                   " is refused",
+                            {"axes_dims_rope", "three"});
+    }
+    {
+        nlohmann::json j = supported_dit_config();
+        j.erase("axes_dims_rope");
+        expect_rope_refuses(j, "a missing axes_dims_rope is refused", {"axes_dims_rope"});
+        nlohmann::json h = supported_dit_config();
+        h.erase("attention_head_dim");
+        expect_rope_refuses(h, "a missing attention_head_dim is refused", {"attention_head_dim"});
+        nlohmann::json f = supported_dit_config();
+        f["attention_head_dim"] = 128.0;
+        expect_rope_refuses(f, "attention_head_dim as a JSON float is refused", {"attention_head_dim"});
+    }
+    // A zero, a negative or an odd axis cannot emit whole (cos, sin) pairs.
+    for (const char* document : {"[0, 56, 72]", "[-16, 56, 144]", "[17, 55, 56]"}) {
+        nlohmann::json j = supported_dit_config();
+        j["axes_dims_rope"] = nlohmann::json::parse(document);
+        expect_rope_refuses(j, std::string("the rope axes ") + std::string(document) + " are refused",
+                            {"axes_dims_rope"});
+    }
+    // The axes have to rotate the whole head: their sum is attention_head_dim, and the emitted table is
+    // sum/2 interleaved (cos, sin) pairs -- attention_head_dim/2 -- wide. A document that adds up to
+    // anything else is refused by name and by both numbers.
+    {
+        nlohmann::json j = supported_dit_config();
+        j["axes_dims_rope"] = {16, 56, 55}; // 127, and odd
+        expect_rope_refuses(j, "rope axes that do not add up to the head are refused",
+                            {"axes_dims_rope", "attention_head_dim"});
+        nlohmann::json h = supported_dit_config();
+        h["axes_dims_rope"] = {16, 56, 40}; // 112, all even: still not the head
+        expect_rope_refuses(h, "rope axes narrower than the head are refused",
+                            {"axes_dims_rope", "attention_head_dim"});
+        nlohmann::json o = supported_dit_config();
+        o["attention_head_dim"] = 126; // the axes sum to 128, an odd-narrowed head cannot be rotated
+        expect_rope_refuses(o, "an attention_head_dim the axes cannot add up to is refused",
+                            {"axes_dims_rope", "attention_head_dim"});
+    }
+    // A document that is not an object at all.
+    expect_rope_refuses(nlohmann::json::array(), "a non-object dit document is refused", {"dit"});
+
+    // The table's width comes from the ARTIFACT's axes: a different, legal architecture gets its own
+    // width, so nothing in the emitter is pinned at the shipped 64 pairs.
+    {
+        const auto other = qi::read_dit_rope_axes(nlohmann::json{{"attention_head_dim", 24},
+                                                                {"axes_dims_rope", {8, 8, 8}}});
+        if (!other.has_value()) {
+            check_detail(false, "a second, legal rope architecture is accepted", other.error());
+        } else {
+            const std::size_t row_floats = qi::rope_row_floats(*other);
+            const std::vector<float> table = qi::build_joint_rope(*other, 3, 2, 2);
+            check_detail(row_floats == 24 && table.size() == 7 * 24,
+                         "a legal other architecture emits its own table width",
+                         "row=" + std::to_string(row_floats) + " floats=" + std::to_string(table.size()));
+        }
+        const auto shipped = qi::read_dit_rope_axes(supported_dit_config());
+        if (!shipped.has_value()) {
+            check_detail(false, "the shipped architecture's axes are readable", shipped.error());
+        } else {
+            const std::vector<float> table = qi::build_joint_rope(*shipped, 3, 2, 2);
+            check_detail(qi::rope_row_floats(*shipped) == 128 && table.size() == 7 * 128,
+                         "the shipped architecture keeps the certified table width",
+                         "row=" + std::to_string(qi::rope_row_floats(*shipped)) +
+                             " floats=" + std::to_string(table.size()));
+        }
+    }
+    // Theta is the supported pipeline implementation's default and the artifact is never ASKED to declare
+    // one (the shipped dit config declares none, and no theta key was introduced for tidiness). But an
+    // artifact that DOES declare one is stating which rotary scheme it was trained under, so a theta that
+    // disagrees with this build's has to refuse rather than be silently rotated at the code's value: the
+    // same fail-closed rule the scheduler side applies to a foreign "_class_name" or a "use_lms" flag, and
+    // the contract this lane's text tower already keeps (its rope_theta is read from the artifact and
+    // refused when absent, image_weights.cpp). An AGREING declaration is the one theta key that binds, and
+    // it changes no byte -- the emitter still rotates at the code's theta, so the certified numbers cannot
+    // move.
+    {
+        check(qi::kQwenImageRopeTheta == 10000.0F,
+              "the rope theta is the documented pipeline implementation default");
+        expect_rope_refuses(nlohmann::json{{"attention_head_dim", 128}, {"axes_dims_rope", {16, 56, 56}},
+                                           {"rope_theta", 7000.0}},
+                            "an artifact-declared rope_theta that disagrees with the pipeline is refused",
+                            {"rope_theta", "7000.0", "kQwenImageRopeTheta"});
+        expect_rope_refuses(nlohmann::json{{"attention_head_dim", 128}, {"axes_dims_rope", {16, 56, 56}},
+                                           {"rope_theta", 10000}},
+                            "a rope_theta written as a JSON integer is refused",
+                            {"rope_theta", "JSON float"});
+        expect_rope_refuses(nlohmann::json{{"attention_head_dim", 128}, {"axes_dims_rope", {16, 56, 56}},
+                                           {"rope_theta", "10000.0"}},
+                            "a rope_theta written as a string is refused",
+                            {"rope_theta", "JSON float"});
+        expect_rope_refuses(nlohmann::json{{"attention_head_dim", 128}, {"axes_dims_rope", {16, 56, 56}},
+                                           {"rope_theta", nullptr}},
+                            "a rope_theta that is not a number is refused", {"rope_theta"});
+        const auto agreeing =
+            qi::read_dit_rope_axes(nlohmann::json{{"attention_head_dim", 128},
+                                                  {"axes_dims_rope", {16, 56, 56}},
+                                                  {"rope_theta", 10000.0}});
+        if (!agreeing.has_value()) {
+            check_detail(false, "a rope_theta that agrees with the pipeline is accepted",
+                         agreeing.error());
+        } else {
+            const std::vector<float> declared  = qi::build_joint_rope(*agreeing, 3, 2, 2);
+            const auto plain                   = qi::read_dit_rope_axes(supported_dit_config());
+            const std::vector<float> untouched = qi::build_joint_rope(*plain, 3, 2, 2);
+            check_detail(declared == untouched && declared.size() == 7 * 128,
+                         "an agreeing rope_theta declares the same scheme and changes no byte",
+                         "floats=" + std::to_string(declared.size()));
+        }
+    }
+}
+
 // ---- the live artifact through the production reader (skips when absent) ----
 
 void gate_real_artifact() {
@@ -294,6 +467,18 @@ void gate_real_artifact() {
         // the whole point of the change, so that no job is drawn with a compiled schedule.
         std::printf("ok: the live artifact carries no scheduler component -- the strict reader must refuse it\n");
     }
+
+    // The DiT rope axes are the checkpoint's own transformer/config.json keys, so the live artifact is
+    // the only place they can be qualified: the shipped architecture must read as 16/56/56 over a
+    // 128-wide head, which is what the certified rotary tables and ops::rope_c64's 64-pair contract
+    // require.
+    const bool has_dit = directory.components.find("dit") != directory.components.end();
+    if (has_dit) {
+        expect_rope_axes(directory.component("dit").config,
+                         "the live artifact declares the shipped rope axes", 16, 56, 56);
+    } else {
+        check(false, "the live artifact declares a dit component");
+    }
 }
 
 } // namespace
@@ -302,6 +487,7 @@ int main() {
     gate_shipped_metadata();
     gate_strict_typing();
     gate_mode_flags();
+    gate_rope_axes();
     gate_real_artifact();
     if (g_failures != 0) {
         std::printf("IMAGE_ARTIFACT_CONSTANTS_TEST: FAIL (%d check(s))\n", g_failures);
