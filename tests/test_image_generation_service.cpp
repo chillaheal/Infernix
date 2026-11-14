@@ -1562,6 +1562,90 @@ int main() {
         }
     }
 
+    // The stored record tells the truth about the canvas that was drawn. The host walk settles on the
+    // asked canvas because the (non-exclusive) probe promised a card another draw had yielded; the net
+    // inside this job's own interlude then hands over only what 512x512 costs and steps the canvas down
+    // before the first allocation. The wire then names 512x512 (data[0].size) -- but the record, written
+    // by put() BEFORE the interlude, kept advertising the 768x768 it was submitted at. It must agree with
+    // the picture the client actually got back.
+    {
+        std::vector<std::uint8_t> rgba(64U * 48U * 4, 90U);
+        for (unsigned i = 0; i < 64U * 48U; ++i) rgba[4 * i + 3] = 255U;
+        const std::string payload =
+            base64_encode_bytes(infernix::media::encode::encode_png_rgba8(64, 48, rgba));
+        const std::uint64_t margin = 512ULL * 1024ULL * 1024ULL;
+
+        // The delivered ceiling is read from the service's OWN arithmetic, not a constant: what a
+        // generous run says 512x512 costs, plus the yield's margin.
+        auto need_at = [&](std::uint32_t side) {
+            ImageJobStore measure_store(8, 8ULL << 20);
+            auto          measure_runner = std::make_unique<FakeRunner>(); // generous: every ask fits
+            FakeRunner*   measure_eyes   = measure_runner.get();
+            ImageGenerationService measure(std::move(measure_runner), measure_store, fixed_renderer(),
+                                           fixed_provider(), fixed_dims(), fixed_executor(),
+                                           fixed_vision(), fixed_reference_renderer());
+            OpenAIImagesRequest r = sample_request();
+            r.images         = {payload};
+            r.size_requested = true;
+            r.width          = side;
+            r.height         = side;
+            (void)measure.generate(r, 1000U + side);
+            return measure_eyes->probed_target;
+        };
+        const std::uint32_t small_side = 512U;
+        const std::uint64_t delivered  = need_at(small_side) + margin;
+
+        ImageJobStore store(8, 8ULL << 20);
+        auto          runner = std::make_unique<FakeRunner>();
+        FakeRunner*   eyes   = runner.get();
+        // The probe promises a generous card for every ask, so the host walk settles at the 768x768 it
+        // was handed -- the promise is read off a card another draw had yielded, and this job's own yield
+        // delivers only what 512x512 costs (device_free 0: the other draw restored its pools).
+        eyes->probe_for = [](std::uint64_t target) {
+            return FakeRunner::Fit{.fits = true,
+                                   .freed_bytes_expected = target + margin + 8ULL * FakeRunner::kGiB,
+                                   .device_free_bytes    = 8ULL * FakeRunner::kGiB};
+        };
+        eyes->freed_for   = [delivered](std::uint64_t) { return delivered; };
+        eyes->device_free = 0ULL;
+        std::uint32_t drew_w = 0, drew_h = 0;
+        ImageJobExecutor watch = [&](const OpenAIImagesRequest& request, std::uint64_t,
+                                     std::span<const std::uint16_t>, std::span<const std::uint16_t>,
+                                     std::span<const ReferencePlanes>, void*,
+                                     const std::shared_ptr<ImageJobProgress>&,
+                                     const EditConditioning*) {
+            drew_w = request.width;
+            drew_h = request.height;
+            FinishedPicture picture; // the size the job was SUBMITTED at, as the real executor returns
+            picture.width  = request.width;
+            picture.height = request.height;
+            picture.rgba.assign(4ULL * request.width * request.height, 0x02U);
+            for (std::size_t i = 0; i < picture.rgba.size(); i += 4U) { picture.rgba[i + 3] = 255U; }
+            return picture;
+        };
+        ImageGenerationService service(std::move(runner), store, fixed_renderer(), fixed_provider(),
+                                       fixed_dims(), watch, fixed_vision(), fixed_reference_renderer());
+        OpenAIImagesRequest request = sample_request();
+        request.images         = {payload};
+        request.size_requested = true;
+        request.width          = 768U;
+        request.height         = 768U;
+        const auto outcome     = attempt([&] { return service.generate(request, 1000); });
+        check(!outcome.threw, "the stepped-down edit is drawn, not refused");
+        const auto record = only_record(store);
+        check(record != nullptr && record->state == ImageJobState::Succeeded,
+              "the served edit is stored once as Succeeded");
+        const std::string drawn = outcome.response["data"].front().at("size").get<std::string>();
+        check(drew_w == small_side && drew_h == small_side &&
+                  drawn == std::to_string(drew_w) + "x" + std::to_string(drew_h),
+              "the walk stepped the picture down and the answer names the canvas it drew");
+        check(record && record->request.at("width") == drew_w &&
+                  record->request.at("height") == drew_h,
+              "the stored record records the canvas that was drawn, not the one that was asked for");
+        check(record && record->request.at("width") != 768U && record->request.at("height") != 768U,
+              "and the record no longer advertises the canvas the job was submitted at");
+    }
+
     // True CFG: with true_cfg_scale above 1 the negative prompt goes through the same embeds provider
     // and arrives at the executor; without it the executor gets no negative embeds and the (empty)
     // negative prompt never reaches the text tower.

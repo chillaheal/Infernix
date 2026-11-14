@@ -1292,8 +1292,10 @@ RequestJson ImageGenerationService::generate(const OpenAIImagesRequest& request,
     record.state    = ImageJobState::Queued;
     record.created  = now;
     record.progress = std::make_shared<ImageJobProgress>();
-    // What the job actually ran, not what was asked: a stored canvas that disagreed with the picture
-    // the client got back would make the record useless for a later diagnosis.
+    // The canvas the HOST walk settled on, written by put() here -- before the interlude, whose own net
+    // (below) can still step it down on the bytes the yield actually delivers. So this is not yet the
+    // picture the client gets back; the terminal advance rewrites width/height to the canvas that was
+    // really drawn, so a stored record never advertises a canvas that only went out on the wire.
     // `prompt_enhance_outcome` is the reason, not the request field: the field would say what the client
     // asked and leave the four legitimate auto skips identical in the log.
     record.request  = nlohmann::json{{"prompt", effective.prompt},
@@ -1404,9 +1406,22 @@ RequestJson ImageGenerationService::generate(const OpenAIImagesRequest& request,
             response["data"][0]["size"]       = drawn;
             response["data"][0]["size_asked"] = std::to_string(asked_width) + "x" + std::to_string(asked_height);
         }
+        // The record was written by put() before the interlude, so its request still names the canvas the
+        // host walk settled on. The net inside the interlude may have stepped it further down on the bytes
+        // the yield actually delivered, and the picture the client got back -- which is what the response
+        // above names -- is `finished`. Hand the record that same canvas here, in the one terminal advance
+        // the job already makes; no second move, and no request at all when the walk never stepped.
+        nlohmann::json served_request;
+        if (record.request.value("width", 0ULL) != static_cast<std::uint64_t>(finished.width) ||
+            record.request.value("height", 0ULL) != static_cast<std::uint64_t>(finished.height)) {
+            served_request          = record.request;
+            served_request["width"]  = finished.width;
+            served_request["height"] = finished.height;
+        }
         store_.advance(record.id,
                        JobUpdate{.to = ImageJobState::Succeeded, .now = now,
-                                 .response = nlohmann::json::parse(response.dump())});
+                                 .response = nlohmann::json::parse(response.dump()),
+                                 .request  = served_request});
         return response;
     } catch (const std::exception& error) {
         const std::string message  = error.what();

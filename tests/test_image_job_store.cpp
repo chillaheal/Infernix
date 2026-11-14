@@ -230,6 +230,29 @@ int test_job_progress_rides_the_record() {
     return failures;
 }
 
+int test_advance_replaces_the_request() {
+    // A job whose canvas was stepped down must not keep advertising the canvas it was asked for.
+    ImageJobStore store(8, 1ULL << 20);
+    StoredImageJob value;
+    value.id      = "img_step";
+    value.created = 1700000000;
+    value.state   = ImageJobState::Queued;
+    value.request = nlohmann::json{{"size", "1792x1792"}};
+    store.put(std::move(value));
+
+    int failures = 0;
+    // Queued -> WaitingForFrontier carrying the canvas the walk served instead of the ask.
+    (void)store.advance("img_step", JobUpdate{.to = ImageJobState::WaitingForFrontier, .now = 2,
+                                              .request = nlohmann::json{{"size", "1024x1024"}}});
+    failures += check(store.get("img_step")->request.at("size") == "1024x1024",
+                      "advance replaces the request when the caller hands one in");
+    // A later move that hands in no request leaves the stored canvas alone (legal terminal step).
+    (void)store.advance("img_step", JobUpdate{.to = ImageJobState::Failed, .now = 3});
+    failures += check(store.get("img_step")->request.at("size") == "1024x1024",
+                      "an update without a request leaves the stored one alone");
+    return failures;
+}
+
 int test_oversized_record() {
     ImageJobStore store(4, 256);
     StoredImageJob large = job("img_large");
@@ -258,6 +281,7 @@ int main() {
     failures += test_prune_expired_touches_only_terminals();
     failures += test_lru_recency_and_delete();
     failures += test_job_progress_rides_the_record();
+    failures += test_advance_replaces_the_request();
     failures += test_oversized_record();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

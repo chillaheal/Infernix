@@ -152,6 +152,7 @@ std::shared_ptr<const StoredImageJob> ImageJobStore::advance(const std::string& 
     if (!update.error.is_null())             { next.error = update.error; }
     if (!update.restoration_error.is_null()) { next.restoration_error = update.restoration_error; }
     if (!update.response.is_null())          { next.response = update.response; }
+    if (!update.request.is_null())           { next.request = update.request; }
     if (is_terminal(update.to))              { next.finished = update.now; }
 
     const std::size_t envelope_bytes = record_envelope_bytes(next);

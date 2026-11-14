@@ -57,6 +57,11 @@ struct JobUpdate {
     nlohmann::json error;
     nlohmann::json restoration_error;
     nlohmann::json response;
+    // The served geometry, when the canvas the caller asked for is not the canvas that was drawn: the
+    // VRAM walk steps a too-large ask down inside the interlude, and the stored record must then say
+    // what went out on the wire instead of what was asked for. Applied when non-null; a null request
+    // leaves the stored one alone.
+    nlohmann::json request;
 };
 
 class ImageJobStore {
