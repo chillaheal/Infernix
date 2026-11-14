@@ -412,27 +412,6 @@ GeneratedImage run_image_job(artifact::Reader& reader, const DiTWeights& dit, co
             "image job: the artifact's DiT rope axes were never read, or they describe a head this "
             "build's rope Op cannot rotate");
     }
-    // The stage telemetry goes through the caller's sink (the serving route's logger, serialized
-    // against the console's stats panel); with no sink the certified route prints nothing.
-    // The ledger is the module's own account of what it holds; the driver free and the stream-ordered
-    // pool's reserved bytes are what the NEXT allocator (the LLM's restore, plain cudaMalloc) can
-    // actually get. Reporting all three per stage is what separates a leak from a release that is still
-    // queued on the image stream: live 0 with a large pool reserved means the latter.
-    const auto log_mem = [&](const char* stage) {
-        if (!log_line) { return; }
-        std::size_t driver_free = 0, driver_total = 0;
-        (void)cudaMemGetInfo(&driver_free, &driver_total);
-        std::size_t pool_reserved = 0;
-        cudaMemPool_t pool = nullptr;
-        if (cudaDeviceGetDefaultMemPool(&pool, 0) == cudaSuccess && pool != nullptr) {
-            (void)cudaMemPoolGetAttribute(pool, cudaMemPoolAttrReservedMemCurrent, &pool_reserved);
-        }
-        log_line("image job: " + std::string(stage) + " | ledger live " +
-                 std::to_string(g_image_device_live.load() / (1024 * 1024)) + " MiB peak " +
-                 std::to_string(g_image_device_peak.load() / (1024 * 1024)) +
-                 " MiB | driver free " + std::to_string(driver_free / (1024 * 1024)) +
-                 " MiB pool reserved " + std::to_string(pool_reserved / (1024 * 1024)) + " MiB");
-    };
     // Bundle B's attribution, measured only when a sink exists. In fas 2 the block copies are
     // asynchronous on a copy stream, so a host clock around the enqueue is meaningless; the transfer
     // time is measured on the device (one block's copy bracketed by events) and extrapolated over the
@@ -445,15 +424,37 @@ GeneratedImage run_image_job(artifact::Reader& reader, const DiTWeights& dit, co
         }
     };
     // A stalled throw unwinds the same RAII buffers as any other failure: the job's device
-    // memory is freed before the interlude restores the LLM's pools.
+    // memory is freed before the interlude restores the LLM's pools. The scope takes the region's
+    // device FROM THE STREAM, binds this thread to it, and borrows that device's default pool for the
+    // region -- lowering its release threshold and writing the found value back on close -- so the lane
+    // never keeps a global setting it only needed while it held the stream. It lives here, before any
+    // Buf, because the Bufs destroyed at the end of this scope must retire while the threshold is still
+    // 0 or their bytes stay in the pool.
     ImageStreamScope stream_scope(stream);
-    cudaMemPool_t pool = nullptr;
-    if (cudaDeviceGetDefaultMemPool(&pool, 0) == cudaSuccess && pool != nullptr) {
-        // Release retired buffers to the driver once their stream passes them: the arena and the
-        // LLM's restore allocate with plain cudaMalloc and cannot take bytes the pool keeps.
-        std::uint64_t threshold = 0;
-        cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold, static_cast<void*>(&threshold));
-    }
+
+    // The stage telemetry goes through the caller's sink (the serving route's logger, serialized
+    // against the console's stats panel); with no sink the certified route prints nothing.
+    // The ledger is the module's own account of what it holds; the driver free and the stream-ordered
+    // pool's reserved bytes are what the NEXT allocator (the LLM's restore, plain cudaMalloc) can
+    // actually get. Reporting all three per stage is what separates a leak from a release that is still
+    // queued on the image stream: live 0 with a large pool reserved means the latter. The driver and
+    // pool figures are the REGION's device's: cudaMemGetInfo answers for the calling thread's current
+    // device (which the scope bound), and the pool is asked for by number rather than assumed.
+    const auto log_mem = [&](const char* stage) {
+        if (!log_line) { return; }
+        std::size_t driver_free = 0, driver_total = 0;
+        (void)cudaMemGetInfo(&driver_free, &driver_total);
+        std::size_t pool_reserved = 0;
+        cudaMemPool_t pool = nullptr;
+        if (cudaDeviceGetDefaultMemPool(&pool, stream_scope.device()) == cudaSuccess && pool != nullptr) {
+            (void)cudaMemPoolGetAttribute(pool, cudaMemPoolAttrReservedMemCurrent, &pool_reserved);
+        }
+        log_line("image job: " + std::string(stage) + " | ledger live " +
+                 std::to_string(g_image_device_live.load() / (1024 * 1024)) + " MiB peak " +
+                 std::to_string(g_image_device_peak.load() / (1024 * 1024)) +
+                 " MiB | driver free " + std::to_string(driver_free / (1024 * 1024)) +
+                 " MiB pool reserved " + std::to_string(pool_reserved / (1024 * 1024)) + " MiB");
+    };
     const std::size_t D     = dit.dims.hidden;
     const std::size_t heads = dit.dims.heads;
     const std::size_t mlp0  = dit.dims.intermediate;
@@ -1147,7 +1148,9 @@ GeneratedImage run_image_job(artifact::Reader& reader, const DiTWeights& dit, co
         static int s_async_engine = -1;
         if (s_async_engine < 0) {
             cudaDeviceProp prop{};
-            s_async_engine = (cudaGetDeviceProperties(&prop, 0) == cudaSuccess) ? prop.asyncEngineCount : 0;
+            s_async_engine = (cudaGetDeviceProperties(&prop, stream_scope.device()) == cudaSuccess)
+                                 ? prop.asyncEngineCount
+                                 : 0;
         }
         char loopb[32], copyb[32];
         std::snprintf(loopb, sizeof(loopb), "%.0f", loop_ms);

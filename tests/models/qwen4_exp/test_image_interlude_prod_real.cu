@@ -257,6 +257,20 @@ int main() {
                 check(ctx.freed_bytes > 0, "the interlude yield freed "
                                                + std::to_string(ctx.freed_bytes >> 20) + " MiB");
                 check(ctx.image_stream != nullptr, "the interlude handed the job a dedicated stream");
+                // THE guard on the production line: a cudaStream_t belongs to the device of the thread
+                // that created it, and the lane's Bufs allocate with cudaMallocAsync, which the runtime
+                // documents as allocating "from the memory pool associated with the stream's device". So
+                // the stream the interlude DELIVERS has to be the engine's own device's -- the device
+                // this test built the Engine with -- or the job's bytes and the LLM's restore that goes
+                // looking for them land on a card nobody picked.
+                int  delivered_device = -1;
+                const cudaError_t delivered =
+                    cudaStreamGetDevice(static_cast<cudaStream_t>(ctx.image_stream), &delivered_device);
+                check(delivered == cudaSuccess,
+                      "cudaStreamGetDevice reports the stream the interlude delivered");
+                check(delivered == cudaSuccess && delivered_device == options.device,
+                      "the interlude's stream lives on the device the Engine was built with (device " +
+                          std::to_string(options.device) + ")");
                 check(infernix::models::qwen4_exp::testing::image_interlude_state() == 3,
                       "the Program is Leased while the job runs");
                 check(!infernix::models::qwen4_exp::testing::image_interlude_submit_open(),

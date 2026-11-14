@@ -483,3 +483,15 @@ infernix_add_op_test(infernix_image_edit_behavior_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_image_edit_behavior.cu"
   LIBRARIES infernix_ops infernix_qwen_image infernix_qwen_image_runtime infernix_serve)
 set_tests_properties(infernix_image_edit_behavior_test PROPERTIES SKIP_RETURN_CODE 77)
+
+# Task 6 (image fail-closed): the interlude's stream is created on the ENGINE's device and the lane's
+# ImageStreamScope governs that device's default memory pool -- reading its release threshold, lowering
+# it while the region holds the stream, and handing the value it found back on close -- so the image
+# lane borrows a global setting instead of keeping it. _real because it reads and writes DEVICE-GLOBAL
+# state and a CUDA context: it refuses (77) while an infernix-serve.exe process holds the card, before
+# any CUDA call, and skips (77) with no device. tests/CMakeLists.txt gives every "_real" name
+# RUN_SERIAL, the "gpu;real" labels and SKIP_RETURN_CODE 77, so the sanctioned host wrapper never
+# touches the card and the run lands in the one offline window.
+infernix_add_test(infernix_image_stream_device_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_image_stream_device_real.cpp"
+  LIBRARIES infernix_qwen_image_runtime infernix_model_runtime infernix_engine)

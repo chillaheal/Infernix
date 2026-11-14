@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <new>
 #include <stdexcept>
 #include <string>
@@ -82,14 +83,160 @@ inline std::atomic<std::uint64_t> g_image_device_alloc_fail_after{0};
 // (the driver counts them used, legacy allocs cannot take them) -- that OOMed the 2048x2048 decode
 // at 6.5 GiB of ledger live against a full card. RAII so a nested call cannot leak a foreign stream.
 inline std::atomic<cudaStream_t> g_image_stream{nullptr};
+
+// The lane's BORROW of two things that are not its own: the calling thread's current device, and one
+// device-global pool setting.
+//
+// The stream handed to the interlude was created with the calling thread bound to the ENGINE's device
+// (Program::run_image_interlude), because a cudaStream_t takes the current device of the thread that
+// creates it and the engine, not the serving worker, owns that choice. The Bufs above then allocate
+// with cudaMallocAsync, which the CUDA runtime documents as allocating "from the memory pool associated
+// with the stream's device" -- so the pool this region allocates from, and retires into, is THAT
+// device's default pool. Lowering its release threshold for the region is what lets the arena and the
+// LLM's restore (both plain cudaMalloc) take back the bytes the pool would otherwise keep; the
+// threshold itself is somebody else's setting on a shared card, so the value found on entry is written
+// back when the region ends, and the thread's current device goes back the way the card goes back.
+//
+// A null stream is a LEGACY region (the text and vision towers run on the default stream): no device is
+// claimed and no pool is touched, exactly as before -- and no CUDA call of this class is made at all, so
+// a sticky error that belongs to somebody else survives the region and their next CUDA_CHECK still sees
+// it. Only an error this scope produced itself is ever consumed.
 struct ImageStreamScope {
-    explicit ImageStreamScope(cudaStream_t s) : prev_(g_image_stream.exchange(s)) {}
-    ~ImageStreamScope() { g_image_stream.store(prev_); }
+    explicit ImageStreamScope(cudaStream_t s) : prev_(g_image_stream.exchange(s)), stream_(s) {
+        if (stream_ == nullptr) { return; }
+        if (!try_enter()) {
+            std::string reason = failure_;
+            // Hands the stream slot, the thread and the pool back before refusing; a refusal there is
+            // part of this same refusal, not a dropped one.
+            if (const std::string handed_back = close(); !handed_back.empty()) { reason += "; " + handed_back; }
+            throw std::runtime_error("image lane: " + reason);
+        }
+    }
+    // noexcept(false) on purpose: a destruction that is already unwinding stays silent (a second
+    // exception would terminate the process), while the NORMAL path reports a failed restoration,
+    // because global state left borrowed is what makes the next allocator's starvation unexplainable.
+    // Program::run_image_interlude owns that report: it catches everything the job raises, unwinds the
+    // yield and turns it into the interlude error the server logs. An unwinding destruction cannot
+    // speak, so the text is kept in last_report() instead of dropped: global state the lane failed to
+    // hand back must stay readable after the stack that discovered it is gone.
+    ~ImageStreamScope() noexcept(false) {
+        // The caller's own RAII (the job's Bufs) is destroyed before this scope, so the lane's retired
+        // bytes are still released to the driver while the threshold is 0.
+        const std::string report = close();
+        if (report.empty() || std::uncaught_exceptions() > 0) { return; }
+        throw std::runtime_error("image lane: " + report);
+    }
     ImageStreamScope(const ImageStreamScope&)            = delete;
     ImageStreamScope& operator=(const ImageStreamScope&) = delete;
 
+    // Ends the region. Returns "" when everything the lane borrowed came back as it was, and the
+    // failure text otherwise; the destructor decides whether that text becomes an error, since it is
+    // the one that must not throw while unwinding. EVERY failure is in that text -- appending rather
+    // than keeping only the first -- because both the pool and the thread are left borrowed when either
+    // refuses. Idempotent.
+    [[nodiscard]] std::string close() {
+        if (closed_) { return last_report_; }
+        std::string report;
+        if (threshold_borrowed_) {
+            if (const cudaError_t e =
+                    cudaMemPoolSetAttribute(pool_, cudaMemPoolAttrReleaseThreshold, &saved_threshold_);
+                e != cudaSuccess) {
+                if (!report.empty()) { report += "; "; }
+                report += std::string("cudaMemPoolSetAttribute (restore the release threshold): ") +
+                          cudaGetErrorString(e);
+                self_produced_ = true;
+            }
+            threshold_borrowed_ = false;
+        }
+        if (thread_bound_) {
+            if (const cudaError_t e = cudaSetDevice(thread_device_); e != cudaSuccess) {
+                if (!report.empty()) { report += "; "; }
+                report += "cudaSetDevice (restore the calling thread's device to " +
+                          std::to_string(thread_device_) + "): " + cudaGetErrorString(e);
+                self_produced_ = true;
+            }
+            thread_bound_ = false;
+        }
+        if (!stream_returned_) {
+            g_image_stream.store(prev_);
+            stream_returned_ = true;
+        }
+        // Only an error this scope produced is consumed, and it is already in the text returned; leaving
+        // one sticky would be charged to the caller's next unrelated call. On the legacy (null-stream)
+        // path and on a clean hand-back no CUDA call of ours failed, so nothing is consumed here and the
+        // tree's CUDA_CHECK(cudaGetLastError()) idiom still sees the error its own call raised.
+        if (self_produced_) { (void)cudaGetLastError(); }
+        closed_      = true;
+        last_report_ = report;
+        return report;
+    }
+
+    // The stream the region runs on and the device it belongs to -- the device every pool and memory
+    // query of the region must name explicitly instead of assuming one.
+    [[nodiscard]] cudaStream_t stream() const noexcept { return stream_; }
+    [[nodiscard]] int device() const noexcept { return device_; }
+
+    // The text of the failed hand-back, if any -- the record that outlives an unwinding destruction, for
+    // the caller's own error handling or telemetry to surface. "" means everything borrowed came back.
+    [[nodiscard]] const std::string& last_report() const noexcept { return last_report_; }
+
 private:
-    cudaStream_t prev_;
+    [[nodiscard]] bool refuse(std::string what, cudaError_t error) {
+        failure_      = what + ": " + cudaGetErrorString(error);
+        self_produced_ = true; // its sticky flag is ours to consume, and only ours
+        return false;
+    }
+    // Takes the thread and the pool for the region. On the first refusal everything acquired so far is
+    // left for close() to hand back, and failure_ holds the reason.
+    [[nodiscard]] bool try_enter() {
+        if (const cudaError_t e = cudaStreamGetDevice(stream_, &device_); e != cudaSuccess) {
+            return refuse("cudaStreamGetDevice", e);
+        }
+        if (const cudaError_t e = cudaGetDevice(&thread_device_); e != cudaSuccess) {
+            return refuse("cudaGetDevice", e);
+        }
+        if (const cudaError_t e = cudaSetDevice(device_); e != cudaSuccess) {
+            return refuse("cudaSetDevice (bind the region to device " + std::to_string(device_) + ")", e);
+        }
+        thread_bound_ = true;
+        if (const cudaError_t e = cudaDeviceGetDefaultMemPool(&pool_, device_); e != cudaSuccess) {
+            return refuse("cudaDeviceGetDefaultMemPool (device " + std::to_string(device_) + ")", e);
+        }
+        if (pool_ == nullptr) {
+            failure_ = "cudaDeviceGetDefaultMemPool returned no pool for device " + std::to_string(device_);
+            return false;
+        }
+        if (const cudaError_t e =
+                cudaMemPoolGetAttribute(pool_, cudaMemPoolAttrReleaseThreshold, &saved_threshold_);
+            e != cudaSuccess) {
+            return refuse("cudaMemPoolGetAttribute (read the release threshold)", e);
+        }
+        threshold_borrowed_ = true;
+        // Release retired buffers to the driver once their stream passes them: the arena and the LLM's
+        // restore allocate with plain cudaMalloc and cannot take bytes the pool keeps.
+        std::uint64_t release_everything = 0;
+        if (const cudaError_t e =
+                cudaMemPoolSetAttribute(pool_, cudaMemPoolAttrReleaseThreshold, &release_everything);
+            e != cudaSuccess) {
+            return refuse("cudaMemPoolSetAttribute (lower the release threshold)", e);
+        }
+        return true;
+    }
+
+    cudaStream_t  prev_;
+    cudaStream_t  stream_          = nullptr;
+    cudaMemPool_t pool_            = nullptr;
+    int           device_          = -1;
+    int           thread_device_   = -1;
+    std::uint64_t saved_threshold_ = 0;
+    std::string   failure_;
+    std::string   last_report_;
+    // Did a CUDA call of THIS scope fail? Only then is the sticky error the lane's own to consume.
+    bool          self_produced_     = false;
+    bool          thread_bound_      = false;
+    bool          threshold_borrowed_ = false;
+    bool          stream_returned_   = false;
+    bool          closed_            = false;
 };
 
 // A device buffer the image job owns: freed (RAII) at scope exit -- always before the interlude
