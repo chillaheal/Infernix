@@ -429,7 +429,9 @@ int main() {
                 "the fixture breaks the x4 vision/VAE invariant");
 
         const ImageGeometry geom = ImageGeometry::derive(kOutSide, kOutSide);
-        const Schedule      sched = ImageJob{kOutSide, kOutSide, kSteps}.schedule(SchedulerConfig{});
+        // The artifact's own schedule constants, bound above with the weights: the job this gate draws is
+        // drawn on the schedule the artifact declares.
+        const Schedule      sched = ImageJob{kOutSide, kOutSide, kSteps}.schedule(dit.scheduler);
 
         // The reference latents do not depend on the instruction, but the encode is re-run per job so
         // each job owns its own ledger window and the byte-zero gate attributes a leak to one prompt.
@@ -574,7 +576,7 @@ int main() {
                     "the extra run: the VAE encode left image device bytes live");
             const ImageGeometry g = ImageGeometry::derive(canvas_h, canvas_w);
             const Schedule job_sched =
-                ImageJob{g.width, g.height, kSteps}.schedule(SchedulerConfig{});
+                ImageJob{g.width, g.height, kSteps}.schedule(dit.scheduler);
             ImageJobInputs inputs;
             inputs.prompt_embeds         = embeds.prompt_embeds;
             inputs.prompt_image_pad_mask = embeds.image_pad_mask;
@@ -746,7 +748,7 @@ int main() {
 
             const ImageGeometry pgeom = ImageGeometry::derive(real.vae.height_px, real.vae.width_px);
             const Schedule psched =
-                ImageJob{pgeom.height, pgeom.width, kSteps}.schedule(SchedulerConfig{});
+                ImageJob{pgeom.height, pgeom.width, kSteps}.schedule(dit.scheduler);
             ImageJobInputs inputs;
             inputs.prompt_embeds         = embeds.prompt_embeds;
             inputs.prompt_image_pad_mask = embeds.image_pad_mask;

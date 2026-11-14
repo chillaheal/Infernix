@@ -297,7 +297,20 @@ int main() {
         // fixed .npy. The dumped sigmas.npy/timesteps.npy are kept as the parity reference to prove the
         // module is a drop-in; the loop then consumes the COMPUTED schedule.
         const qi::ImageGeometry geom = qi::ImageGeometry::derive((std::uint32_t)H, (std::uint32_t)W);
-        const qi::SchedulerConfig scfg;
+        // The six values the shipped artifact declares for the schedule (the converter's verbatim copy of
+        // the checkpoint's scheduler/scheduler_config.json, committed as
+        // tests/convert/fixtures/qwen_image_scheduler_config.json). They are written out here because this
+        // is a CUDA translation unit at C++20, where the artifact-facing reader (std::expected) is not
+        // compiled; tests/models/qwen_image/test_image_artifact_constants.cpp pins the fixture against the
+        // production reader and against the certified mu, so these six cannot drift from the artifact
+        // without that gate failing.
+        qi::SchedulerConstants scfg;
+        scfg.base_image_seq_len  = 256;
+        scfg.max_image_seq_len   = 8192;
+        scfg.base_shift          = 0.5;
+        scfg.max_shift           = 0.9;
+        scfg.num_train_timesteps = 1000;
+        scfg.shift_terminal      = 0.02;
         const double mu = qi::calculate_shift(scfg, geom.tokens);
         std::size_t n_steps = 40;
         qi::Schedule sched;

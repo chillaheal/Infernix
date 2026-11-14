@@ -133,7 +133,9 @@ int main() {
             inputs.height_px     = geom.height;
             inputs.width_px      = geom.width;
             inputs.init_latent   = zero_bits(static_cast<std::size_t>(geom.tokens) * dit.dims.image_in);
-            const Schedule sched = ImageJob{geom.height, geom.width, kSteps}.schedule(SchedulerConfig{});
+            // The artifact's own constants, bound with the weights above: the need this row predicts is
+            // the need of a job drawn on the schedule the artifact declares.
+            const Schedule sched = ImageJob{geom.height, geom.width, kSteps}.schedule(dit.scheduler);
             inputs.timesteps = sched.timesteps;
             inputs.sigmas    = sched.sigmas;
             if (c.ref_side != 0) {

@@ -14,6 +14,7 @@
 // before any quiesce, yield or device work.
 
 #include "artifact/binder.h"
+#include "models/qwen_image/artifact_constants.h"
 
 #include <array>
 #include <cstdint>
@@ -66,6 +67,11 @@ struct DiTBlockWeights {
 
 struct DiTWeights {
     DiTDims dims;
+    // The denoise schedule's constants, read from the artifact's "scheduler" component by
+    // read_scheduler_config while the plan is being built. An artifact that cannot express the
+    // supported FlowMatchEulerDiscrete scheme never gets here: bind_dit refuses it, so a zero set
+    // (NEVER READ) cannot reach a job. docs/maintainer/qwen-image-2-1-variables.md.
+    SchedulerConstants scheduler;
     artifact::ParameterReference img_in, proj_out, modulation, norm_out;
     artifact::ParameterReference txt_in_in, txt_in_out, txt_in_norm;
     artifact::ParameterReference time_linear_1, time_linear_2;

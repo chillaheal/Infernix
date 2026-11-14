@@ -4,13 +4,17 @@
 
 namespace infernix::models::qwen_image {
 
-double calculate_shift(const SchedulerConfig& c, std::size_t image_seq_len) noexcept {
-    const double m = (c.max_shift - c.base_shift) / (c.max_image_seq_len - c.base_image_seq_len);
-    const double b = c.base_shift - m * c.base_image_seq_len;
+double calculate_shift(const SchedulerConstants& c, std::size_t image_seq_len) noexcept {
+    // The token counts are the artifact's JSON integers; they are widened here rather than stored as
+    // doubles, so an artifact that declares 8192.0 never reaches this arithmetic (see the reader).
+    const double max_seq = static_cast<double>(c.max_image_seq_len);
+    const double base_seq = static_cast<double>(c.base_image_seq_len);
+    const double m = (c.max_shift - c.base_shift) / (max_seq - base_seq);
+    const double b = c.base_shift - m * base_seq;
     return static_cast<double>(image_seq_len) * m + b;
 }
 
-Schedule build_schedule(const SchedulerConfig& c, std::size_t steps, double mu) {
+Schedule build_schedule(const SchedulerConstants& c, std::size_t steps, double mu) {
     // Input sigmas = linspace(1.0, 1/steps, steps); the value is computed in double and cast to the
     // float32 pipeline boundary (set_timesteps runs in float32).
     std::vector<float> sig_in(steps);
@@ -38,7 +42,11 @@ Schedule build_schedule(const SchedulerConfig& c, std::size_t steps, double mu) 
     sigmas[steps] = 0.0F;
 
     std::vector<float> timesteps(steps);
-    for (std::size_t i = 0; i < steps; ++i) timesteps[i] = sigmas[i] * static_cast<float>(c.num_train_timesteps);
+    // static_cast<float> of the artifact's integer 1000 is the same float32 the previous double 1000.0
+    // produced, so the certified timesteps do not move.
+    for (std::size_t i = 0; i < steps; ++i) {
+        timesteps[i] = sigmas[i] * static_cast<float>(c.num_train_timesteps);
+    }
 
     return Schedule{std::move(sigmas), std::move(timesteps)};
 }

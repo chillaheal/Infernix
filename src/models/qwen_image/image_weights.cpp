@@ -100,6 +100,28 @@ std::vector<float> cfg_float_array(const Json& config, const char* key, std::str
     return out;
 }
 
+// Read the denoise schedule's constants from the artifact's "scheduler" component through the strict
+// reader. The reader names the key it refuses and, for a deviating value, prints what the artifact
+// declared; this adds WHICH artifact the refusal concerns so the operator who passed --image-artifact
+// reads the reason instead of guessing it. An artifact packed before the converter carried the
+// scheduler document has no such component and is refused: no job is ever drawn with a schedule the
+// artifact did not declare. It throws while the MaterializationPlan is still being built -- before any
+// quiesce, yield, CUDA allocation or partially initialised model state.
+SchedulerConstants read_scheduler_constants(Binder& binder) {
+    const std::string artifact_name = binder.reader().file_path(0).string();
+    const Directory& directory      = binder.reader().directory();
+    if (directory.components.find("scheduler") == directory.components.end()) {
+        throw ArtifactError(artifact_name + " carries no \"scheduler\" component, so the "
+                            "FlowMatchEulerDiscrete schedule this build produces would not be the "
+                            "schedule the artifact declares");
+    }
+    const auto constants = read_scheduler_config(directory.component("scheduler").config);
+    if (!constants.has_value()) {
+        throw ArtifactError(artifact_name + ": " + constants.error());
+    }
+    return *constants;
+}
+
 } // namespace
 
 VaeDenorm read_vae_denorm(Binder& binder) {
@@ -118,6 +140,9 @@ DiTWeights bind_dit(Binder& binder) {
     const std::string_view component = "dit";
 
     DiTWeights out;
+    // Refuse the artifact before a single parameter is resolved: the schedule is read first so an
+    // unhandled scheme costs no bindings, no device work and no partially initialised state.
+    out.scheduler = read_scheduler_constants(binder);
     out.dims.heads      = static_cast<std::uint32_t>(cfg_integer(config, "num_attention_heads", component));
     out.dims.head_dim   = static_cast<std::uint32_t>(cfg_integer(config, "attention_head_dim", component));
     out.dims.layers     = static_cast<std::uint32_t>(cfg_integer(config, "num_layers", component));

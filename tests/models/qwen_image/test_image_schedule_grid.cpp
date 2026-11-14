@@ -11,22 +11,34 @@
 // A wrong scale (the stretch) or a wrong shift slope would break one of these; none is narrowed to pass.
 
 #include "models/qwen_image/image_job.h"
+#include "scheduler_constants_fixture.h"
 
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <exception>
 #include <vector>
 
 namespace qi = infernix::models::qwen_image;
 
 int main() {
+    // The six constants are read from the committed artifact document through the production reader --
+    // the same document and the same reader the serve route builds every schedule from, so this guard
+    // certifies the schedule that ships (and its numbers are the ones the artifact declares).
+    qi::SchedulerConstants cfg;
+    try {
+        cfg = infernix::tests::qwen_image::scheduler_constants_from_artifact();
+    } catch (const std::exception& error) {
+        std::printf("  FAIL: the scheduler constants are not readable from the artifact (%s)\n", error.what());
+        std::printf("IMAGE_SCHEDULE_GRID_TEST: FAIL (1 stage(s))\n");
+        return 1;
+    }
+
     int failures = 0;
     auto fail = [&](const char* msg, const char* detail) {
         std::printf("  FAIL: %s (%s)\n", msg, detail);
         ++failures;
     };
-
-    const qi::SchedulerConfig cfg; // the real Qwen-Image-2.1 scheduler constants
 
     // mu must be strictly increasing in the latent token count (the resolution-dependent shift input).
     {

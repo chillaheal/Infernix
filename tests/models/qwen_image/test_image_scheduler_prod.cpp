@@ -9,10 +9,12 @@
 
 #include "models/qwen_image/image_job.h"
 #include "qwen_image_oracle_ref.h"
+#include "scheduler_constants_fixture.h"
 
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <exception>
 #include <string>
 #include <vector>
 
@@ -46,7 +48,18 @@ int main() {
         std::printf("  %-14s hl=%u wl=%u tokens=%u  OK\n", "geometry", g.hl, g.wl, g.tokens);
     }
 
-    const qi::SchedulerConfig cfg;
+    // The constants are read from the committed artifact document through the production reader, the
+    // same document the serve route binds its schedule from (DiTWeights::scheduler): the oracle numbers
+    // below are qualified against the schedule the shipped artifact declares, not against a copy a test
+    // keeps for itself.
+    qi::SchedulerConstants cfg;
+    try {
+        cfg = infernix::tests::qwen_image::scheduler_constants_from_artifact();
+    } catch (const std::exception& error) {
+        std::printf("  %-14s FAIL (%s)\n", "artifact-fixture", error.what());
+        std::printf("IMAGE_SCHEDULER_PROD_TEST: FAIL (1 stage(s))\n");
+        return 1;
+    }
     const double mu = qi::calculate_shift(cfg, g.tokens);
     const double mu_ref = 0.5387096774193548; // schedule.json (the real pipeline schedule)
     std::printf("  mu = %.10f\n", mu);

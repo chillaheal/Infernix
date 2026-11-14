@@ -443,8 +443,10 @@ private:
         desc.height = height_px;
         desc.width  = width_px;
         desc.steps  = steps;
-        schedules_.push_back(ScheduleCache{height_px, width_px, steps,
-                                           desc.schedule(qi::SchedulerConfig{})});
+        // The artifact's own constants (bound by ensure_locked before this is ever reached, which the
+        // caller's lock guarantees): the schedule a job is drawn with is the schedule the artifact
+        // declared, never a compiled default.
+        schedules_.push_back(ScheduleCache{height_px, width_px, steps, desc.schedule(dit_.scheduler)});
         return schedules_.back().schedule;
     }
 

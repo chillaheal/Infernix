@@ -380,6 +380,18 @@ GeneratedImage run_image_job(artifact::Reader& reader, const DiTWeights& dit, co
                              const ImageJobInputs& inputs, cudaStream_t stream,
                              ImageJobProgressView* progress,
                              std::function<void(const std::string&)> log_line) {
+    // The schedule gate, first statement of the job: the six constants are the artifact's own and only
+    // bind_dit produces them, so a set that was never read is the zero-initialised one -- an artifact
+    // that said nothing about the denoise scheme. Nothing may be drawn with such a schedule and there is
+    // no compiled value to fall back to, so this refuses before the ledger's first query, before any
+    // quiesce or yield, and before any CUDA allocation or partially initialised model state.
+    if (dit.scheduler.base_image_seq_len <= 0 || dit.scheduler.max_image_seq_len <= dit.scheduler.base_image_seq_len ||
+        dit.scheduler.num_train_timesteps <= 0 || !(dit.scheduler.shift_terminal >= 0.0 && dit.scheduler.shift_terminal < 1.0) ||
+        !std::isfinite(dit.scheduler.base_shift) || !std::isfinite(dit.scheduler.max_shift)) {
+        throw std::runtime_error(
+            "image job: the artifact's scheduler constants were never read, so this build would draw the "
+            "job with a denoise schedule the artifact did not declare");
+    }
     // The stage telemetry goes through the caller's sink (the serving route's logger, serialized
     // against the console's stats panel); with no sink the certified route prints nothing.
     // The ledger is the module's own account of what it holds; the driver free and the stream-ordered

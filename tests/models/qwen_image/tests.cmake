@@ -43,22 +43,47 @@ infernix_add_op_test(infernix_image_forward_test
 infernix_add_op_test(infernix_image_scheduler_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_image_scheduler.cpp")
 
+# Task 9, the fail-closed reader gate: the image lane's scheduler constants and DiT rope axes come
+# from the artifact's metadata (src/models/qwen_image/artifact_constants.{h,cpp}) and nothing falls
+# back to a compiled value. Qualified against the committed copy of the reference checkpoint's own
+# scheduler/scheduler_config.json (tests/convert/fixtures/, read from disk -- not a hand-written
+# literal), so a reader that only matches a test-local JSON cannot pass. Every deviation the
+# supported FlowMatchEulerDiscrete path cannot express -- a JSON float where an integer is required,
+# an integer where a boolean is required, a non-finite float, a flipped mode flag, an unknown scheme
+# key, another sampler class, a missing key, a zero/negative divisor -- must be refused by name, with
+# the offending value. The last section reads the live artifact through the production reader and
+# SKIPs when INFERNIX_TEST_ARTIFACT is absent. Host-only, no GPU, no server. The readers return
+# std::expected, which this tree compiles per target at C++23 (the CUDA lane stays at C++20).
+infernix_add_op_test(infernix_image_artifact_constants_test
+  NEEDS_SOURCE_DIR
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_image_artifact_constants.cpp"
+  LIBRARIES infernix_qwen_image infernix_artifact infernix::json)
+target_compile_features(infernix_image_artifact_constants_test PRIVATE cxx_std_23)
+
 # Production scheduler qualification: the infernix_qwen_image FlowMatchEulerDiscrete schedule
 # (calculate_shift + build_schedule) and the geometry's token count against the real 512x512 40-step
 # pipeline oracle (tensors_pipeline/ sigmas.npy + timesteps.npy, dumped by image-spike/oracle/
 # dump_pipeline.py). Host-only, weights-free. A-priori tol 2e-5 on the f32 schedule, never narrowed.
 # Skips (77) without INFERNIX_IMAGE_ORACLE_PIPELINE.
 infernix_add_op_test(infernix_image_scheduler_prod_test
+  NEEDS_SOURCE_DIR
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_image_scheduler_prod.cpp"
-  LIBRARIES infernix_qwen_image)
+  LIBRARIES infernix_qwen_image infernix_artifact infernix::json)
+# The schedule's constants are read from the committed artifact document through the production reader,
+# which returns std::expected (host-only, compiled per target at C++23; the CUDA lane stays at C++20).
+target_compile_features(infernix_image_scheduler_prod_test PRIVATE cxx_std_23)
 
 # Resolution-grid invariants of the production schedule (infernix_qwen_image): mu monotone in the
 # latent token count, sigmas[0]=1 / sigmas[steps]=0 / sigmas[steps-1]=shift_terminal, strictly
 # decreasing within [0,1], timesteps==sigmas*num_train_timesteps. Host-only, weights-free, no oracle,
 # always runs -- guards the variable-resolution gap the single 512 pipeline oracle cannot cover.
 infernix_add_op_test(infernix_image_schedule_grid_test
+  NEEDS_SOURCE_DIR
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_image_schedule_grid.cpp"
-  LIBRARIES infernix_qwen_image)
+  LIBRARIES infernix_qwen_image infernix_artifact infernix::json)
+# The schedule's constants are read from the committed artifact document through the production reader,
+# which returns std::expected (host-only, compiled per target at C++23; the CUDA lane stays at C++20).
+target_compile_features(infernix_image_schedule_grid_test PRIVATE cxx_std_23)
 
 # Seeded standard-normal init-latent noise (infernix_qwen_image::fill_normal): the image job's "seed"
 # knob. Host-only, no oracle file -- the independent reference is the N(0,1) distribution, so the
@@ -418,8 +443,12 @@ set_tests_properties(infernix_image_pipeline_gate_test PROPERTIES SKIP_RETURN_CO
 # rope rows == img_mask len == text_len + tokens/4; tokens == 4*packed; schedule length tracks steps; init
 # latent count == packed*64 and finite. Host-only, no oracle, no GPU -- always runs.
 infernix_add_op_test(infernix_image_job_assembly_test
+  NEEDS_SOURCE_DIR
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_image_job_assembly.cpp"
-  LIBRARIES infernix_qwen_image)
+  LIBRARIES infernix_qwen_image infernix_artifact infernix::json)
+# The job's schedule constants come from the committed artifact document through the production reader,
+# which returns std::expected (host-only, compiled per target at C++23; the CUDA lane stays at C++20).
+target_compile_features(infernix_image_job_assembly_test PRIVATE cxx_std_23)
 
 # M9, THE SHIP GATE for the reference_image capability: the edit instruction graded on the picture
 # instead of on a row. The synthetic fixture (a blue field, a centred red square) goes through the
