@@ -100,7 +100,7 @@ inline constexpr std::size_t kMaximumImageInputBytes = 16ULL * 1024 * 1024;
 // conditions the same forward, so this is a route policy and not a model limit. What really bounds it
 // is measured per request, not here: each reference costs 4 * its vision tokens of joint sequence
 // (models/qwen_image/joint_layout.h joint_token_count, admitted against
-// ops::kAttnDitJointMaxTokens before any VRAM is yielded) plus its latent tokens in the reservation
+// ops::kImageJointMaxTokens before any VRAM is yielded) plus its latent tokens in the reservation
 // (image_device_need.h: all_img == ref_tokens + target). Four 1024^2-area references reach roughly
 // half the joint ceiling with room left for the instruction and a CFG pass; a fifth, or any set that
 // does not fit, is the admission's refusal -- never a silent drop. The joint attention, the rope walk
@@ -112,7 +112,7 @@ inline constexpr std::size_t kMaximumImageReferences = 4;
 // Upper bound on prompt length accepted at the images boundary (bytes). This is a WIRE bound -- what one
 // request may carry -- and deliberately not the model's bound: the model's limit is the joint sequence
 // (image_generation_service.h and models/qwen_image/joint_layout.h joint_token_count against
-// ops::kAttnDitJointMaxTokens), which depends on the canvas and the reference and is therefore admitted
+// ops::kImageJointMaxTokens), which depends on the canvas and the reference and is therefore admitted
 // per request after the prompt is rendered. The two used to be the same 4096, which refused a
 // text-rendering prompt the model would have served fine: Qwen-Image-2.1's own prompt enhancer writes
 // an instruction of thousands of characters, and 4096 bytes is a few hundred CJK characters. Nothing on

@@ -1,5 +1,6 @@
 #include "infernix/ops/rope_c64.h"
 
+#include "infernix/ops/image_joint_limits.h"
 #include "ops/rope_c64/launch.h"
 
 #include <array>
@@ -14,7 +15,6 @@ namespace {
 constexpr std::int32_t kHeadDim   = 128;  // 64 complex pairs
 constexpr std::int32_t kHeads     = 32;   // DiT full (non-GQA) attention
 constexpr std::int32_t kMaxHeads  = 40;
-constexpr std::int32_t kMaxTokens = 20480;
 
 bool aligned_to(const void* pointer, std::uintptr_t alignment) {
     return pointer != nullptr && (reinterpret_cast<std::uintptr_t>(pointer) & (alignment - 1)) == 0;
@@ -58,8 +58,8 @@ void require_geometry(const Tensor& rot, const Tensor& q, const Tensor* k) {
     if (heads < 1 || heads > kMaxHeads) {
         throw std::invalid_argument("rope_c64: heads must be 1..40");
     }
-    if (tokens < 1 || tokens > kMaxTokens) {
-        throw std::invalid_argument("rope_c64: S must be 1..20480");
+    if (!image_joint_tokens_ok(tokens)) {
+        throw std::invalid_argument(image_joint_range_message("rope_c64"));
     }
     require_rot(rot, tokens);
     require_head_tensor(q, heads, tokens, "q");

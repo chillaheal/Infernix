@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/tensor.h"
+#include "infernix/ops/image_joint_limits.h"
 
 #include <cuda_runtime.h>
 
@@ -8,11 +9,11 @@
 
 namespace infernix::ops {
 
-// The longest joint sequence this module serves, both as documented below ("S is 1..20480") and as the
-// check every entry performs. Public because the serve layer has to answer the same question BEFORE it
-// yields the LLM's VRAM: a request whose sequence cannot be assembled is the client's to be told about
-// (HTTP 400, with the numbers), not a job that dies inside the interlude with a 500.
-inline constexpr std::int32_t kAttnDitJointMaxTokens = 20480;
+// The longest joint sequence the image lane serves is infernix::ops::kImageJointMaxTokens, one symbol
+// in image_joint_limits.h shared with rope_c64, dit_adaln, canvas admission, the chat tool schema and
+// /v1/capabilities. Every entry below checks it, and the serve layer has to answer the same question
+// BEFORE it yields the LLM's VRAM: a request whose sequence cannot be assembled is the client's to be
+// told about (HTTP 400, with the numbers), not a job that dies inside the interlude with a 500.
 
 /**
  * Qwen-Image-2.1 DiT joint block-causal softmax attention over the text-prefix / image-suffix
@@ -32,8 +33,9 @@ inline constexpr std::int32_t kAttnDitJointMaxTokens = 20480;
  *
  * All three operands and the output use the channel-first head layout [head_dim, heads, S, 1] with
  * head_dim (128) fastest, then heads, then the token. head_dim is fixed at 128; a caller dispatches
- * here only for a 128-wide head. heads is 1..40 and S is 1..20480. text_prefix is 0..S: 0 makes the
- * whole sequence one bidirectional image block, S makes it fully causal text. q, k, v, out are
+ * here only for a 128-wide head. heads is 1..40 and S is 1..kImageJointMaxTokens (the one ceiling in
+ * image_joint_limits.h). text_prefix is 0..S: 0 makes the whole sequence one bidirectional image
+ * block, S makes it fully causal text. q, k, v, out are
  * BF16, contiguous and 4-byte aligned; out is a separate buffer that must not overlap q, k or v.
  * q, k and v may alias each other only if the caller has already written them.
  *

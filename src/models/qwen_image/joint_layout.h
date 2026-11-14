@@ -84,7 +84,7 @@ struct JointLayout {
 // three arguments are exactly what serve/image_generation_service.cpp holds before the probe.
 //
 // This exists so the joint sequence can be admitted BEFORE the LLM's VRAM is yielded -- the joint
-// attention Op refuses S above ops::kAttnDitJointMaxTokens, and a job that dies on that throw inside
+// attention Op refuses S above ops::kImageJointMaxTokens, and a job that dies on that throw inside
 // the interlude is a 500 the client could have been told about as a 400. Its agreement with
 // build_joint_layout is pinned by a host test, which is what makes quoting it here safe.
 [[nodiscard]] long long joint_token_count(long long prompt_rows, long long vision_tokens,

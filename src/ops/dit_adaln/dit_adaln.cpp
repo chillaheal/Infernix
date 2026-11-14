@@ -1,5 +1,6 @@
 #include "infernix/ops/dit_adaln.h"
 
+#include "infernix/ops/image_joint_limits.h"
 #include "ops/dit_adaln/launch.h"
 
 #include <array>
@@ -11,7 +12,6 @@
 namespace infernix::ops {
 namespace {
 
-constexpr std::int32_t kMaxSeq = 20480;
 constexpr std::int32_t kMaxDim = 65536;
 
 bool aligned_to(const void* pointer, std::uintptr_t alignment) {
@@ -62,8 +62,8 @@ void require_geometry(std::int32_t dim, std::int32_t tokens, std::int32_t text_p
     if (dim < 1 || dim > kMaxDim) {
         throw std::invalid_argument("dit_adaln: D must be 1..65536");
     }
-    if (tokens < 1 || tokens > kMaxSeq) {
-        throw std::invalid_argument("dit_adaln: S must be 1..20480");
+    if (!image_joint_tokens_ok(tokens)) {
+        throw std::invalid_argument(image_joint_range_message("dit_adaln"));
     }
     if (text_prefix < 0 || text_prefix > tokens) {
         throw std::invalid_argument("dit_adaln: text_prefix must be 0..S");

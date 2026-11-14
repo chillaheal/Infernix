@@ -172,6 +172,13 @@ infernix_add_op_test(infernix_dit_adaln_test
   LIBRARIES infernix_ops)
 set_tests_properties(infernix_dit_adaln_test PROPERTIES SKIP_RETURN_CODE 77)
 
+# One joint-sequence ceiling, shared by the image ops, /v1/capabilities and the chat tool
+# schema. Host-only: the ops' token check runs before any device work is enqueued, so the
+# refusals need no CUDA device and the suite must never skip.
+infernix_add_test(infernix_image_joint_limits_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_image_joint_limits.cpp"
+  LIBRARIES infernix_ops infernix_serve)
+
 infernix_add_family_op_test(infernix_softmax_attention_test FAMILY attention
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/softmax_attention/main.cpp"
           "${CMAKE_CURRENT_LIST_DIR}/softmax_attention/causal_cache.cpp"

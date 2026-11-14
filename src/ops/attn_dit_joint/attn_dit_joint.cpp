@@ -1,5 +1,6 @@
 #include "infernix/ops/attn_dit_joint.h"
 
+#include "infernix/ops/image_joint_limits.h"
 #include "ops/attn_dit_joint/launch.h"
 
 #include <array>
@@ -13,8 +14,6 @@ namespace {
 
 constexpr std::int32_t kHeadDim   = 128;
 constexpr std::int32_t kMaxHeads  = 40;
-// The one ceiling, from the header, so the serve admission and this check cannot drift apart.
-constexpr std::int32_t kMaxTokens = kAttnDitJointMaxTokens;
 
 bool aligned_to(const void* pointer, std::uintptr_t alignment) {
     return pointer != nullptr && (reinterpret_cast<std::uintptr_t>(pointer) & (alignment - 1)) == 0;
@@ -44,8 +43,8 @@ void attn_dit_joint(const Tensor& q, const Tensor& k, const Tensor& v, std::int3
     if (heads < 1 || heads > kMaxHeads) {
         throw std::invalid_argument("attn_dit_joint: heads must be 1..40");
     }
-    if (tokens < 1 || tokens > kMaxTokens) {
-        throw std::invalid_argument("attn_dit_joint: S must be 1..20480");
+    if (!image_joint_tokens_ok(tokens)) {
+        throw std::invalid_argument(image_joint_range_message("attn_dit_joint"));
     }
     if (text_prefix < 0 || text_prefix > tokens) {
         throw std::invalid_argument("attn_dit_joint: text_prefix must be 0..S");
@@ -70,8 +69,8 @@ void attn_dit_joint_block_causal(const Tensor& q, const Tensor& k, const Tensor&
     if (heads < 1 || heads > kMaxHeads) {
         throw std::invalid_argument("attn_dit_joint: heads must be 1..40");
     }
-    if (tokens < 1 || tokens > kMaxTokens) {
-        throw std::invalid_argument("attn_dit_joint: S must be 1..20480");
+    if (!image_joint_tokens_ok(tokens)) {
+        throw std::invalid_argument(image_joint_range_message("attn_dit_joint"));
     }
     // One id per token and nothing else: the kernel indexes it with the key token alone, so a mask
     // of any other shape would read past its end at the last tile.

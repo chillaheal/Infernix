@@ -1,6 +1,6 @@
 #include "serve/http_server.h"
 
-#include "infernix/ops/attn_dit_joint.h"
+#include "infernix/ops/image_joint_limits.h"
 #include "product/logging/logging.h"
 #include "product/speculative_options.h"
 #include "serve/anthropic_messages.h"
@@ -728,7 +728,7 @@ std::string make_capabilities_json(const ServeOptions& options, std::string_view
                                      // so nobody reaches for free VRAM to raise it, because freeing memory
                                      // changes nothing: 2048x2048 draws from words and is refused as an edit.
                                      {"joint_sequence",
-                                      Json{{"ceiling_tokens", ops::kAttnDitJointMaxTokens},
+                                      Json{{"ceiling_tokens", ops::kImageJointMaxTokens},
                                            {"counts", "the canvas costs (W/16)x(H/16) tokens, every "
                                                       "reference triple its vision tokens, and every text "
                                                       "row one token; the sum must stay under the ceiling"},

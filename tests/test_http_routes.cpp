@@ -1,4 +1,4 @@
-#include "infernix/ops/attn_dit_joint.h"
+#include "infernix/ops/image_joint_limits.h"
 #include "serve/chat_image_tool.h"
 #include "serve/http_server.h"
 #include "serve/image_generation_service.h"
@@ -162,7 +162,7 @@ int main() {
     // two limits look like one and a client keeps asking the machine for memory it cannot spend.
     failures += check(
         configured.at("image_generation").at("canvas").at("joint_sequence").at("ceiling_tokens") ==
-            static_cast<int>(infernix::ops::kAttnDitJointMaxTokens) &&
+            static_cast<int>(infernix::ops::kImageJointMaxTokens) &&
             configured.at("image_generation").at("canvas").at("joint_sequence").at("counts")
                     .get<std::string>().find("(W/16)x(H/16)") != std::string::npos,
         "the capability names the joint sequence ceiling and how a canvas is counted against it");

@@ -8,7 +8,7 @@
 #include "artifact/schema.h"
 #include "media/decode/decode.h"
 #include "media/encode/png_encode.h"
-#include "infernix/ops/attn_dit_joint.h"
+#include "infernix/ops/image_joint_limits.h"
 #include "models/qwen_image/image_device_need.h"
 #include "models/qwen_image/image_job.h"
 #include "models/qwen_image/image_pipeline.h"
@@ -1148,7 +1148,7 @@ RequestJson ImageGenerationService::generate(const OpenAIImagesRequest& request,
     // The joint sequence's LENGTH is a host fact once the prompt is rendered, so it is admitted here
     // and not discovered by the attention Op inside the interlude: every text row is one position and
     // every image slot four (models/qwen_image/joint_layout.h), and the Op refuses a sequence longer
-    // than ops::kAttnDitJointMaxTokens. A request over that is the client's -- its prompt, its canvas --
+    // than ops::kImageJointMaxTokens. A request over that is the client's -- its prompt, its canvas --
     // and it gets the numbers and a 400 before the LLM is quiesced, instead of a job that yields the
     // card, throws and comes back a 500. The CFG negative pass is its own joint sequence over the SAME
     // references, so its rows are admitted on their own count.
@@ -1159,7 +1159,7 @@ RequestJson ImageGenerationService::generate(const OpenAIImagesRequest& request,
         const long long joint = qi::joint_token_count(static_cast<long long>(rows),
                                                       static_cast<long long>(vision_tokens),
                                                       static_cast<long long>(canvas.tokens));
-        if (joint > ops::kAttnDitJointMaxTokens) {
+        if (joint > ops::kImageJointMaxTokens) {
             // What the canvas may cost is the ceiling minus everything the request already fixed: the
             // joint count without the target term, taken from the same call that produced `joint` so the
             // two can never drift apart. Then name the biggest canvas that fits -- or, when not even the
@@ -1168,13 +1168,13 @@ RequestJson ImageGenerationService::generate(const OpenAIImagesRequest& request,
             const long long overhead = joint - static_cast<long long>(canvas.tokens);
             const auto [fit_w, fit_h] =
                 largest_fitting_canvas(effective.width, effective.height,
-                                       ops::kAttnDitJointMaxTokens - overhead);
+                                       ops::kImageJointMaxTokens - overhead);
             const std::string advice =
                 qi::joint_token_count(static_cast<long long>(rows),
                                       static_cast<long long>(vision_tokens),
                                       static_cast<long long>(
                                           qi::ImageGeometry::derive(fit_h, fit_w).tokens)) <=
-                        ops::kAttnDitJointMaxTokens
+                        ops::kImageJointMaxTokens
                     ? "a smaller size or a shorter " + std::string(lane) + " both work: " +
                           std::to_string(fit_w) + "x" + std::to_string(fit_h) + " fits"
                     : "no canvas fits this many " + std::string(lane) +
@@ -1183,7 +1183,7 @@ RequestJson ImageGenerationService::generate(const OpenAIImagesRequest& request,
                 400, "invalid_request_error",
                 std::string("the ") + lane + " is too long for this canvas: it makes a joint sequence of " +
                     std::to_string(joint) + " tokens, and the model serves at most " +
-                    std::to_string(ops::kAttnDitJointMaxTokens) + " (" + advice + ")",
+                    std::to_string(ops::kImageJointMaxTokens) + " (" + advice + ")",
                 "prompt", "image_prompt_too_long"}};
         }
     }
