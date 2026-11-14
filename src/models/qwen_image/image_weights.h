@@ -153,11 +153,48 @@ struct VisionWeights {
     std::uint64_t max_object_bytes = 0;
 };
 
-// The named VAE-decoder parameters the production decode route consumes, keyed by their artifact
-// binding names ("vae/..." -- the recipe maps every VAE source tensor one-to-one as a direct BF16
-// parameter, so the source key IS the contract). The decode walks a fixed chain: every operand it
-// needs is a key here; a role the artifact no longer stores throws at bind time, not mid-decode.
+// The operands and op scratch the ledger's inventory does not enumerate: the DiT's top-level
+// projections, the VAE's weights, and whatever workspace the linear/conv/attention ops take per
+// call. An over-estimated need refuses a job that might have run; an under-estimated one OOMs it.
+//
+// It is a calibration of THIS build -- its allocator, its ops, its interlude floor -- never a claim of
+// the checkpoint's, which is why the value lives with the binding that produces the measurement rather
+// than with the ledger's arithmetic, why read_vae_topology leaves VaeTopology::weight_resident_bytes
+// zero, why the binding stamps this number into the topology it returns, and why check_vae_topology
+// refuses an unstamped one: an admission decision taken from a zero allowance would refuse nothing at
+// all. It is the term the image ledger's own qualification drives (see
+// src/models/qwen_image/image_device_need.h for the term it feeds).
+//
+// Two calibrations set it:
+//   - the ledger qualification (tests/models/qwen_image/test_image_need_ledger_real.cu) proves predicted
+//     >= measured for the certified inputs, and
+//   - the stage bench (image-spike/stage_bench_A_full_overlap.err.log) gives the REAL per-step ledger
+//     peak a live job reaches -- higher than the cert's, because the cert feeds zero-filled trivial
+//     inputs while a served job carries a real prompt/negative/reference. The cert alone would let
+//     this drift below what a live job actually holds.
+//
+// Subtracting the enumerated structural terms (dit_activations + latent_and_velocity + vae_peak +
+// rope_and_tables) from the real peak leaves the residual this term must absorb: ~772 MiB at 512,
+// ~322 at 768, and ~1180 at 768+ref / 768+CFG (the ref/CFG rows, where the real sequence is longest
+// and the cert's trivial inputs understate it most). The 1024 row's structural terms alone already
+// exceed its real peak, so its residual is negative. So the largest residual to cover is ~1184 MiB;
+// 3072 MiB leaves ~1.9 GiB on top of it for the 512 MiB interlude floor plus whatever the KV pool
+// and the LLM restore hold during the interlude. That puts the predicted total at ~1.6-2.5x the real
+// peak on every certified row -- down from the ~4x this term carried when it was the whole-measured-
+// peak proxy (6183, then 5972 after the second resident block was counted explicitly in bundle B
+// fas 2) -- without ever dropping predicted below the measured peak plus the 512 MiB floor.
+inline constexpr std::uint64_t kQwenImageWeightResidentBytes = 3072ULL * 1024ULL * 1024ULL;
+
+// The named VAE-decoder parameters the production decode route consumes, keyed by their artifact binding
+// names ("vae/..." -- the recipe maps every VAE source tensor one-to-one as a direct BF16 parameter, so
+// the source key IS the contract), together with the decoder geometry the artifact declared them under.
+// The decode walks a fixed chain: every operand it needs is a key here, bound at the shape the topology
+// says it has, and a role the artifact no longer stores throws at bind time, not mid-decode. The
+// topology is the ONE copy of the channel widths in the build: the CUDA decode graph reads it off this
+// object (image_pipeline.cu) and the VRAM ledger charges for exactly the same fields
+// (image_device_need.h), so nothing in the tree keeps a second literal of a width this artifact owns.
 struct VaeWeights {
+    VaeTopology topology;
     std::map<std::string, artifact::ParameterReference> by_name;
     std::uint64_t max_object_bytes = 0;
 };
@@ -170,9 +207,13 @@ struct VaeDenorm {
     std::vector<float> std;  // [image_in]
 };
 
-// Read the denormalization pair from the artifact's "vae" component config. A missing key, a
-// non-array value, a non-number entry or a length mismatch throws artifact::ArtifactError.
-[[nodiscard]] VaeDenorm read_vae_denorm(artifact::Binder& binder);
+// Read the denormalization pair from the artifact's "vae" component config. A missing key, a non-array
+// value, a non-number entry or a length mismatch throws artifact::ArtifactError -- including a pair whose
+// length disagrees with the bound topology's denorm_elements, which is the artifact-owned latent width
+// read_vae_topology verified against the checkpoint's own "z_dim": the statistics and the latent plane are
+// one declaration, and the caller passes the topology the SAME binding produced (never a defaulted one),
+// so the route can never denormalize a plane against a pair the artifact did not describe.
+[[nodiscard]] VaeDenorm read_vae_denorm(artifact::Binder& binder, const VaeTopology& topology);
 
 // Resolve every logical DiT / text-tower / VAE (decoder + #75 encoder/quant_conv) parameter through
 // the caller's Binder (so the caller's finish() sees one combined, streamed-only MaterializationPlan).
@@ -195,3 +236,31 @@ struct VaeDenorm {
 [[nodiscard]] VisionWeights bind_image_vision(artifact::Binder& binder);
 
 } // namespace infernix::models::qwen_image
+
+// check_vae_topology returns std::expected, which -- exactly as in artifact_constants.h -- the project
+// compiles only where it builds at C++23 (the CUDA lane is pinned to C++20, whose standard library does
+// not provide it). The record it checks is plain data and stays visible to every translation unit; the
+// check itself is called from the host binding path, before bind_image_vae returns, and never from a
+// device translation unit.
+#ifdef INFERNIX_IMAGE_READS_ARTIFACT_CONSTANTS
+#    include <expected>
+
+namespace infernix::models::qwen_image {
+
+// Verify the artifact-declared decoder topology against the references the binding actually resolved:
+// every operand the CUDA decode graph consumes must be bound at exactly the shape the topology says it
+// has, and the topology must be self-consistent with the one chain this build runs (a stage that does not
+// continue its predecessor's channels, a doubling pattern other than "every up block except the last", or
+// an unstamped calibration is a topology nothing ran). The first deviation is returned naming the role,
+// its stage and index, and the expected-versus-bound shape -- never the first one that happens to match.
+//
+// It is a hard gate, not a report: bind_image_vae calls it before returning, so a refusal stops the
+// binding the same way a missing role does, and no job is ever decoded with a geometry the artifact did
+// not declare. Three representations have to agree for it to pass -- the artifact's declared config, the
+// shapes the Binder resolved from the stored bytes, and this comparison -- so a pass is verification
+// rather than a tautology, and a topology that was never read (every field zero) is refused outright.
+[[nodiscard]] std::expected<void, std::string> check_vae_topology(const VaeTopology& topology,
+                                                                  const VaeWeights& weights);
+
+} // namespace infernix::models::qwen_image
+#endif // INFERNIX_IMAGE_READS_ARTIFACT_CONSTANTS

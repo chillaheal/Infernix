@@ -283,7 +283,13 @@ int main() {
         // carries a reference with either one missing is refused as unconfigured. `tower` is the same
         // processor directory the t2i renderer above reads.
         infernix::serve::make_artifact_vision_dims_provider(image_artifact),
-        infernix::serve::make_tower_reference_prompt_renderer(tower));
+        infernix::serve::make_tower_reference_prompt_renderer(tower),
+        // No prompt enhancer for this tool (the documented absent sidecar), and then the artifact's own VAE
+        // decoder geometry: every row here goes through the same admission a served request does, which
+        // prices each job's decode from the topology the binding verified -- and refuses a job that has
+        // none rather than reserving for a decode nobody read.
+        std::shared_ptr<infernix::serve::PromptEnhancer>{},
+        infernix::serve::make_artifact_vae_topology_provider(image_artifact));
 
     std::printf("BENCH engine max_context=%u expert_ram_gib=%llu image_artifact=%s\n", max_context,
                 static_cast<unsigned long long>(expert_ram / (1024ULL * 1024ULL * 1024ULL)),

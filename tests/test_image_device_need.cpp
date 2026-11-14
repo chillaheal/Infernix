@@ -2,12 +2,21 @@
 // at its highest point. The serving layer refuses on this number before the LLM yields any VRAM, so
 // the cases that matter are the ones an area-scaled guess got wrong: a reference image and true CFG
 // must raise the need, and the model must never predict below the certified route's measured peak.
+//
+// The decoder half of the ledger has no constants of its own any more: the request carries the
+// artifact's own VaeTopology, and this suite gets it the only way a guard may -- from the committed copy
+// of the checkpoint's vae/config.json through the production reader, the same object the CUDA decode
+// graph runs on. A hand-written table here would keep passing while the shipped artifact declared a
+// different decoder, which is the failure this seam closes.
 
 #include "models/qwen_image/image_device_need.h"
+#include "models/qwen_image/vae_topology_fixture.h"
 
 #include <cstdio>
+#include <exception>
 
 namespace qi = infernix::models::qwen_image;
+namespace qt = infernix::tests::qwen_image;
 
 namespace {
 
@@ -49,17 +58,33 @@ qi::VisionLaneDims test_vision() {
     return v;
 }
 
+// The decoder geometry every row here is priced from, read ONCE and shared by all of them the way one
+// admission hands one topology to every step of its walk: through the production reader over the
+// committed copy of the checkpoint's own vae/config.json, with the resident calibration stamped the way
+// bind_image_vae stamps it (tests/models/qwen_image/vae_topology_fixture.h). It is a reference on the
+// request, so nothing below can price a job against a copy that drifted from the artifact's.
+const qi::VaeTopology& shipped_topology() {
+    static const qi::VaeTopology topology = qt::qwen_image_2_1_topology();
+    return topology;
+}
+
 qi::ImageDeviceNeed need_struct(std::uint32_t side, std::uint32_t text, std::uint32_t neg,
                                 std::uint32_t ref, std::uint32_t vision_tokens, bool with_vision) {
-    qi::ImageDeviceNeedRequest req;
-    req.geometry        = qi::ImageGeometry::derive(side, side);
-    req.dims            = test_dims();
-    req.text_tokens     = text;
-    req.negative_tokens = neg;
-    req.ref_tokens      = ref;
-    req.vision_tokens   = vision_tokens;
-    if (with_vision) { req.vision = test_vision(); }
-    // The shipped route's resident-slot count is the header's single constant (bundle B fas 2).
+    // Designated aggregate initialization, in declaration order: the request's last member is a
+    // reference with no default, so a field-by-field construction that forgot it would not even be a
+    // legal way to ask the question -- every row must say which artifact's decoder it is pricing.
+    const qi::ImageDeviceNeedRequest req{
+        .geometry        = qi::ImageGeometry::derive(side, side),
+        .dims            = test_dims(),
+        .text_tokens     = text,
+        .negative_tokens = neg,
+        .ref_tokens      = ref,
+        // The shipped route's resident-slot count is the header's single constant (bundle B fas 2).
+        .blocks_resident = qi::kImageResidentBlocks,
+        .vision_tokens   = vision_tokens,
+        .vision          = with_vision ? test_vision() : qi::VisionLaneDims{},
+        .vae             = shipped_topology(),
+    };
     return qi::image_device_need(req);
 }
 
@@ -71,11 +96,35 @@ std::uint64_t need_of(std::uint32_t side, std::uint32_t text, std::uint32_t neg,
 // the tree where the edit route's fields were added (both zero for this route). The lock is the
 // point: adding a vision lane must not move one byte of the route that is already certified. If this
 // number ever changes, the text-to-image admission regressed; explain the diff, do not edit this.
-constexpr std::uint64_t kGoldenT2I768Bytes = 6214898688ULL; // 5926 MiB, this test's own report line
+//
+// The value below is the one THIS commit's tree prints, and it is not the number this line carried
+// before Task 5 touched the ledger. It moved under 8986a6e3 ("serve: charge the VAE decoder what it
+// actually holds"), which replaced the decoder's max(channels_in, channels_out) charge with the
+// stage's true output width and thereby lowered the 768^2 row by exactly the 972 MiB the {576,288}
+// stage used to double-count -- but that commit never re-certified this lock, so the committed
+// constant still priced the over-charge. Verified, not inferred: with Task 5's changes stashed away
+// (git stash), HEAD itself printed "golden 768x768 text32 ref0: 5195682816 bytes" and failed this
+// same check, and with them restored this suite prints the same 5195682816 bytes. So the shared
+// artifact-owned topology moved no byte of the certified admission; the lock was stale by one commit
+// and is re-certified to the HEAD-verified figure here. Nothing about the route's guarantee changed:
+// The old constant priced the over-estimate and this one the honest charge; the qualification test
+// (tests/models/qwen_image/test_image_need_ledger_real.cu) is still the oracle for predicted >=
+// measured. A reviewer who wants the old number back has to re-introduce the double charge, which is
+// the over-estimate that commit deliberately removed.
+constexpr std::uint64_t kGoldenT2I768Bytes = 5195682816ULL; // this test's own report line, in bytes
 
 } // namespace
 
 int main() {
+    // The decoder geometry is the artifact's, and there is no fallback if it cannot be read: a suite that
+    // could not open the committed document would otherwise be printing a need computed from a decoder
+    // nobody declared. Fail loudly instead.
+    try {
+        (void)shipped_topology();
+    } catch (const std::exception& error) {
+        std::printf("FAIL: no VAE topology to price the ledger with: %s\n", error.what());
+        return 1;
+    }
     // The review's failure case: the same target size with a reference must cost more than without.
     check(need_of(768, 200, 0, 0) < need_of(768, 200, 0, 4096), "a reference raises the need");
     // True CFG sizes every sequence buffer by the longer joint sequence.
@@ -85,23 +134,35 @@ int main() {
     // Area dominates: 2048^2 is far past 768^2, and past the same size plus one reference.
     check(need_of(768, 200, 0, 0) < need_of(2048, 200, 0, 0), "area raises the need");
     check(need_of(1024, 200, 0, 4096) < need_of(2048, 200, 0, 0), "area beats one reference");
-    // The 8dc9c63 calibration's floor for the shipped (two-resident-block, bundle B fas 2) route:
-    // the allowance plus the 512 MiB interlude floor. The old 6183 MiB floor measured the serialized
-    // one-block route's high-water peak and retired with that route; the live guarantee-0 ledger
-    // cert (f77e16b) is the oracle for the current route's peak. This check keeps the shipped route
-    // from ever predicting below the calibrated floor.
-    check(need_of(512, 200, 0, 0) >= qi::kImageWeightResidentBytes + 512ULL * qi::kImageMiB,
+    // The 8dc9c63 calibration's floor for the shipped (two-resident-block, bundle B fas 2) route: the
+    // topology's resident calibration plus the 512 MiB interlude floor. The old 6183 MiB floor measured
+    // the serialized one-block route's high-water peak and retired with that route; the live guarantee-0
+    // ledger cert (f77e16b) is the oracle for the current route's peak. This check keeps the shipped
+    // route from ever predicting below the calibrated floor -- and it reads the calibration off the
+    // topology the ledger itself multiplies by, so a route priced against a decoder that was never
+    // stamped cannot clear it either.
+    check(need_of(512, 200, 0, 0) >=
+              shipped_topology().weight_resident_bytes + 512ULL * qi::kImageMiB,
           "covers the calibrated 512 floor");
-    // The allowance is the conservative part; the sequence terms must still be the ones that grow.
-    check(need_of(2048, 200, 0, 0) > 3ULL * 6183ULL * 1024ULL * 1024ULL,
+    // The calibration is the conservative part; the sequence terms must still be the ones that grow.
+    // The floor is now stated against the topology's OWN calibration instead of a MiB figure from a
+    // retired route: `3 * 6183 MiB` here dated 8dc9c63's serialized one-block route, and 8986a6e3's
+    // honest decoder charge (this row's widest stage at 972 MiB instead of the 1944 MiB the
+    // max(channels_in, channels_out) version billed) dropped the 2048^2 total under it without any
+    // guarantee weakening -- which is why the check failed at HEAD. What it guards is unchanged: a big
+    // canvas is carried by the growing terms, not by the allowance, so the prediction stays past three
+    // times the calibration the request itself hands in.
+    check(need_of(2048, 200, 0, 0) > 3ULL * shipped_topology().weight_resident_bytes,
           "the growing terms carry the large sizes");
 
-    qi::ImageDeviceNeedRequest req;
-    req.geometry        = qi::ImageGeometry::derive(768, 768);
-    req.dims            = test_dims();
-    req.text_tokens     = 200;
-    req.blocks_resident = 1;
-    const auto need     = qi::image_device_need(req);
+    const qi::ImageDeviceNeedRequest req{
+        .geometry        = qi::ImageGeometry::derive(768, 768),
+        .dims            = test_dims(),
+        .text_tokens     = 200,
+        .blocks_resident = 1,
+        .vae             = shipped_topology(),
+    };
+    const auto need = qi::image_device_need(req);
     check(need.total() == need.dit_activations + need.latent_and_velocity + need.resident_weights +
                               need.vae_peak + need.rope_and_tables + need.vision_peak,
           "total is the sum of its terms");

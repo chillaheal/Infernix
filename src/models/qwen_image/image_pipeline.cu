@@ -459,11 +459,31 @@ GeneratedImage run_image_job(artifact::Reader& reader, const DiTWeights& dit, co
     const std::size_t mlp0  = dit.dims.intermediate;
     const std::size_t Cin   = dit.dims.image_in;
     const float eps         = dit.dims.eps;
-    if (D == 0 || heads == 0 || mlp0 == 0 || Cin == 0 || dit.blocks.empty() || inputs.height_px % 16 ||
-        inputs.width_px % 16 || inputs.height_px == 0 || inputs.width_px == 0) {
+    // The decoder geometry belongs to the artifact: the channels every stage below runs at, the latent
+    // plane it reads, the pixels per latent row it expands to and the resident bytes the ledger priced
+    // all come from this one object -- read by read_vae_topology from the artifact's own "vae" component
+    // config and verified against every bound decoder weight by check_vae_topology (image_weights.cpp),
+    // which is what makes this graph and that ledger unable to disagree about a stage. What the check
+    // here adds is the seam the binding cannot see: the DiT's latent plane and the VAE's have to be the
+    // same plane (they were bound from the same artifact or they were not), and a topology nobody read
+    // -- every field zero -- would otherwise divide the geometry by nothing and convolve zero-wide
+    // tensors.
+    const VaeTopology& topo = vae.topology;
+    if (topo.latent_channels == 0 || topo.spatial_downscale == 0 || topo.denorm_elements == 0 ||
+        topo.denorm_elements != topo.latent_channels || topo.weight_resident_bytes == 0 ||
+        topo.mid_stage.channels_out == 0 || topo.up_stages.size() != kQwenImageVaeUpBlocks ||
+        Cin != static_cast<std::size_t>(topo.latent_channels) ||
+        topo.final_channels - topo.up_stages.back().channels_out != kImageOutputChannels) {
+        throw std::runtime_error("image job: the bound VAE topology does not describe the DiT's latent plane "
+                                 "or the RGBA plane this route hands back");
+    }
+    if (D == 0 || heads == 0 || mlp0 == 0 || Cin == 0 || dit.blocks.empty() ||
+        inputs.height_px % topo.spatial_downscale || inputs.width_px % topo.spatial_downscale ||
+        inputs.height_px == 0 || inputs.width_px == 0) {
         throw std::runtime_error("image job: dims or job size are unusable");
     }
-    const std::size_t Hl = inputs.height_px / 16, Wl = inputs.width_px / 16;
+    const std::size_t Hl = inputs.height_px / topo.spatial_downscale,
+                      Wl = inputs.width_px / topo.spatial_downscale;
     const std::size_t img_tokens = Hl * Wl;
     const std::size_t tp = D == 0 ? 0 : inputs.prompt_embeds.size() / D;
     std::size_t ref_tokens = 0; // #75: the reference/edit-image block (0 = plain text-to-image)
@@ -1168,16 +1188,30 @@ GeneratedImage run_image_job(artifact::Reader& reader, const DiTWeights& dit, co
     // by encode_reference_image, #75).
     VaeGraph vg{reader, vae, stream};
 
-    // run the decode: [Cin,Hl,Wl] -> post_quant -> conv_in -> mid -> 5 up -> norm_out -> conv_out.
-    const struct UpCfg { int cin, cout; bool temporal, up; } cfg[5] = {
-        {1152, 1152, true, true}, {1152, 1152, true, true}, {1152, 576, true, true},
-        {576, 288, false, true}, {288, 144, false, false},
-    };
-    int Hh = static_cast<int>(Hl), Ww = static_cast<int>(Wl);
+    // run the decode: [Cin,Hl,Wl] -> post_quant -> conv_in -> mid -> the artifact's up chain -> norm_out ->
+    // conv_out.
+    //
+    // Every channel width below is a field of the topology the binding read from the artifact's own "vae"
+    // component document and verified against the bound weights (check_vae_topology, image_weights.cpp) --
+    // the same object the VRAM ledger charged (image_device_need.h), so a stage's width can no longer be
+    // 1152 here and something else there, and a VAE of another geometry decodes at the widths its own
+    // checkpoint declares. The 1152-channel deepest level, its halving to 144 and the 4-channel conv_out
+    // were the literals this replaced; they are the shipped artifact's declaration, read through
+    // read_vae_topology (tests/convert/fixtures/qwen_image_vae_config.json carries the same document the
+    // live artifact packs, which is what the host gate checks). What stays code-owned is what THIS build
+    // runs and the artifact is only allowed to CONFIRM: the per-block resnet count, the single mid-block
+    // attention, the doubling pattern, and dupup3d's shortcut factor (kQwenImageVaeUpBlockTemporal, whose
+    // encoder-side claim the reader verified against the artifact's "temperal_downsample").
+    const int mid_channels = static_cast<int>(topo.mid_stage.channels_out);
+    const int final_in     = static_cast<int>(topo.up_stages.back().channels_out);
+    const int final_out    = static_cast<int>(topo.final_channels) - final_in;
+    const int Hli          = static_cast<int>(Hl), Wli = static_cast<int>(Wl);
+    int Hh = Hli, Ww = Wli;
     void* vx = d_vae.d; // [Cin,Hl,Wl] channel-major
     {
         // post_quant_conv is a linear on the token-major view (the qualified bridge: transpose to
-        // [P,C], linear, transpose back).
+        // [P,C], linear, transpose back). Cin is the DiT's latent plane, which the guard above proved is
+        // the very plane the artifact's z_dim says post_quant_conv takes.
         void* xt = vg.alloc(Cin * (Hl * Wl) * 2);
         vg.xT(vx, xt, static_cast<int>(Cin), static_cast<int>(Hl * Wl));
         d_vae.retire(stream);
@@ -1191,34 +1225,46 @@ GeneratedImage run_image_job(artifact::Reader& reader, const DiTWeights& dit, co
         vg.xT(x1t, x1, static_cast<int>(Hl * Wl), static_cast<int>(Cin));
         vg.retire(x1t);
         vx = x1;
-        void* x2 = vg.alloc(static_cast<std::size_t>(1152) * Hl * Wl * 2);
-        Tensor x2_v = view(x2, 1152, static_cast<int>(Hl), static_cast<int>(Wl));
-        ops::conv2d(view(x1, static_cast<int>(Cin), static_cast<int>(Hl), static_cast<int>(Wl)),
-                    vg.d3("vae/decoder.conv_in.weight", 1152, static_cast<int>(Cin), 3, 3),
-                    vg.d3("vae/decoder.conv_in.bias", 1152, 1, 1, 1), nullptr, x2_v, stream);
+        void* x2 = vg.alloc(static_cast<std::size_t>(mid_channels) * Hl * Wl * 2);
+        Tensor x2_v = view(x2, mid_channels, Hli, Wli);
+        ops::conv2d(view(x1, static_cast<int>(Cin), Hli, Wli),
+                    vg.d3("vae/decoder.conv_in.weight", mid_channels, static_cast<int>(Cin), 3, 3),
+                    vg.d3("vae/decoder.conv_in.bias", mid_channels, 1, 1, 1), nullptr, x2_v, stream);
         vg.retire(x1);
         vx = x2;
-        vx = vg.dresnet(vx, 1152, 1152, static_cast<int>(Hl), static_cast<int>(Wl), "vae/decoder.mid_block.resnets.0.", false, true);
-        vx = vg.att(vx, 1152, "vae/decoder.mid_block.attentions.0.", static_cast<int>(Hl), static_cast<int>(Wl));
-        vx = vg.dresnet(vx, 1152, 1152, static_cast<int>(Hl), static_cast<int>(Wl), "vae/decoder.mid_block.resnets.1.", false, true);
-        for (int b = 0; b < 5; ++b) {
-            const std::string pre = "vae/decoder.up_blocks." + std::to_string(b) + ".";
-            vx = vg.dup_up(vx, cfg[b].cin, cfg[b].cout, Hh, Ww, cfg[b].temporal, cfg[b].up, pre);
-            if (cfg[b].up) { Hh *= 2; Ww *= 2; }
+        // The mid block: the route's one spatial attention, between the resnets, at the deepest level's
+        // width -- the number of resnets is the chain fact the reader verified the artifact's
+        // "num_res_blocks" against.
+        vx = vg.dresnet(vx, mid_channels, mid_channels, Hli, Wli, "vae/decoder.mid_block.resnets.0.", false,
+                        true);
+        vx = vg.att(vx, mid_channels, "vae/decoder.mid_block.attentions.0.", Hli, Wli);
+        for (std::uint32_t r = 1; r < kQwenImageVaeMidBlockResnets; ++r) {
+            vx = vg.dresnet(vx, mid_channels, mid_channels, Hli, Wli,
+                            "vae/decoder.mid_block.resnets." + std::to_string(r) + ".", false, true);
         }
-        void* n = vg.drms(vx, 144, Hh * Ww, "vae/decoder.norm_out.gamma");
+        for (std::size_t b = 0; b < topo.up_stages.size(); ++b) {
+            const VaeStage& stage = topo.up_stages[b];
+            const std::string pre = "vae/decoder.up_blocks." + std::to_string(b) + ".";
+            vx = vg.dup_up(vx, static_cast<int>(stage.channels_in), static_cast<int>(stage.channels_out), Hh,
+                           Ww, kQwenImageVaeUpBlockTemporal[b], stage.doubles_side, pre);
+            if (stage.doubles_side) { Hh *= 2; Ww *= 2; }
+        }
+        // norm_out normalizes and conv_out convolves at the shallowest level's width, writing the RGBA the
+        // route hands back: both are the topology's, and the graph charges the same planes the ledger
+        // enumerated for them.
+        void* n = vg.drms(vx, final_in, Hh * Ww, "vae/decoder.norm_out.gamma");
         vg.retire(vx);
-        Tensor n_flat = view(n, 144, Hh * Ww);
+        Tensor n_flat = view(n, final_in, Hh * Ww);
         ops::silu(n_flat, stream);
-        void* fin = vg.alloc(4 * static_cast<std::size_t>(Hh) * Ww * 2);
-        Tensor fin_v = view(fin, 4, Hh, Ww);
-        ops::conv2d(view(n, 144, Hh, Ww), vg.d3("vae/decoder.conv_out.weight", 4, 144, 3, 3),
-                    vg.d3("vae/decoder.conv_out.bias", 4, 1, 1, 1), nullptr, fin_v, stream);
+        void* fin = vg.alloc(static_cast<std::size_t>(final_out) * static_cast<std::size_t>(Hh) * Ww * 2);
+        Tensor fin_v = view(fin, final_out, Hh, Ww);
+        ops::conv2d(view(n, final_in, Hh, Ww), vg.d3("vae/decoder.conv_out.weight", final_out, final_in, 3, 3),
+                    vg.d3("vae/decoder.conv_out.bias", final_out, 1, 1, 1), nullptr, fin_v, stream);
         vg.retire(n);
         cuda_ok(cudaStreamSynchronize(stream), "VAE decode did not complete");
         log_mem("VAE decode done");
         step(progress_units);
-        const std::size_t fout = 4 * static_cast<std::size_t>(Hh) * Ww;
+        const std::size_t fout = static_cast<std::size_t>(final_out) * static_cast<std::size_t>(Hh) * Ww;
         std::vector<std::uint16_t> fin_bits(fout);
         cuda_ok(cudaMemcpy(fin_bits.data(), fin, fout * 2, cudaMemcpyDeviceToHost), "image D2H");
         vg.retire(fin);
@@ -1244,10 +1290,30 @@ EncodedReference encode_reference_image(artifact::Reader& reader, const VaeWeigh
                                         const ReferenceEncodeInputs& in, cudaStream_t stream) {
     ImageStreamScope stream_scope(stream);
     const std::uint32_t H = in.height_px, W = in.width_px;
-    if (H == 0 || W == 0 || H % 16 || W % 16 || in.pixels.size() != 4ULL * H * W ||
-        in.latents_mean.size() != 64 || in.latents_std.size() != 64) {
-        throw std::runtime_error("reference encode: image size must be a positive multiple of 16 "
-                                 "with [4,H,W] pixels and 64-wide latent stats");
+    // The same artifact-owned geometry the decode runs from, and the same reason it is checked: this
+    // route samples the first `latent_channels` of quant_conv's [mean | logvar] pair and normalizes each
+    // plane by the caller's statistics, so the plane width, the statistics pair and the pixels per latent
+    // row all have to be what the bound artifact declares -- and the pair the route allocates has to be
+    // twice the plane it samples, or the slice reads past the tensor. What stays the route's own literal
+    // is the encoder's per-block channel list (96/192/384/768) and the quant_conv/conv_out width it
+    // writes: the published VaeTopology describes the DECODER, which is what the ledger and the decode
+    // graph share, and the encoder's geometry is not a claim the image route adopts (disclosed). That
+    // literal lives where it is bound, in image_weights.cpp's bind_image_vae under the marker
+    // "RETAINED COMPILED LITERAL", which says the same thing at the other end of this route.
+    const VaeTopology& topo = vae.topology;
+    constexpr std::size_t kEncoderLatentRows = 128; // [mean | logvar]: twice the plane this route samples
+    if (topo.latent_channels == 0 || topo.spatial_downscale == 0 || topo.denorm_elements == 0 ||
+        topo.denorm_elements != topo.latent_channels || topo.weight_resident_bytes == 0 ||
+        static_cast<std::size_t>(topo.latent_channels) * 2ULL != kEncoderLatentRows) {
+        throw std::runtime_error("reference encode: the bound VAE topology does not describe the latent "
+                                 "plane this route samples");
+    }
+    if (H == 0 || W == 0 || H % topo.spatial_downscale || W % topo.spatial_downscale ||
+        in.pixels.size() != static_cast<std::size_t>(kImageOutputChannels) * H * W ||
+        in.latents_mean.size() != topo.denorm_elements || in.latents_std.size() != topo.denorm_elements) {
+        throw std::runtime_error("reference encode: image size must be a positive multiple of the VAE's "
+                                 "spatial downscale, with [4,H,W] pixels and one latent statistics pair per "
+                                 "declared latent channel");
     }
     int Hs = static_cast<int>(H), Ws = static_cast<int>(W);
     VaeGraph vg{reader, vae, stream};
@@ -1369,14 +1435,17 @@ EncodedReference encode_reference_image(artifact::Reader& reader, const VaeWeigh
     EncodedReference out;
     out.height_lat = static_cast<std::uint32_t>(Hs);
     out.width_lat  = static_cast<std::uint32_t>(Ws);
-    out.latents.resize(static_cast<std::size_t>(P) * 64);
-    // mode sample = first 64 channels; normalize in the reference's BF16 operation order:
-    // bf16(x - mean) then bf16(that / std), x already the represented BF16 value.
+    // mode sample = the first `latent_channels` of the [mean | logvar] pair -- the artifact's own plane
+    // width, which the guard above proved is exactly half of what quant_conv writes -- normalized in the
+    // reference's BF16 operation order: bf16(x - mean) then bf16(that / std), x already the represented
+    // BF16 value. The statistics pair is the caller's, already length-checked against denorm_elements.
+    const int latent_planes = static_cast<int>(topo.latent_channels);
+    out.latents.resize(static_cast<std::size_t>(P) * latent_planes);
     for (int t = 0; t < P; ++t) {
-        for (int c = 0; c < 64; ++c) {
-            const std::uint16_t raw = qbits[static_cast<std::size_t>(t) * 128 + c];
+        for (int c = 0; c < latent_planes; ++c) {
+            const std::uint16_t raw = qbits[static_cast<std::size_t>(t) * kEncoderLatentRows + c];
             const float d = from_bf16(to_bf16(from_bf16(raw) - in.latents_mean[c]));
-            out.latents[static_cast<std::size_t>(t) * 64 + c] = to_bf16(d / in.latents_std[c]);
+            out.latents[static_cast<std::size_t>(t) * latent_planes + c] = to_bf16(d / in.latents_std[c]);
         }
     }
     if (stage_stats) {

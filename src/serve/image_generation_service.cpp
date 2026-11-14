@@ -106,22 +106,31 @@ enum class AutoWish : std::uint8_t { Rewrite, SkipNoReference, SkipAlreadyRewrit
 // <|image_pad|> rows already inside text_tokens, which the joint sequence carries four times each) and
 // the bound ViT's shape. Both stay 0/zero for the certified text-to-image route, which keeps every
 // term -- and total() -- bit-identical to what it was before the edit route existed.
+// `vae` is the artifact's own decoder geometry -- the topology the binding read from the artifact's
+// "vae" component config and verified against every bound decoder weight. The request carries it by
+// REFERENCE and it has no default, so the bytes this admission reserves are priced from the very object
+// the CUDA graph will decode with, and a job can never be admitted on a decoder nobody read.
 std::uint64_t image_need_bytes(std::int64_t width, std::int64_t height, std::size_t text_tokens,
                               std::size_t negative_tokens, std::size_t ref_tokens,
-                              const qi::DiTDims& dims, std::size_t vision_tokens = 0,
+                              const qi::DiTDims& dims, const qi::VaeTopology& vae,
+                              std::size_t vision_tokens = 0,
                               const qi::VisionLaneDims& vision = {}) {
-    qi::ImageDeviceNeedRequest req;
-    req.vision_tokens   = static_cast<std::uint32_t>(vision_tokens);
-    req.vision          = vision;
-    req.geometry        = qi::ImageGeometry::derive(static_cast<std::uint32_t>(height),
-                                                   static_cast<std::uint32_t>(width));
-    req.dims            = dims;
-    req.text_tokens     = static_cast<std::uint32_t>(text_tokens);
-    req.negative_tokens = static_cast<std::uint32_t>(negative_tokens);
-    req.ref_tokens      = static_cast<std::uint32_t>(ref_tokens);
-    req.blocks_resident = qi::kImageResidentBlocks; // the shipped route double-buffers two DiT block
-                             // slots (copy prefetches i+1 while i computes); the same symbol the
-                             // pipeline asserts and the cert requests, so the need can't drift from it
+    // Aggregate-initialised in declaration order rather than field by field: the request's last member
+    // is that reference, and a reference has no assignment that does not write through it.
+    const qi::ImageDeviceNeedRequest req{
+        .geometry        = qi::ImageGeometry::derive(static_cast<std::uint32_t>(height),
+                                                    static_cast<std::uint32_t>(width)),
+        .dims            = dims,
+        .text_tokens     = static_cast<std::uint32_t>(text_tokens),
+        .negative_tokens = static_cast<std::uint32_t>(negative_tokens),
+        .ref_tokens      = static_cast<std::uint32_t>(ref_tokens),
+        // the shipped route double-buffers two DiT block slots (copy prefetches i+1 while i computes);
+        // the same symbol the pipeline asserts and the cert requests, so the need can't drift from it
+        .blocks_resident = qi::kImageResidentBlocks,
+        .vision_tokens   = static_cast<std::uint32_t>(vision_tokens),
+        .vision          = vision,
+        .vae             = vae,
+    };
     return qi::image_device_need(req).total();
 }
 
@@ -180,8 +189,9 @@ std::uint64_t image_need_bytes(std::int64_t width, std::int64_t height, std::siz
 }
 
 // The smallest canvas the server will trade a refused request for (see the walk in generate()). The
-// admission need is dominated by a term that does NOT shrink with the picture -- kImageWeightResidentBytes
-// and the resident block slots -- so a card that can hold the job at all converges above this line, and
+// admission need is dominated by a term that does NOT shrink with the picture -- the topology's resident
+// calibration (VaeTopology::weight_resident_bytes) and the resident block slots -- so a card that can hold
+// the job at all converges above this line, and
 // below it the documented 503 with its two numbers is the honest answer rather than a thumbnail. It is a
 // multiple of the geometry's own grid, so a canvas that reaches it is still a legal request.
 inline constexpr std::uint32_t kVramCanvasFloorPx = 256U;
@@ -422,7 +432,10 @@ private:
         binder_ = std::make_unique<artifact::Binder>(*reader_);
         dit_    = qi::bind_dit(*binder_);
         vae_    = qi::bind_image_vae(*binder_);
-        denorm_ = qi::read_vae_denorm(*binder_);
+        // The topology the binding just read and verified is what says how long those two vectors must
+        // be: the artifact's "vae" config declares z_dim, and read_vae_denorm refuses a pair whose length
+        // disagrees with it, so the denormalization can never be adopted at a length nobody declared.
+        denorm_ = qi::read_vae_denorm(*binder_, vae_.topology);
         if (denorm_.mean.size() != dit_.dims.image_in) {
             throw std::runtime_error(
                 "image job: the artifact's VAE denormalization length differs from the DiT image_in");
@@ -692,13 +705,15 @@ ImageGenerationService::ImageGenerationService(std::unique_ptr<ImageInterludeRun
                                                ImageJobExecutor job_executor,
                                                VisionLaneDimsProvider vision_dims,
                                                ReferencePromptRendererProvider reference_prompt_renderer,
-                                               std::shared_ptr<PromptEnhancer> enhancer)
+                                               std::shared_ptr<PromptEnhancer> enhancer,
+                                               VaeTopologyProvider vae_topology)
     : runner_(std::move(runner)),
       store_(store),
       prompt_renderer_(std::move(prompt_renderer)),
       prompt_embeds_(std::move(prompt_embeds)),
       dit_dims_(std::move(dit_dims)),
       vision_dims_(std::move(vision_dims)),
+      vae_topology_(std::move(vae_topology)),
       reference_prompt_renderer_(std::move(reference_prompt_renderer)),
       job_executor_(std::move(job_executor)),
       enhancer_(std::move(enhancer)) {}
@@ -797,6 +812,28 @@ VisionLaneDimsProvider make_artifact_vision_dims_provider(const std::string& ima
     };
 }
 
+// The same host-side read for the VAE decode. It goes through the real binding rather than a config-only
+// helper on purpose: bind_image_vae reads the topology from the artifact's own "vae" component config and
+// then refuses (an artifact::ArtifactError, before any VRAM is yielded) unless every decoder weight the
+// build runs is stored at exactly the shape that topology declares. What the ledger is handed is therefore
+// the geometry a verification already passed, and it is the same object the job decodes with -- so the
+// reservation and the decode cannot be sized from two different readings of two different files. Throws
+// when the artifact carries no readable "vae" component, which the caller must answer by refusing the job.
+VaeTopologyProvider make_artifact_vae_topology_provider(const std::string& image_artifact_path) {
+    auto cached = std::make_shared<std::optional<qi::VaeTopology>>();
+    auto guard  = std::make_shared<std::mutex>();
+    return [path = image_artifact_path, cached, guard]() -> qi::VaeTopology {
+        const std::lock_guard lock(*guard);
+        if (cached->has_value()) { return **cached; }
+        artifact::Reader reader(path);
+        artifact::Binder binder(reader);
+        const qi::VaeTopology topology = qi::bind_image_vae(binder).topology;
+        (void)std::move(binder).finish();
+        *cached = topology;
+        return topology;
+    };
+}
+
 std::string ImageGenerationService::next_job_id(std::int64_t created) {
     std::lock_guard lock(sequence_mutex_);
     return "img-" + std::to_string(created) + "-" + std::to_string(++sequence_);
@@ -840,6 +877,19 @@ RequestJson ImageGenerationService::generate(const OpenAIImagesRequest& request,
     if (!runner_->is_available()) {
         throw ApiException{ApiError{503, "server_error", "the engine is not available", "",
                                     "engine_unavailable"}};
+    }
+    // Every image job needs the artifact's own decoder geometry, because the VRAM ledger prices the decode
+    // from it (image_device_need.h reads the same VaeTopology the CUDA graph decodes with). Nothing
+    // compiled stands in for it: a service that was never given a provider has no topology to reserve
+    // against, and a zero one would reserve for a decode of nothing -- so this is refused as unconfigured
+    // here, before the busy signal starts and before the card is touched, rather than admitted on a guess.
+    // (The vision lane has the same shape of refusal further down, but only for requests that carry a
+    // reference; the decode is not optional, so this one is.)
+    if (!vae_topology_) {
+        throw ApiException{ApiError{503, "server_error",
+                                    "the image artifact's VAE decoder geometry is not configured, so an "
+                                    "image job cannot be sized",
+                                    "image_artifact", "image_generation_not_configured"}};
     }
 
     // From here the card is ours until the function returns, so this is where the busy signal starts:
@@ -1229,9 +1279,16 @@ RequestJson ImageGenerationService::generate(const OpenAIImagesRequest& request,
     // The need and the one step of the walk, named ONCE: the shortfall net inside the interlude below
     // makes this same walk again, on the bytes the yield actually delivered, and two copies of this
     // arithmetic is exactly how a canvas and a need would learn to disagree.
+    // The decoder geometry, read ONCE for this admission and handed to every step of the walk below and to
+    // the re-walk inside the interlude: the ledger, the reservation this function commits to, and the job's
+    // own binding all price the decode from the same artifact-verified topology, so no two readings of the
+    // artifact can disagree about how big the planes are. Like dit_dims_() it is host work, outside any
+    // interlude, and a throwing provider (an artifact with no readable "vae" component) refuses the job
+    // the same way one that cannot name the DiT's dimensions does.
+    const qi::VaeTopology vae_topology = vae_topology_();
     const auto need_at = [&](std::uint32_t w, std::uint32_t h) {
         return image_need_bytes(w, h, prompt.tokens(), negative_prompt.tokens(), ref_tokens,
-                                dit_dims_(), vision_tokens, vision);
+                                dit_dims_(), vae_topology, vision_tokens, vision);
     };
     const auto step_down = [canvas_step](std::uint32_t& side) {
         side = side > kVramCanvasFloorPx + canvas_step ? side - canvas_step : kVramCanvasFloorPx;

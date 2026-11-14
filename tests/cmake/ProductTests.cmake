@@ -64,9 +64,15 @@ infernix_add_test(infernix_openai_images_schema_test
   LIBRARIES infernix_serve)
 
 # Synchronous image route service: failure mapping -> ApiException surface and store terminals.
+# Every service in it is built with the artifact's own decoder geometry (the request's topology member is
+# a reference with no default), which the suite reads through the production reader over the committed copy
+# of the checkpoint's vae/config.json -- so it needs the source dir and the reader, which returns
+# std::expected (host-only, compiled per target at C++23; the CUDA lane stays at C++20).
 infernix_add_test(infernix_image_generation_service_test
+  NEEDS_SOURCE_DIR
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_image_generation_service.cpp"
-  LIBRARIES infernix_serve)
+  LIBRARIES infernix_serve infernix_qwen_image infernix_artifact infernix::json)
+target_compile_features(infernix_image_generation_service_test PRIVATE cxx_std_23)
 
 # The prompt enhancer's answer contract and the refusal a client gets when no sidecar is running: the
 # rules the shipped edit system prompt puts on its own answer, and the codes that keep a bad rewrite
@@ -76,10 +82,16 @@ infernix_add_test(infernix_prompt_enhancer_test
   LIBRARIES infernix_serve)
 
 # The image job's computed device-memory need: the number the serving layer refuses on before the LLM
-# yields anything, qualified here against the certified route's measured peak.
+# yields anything, qualified here against the certified route's measured peak. The ledger's decoder half
+# has no constants of its own: the request carries the artifact's VaeTopology, which this suite reads
+# through the PRODUCTION reader over the committed copy of the checkpoint's own vae/config.json
+# (tests/models/qwen_image/vae_topology_fixture.h), so the target needs the source dir and the reader,
+# which returns std::expected (host-only, compiled per target at C++23; the CUDA lane stays at C++20).
 infernix_add_test(infernix_image_device_need_test
+  NEEDS_SOURCE_DIR
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_image_device_need.cpp"
-  LIBRARIES infernix_qwen_image)
+  LIBRARIES infernix_qwen_image infernix_artifact infernix::json)
+target_compile_features(infernix_image_device_need_test PRIVATE cxx_std_23)
 
 # Server-executed chat image tool: injection gating, round feedback shape, caps and error surface,
 # and the round loop's end contract of exactly one answer that carries every URL.

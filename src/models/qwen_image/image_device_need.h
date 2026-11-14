@@ -8,9 +8,10 @@
 // longer of the two joint sequences (image_pipeline.cu:332-342) and carries the reference block ahead
 // of the target latent (:328).
 //
-// The image ledger (image_device_bytes_peak(), image_pipeline.h:93-99) is the oracle for this model:
+// The image ledger (image_device_bytes_peak(), image_pipeline.h) is the oracle for this model:
 // the qualification test asserts the predicted total is never below the measured peak for the same
-// inputs, and the allowance below is what that test tightens.
+// inputs, and the resident calibration in models/qwen_image/image_weights.h
+// (kQwenImageWeightResidentBytes, carried in on the request's `vae`) is what that test tightens.
 
 #include "models/qwen_image/image_job.h"
 #include "models/qwen_image/image_weights.h"
@@ -28,33 +29,10 @@ inline constexpr std::uint64_t kImageMiB          = 1024ULL * 1024ULL;
 // model, the serving layer and the ledger cert must all agree on. The pipeline's CopyLane double-
 // buffers exactly this many slots (a static_assert in image_pipeline.cu pins it to 2), the serving
 // layer stamps it onto ImageDeviceNeedRequest::blocks_resident, and the cert requests the same value
-// the allowance below was calibrated against. A single symbol so `resident_weights` can never drift
-// from the slots actually allocated, nor from the blocks_resident the 3072 MiB allowance measured.
+// the resident calibration was measured with. A single symbol so `resident_weights` can never drift
+// from the slots actually allocated, nor from the blocks_resident that calibration (stamped onto the
+// VaeTopology by the binding, and multiplied by this constant below) was taken against.
 inline constexpr std::uint32_t kImageResidentBlocks = 2;
-
-// The operands and op scratch the inventory above does not enumerate: the DiT's top-level
-// projections, the VAE's weights, and whatever workspace the linear/conv/attention ops take per
-// call. An over-estimated need refuses a job that might have run; an under-estimated one OOMs it.
-//
-// Two calibrations set this term:
-//   - the ledger qualification (test_image_need_ledger_real.cu) proves predicted >= measured for the
-//     certified inputs, and
-//   - the stage bench (image-spike/stage_bench_A_full_overlap.err.log) gives the REAL per-step ledger
-//     peak a live job reaches -- higher than the cert's, because the cert feeds zero-filled trivial
-//     inputs while a served job carries a real prompt/negative/reference. The cert alone would let
-//     this drift below what a live job actually holds.
-//
-// Subtracting the enumerated structural terms (dit_activations + latent_and_velocity + vae_peak +
-// rope_and_tables) from the real peak leaves the residual this term must absorb: ~772 MiB at 512,
-// ~322 at 768, and ~1180 at 768+ref / 768+CFG (the ref/CFG rows, where the real sequence is longest
-// and the cert's trivial inputs understate it most). The 1024 row's structural terms alone already
-// exceed its real peak, so its residual is negative. So the largest residual to cover is ~1184 MiB;
-// 3072 MiB leaves ~1.9 GiB on top of it for the 512 MiB interlude floor plus whatever the KV pool
-// and the LLM restore hold during the interlude. That puts the predicted total at ~1.6-2.5x the real
-// peak on every certified row -- down from the ~4x this term carried when it was the whole-measured-
-// peak proxy (6183, then 5972 after the second resident block was counted explicitly in bundle B
-// fas 2) -- without ever dropping predicted below the measured peak plus the 512 MiB floor.
-inline constexpr std::uint64_t kImageWeightResidentBytes = 3072ULL * kImageMiB;
 
 // One DiT block resident on device: the seven FP8 RowScale roles (four [hidden,hidden] and three
 // [intermediate,hidden], one byte per code) plus the two BF16 head norms. Derived from the bound
@@ -64,31 +42,17 @@ inline constexpr std::uint64_t kImageWeightResidentBytes = 3072ULL * kImageMiB;
     return 4ULL * d * d + 3ULL * mlp * d + 2ULL * dims.head_dim * kImageElementBytes;
 }
 
-// One decoder stage: the channels its widest planes carry and how many full [C,H,W] planes the code
-// holds live at once. The counts are read off image_pipeline.cu: `att` keeps the qkv buffer (3C),
-// its attention output (C) and the still-live input (C) at the spatial_attn call (:207-222);
-// `dup_up` holds the upsampled input, the duplicated shortcut and the conv output at the DOUBLED
-// resolution (:252-264); `dresnet` holds its input, shortcut and two conv outputs (:161-192).
-struct VaeStage {
-    std::uint32_t channels_in;
-    std::uint32_t channels_out;
-    std::uint32_t planes;
-    bool          doubles_side; // the stage works at the doubled side after its upsample
-};
-
-// The decoder's fixed chain as image_pipeline.cu:620-665 runs it (the channels are the recipe's).
-inline constexpr VaeStage kVaeMidStage{1152, 1152, 5, false};
-inline constexpr VaeStage kVaeUpStages[5] = {
-    {1152, 1152, 3, true},
-    {1152, 1152, 3, true},
-    {1152, 576, 3, true},
-    {576, 288, 3, true},
-    {288, 144, 3, false},
-};
-
-// The last two planes of the decode: the norm_out stage (144 channels) and the 4-channel conv_out,
-// both at full pixel resolution.
-inline constexpr std::uint64_t kVaeFinalChannels = 144ULL + 4ULL;
+// The decoder chain this ledger prices is NOT a table kept here: its channels, its latent width, its
+// final conv_out width and its resident calibration are the artifact's own declaration, read by
+// read_vae_topology into the VaeTopology (models/qwen_image/artifact_constants.h) that the family's
+// binding stamps and verifies against every bound weight, and handed in on the request below. The CUDA
+// decode graph reads the SAME object off the bound VaeWeights (image_pipeline.cu), so the bytes the
+// graph allocates and the bytes the ledger reserves can no longer be two different guesses -- and an
+// artifact that declares a decoder this build does not run is refused by the binding instead of being
+// priced against another family's geometry. The one code-owned field the terms below multiply by,
+// VaeStage::planes (how many full [C,H,W] planes the route holds live at a stage), is documented where
+// it is set: it is a measurement of image_pipeline.cu's att()/dup_up()/dresnet(), not a claim of the
+// checkpoint's.
 
 // The bound ViT's shape, as far as the ledger needs it: enough to derive the streamed block's roles
 // and the eleven live planes of vision_tower.cu rather than hardcode a number. All zero (or hidden
@@ -123,12 +87,19 @@ struct ImageDeviceNeedRequest {
     // ref_tokens would count those rows twice (for a portrait reference, ~1014 rows too many).
     std::uint32_t   vision_tokens = 0;
     VisionLaneDims  vision;             // zero == no vision lane, and the vision term is then zero
+    // The decoder geometry the job's OWN artifact declared, read by read_vae_topology and verified against
+    // every bound decoder weight by check_vae_topology (image_weights.cpp) -- the same object the CUDA
+    // graph decodes from, which is why the ledger has no decoder constants of its own any more. A
+    // reference, so the caller cannot hand in a copy that drifted from the bound one, and it has no
+    // default: every construction site must say which artifact's topology it is pricing, and a job whose
+    // binding never ran cannot be admitted at all.
+    const VaeTopology& vae;
 };
 
 struct ImageDeviceNeed {
     std::uint64_t dit_activations     = 0; // block workspace + joint/ping-pong/norm buffers at s_max
     std::uint64_t latent_and_velocity = 0; // [ref+target] latent, its hidden, the text stages
-    std::uint64_t resident_weights    = 0; // the allowance above plus the resident block(s)
+    std::uint64_t resident_weights    = 0; // the topology's resident calibration + the resident block(s)
     std::uint64_t vae_peak            = 0; // the widest simultaneous set of decode planes
     std::uint64_t rope_and_tables     = 0; // both rope tables and the shared constants
     std::uint64_t vision_peak         = 0; // the ViT lane: one streamed block + its live set
@@ -194,8 +165,8 @@ struct ImageDeviceNeed {
     const auto stage_bytes = [](const VaeStage& stage, std::uint64_t sh, std::uint64_t sw) {
         return static_cast<std::uint64_t>(stage.planes) * stage.channels_out * sh * sw * kImageElementBytes;
     };
-    need.vae_peak = stage_bytes(kVaeMidStage, hl, wl);
-    for (const auto& stage : kVaeUpStages) {
+    need.vae_peak = stage_bytes(req.vae.mid_stage, hl, wl);
+    for (const auto& stage : req.vae.up_stages) {
         if (stage.doubles_side) {
             hl *= 2;
             wl *= 2;
@@ -203,7 +174,7 @@ struct ImageDeviceNeed {
         const std::uint64_t bytes = stage_bytes(stage, hl, wl);
         if (bytes > need.vae_peak) { need.vae_peak = bytes; }
     }
-    const std::uint64_t final_planes = kVaeFinalChannels *
+    const std::uint64_t final_planes = req.vae.final_channels *
                                        static_cast<std::uint64_t>(req.geometry.height) *
                                        static_cast<std::uint64_t>(req.geometry.width) *
                                        kImageElementBytes;
@@ -238,7 +209,7 @@ struct ImageDeviceNeed {
              2ULL * req.vision.head_dim * kImageElementBytes);                 // one block's roles
     }
 
-    need.resident_weights = kImageWeightResidentBytes +
+    need.resident_weights = req.vae.weight_resident_bytes +
                             static_cast<std::uint64_t>(req.blocks_resident) * image_block_bytes(req.dims);
     return need;
 }

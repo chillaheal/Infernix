@@ -372,7 +372,14 @@ int main(int argc, char** argv) {
                 // run yet; without it a reference request is refused rather than guessed, because an
                 // under-reserved interlude takes the resident LLM down with it.
                 infernix::serve::make_artifact_vision_dims_provider(options.image_artifact_path),
-                std::move(reference_prompt_renderer), std::move(enhancer));
+                std::move(reference_prompt_renderer), std::move(enhancer),
+                // The third provider that reads this artifact's own declarations: the VAE decoder geometry
+                // the VRAM ledger prices every job's decode from (the same topology the binding verifies
+                // against every stored decoder weight). Unlike the ViT lane's, it is needed by EVERY image
+                // job, so it goes to the same artifact the DiT and the VAE are streamed from and a serve
+                // whose artifact has no readable "vae" component refuses jobs as unconfigured -- there is
+                // no compiled-in decoder geometry standing in for the checkpoint's.
+                infernix::serve::make_artifact_vae_topology_provider(options.image_artifact_path));
             server.attach_images(*images);
             // A picture's URL is the only handle a chat reply hands out, so the file behind it is kept
             // for a stated number of days and then swept; 0 switches the cleanup off, and the server

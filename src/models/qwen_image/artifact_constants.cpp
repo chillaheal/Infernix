@@ -12,9 +12,13 @@
 // constant -- reading it here is a check on what the artifact CLAIMS, never a value the code adopts.
 #include "models/qwen_image/rope.h"
 
+#include <array>
 #include <cmath>
+#include <cstdint>
+#include <limits>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace infernix::models::qwen_image {
 namespace {
@@ -22,6 +26,14 @@ namespace {
 using Json = nlohmann::json;
 
 std::string quoted_key(std::string_view text) { return "\"" + std::string(text) + "\""; }
+
+// Every refusal prints the value as the artifact declared it, and nlohmann's dump() THROWS on a
+// non-finite number: an artifact may declare inf or NaN in any numeric position, and a refusal that
+// aborts the host process instead of naming the key is the failure mode this file exists to avoid.
+std::string dump_safe(const Json& value) {
+    if (value.is_number_float() && !std::isfinite(value.get<double>())) { return "a non-finite JSON number"; }
+    return value.dump();
+}
 
 std::string prefix() { return "the scheduler config "; }
 
@@ -33,17 +45,17 @@ std::string absent_key(std::string_view key) {
 }
 
 std::string wrong_type(std::string_view key, const Json& value, std::string_view wanted) {
-    return prefix() + quoted_key(key) + " is " + value.dump() + " but must be " + std::string(wanted) +
+    return prefix() + quoted_key(key) + " is " + dump_safe(value) + " but must be " + std::string(wanted) +
            "; the reader does not coerce a JSON type";
 }
 
 std::string wrong_value(std::string_view key, const Json& value, std::string_view wanted) {
-    return prefix() + quoted_key(key) + " is " + value.dump() + " but the supported "
+    return prefix() + quoted_key(key) + " is " + dump_safe(value) + " but the supported "
            "FlowMatchEulerDiscrete path requires " + std::string(wanted);
 }
 
 std::string out_of_supported_range(std::string_view key, const Json& value, std::string_view wanted) {
-    return prefix() + quoted_key(key) + " is " + value.dump() + " but the supported schedule requires " +
+    return prefix() + quoted_key(key) + " is " + dump_safe(value) + " but the supported schedule requires " +
            std::string(wanted);
 }
 
@@ -126,7 +138,7 @@ std::string dit_absent_key(std::string_view key) {
 }
 
 std::string dit_wrong_type(std::string_view key, const Json& value, std::string_view wanted) {
-    return std::string(kDitDocument) + quoted_key(key) + " is " + value.dump() + " but must be " +
+    return std::string(kDitDocument) + quoted_key(key) + " is " + dump_safe(value) + " but must be " +
            std::string(wanted) + "; the reader does not coerce a JSON type";
 }
 
@@ -140,7 +152,7 @@ std::expected<std::int64_t, std::string> dit_required_integer(const Json& config
 // A refusal about the axes list always names the key (the operator greps for it), prints the document's
 // own declaration, and says which axis is the problem.
 std::string dit_axes_refusal(const Json& axes, std::string_view what) {
-    return std::string(kDitDocument) + quoted_key(kRopeAxesKey) + " is " + axes.dump() + " but the DiT "
+    return std::string(kDitDocument) + quoted_key(kRopeAxesKey) + " is " + dump_safe(axes) + " but the DiT "
            "rope rotation requires " + std::string(what);
 }
 
@@ -183,6 +195,199 @@ std::expected<void, std::string> dit_theta_agrees(const Json& config) {
                                "artifact is refused rather than drawn at a base it does not declare. "
                                "Changing theta is a deliberate change of the supported pipeline "
                                "implementation, not an artifact field.");
+    }
+    return {};
+}
+
+// --- the "vae" component document -------------------------------------------------------------------
+//
+// Same rule as the dit document above: no key allowlist (the recipe's parameter contract owns the keys
+// this route does not read), and the same strictness about the keys it does -- no coercion across JSON
+// types, no default for an absent key, and every refusal names the key and prints the value exactly as
+// the artifact declared it. What is different here is that some keys are VERIFIED rather than ADOPTED:
+// the graph in image_pipeline.cu runs one decoder chain, so an artifact that declares a different
+// resnet count, a different number of doublings, a non-residual block, attention outside the mid block
+// or another temporal scheme describes weights this build cannot decode, and the alternative to
+// refusing is drawing them through a chain they were not trained under -- the silent divergence this
+// lane refuses everywhere else (dit_theta_agrees above, the scheduler's mode flags).
+
+constexpr std::string_view kVaeDocument = "the vae config ";
+
+// The chain as THIS build runs it, read off image_pipeline.cu: five up blocks whose last one does not
+// upsample (four 2x doublings), three resnets per up block (dup_up's resnets.0/.1/.2 at :329-332), and
+// the live-buffer inventory of each stage (VaeStage::planes). An artifact's claim about any of these is
+// compared against them. The block and resnet counts are the header's, because the binding that resolves
+// the operand shapes and the graph that runs them have to read the same numbers this reader verifies
+// against; the per-stage plane counts are this reader's alone -- nothing but the topology it returns
+// consumes them.
+constexpr std::size_t   kVaeUpBlocks           = kQwenImageVaeUpBlocks;
+constexpr std::uint32_t kVaeResnetsPerUpBlock  = kQwenImageVaeResnetsPerUpBlock;
+constexpr std::uint32_t kVaeMidStagePlanes  = 5;
+constexpr std::uint32_t kVaeUpStagePlanes   = 3;
+// The encoder blocks that carry a temporal declaration: every up block except the last one (the last
+// neither downsamples nor upsamples), each paired with the decoder's up block kQwenImageVaeUpBlocks - 2 -
+// index. The claim itself is compared against the graph's own scheme -- kQwenImageVaeUpBlockTemporal in
+// the header, which is what image_pipeline.cu's dup_up() passes to dupup3d -- so there is one table of
+// what this build runs, not one per file.
+constexpr std::size_t kVaeEncoderTemporalBlocks = kQwenImageVaeUpBlocks - 1;
+
+// No plausible convolution width, and far below an int64 overflow of any product made from it: an
+// absurd declaration is refused by name instead of wrapping into a channel count the graph would
+// allocate and then fail on.
+constexpr std::int64_t kVaeLargestPlausibleValue = 1LL << 20;
+
+std::string vae_absent_key(std::string_view key) {
+    return std::string(kVaeDocument) + "has no " + quoted_key(key) +
+           ", which the decoder topology this build runs is read from";
+}
+
+std::string vae_wrong_type(std::string_view key, const Json& value, std::string_view wanted) {
+    return std::string(kVaeDocument) + quoted_key(key) + " is " + dump_safe(value) + " but must be " +
+           std::string(wanted) + "; the reader does not coerce a JSON type";
+}
+
+// A refusal about a claim the graph cannot honour: the key, the declared value, and what the chain
+// running these weights actually requires.
+std::string vae_wrong_claim(std::string_view key, const Json& value, std::string_view required) {
+    return std::string(kVaeDocument) + quoted_key(key) + " is " + dump_safe(value) + " but the decoder "
+           "chain this build runs requires " + std::string(required) + ": this artifact would be decoded "
+           "through a chain its weights were not trained under, so it is refused rather than drawn.";
+}
+
+std::expected<std::int64_t, std::string> vae_required_integer(const Json& config, std::string_view key) {
+    if (!config.contains(key)) { return std::unexpected(vae_absent_key(key)); }
+    const Json& value = config.at(key);
+    // is_number_integer, not is_number: 144 is the promise, 144.0 is a different one.
+    if (!value.is_number_integer()) { return std::unexpected(vae_wrong_type(key, value, "a JSON integer")); }
+    const std::int64_t declared = value.get<std::int64_t>();
+    if (declared >= kVaeLargestPlausibleValue || declared <= -kVaeLargestPlausibleValue) {
+        return std::unexpected(std::string(kVaeDocument) + quoted_key(key) + " is " + dump_safe(value) +
+                               " but must be between " + std::to_string(-kVaeLargestPlausibleValue) +
+                               " and " + std::to_string(kVaeLargestPlausibleValue));
+    }
+    return declared;
+}
+
+std::expected<void, std::string> vae_required_boolean(const Json& config, std::string_view key,
+                                                      const bool required) {
+    if (!config.contains(key)) { return std::unexpected(vae_absent_key(key)); }
+    const Json& value = config.at(key);
+    // is_boolean, not a truthiness test: 1 and 0 are numbers, and a scheme flag the artifact spells as a
+    // number is not the flag this route verified.
+    if (!value.is_boolean()) { return std::unexpected(vae_wrong_type(key, value, "a JSON boolean")); }
+    if (value.get<bool>() != required) {
+        return std::unexpected(vae_wrong_claim(key, value, required ? "true" : "false"));
+    }
+    return {};
+}
+
+// One array of JSON integers, each a positive channel multiplier: "dim_mult". An entry written 8.0 or
+// "8" is a different promise than the width the convolutions are built from, and the reader coerces
+// nothing.
+std::expected<std::vector<std::int64_t>, std::string> vae_positive_integer_array(const Json& config,
+                                                                                std::string_view key,
+                                                                                const std::size_t expected_size) {
+    if (!config.contains(key)) { return std::unexpected(vae_absent_key(key)); }
+    const Json& value = config.at(key);
+    if (!value.is_array() || value.size() != expected_size) {
+        return std::unexpected(std::string(kVaeDocument) + quoted_key(key) + " is " + dump_safe(value) +
+                               " but must be a JSON array of exactly " + std::to_string(expected_size) +
+                               " entries, which is the number of " +
+                               (expected_size == kVaeUpBlocks ? "levels the decoder's up chain runs"
+                                                              : "entries this route reads") +
+                               "; the reader does not coerce a JSON type");
+    }
+    std::vector<std::int64_t> out;
+    out.reserve(expected_size);
+    for (std::size_t i = 0; i < expected_size; ++i) {
+        const Json& entry = value[i];
+        if (!entry.is_number_integer()) {
+            return std::unexpected(
+                std::string(kVaeDocument) + quoted_key(key) + " holds " + dump_safe(entry) + " at index " +
+                std::to_string(i) + " but every entry must be a JSON integer; the reader does not coerce a "
+                "JSON type");
+        }
+        const std::int64_t declared = entry.get<std::int64_t>();
+        if (declared <= 0 || declared >= kVaeLargestPlausibleValue) {
+            return std::unexpected(std::string(kVaeDocument) + quoted_key(key) + " holds " +
+                                   dump_safe(entry) + " at index " + std::to_string(i) +
+                                   " but every entry must be a positive channel multiplier below " +
+                                   std::to_string(kVaeLargestPlausibleValue));
+        }
+        out.push_back(declared);
+    }
+    return out;
+}
+
+std::expected<void, std::string> vae_finite_number_array_of(const Json& config, std::string_view key,
+                                                           const std::size_t expected_size) {
+    if (!config.contains(key)) { return std::unexpected(vae_absent_key(key)); }
+    const Json& value = config.at(key);
+    if (!value.is_array()) { return std::unexpected(vae_wrong_type(key, value, "a JSON array")); }
+    if (value.size() != expected_size) {
+        return std::unexpected(std::string(kVaeDocument) + quoted_key(key) + " has " +
+                               std::to_string(value.size()) + " entries but the latent width " +
+                               quoted_key("z_dim") + " is " + std::to_string(expected_size) +
+                               ": the per-channel statistics and the latent plane are one fact, and an "
+                               "artifact that disagrees with itself is refused");
+    }
+    for (const Json& entry : value) {
+        // is_number, matching the pair's existing reader (read_vae_denorm, which is what consumes these
+        // values): the route takes a number per channel, and a non-number or a non-finite one normalizes
+        // nothing -- it silently makes every latent NaN.
+        if (!entry.is_number()) {
+            return std::unexpected(std::string(kVaeDocument) + quoted_key(key) + " holds " +
+                                   dump_safe(entry) + " but every entry must be a JSON number");
+        }
+        if (!std::isfinite(entry.get<double>())) {
+            return std::unexpected(std::string(kVaeDocument) + quoted_key(key) +
+                                   " holds a non-finite number, which would denormalize every latent to NaN");
+        }
+    }
+    return {};
+}
+
+std::expected<void, std::string> vae_empty_array(const Json& config, std::string_view key,
+                                                std::string_view required) {
+    if (!config.contains(key)) { return std::unexpected(vae_absent_key(key)); }
+    const Json& value = config.at(key);
+    if (!value.is_array()) { return std::unexpected(vae_wrong_type(key, value, "a JSON array")); }
+    if (!value.empty()) { return std::unexpected(vae_wrong_claim(key, value, required)); }
+    return {};
+}
+
+// The graph's dup_up() takes its dupup3d shortcut factor per up block, and the pure-2D image route
+// implements exactly one scheme. The checkpoint declares the temporal behaviour on the ENCODER's blocks,
+// so the decoder's factors are that list mirrored -- compared entry by entry against what the graph
+// passes, because an artifact that declares another scheme would have its shortcut duplicated wrong.
+std::expected<void, std::string> vae_temporal_scheme(const Json& config) {
+    constexpr std::string_view key = "temperal_downsample"; // the checkpoint's own spelling
+    if (!config.contains(key)) { return std::unexpected(vae_absent_key(key)); }
+    const Json& value = config.at(key);
+    if (!value.is_array() || value.size() != kVaeEncoderTemporalBlocks) {
+        return std::unexpected(
+            std::string(kVaeDocument) + quoted_key(key) + " is " + dump_safe(value) + " but must be a JSON "
+            "array of exactly " + std::to_string(kVaeEncoderTemporalBlocks) +
+            " booleans, one per encoder block that downsamples");
+    }
+    for (std::size_t i = 0; i < kVaeEncoderTemporalBlocks; ++i) {
+        const Json& entry = value[i];
+        if (!entry.is_boolean()) {
+            return std::unexpected(std::string(kVaeDocument) + quoted_key(key) + " holds " + dump_safe(entry) +
+                                   " at index " + std::to_string(i) + " but every entry must be a JSON boolean");
+        }
+        // The encoder block at index i is the decoder's up block (kVaeUpBlocks - 2 - i): the decoder walks
+        // the chain from the deepest level outward, and the graph's dup_up() passes this build's own
+        // scheme (kQwenImageVaeUpBlockTemporal) as the dupup3d shortcut factor there.
+        const std::size_t up_block = kVaeUpBlocks - 2 - i;
+        const bool required        = kQwenImageVaeUpBlockTemporal[up_block];
+        if (entry.get<bool>() != required) {
+            return std::unexpected(vae_wrong_claim(
+                key, entry, std::string(required ? "true" : "false") + " at index " + std::to_string(i) +
+                                ", which is the decoder's up block " + std::to_string(up_block) +
+                                " whose dupup3d shortcut factor this build implements as " +
+                                (required ? "2" : "1")));
+        }
     }
     return {};
 }
@@ -322,7 +527,7 @@ std::expected<DitRopeAxes, std::string> read_dit_rope_axes(const nlohmann::json&
         if (!axis.is_number_integer()) {
             return std::unexpected(
                 dit_axes_refusal(axes, "three JSON integers, but axis " + std::to_string(i) + " is " +
-                                       axis.dump() + " and the reader does not coerce a JSON type"));
+                                       dump_safe(axis) + " and the reader does not coerce a JSON type"));
         }
         value[i] = axis.get<std::int64_t>();
         // An absurd channel count could overflow the sum below and turn the refusal into a nonsense
@@ -367,6 +572,194 @@ std::expected<DitRopeAxes, std::string> read_dit_rope_axes(const nlohmann::json&
         }
         out.axes[i] = static_cast<std::uint32_t>(value[i]);
     }
+    return out;
+}
+
+std::expected<VaeTopology, std::string> read_vae_topology(const nlohmann::json& config) {
+    if (!config.is_object()) {
+        return std::unexpected(std::string(kVaeDocument) +
+                               "is not a JSON object, so the decoder topology cannot be read from the artifact");
+    }
+
+    // The scheme claims this build implements unconditionally come first, before a single width is
+    // adopted -- the same order the scheduler reader uses, where a foreign "_class_name" or an
+    // unverified mode flag refuses before any sigma is read. An artifact that declares a chain the CUDA
+    // graph does not run describes weights this build cannot decode, and the alternative to refusing is
+    // drawing them through a chain they were not trained under.
+    if (auto verdict = vae_required_boolean(config, "is_residual", true); !verdict.has_value()) {
+        return std::unexpected(verdict.error());
+    }
+    if (auto verdict = vae_empty_array(
+            config, "attn_scales",
+            "the empty array: this build places its one attention in the decoder's mid block and runs no "
+            "per-block attention, so a listed scale describes attention that never runs");
+        !verdict.has_value()) {
+        return std::unexpected(verdict.error());
+    }
+    if (auto verdict = vae_temporal_scheme(config); !verdict.has_value()) {
+        return std::unexpected(verdict.error());
+    }
+    if (auto value = vae_required_integer(config, "num_res_blocks"); !value.has_value()) {
+        return std::unexpected(value.error());
+    } else if (*value != static_cast<std::int64_t>(kVaeResnetsPerUpBlock) - 1) {
+        // Three resnets per up block is what dup_up() runs, and three is num_res_blocks + 1 in the
+        // diffusers chain's convention -- a declaration of any other count is a chain with a resnet
+        // missing or an extra one, whose bound convolutions this build would hand the wrong weights.
+        return std::unexpected(vae_wrong_claim(
+            "num_res_blocks", config.at("num_res_blocks"),
+            std::to_string(static_cast<std::int64_t>(kVaeResnetsPerUpBlock) - 1) +
+                ", because image_pipeline.cu's dup_up() runs " + std::to_string(kVaeResnetsPerUpBlock) +
+                " resnets per up block (num_res_blocks + 1)"));
+    }
+
+    // The widths, read as the JSON integers they promise to be: the reader coerces nothing, so a 144.0
+    // or a "144" refuses naming the key and printing the declaration as it stands.
+    auto levels = vae_positive_integer_array(config, "dim_mult", kVaeUpBlocks);
+    if (!levels.has_value()) { return std::unexpected(levels.error()); }
+    // The last level is the shallowest one, the width norm_out normalizes at and conv_out convolves:
+    // that is decoder_base_dim, so the multiplier beside it has to say 1 or the artifact disagrees with
+    // itself about its own output width.
+    if ((*levels)[0] != 1) {
+        return std::unexpected(std::string(kVaeDocument) + quoted_key("dim_mult") + " holds " +
+                               dump_safe(config.at("dim_mult")[0]) + " at index 0 but the shallowest level "
+                               "is the width " + quoted_key("decoder_base_dim") + " names and the final "
+                               "convolution runs at, so its multiplier must be 1");
+    }
+
+    std::int64_t base_dim = 0;
+    if (auto value = vae_required_integer(config, "decoder_base_dim"); !value.has_value()) {
+        return std::unexpected(value.error());
+    } else if (*value <= 0) {
+        return std::unexpected(
+            vae_wrong_claim("decoder_base_dim", config.at("decoder_base_dim"), "a positive channel count"));
+    } else {
+        base_dim = *value;
+    }
+    std::int64_t latent_channels = 0;
+    if (auto value = vae_required_integer(config, "z_dim"); !value.has_value()) {
+        return std::unexpected(value.error());
+    } else if (*value <= 0) {
+        return std::unexpected(vae_wrong_claim("z_dim", config.at("z_dim"),
+                                               "a positive latent channel count"));
+    } else {
+        latent_channels = *value;
+    }
+    std::int64_t out_channels = 0;
+    if (auto value = vae_required_integer(config, "out_channels"); !value.has_value()) {
+        return std::unexpected(value.error());
+    } else if (*value <= 0) {
+        return std::unexpected(
+            vae_wrong_claim("out_channels", config.at("out_channels"), "a positive channel count"));
+    } else {
+        out_channels = *value;
+    }
+    std::int64_t scale_factor_spatial = 0;
+    if (auto value = vae_required_integer(config, "scale_factor_spatial"); !value.has_value()) {
+        return std::unexpected(value.error());
+    } else if (*value <= 0) {
+        return std::unexpected(vae_wrong_claim("scale_factor_spatial", config.at("scale_factor_spatial"),
+                                               "a positive number of pixels per latent row"));
+    } else {
+        scale_factor_spatial = *value;
+    }
+
+    // The per-channel statistics ARE the latent width: the route divides each latent plane by its own
+    // std, so an artifact whose statistics are any other length than its own latent declaration is
+    // refused naming both numbers rather than reading past the end or normalizing nothing.
+    if (auto verdict = vae_finite_number_array_of(config, "latents_mean",
+                                                 static_cast<std::size_t>(latent_channels));
+        !verdict.has_value()) {
+        return std::unexpected(verdict.error());
+    }
+    if (auto verdict = vae_finite_number_array_of(config, "latents_std",
+                                                 static_cast<std::size_t>(latent_channels));
+        !verdict.has_value()) {
+        return std::unexpected(verdict.error());
+    }
+
+    // The decoder walks the chain from the deepest level outward, so the level widths are the declared
+    // multipliers reversed and scaled by the decoder's own base width: the shipped family's
+    // [1, 2, 4, 8, 8] x 144 becomes 1152, 1152, 576, 288, 144 -- the channels every bound convolution
+    // carries and the numbers the VRAM ledger charges for.
+    //
+    // Each factor is bounded on its own by kVaeLargestPlausibleValue, so the int64 product cannot wrap --
+    // but that bound says nothing about the PRODUCT, and these widths are stored and priced as
+    // std::uint32_t. A hand-authored document with decoder_base_dim 524288 and a dim_mult entry of 8192 --
+    // each one under its own bound, so each one passes it -- multiplies to exactly 2^32, which narrows to
+    // 0. A zero-channel stage is then bound at zero-width weights and charged ZERO bytes of vae_peak by the
+    // ledger, admitting a job whose real peak is gigabytes: precisely the admission blindness this plan
+    // exists to close. So every product is refused here, naming both keys, both factors and the product,
+    // BEFORE a single narrowing cast happens. The ceiling is the widest channel count the field the ledger
+    // multiplies can hold exactly; nothing is widened, because the fields are the contract.
+    constexpr std::int64_t kLargestStorableChannels =
+        static_cast<std::int64_t>(std::numeric_limits<std::uint32_t>::max());
+    std::vector<std::int64_t> widths(kVaeUpBlocks, 0);
+    for (std::size_t b = 0; b < kVaeUpBlocks; ++b) {
+        const std::size_t level   = kVaeUpBlocks - 1 - b;
+        const std::int64_t channels = base_dim * (*levels)[level];
+        if (channels > kLargestStorableChannels) {
+            return std::unexpected(std::string(kVaeDocument) + quoted_key("decoder_base_dim") + " = " +
+                                   std::to_string(base_dim) + " times " + quoted_key("dim_mult") + "[" +
+                                   std::to_string(level) + "] = " + std::to_string((*levels)[level]) + " is " +
+                                   std::to_string(channels) + " channels for the decoder's up stage " +
+                                   std::to_string(b) + ", more than the " +
+                                   std::to_string(kLargestStorableChannels) + " a stage's channel count is "
+                                   "stored and priced in: each declaration is plausible on its own, but the "
+                                   "chain's width is their PRODUCT, and a stage that did not fit would be "
+                                   "bound and admitted at its truncated width");
+        }
+        widths[b] = channels;
+    }
+
+    // The doublings the chain performs are not adopted from the artifact but verified against it: every
+    // up block except the last one upsamples, and the pixels per latent row the route divides the
+    // request geometry by has to be what those stages actually produce. A declaration of another factor
+    // would make the decode emit an image of a size nothing admitted.
+    std::uint64_t produced = 1ULL;
+    for (std::size_t b = 0; b + 1 < kVaeUpBlocks; ++b) { produced *= 2ULL; }
+    if (produced != static_cast<std::uint64_t>(scale_factor_spatial)) {
+        return std::unexpected(
+            vae_wrong_claim("scale_factor_spatial", config.at("scale_factor_spatial"),
+                            std::to_string(produced) + ", which is the only factor the " +
+                                std::to_string(kVaeUpBlocks) + " up blocks " + quoted_key("dim_mult") +
+                                " declares can produce: " + std::to_string(kVaeUpBlocks - 1) +
+                                " of them upsample by 2 and the last one does not"));
+    }
+
+    // The casts below are honest because of where their values come from, not by luck: latent_channels,
+    // spatial_downscale and out_channels each arrived through vae_required_integer, which refuses anything
+    // at or above kVaeLargestPlausibleValue (2^20) -- a single declaration, never a product -- and every
+    // width in `widths` was bounded to kLargestStorableChannels just above, by the same argument the
+    // product needs and a single bounded value does not.
+    VaeTopology out;
+    out.latent_channels   = static_cast<std::uint32_t>(latent_channels);
+    out.spatial_downscale = static_cast<std::uint32_t>(scale_factor_spatial);
+    out.mid_stage = VaeStage{static_cast<std::uint32_t>(widths.front()),
+                             static_cast<std::uint32_t>(widths.front()), kVaeMidStagePlanes, false};
+    for (std::size_t b = 0; b < kVaeUpBlocks; ++b) {
+        const std::int64_t channels_in = (b == 0) ? widths.front() : widths[b - 1];
+        out.up_stages.push_back(VaeStage{static_cast<std::uint32_t>(channels_in),
+                                         static_cast<std::uint32_t>(widths[b]), kVaeUpStagePlanes,
+                                         /*doubles_side=*/b + 1 < kVaeUpBlocks});
+    }
+    // The final convolution's width is the shallowest level plus the artifact's declared output channels:
+    // the same narrowing class as the stage widths, so it is bounded the same way -- and by subtraction,
+    // so the bound's own arithmetic cannot overflow. conv_out is the term the ledger charges on the FULL
+    // pixel canvas, so a truncated one under-charges a whole image, not one stage.
+    if (widths.back() > kLargestStorableChannels - out_channels) {
+        return std::unexpected(std::string(kVaeDocument) + quoted_key("out_channels") + " = " +
+                               std::to_string(out_channels) + " on top of the shallowest level " +
+                               quoted_key("decoder_base_dim") + " = " + std::to_string(widths.back()) +
+                               " is more channels for the final convolution than the " +
+                               std::to_string(kLargestStorableChannels) + " it is stored and priced in, and "
+                               "that stage is charged on the full pixel canvas");
+    }
+    out.final_channels  = static_cast<std::uint32_t>(widths.back() + out_channels);
+    out.denorm_elements = static_cast<std::uint32_t>(latent_channels);
+    // weight_resident_bytes is deliberately left zero: it is a calibration of THIS build's allocator and
+    // ops, not a declaration of the checkpoint's. The family's binding stamps it, and check_vae_topology
+    // refuses an unstamped topology -- an admission decision taken from a zero allowance would admit
+    // anything.
     return out;
 }
 

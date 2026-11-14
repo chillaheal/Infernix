@@ -60,6 +60,25 @@ infernix_add_op_test(infernix_image_artifact_constants_test
   LIBRARIES infernix_qwen_image infernix_artifact infernix::json)
 target_compile_features(infernix_image_artifact_constants_test PRIVATE cxx_std_23)
 
+# Task 5, the one-topology seam: the image VRAM ledger and the CUDA decoder graph read ONE
+# artifact-owned VAE topology (VaeTopology in src/models/qwen_image/artifact_constants.h, built by
+# read_vae_topology from the committed copy of the checkpoint's own vae/config.json), and
+# check_vae_topology compares it against every bound decoder weight. This suite pins the shipped
+# family's certified ledger total byte for byte (so the literals becoming fields moved no number) and
+# proves a DIFFERENT family -- its own channels, its own decoder width -- drives a different vae_peak,
+# which is the only way to show the ledger really follows the topology rather than a header array. The
+# reader's refusals (a missing key, a JSON float where an integer is required, a chain whose resnet
+# count or spatial downscale or temporal scheme the graph does not run, a denormalization pair that
+# disagrees with z_dim) must name the key and the observed value. The last section reads the live
+# artifact through the production reader and SKIPs when INFERNIX_TEST_ARTIFACT is absent. Host-only, no
+# GPU, no server, no artifact on disk. The reader returns std::expected, which this tree compiles per
+# target at C++23 (the CUDA lane stays at C++20).
+infernix_add_op_test(infernix_image_vae_topology_test
+  NEEDS_SOURCE_DIR
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_image_vae_topology.cpp"
+  LIBRARIES infernix_qwen_image infernix_artifact infernix::json)
+target_compile_features(infernix_image_vae_topology_test PRIVATE cxx_std_23)
+
 # Production scheduler qualification: the infernix_qwen_image FlowMatchEulerDiscrete schedule
 # (calculate_shift + build_schedule) and the geometry's token count against the real 512x512 40-step
 # pipeline oracle (tensors_pipeline/ sigmas.npy + timesteps.npy, dumped by image-spike/oracle/

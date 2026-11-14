@@ -77,7 +77,10 @@ int main() {
         Binder        binder(reader);
         DiTWeights    dit = bind_dit(binder);
         VaeWeights    vae = bind_image_vae(binder);
-        const VaeDenorm denorm = read_vae_denorm(binder);
+        // The denormalization pair is read against the topology the binding just verified, so its length
+        // is checked against the artifact's own declared z_dim rather than adopted at whatever length the
+        // blob happens to carry.
+        const VaeDenorm denorm = read_vae_denorm(binder, vae.topology);
         // Bound for the edit row below: the same artifact, the same streamed-only plan. Its dims are
         // what the ledger's vision term is derived from, so the row reserves for the ViT the artifact
         // actually ships rather than for a number written into the header.
@@ -159,17 +162,24 @@ int main() {
                 inputs.true_cfg_scale         = 3.5F;
             }
 
-            ImageDeviceNeedRequest req;
-            req.geometry        = geom;
-            req.dims            = dit.dims;
-            // The prompt's kept rows, read back from what the job is actually handed: a reference grew
-            // the prompt by its pad rows above, and the ledger must size the same sequence the job builds.
-            req.text_tokens     = static_cast<std::uint32_t>(inputs.prompt_embeds.size() /
-                                                             static_cast<std::size_t>(dit.dims.hidden));
-            req.negative_tokens = c.neg_tokens;
-            req.ref_tokens      = static_cast<std::uint32_t>(inputs.ref_latents.size() / dit.dims.image_in);
-            req.blocks_resident = kImageResidentBlocks; // same symbol the serving layer and the
-                             // pipeline's CopyLane assert; the allowance was calibrated at this value
+            // The topology is the one THIS artifact's binding produced and verified against every stored
+            // decoder weight -- the same object the job decodes with two statements below -- so the
+            // prediction this row compares against the measured peak is priced from the decoder that
+            // actually ran, not from a table this file could have kept stale.
+            ImageDeviceNeedRequest req{
+                .geometry        = geom,
+                .dims            = dit.dims,
+                // The prompt's kept rows, read back from what the job is actually handed: a reference
+                // grew the prompt by its pad rows above, and the ledger must size the same sequence the
+                // job builds.
+                .text_tokens     = static_cast<std::uint32_t>(inputs.prompt_embeds.size() /
+                                                             static_cast<std::size_t>(dit.dims.hidden)),
+                .negative_tokens = c.neg_tokens,
+                .ref_tokens      = static_cast<std::uint32_t>(inputs.ref_latents.size() / dit.dims.image_in),
+                .blocks_resident = kImageResidentBlocks, // same symbol the serving layer and the
+                             // pipeline's CopyLane assert; the calibration was measured at this value
+                .vae             = vae.topology,
+            };
             if (c.vit) {
                 // The reference's vision tokens are the prompt here: 4096 patches merge to 1024 rows,
                 // all of them <|image_pad|>, so the joint sequence is 0 text + 4096 reference + target.
@@ -215,9 +225,10 @@ int main() {
             }
             // Reservation floor. The serving layer keeps 512 MiB between the predicted need and the
             // device it yields (kInterludeMarginBytes), so a row that clears the real peak by less than
-            // that means kImageWeightResidentBytes was cut below the footprint plus its reservation. This
-            // is the pair to "predicted >= measured": it catches the next change that lowers the constant
-            // too far, exactly the mistake the 3072 MiB tightening must not be re-lowered into.
+            // that means the topology's resident calibration was cut below the footprint plus its
+            // reservation. This is the pair to "predicted >= measured": it catches the next change that
+            // lowers the constant too far, exactly the mistake the 3072 MiB tightening must not be
+            // re-lowered into.
             const std::uint64_t kFloor = 512ULL * mib;
             if (predicted >= measured && predicted < measured + kFloor) {
                 std::cout << "FAIL: " << c.what << " clears the measured peak by only "
@@ -233,8 +244,9 @@ int main() {
         }
         cudaStreamDestroy(stream);
         if (failures != 0) {
-            std::cout << failures << " case(s) failed; lower kImageWeightResidentBytes or widen the "
-                         "inventory in image_device_need.h\n";
+            std::cout << failures << " case(s) failed; lower the resident calibration "
+                         "(kQwenImageWeightResidentBytes, which the binding stamps onto the topology) or "
+                         "widen the inventory in image_device_need.h\n";
             return 1;
         }
         std::cout << "the computed need covers every measured peak\n";

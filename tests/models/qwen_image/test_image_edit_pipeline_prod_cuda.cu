@@ -248,7 +248,9 @@ int main() {
         Binder binder(reader);
         DiTWeights dit = bind_dit(binder);
         VaeWeights vae = bind_image_vae(binder);
-        const VaeDenorm denorm = read_vae_denorm(binder);
+        // Read against the topology that binding verified: its declared z_dim says how long the pair must
+        // be, so the denormalization cannot be adopted at a length nobody declared.
+        const VaeDenorm denorm = read_vae_denorm(binder, vae.topology);
         (void)std::move(binder).finish();
         const std::size_t D = dit.dims.hidden;
         require(D == 4096, "the edit route was authored against hidden 4096, not " + std::to_string(D));

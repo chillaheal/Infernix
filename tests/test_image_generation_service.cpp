@@ -5,6 +5,7 @@
 
 #include "artifact/schema.h"
 #include "media/encode/png_encode.h"
+#include "models/qwen_image/vae_topology_fixture.h"
 
 #include <algorithm>
 #include <chrono>
@@ -189,6 +190,28 @@ VisionLaneDimsProvider fixed_vision() {
     };
 }
 
+// The decoder geometry every service in this file is admitted on. The two providers above are hand-written
+// shipped numbers, because this file's subject is what the serving layer DOES with a need -- but the
+// decode's channels are the artifact's declaration and nothing else, so they are not written a second time
+// here: they come from the committed copy of the checkpoint's own vae/config.json through the PRODUCTION
+// reader, with the resident calibration stamped the way bind_image_vae stamps it
+// (tests/models/qwen_image/vae_topology_fixture.h), which is the same object serve hands its jobs through
+// make_artifact_vae_topology_provider. The VRAM-threshold cases below read the computed need directly, so
+// a fake with its own channel numbers would quietly certify a route that is not the shipped one. Where the
+// artifact's declaration is gated against the topology at all: tests/models/qwen_image/
+// test_image_vae_topology.cpp.
+//
+// Every construction in this file passes it: the request's topology member is a reference with no default
+// (the ledger cannot be asked to price a decode nobody read), and a service left without a provider refuses
+// a job as unconfigured -- which is itself a case below, the one at the unconfigured service.
+VaeTopologyProvider fixed_vae_topology() {
+    return [] {
+        static const infernix::models::qwen_image::VaeTopology topology =
+            infernix::tests::qwen_image::qwen_image_2_1_topology();
+        return topology;
+    };
+}
+
 // The edit route's host half: the ti2i render, counted the way the genuine renderer counts -- the
 // text rows plus one run of tokens_per_image[0] <|image_pad|> rows. The admission sizes the joint
 // sequence on THESE ids (the ledger subtracts the pad rows itself, image_device_need.h:120-125), so a
@@ -298,16 +321,31 @@ int main() {
     // Not configured: no runner, no provider, no executor -> no stored job at all.
     {
         ImageJobStore store(8, 1 << 20);
-        ImageGenerationService service(nullptr, store, PromptRendererProvider{}, PromptEmbedsProvider{}, DiTDimsProvider{}, ImageJobExecutor{});
+        ImageGenerationService service(nullptr, store, PromptRendererProvider{}, PromptEmbedsProvider{}, DiTDimsProvider{}, ImageJobExecutor{}, {}, {}, {}, fixed_vae_topology());
         check(!service.is_configured(), "empty service is not configured");
         expect_precheck("not configured", 503, "image_generation_not_configured", service);
         check(store.size() == 0U, "not-configured stores nothing");
     }
 
+    // Everything configured EXCEPT the decoder geometry: the same service that serves the case below, with
+    // no topology provider. The ledger cannot price a decode nobody read and nothing compiled stands in for
+    // the artifact's declaration, so the job is refused as unconfigured -- before the busy signal starts and
+    // with nothing stored. That is the fail-closed half of the topology seam, and it is why every other
+    // service in this file is built with fixed_vae_topology().
+    {
+        ImageJobStore store(8, 1 << 20);
+        ImageGenerationService without_decoder(std::make_unique<FakeRunner>(), store, fixed_renderer(),
+                                     fixed_provider(), fixed_dims(), fixed_executor(), {}, {}, {});
+        check(without_decoder.is_configured(),
+              "a service without a decoder topology is still configured for everything else");
+        expect_precheck("no decoder topology", 503, "image_generation_not_configured", without_decoder);
+        check(store.size() == 0U, "a job refused for its missing decoder topology stores nothing");
+    }
+
     {
         ImageJobStore store(8, 1 << 20);
         ImageGenerationService service(std::make_unique<FakeRunner>(), store, fixed_renderer(), fixed_provider(), fixed_dims(),
-                                       fixed_executor());
+                                       fixed_executor(), {}, {}, {}, fixed_vae_topology());
         check(service.is_configured(), "full service is configured");
         const auto response = service.generate(sample_request(), 1000);
         check(response["created"] == 1000, "success stamps created");
@@ -331,7 +369,7 @@ int main() {
         // explicit seed verbatim, an omitted one the engine draw that nobody can recover after.
         ImageJobStore store(8, 1 << 20);
         ImageGenerationService service(std::make_unique<FakeRunner>(), store, fixed_renderer(), fixed_provider(), fixed_dims(),
-                                       fixed_executor());
+                                       fixed_executor(), {}, {}, {}, fixed_vae_topology());
         OpenAIImagesRequest pinned = sample_request();
         pinned.seed = 123456789ULL;
         check(!attempt([&] { return service.generate(pinned, 1000); }).threw,
@@ -346,7 +384,7 @@ int main() {
         auto runner = std::make_unique<FakeRunner>();
         runner->supports = false;
         ImageJobStore store(8, 1 << 20);
-        ImageGenerationService service(std::move(runner), store, fixed_renderer(), fixed_provider(), fixed_dims(), fixed_executor());
+        ImageGenerationService service(std::move(runner), store, fixed_renderer(), fixed_provider(), fixed_dims(), fixed_executor(), {}, {}, {}, fixed_vae_topology());
         expect_precheck("interlude unsupported", 503, "image_interlude_unsupported", service);
         check(store.size() == 0U, "unsupported stores nothing");
     }
@@ -355,7 +393,7 @@ int main() {
         auto runner = std::make_unique<FakeRunner>();
         runner->available = false;
         ImageJobStore store(8, 1 << 20);
-        ImageGenerationService service(std::move(runner), store, fixed_renderer(), fixed_provider(), fixed_dims(), fixed_executor());
+        ImageGenerationService service(std::move(runner), store, fixed_renderer(), fixed_provider(), fixed_dims(), fixed_executor(), {}, {}, {}, fixed_vae_topology());
         expect_precheck("engine unavailable", 503, "engine_unavailable", service);
         check(store.size() == 0U, "unavailable stores nothing");
     }
@@ -364,7 +402,7 @@ int main() {
     {
         ImageJobStore store(8, 1 << 20);
         ImageGenerationService service(std::make_unique<FakeRunner>(), store, fixed_renderer(), fixed_provider(), fixed_dims(),
-                                       throwing_executor());
+                                       throwing_executor(), {}, {}, {}, fixed_vae_topology());
         const auto outcome = attempt([&] { return service.generate(sample_request(), 1000); });
         check(outcome.threw && outcome.status == 500 && outcome.code == "image_generation_failed",
               "job failure -> 500 image_generation_failed");
@@ -396,7 +434,7 @@ int main() {
         ImageJobStore store(8, 1 << 20);
         ImageGenerationService refused_by_an_op(std::make_unique<FakeRunner>(), store,
                                                 fixed_renderer(), fixed_provider(), fixed_dims(),
-                                                rejected_by_an_op);
+                                                rejected_by_an_op, {}, {}, {}, fixed_vae_topology());
         const auto op_outcome =
             attempt([&] { return refused_by_an_op.generate(sample_request(), 1000); });
         check(op_outcome.threw && op_outcome.status == 500 &&
@@ -406,7 +444,7 @@ int main() {
         ImageJobStore artifact_store(8, 1 << 20);
         ImageGenerationService artifact_failed(std::make_unique<FakeRunner>(), artifact_store,
                                                fixed_renderer(), fixed_provider(), fixed_dims(),
-                                               artifact_unbound);
+                                               artifact_unbound, {}, {}, {}, fixed_vae_topology());
         const auto artifact_outcome =
             attempt([&] { return artifact_failed.generate(sample_request(), 1000); });
         check(artifact_outcome.threw && artifact_outcome.status == 500 &&
@@ -418,7 +456,7 @@ int main() {
     {
         ImageJobStore store(8, 1 << 20);
         ImageGenerationService service(std::make_unique<FakeRunner>(FakeRunner::Mode::InFlight),
-                                       store, fixed_renderer(), fixed_provider(), fixed_dims(), fixed_executor());
+                                       store, fixed_renderer(), fixed_provider(), fixed_dims(), fixed_executor(), {}, {}, {}, fixed_vae_topology());
         const auto outcome = attempt([&] { return service.generate(sample_request(), 1000); });
         check(outcome.threw && outcome.status == 429 && outcome.code == "image_interlude_in_flight",
               "in flight -> 429 image_interlude_in_flight");
@@ -438,7 +476,7 @@ int main() {
         FakeRunner*   eyes   = runner.get();
         eyes->probe_answer   = FakeRunner::Fit{.fits = false, .freed_bytes_expected = 1ULL << 30};
         ImageGenerationService service(std::move(runner), store, fixed_renderer(), fixed_provider(),
-                                       fixed_dims(), fixed_executor());
+                                       fixed_dims(), fixed_executor(), {}, {}, {}, fixed_vae_topology());
         const auto refusal = attempt([&] { return service.generate(sample_request(), 1700); });
         check(refusal.threw && refusal.status == 503 &&
                   refusal.code == "image_vram_insufficient",
@@ -459,7 +497,7 @@ int main() {
                                                .expert_pool_frozen_by_lease = true,
                                                .freed_bytes_expected = 1ULL << 30};
         ImageGenerationService service(std::move(runner), store, fixed_renderer(), fixed_provider(),
-                                       fixed_dims(), fixed_executor());
+                                       fixed_dims(), fixed_executor(), {}, {}, {}, fixed_vae_topology());
         const auto outcome = attempt([&] { return service.generate(sample_request(), 1750); });
         check(!outcome.threw, "a no from a frame pool the chat is holding admits the job");
         check(eyes->probes == 1 && eyes->runs == 1,
@@ -485,7 +523,7 @@ int main() {
                 return fake_picture(0x01U);
             };
         ImageGenerationService service(std::move(runner), store, fixed_renderer(), fixed_provider(),
-                                       fixed_dims(), watch);
+                                       fixed_dims(), watch, {}, {}, {}, fixed_vae_topology());
         const auto refusal = attempt([&] { return service.generate(sample_request(), 1760); });
         check(refusal.threw && refusal.code == "image_vram_insufficient",
               "a blind no whose yield cannot pay the floor is still refused");
@@ -500,7 +538,7 @@ int main() {
     {
         ImageJobStore store(8, 8ULL << 20);
         ImageGenerationService service(std::make_unique<FakeRunner>(FakeRunner::Mode::Busy), store,
-                                       fixed_renderer(), fixed_provider(), fixed_dims(), fixed_executor());
+                                       fixed_renderer(), fixed_provider(), fixed_dims(), fixed_executor(), {}, {}, {}, fixed_vae_topology());
         const auto outcome = attempt([&] { return service.generate(sample_request(), 1770); });
         check(outcome.threw && outcome.status == 429 && outcome.code == "image_interlude_busy",
               "no yieldable frontier -> 429 image_interlude_busy, never 500");
@@ -515,7 +553,7 @@ int main() {
         FakeRunner*   eyes   = runner.get();
         eyes->probe_answer   = FakeRunner::Fit{.fits = false, .freed_bytes_expected = 1ULL << 30};
         ImageGenerationService service(std::move(runner), store, fixed_renderer(), fixed_provider(),
-                                       fixed_dims(), fixed_executor());
+                                       fixed_dims(), fixed_executor(), {}, {}, {}, fixed_vae_topology());
         OpenAIImagesRequest big    = sample_request();
         big.width    = 1024;
         big.height   = 1024;
@@ -532,7 +570,7 @@ int main() {
         FakeRunner*   eyes   = runner.get();
         eyes->probe_answer   = FakeRunner::Fit{.fits = false, .freed_bytes_expected = 1ULL << 30};
         ImageGenerationService service(std::move(runner), store, fixed_renderer(), fixed_provider(),
-                                       fixed_dims(), fixed_executor());
+                                       fixed_dims(), fixed_executor(), {}, {}, {}, fixed_vae_topology());
         OpenAIImagesRequest tiny  = sample_request();
         tiny.width   = 256;
         tiny.height  = 256;
@@ -562,7 +600,7 @@ int main() {
                 return fake_picture(0x01U);
             };
         ImageGenerationService service(std::move(runner), store, fixed_renderer(), fixed_provider(),
-                                       fixed_dims(), watch);
+                                       fixed_dims(), watch, {}, {}, {}, fixed_vae_topology());
         const auto refusal = attempt([&] { return service.generate(sample_request(), 1800); });
         check(refusal.threw && refusal.code == "image_vram_insufficient",
               "a short grant is reported as the same refusal, not as a failed draw");
@@ -571,7 +609,7 @@ int main() {
     }
 
         ImageGenerationService service(std::make_unique<FakeRunner>(FakeRunner::Mode::DrainFail),
-                                       store, fixed_renderer(), fixed_provider(), fixed_dims(), fixed_executor());
+                                       store, fixed_renderer(), fixed_provider(), fixed_dims(), fixed_executor(), {}, {}, {}, fixed_vae_topology());
         const auto outcome = attempt([&] { return service.generate(sample_request(), 1000); });
         check(outcome.threw && outcome.status == 503 && outcome.code == "image_interlude_failed",
               "drain miss -> 503 image_interlude_failed");
@@ -585,7 +623,7 @@ int main() {
         ImageJobStore store(8, 1 << 20);
         ImageGenerationService service(
             std::make_unique<FakeRunner>(FakeRunner::Mode::RestorationFault), store,
-            fixed_renderer(), fixed_provider(), fixed_dims(), fixed_executor());
+            fixed_renderer(), fixed_provider(), fixed_dims(), fixed_executor(), {}, {}, {}, fixed_vae_topology());
         const auto outcome = attempt([&] { return service.generate(sample_request(), 1000); });
         check(outcome.threw && outcome.status == 503 && outcome.code == "image_engine_degraded",
               "restoration fault -> 503 image_engine_degraded");
@@ -618,7 +656,7 @@ int main() {
                 return fake_picture(0x01U);
             };
         ImageGenerationService service(std::make_unique<FakeRunner>(), store, fixed_renderer(),
-                                       fixed_provider(), fixed_dims(), watch);
+                                       fixed_provider(), fixed_dims(), watch, {}, {}, {}, fixed_vae_topology());
         self = &service;
         check(service.in_flight_jobs() == 0, "no job means nothing is in flight");
         (void)attempt([&] { return service.generate(sample_request(), 1000); });
@@ -632,7 +670,7 @@ int main() {
         // failure, and a count surviving one of those would tell a supervisor the card is busy forever.
         ImageJobStore failing_store(8, 1ULL << 20);
         ImageGenerationService failing(std::make_unique<FakeRunner>(), failing_store, fixed_renderer(),
-                                       fixed_provider(), fixed_dims(), throwing_executor());
+                                       fixed_provider(), fixed_dims(), throwing_executor(), {}, {}, {}, fixed_vae_topology());
         const auto failed = attempt([&] { return failing.generate(sample_request(), 1000); });
         check(failed.threw, "the throwing executor really threw");
         check(failing.in_flight_jobs() == 0, "a job that threw leaves no count behind either");
@@ -692,7 +730,7 @@ int main() {
 
         ImageJobStore store(8, 1 << 20);
         ImageGenerationService service(std::make_unique<FakeRunner>(), store, fixed_renderer(), fixed_provider(), fixed_dims(),
-                                       capture, fixed_vision(), fixed_reference_renderer());
+                                       capture, fixed_vision(), fixed_reference_renderer(), {}, fixed_vae_topology());
         OpenAIImagesRequest request = sample_request();
         request.images              = {payload};
         service.generate(request, 1000);
@@ -713,7 +751,7 @@ int main() {
 
         ImageJobStore bad_store(8, 1 << 20);
         ImageGenerationService bad_service(std::make_unique<FakeRunner>(), bad_store,
-                                           fixed_renderer(), fixed_provider(), fixed_dims(), capture);
+                                           fixed_renderer(), fixed_provider(), fixed_dims(), capture, {}, {}, {}, fixed_vae_topology());
         OpenAIImagesRequest bad = sample_request();
         bad.images              = {"not base64 at all!!"};
         const auto outcome      = attempt([&] { return bad_service.generate(bad, 1000); });
@@ -740,7 +778,7 @@ int main() {
             [](const OpenAIImagesRequest&, std::uint64_t, std::span<const std::uint16_t>,
                std::span<const std::uint16_t>, std::span<const ReferencePlanes>, void*,
                const std::shared_ptr<ImageJobProgress>&,
-               const EditConditioning*) { return fake_picture(0x01U); });
+               const EditConditioning*) { return fake_picture(0x01U); }, {}, {}, {}, fixed_vae_topology());
         OpenAIImagesRequest request = sample_request();
         request.prompt_enhance = PromptEnhanceMode::On;
         const auto outcome = attempt([&] { return service.generate(request, 1000); });
@@ -819,7 +857,7 @@ int main() {
         };
         ImageGenerationService service(std::move(runner), store, fixed_renderer(), fixed_provider(),
                                        fixed_dims(), watch, fixed_vision(),
-                                       fixed_reference_renderer(), enhancer);
+                                       fixed_reference_renderer(), enhancer, fixed_vae_topology());
         OpenAIImagesRequest request        = sample_request();
         request.images                     = {reference};
         request.prompt_enhance             = PromptEnhanceMode::Auto;
@@ -854,7 +892,7 @@ int main() {
         auto refusing_enhancer       = std::make_shared<FakeEnhancer>();
         ImageGenerationService refusing(std::move(refusing_runner), store, fixed_renderer(),
                                         fixed_provider(), fixed_dims(), watch, fixed_vision(),
-                                        fixed_reference_renderer(), refusing_enhancer);
+                                        fixed_reference_renderer(), refusing_enhancer, fixed_vae_topology());
         OpenAIImagesRequest asked      = request;
         asked.prompt_enhance           = PromptEnhanceMode::On;
         const auto asked_outcome = attempt([&] { return refusing.generate(asked, 1101); });
@@ -888,7 +926,7 @@ int main() {
         };
         ImageGenerationService generous(std::move(generous_runner), store, fixed_renderer(),
                                         fixed_provider(), fixed_dims(), note, fixed_vision(),
-                                        fixed_reference_renderer(), generous_enhancer);
+                                        fixed_reference_renderer(), generous_enhancer, fixed_vae_topology());
         const auto paid_outcome = attempt([&] { return generous.generate(asked, 1102); });
         check(!paid_outcome.threw && generous_enhancer->rewrites == 1 &&
                   generous_enhancer->loads == 1 && generous_enhancer->unloads == 1 &&
@@ -922,7 +960,7 @@ int main() {
         };
         ImageGenerationService dead(std::move(dead_runner), store, fixed_renderer(), fixed_provider(),
                                     fixed_dims(), remember, fixed_vision(),
-                                    fixed_reference_renderer(), dead_enhancer);
+                                    fixed_reference_renderer(), dead_enhancer, fixed_vae_topology());
         const auto dead_outcome = attempt([&] { return dead.generate(request, 1104); });
         check(!dead_outcome.threw, "a sidecar that dies on the load is served, not refused, for auto");
         check(own_words == request.prompt,
@@ -945,7 +983,7 @@ int main() {
         dead_asked->load_throws = true;
         ImageGenerationService dead_true(std::move(dead_asked_runner), store, fixed_renderer(),
                                          fixed_provider(), fixed_dims(), remember, fixed_vision(),
-                                         fixed_reference_renderer(), dead_asked);
+                                         fixed_reference_renderer(), dead_asked, fixed_vae_topology());
         OpenAIImagesRequest asked_dead = request;
         asked_dead.prompt_enhance      = PromptEnhanceMode::On;
         const auto dead_asked_outcome  = attempt([&] { return dead_true.generate(asked_dead, 1105); });
@@ -986,7 +1024,7 @@ int main() {
             };
             ImageGenerationService noservice(std::move(nofit_runner), store, fixed_renderer(),
                                              fixed_provider(), fixed_dims(), keep, fixed_vision(),
-                                             fixed_reference_renderer(), nofit_enhancer);
+                                             fixed_reference_renderer(), nofit_enhancer, fixed_vae_topology());
             OpenAIImagesRequest ask          = request;
             ask.images                       = {reference};
             ask.prompt_enhance               = PromptEnhanceMode::Auto;
@@ -1009,7 +1047,7 @@ int main() {
             auto            nofit_refuse_enhancer = std::make_shared<FakeEnhancer>();
             ImageGenerationService nofit_refusal(std::move(nofit_refusing), store, fixed_renderer(),
                                                  fixed_provider(), fixed_dims(), keep, fixed_vision(),
-                                                 fixed_reference_renderer(), nofit_refuse_enhancer);
+                                                 fixed_reference_renderer(), nofit_refuse_enhancer, fixed_vae_topology());
             OpenAIImagesRequest believed = ask;
             believed.prompt_enhance      = PromptEnhanceMode::On;
             const auto refused           = attempt([&] { return nofit_refusal.generate(believed, 1104); });
@@ -1065,7 +1103,7 @@ int main() {
                 };
                 ImageGenerationService service(std::move(lie_runner), lie_store, fixed_renderer(),
                                               fixed_provider(), fixed_dims(), note, fixed_vision(),
-                                              fixed_reference_renderer(), lied);
+                                              fixed_reference_renderer(), lied, fixed_vae_topology());
                 OpenAIImagesRequest asked  = sample_request();
                 asked.prompt_enhance       = PromptEnhanceMode::On; // an explicit ask may be refused
                 const auto refusal = attempt([&] { return service.generate(asked, 1106); });
@@ -1134,7 +1172,7 @@ int main() {
             };
             ImageGenerationService skip(std::move(skip_runner), skip_store, fixed_renderer(),
                                         fixed_provider(), fixed_dims(), note2, fixed_vision(),
-                                        fixed_reference_renderer(), skip_enhancer);
+                                        fixed_reference_renderer(), skip_enhancer, fixed_vae_topology());
             OpenAIImagesRequest r = sample_request();
             if (c.reference) { r.images = {reference}; }
             if (c.marked) { r.prompt = "On <image1>, make the ground green."; }
@@ -1205,7 +1243,7 @@ int main() {
         auto runner = std::make_unique<FakeRunner>();
         FakeRunner* eyes = runner.get();
         ImageGenerationService service(std::move(runner), store, fixed_renderer(), fixed_provider(),
-                                       fixed_dims(), capture, fixed_vision(), recorder);
+                                       fixed_dims(), capture, fixed_vision(), recorder, {}, fixed_vae_topology());
 
         OpenAIImagesRequest request = sample_request();
         request.size_requested = false;  // an edit that named no size: the reference decides the canvas
@@ -1256,7 +1294,7 @@ int main() {
             auto runner = std::make_unique<FakeRunner>();
             FakeRunner* eyes = runner.get();
             ImageGenerationService service(std::move(runner), store, fixed_renderer(), fixed_provider(),
-                                           fixed_dims(), fixed_executor());
+                                           fixed_dims(), fixed_executor(), {}, {}, {}, fixed_vae_topology());
             OpenAIImagesRequest request = sample_request();
             request.images = {payload};
             const auto outcome = attempt([&] { return service.generate(request, 1900); });
@@ -1277,7 +1315,7 @@ int main() {
             FakeRunner* eyes = runner.get();
             ImageGenerationService service(std::move(runner), store, fixed_renderer(), fixed_provider(),
                                            fixed_dims(), fixed_executor(), fixed_vision(),
-                                           fixed_reference_renderer());
+                                           fixed_reference_renderer(), {}, fixed_vae_topology());
             (void)attempt([&] { return service.generate(sample_request(), 1910); });
             asked_without = eyes->probed_target;
             OpenAIImagesRequest request = sample_request();
@@ -1303,7 +1341,7 @@ int main() {
                 };
             ImageGenerationService service(std::move(runner), store, fixed_renderer(), fixed_provider(),
                                            fixed_dims(), watch, fixed_vision(),
-                                           fixed_reference_renderer());
+                                           fixed_reference_renderer(), {}, fixed_vae_topology());
             OpenAIImagesRequest request = sample_request();
             request.images = {payload};
             const auto outcome = attempt([&] { return service.generate(request, 1930); });
@@ -1337,7 +1375,7 @@ int main() {
                 FakeRunner* measure_eyes = measure_runner.get();
                 ImageGenerationService measure(std::move(measure_runner), measure_store, fixed_renderer(),
                                                fixed_provider(), fixed_dims(), fixed_executor(),
-                                               fixed_vision(), fixed_reference_renderer());
+                                               fixed_vision(), fixed_reference_renderer(), {}, fixed_vae_topology());
                 OpenAIImagesRequest r = sample_request();
                 r.images         = {payload};
                 r.size_requested = true;
@@ -1377,7 +1415,7 @@ int main() {
             };
             ImageGenerationService service(std::move(runner), store, fixed_renderer(), fixed_provider(),
                                            fixed_dims(), watch, fixed_vision(),
-                                           fixed_reference_renderer());
+                                           fixed_reference_renderer(), {}, fixed_vae_topology());
             OpenAIImagesRequest request = sample_request();
             request.images         = {payload};
             request.size_requested = true; // the ask is 768x768, and nothing else decides it
@@ -1439,7 +1477,7 @@ int main() {
                 };
                 ImageGenerationService service(std::move(r), s, fixed_renderer(), fixed_provider(),
                                                fixed_dims(), note, fixed_vision(),
-                                               fixed_reference_renderer());
+                                               fixed_reference_renderer(), {}, fixed_vae_topology());
                 OpenAIImagesRequest request = sample_request();
                 request.images              = {payload};
                 request.size_requested      = true;
@@ -1509,7 +1547,7 @@ int main() {
                 };
                 ImageGenerationService gave_service(std::move(gave_runner), gave_store, fixed_renderer(),
                                                     fixed_provider(), fixed_dims(), gave_watch,
-                                                    fixed_vision(), fixed_reference_renderer());
+                                                    fixed_vision(), fixed_reference_renderer(), {}, fixed_vae_topology());
                 OpenAIImagesRequest gave_request = sample_request();
                 gave_request.images         = {payload};
                 gave_request.size_requested = true;
@@ -1546,7 +1584,7 @@ int main() {
                     ImageGenerationService tight_service(std::move(tight_runner), tight_store,
                                                          fixed_renderer(), fixed_provider(), fixed_dims(),
                                                          fixed_executor(), fixed_vision(),
-                                                         fixed_reference_renderer());
+                                                         fixed_reference_renderer(), {}, fixed_vae_topology());
                     OpenAIImagesRequest tight_request = sample_request();
                     tight_request.images         = {payload};
                     tight_request.size_requested = true;
@@ -1583,7 +1621,7 @@ int main() {
             FakeRunner*   measure_eyes   = measure_runner.get();
             ImageGenerationService measure(std::move(measure_runner), measure_store, fixed_renderer(),
                                            fixed_provider(), fixed_dims(), fixed_executor(),
-                                           fixed_vision(), fixed_reference_renderer());
+                                           fixed_vision(), fixed_reference_renderer(), {}, fixed_vae_topology());
             OpenAIImagesRequest r = sample_request();
             r.images         = {payload};
             r.size_requested = true;
@@ -1624,7 +1662,7 @@ int main() {
             return picture;
         };
         ImageGenerationService service(std::move(runner), store, fixed_renderer(), fixed_provider(),
-                                       fixed_dims(), watch, fixed_vision(), fixed_reference_renderer());
+                                       fixed_dims(), watch, fixed_vision(), fixed_reference_renderer(), {}, fixed_vae_topology());
         OpenAIImagesRequest request = sample_request();
         request.images         = {payload};
         request.size_requested = true;
@@ -1668,7 +1706,7 @@ int main() {
         };
 
         ImageJobStore store(8, 1 << 20);
-        ImageGenerationService service(std::make_unique<FakeRunner>(), store, fixed_renderer(), recording, fixed_dims(), capture);
+        ImageGenerationService service(std::make_unique<FakeRunner>(), store, fixed_renderer(), recording, fixed_dims(), capture, {}, {}, {}, fixed_vae_topology());
         OpenAIImagesRequest steered     = sample_request();
         steered.true_cfg_scale          = 3.5;
         steered.negative_prompt         = "blurry, low quality";
@@ -1701,7 +1739,7 @@ int main() {
             return picture;
         };
         ImageJobStore store(8, 1 << 20);
-        ImageGenerationService service(std::make_unique<FakeRunner>(), store, fixed_renderer(), embeds, fixed_dims(), writer);
+        ImageGenerationService service(std::make_unique<FakeRunner>(), store, fixed_renderer(), embeds, fixed_dims(), writer, {}, {}, {}, fixed_vae_topology());
 
         const std::filesystem::path saved =
             std::filesystem::current_path() / "images" / "img-2000-1.png";
@@ -1729,7 +1767,7 @@ int main() {
             return picture;
         };
         ImageJobStore store(8, 1 << 20);
-        ImageGenerationService service(std::make_unique<FakeRunner>(), store, fixed_renderer(), fixed_provider(), fixed_dims(), writer);
+        ImageGenerationService service(std::make_unique<FakeRunner>(), store, fixed_renderer(), fixed_provider(), fixed_dims(), writer, {}, {}, {}, fixed_vae_topology());
 
         OpenAIImagesRequest request = sample_request();
         request.response_format     = ImageResponseFormat::Url;
@@ -1776,7 +1814,7 @@ int main() {
         };
         ImageJobStore store(8, 1 << 20);
         ImageGenerationService service(std::make_unique<FakeRunner>(), store, fixed_renderer(), fixed_provider(), fixed_dims(),
-                                       stepping);
+                                       stepping, {}, {}, {}, fixed_vae_topology());
         (void)service.generate(sample_request(), 4000);
         const auto live = service.last_job_progress();
         check(live != nullptr && live->percent.load() == 100,
@@ -1798,7 +1836,7 @@ int main() {
         };
         ImageJobStore stalled_store(8, 1 << 20);
         ImageGenerationService stalled_service(std::make_unique<FakeRunner>(), stalled_store,
-                                               fixed_renderer(), fixed_provider(), fixed_dims(), stalled);
+                                               fixed_renderer(), fixed_provider(), fixed_dims(), stalled, {}, {}, {}, fixed_vae_topology());
         bool threw = false;
         try {
             (void)stalled_service.generate(sample_request(), 5000);
@@ -1944,7 +1982,7 @@ int main() {
         auto at_ceiling = std::make_unique<FakeRunner>();
         FakeRunner& ceiling_runner = *at_ceiling;
         ImageGenerationService at_limit(std::move(at_ceiling), store, rows_renderer(4096),
-                                        fixed_provider(), fixed_dims(), fixed_executor());
+                                        fixed_provider(), fixed_dims(), fixed_executor(), {}, {}, {}, fixed_vae_topology());
         check(!attempt([&] { return at_limit.generate(big_canvas(), 1000); }).threw,
               "a joint sequence of exactly the ceiling is served");
         check(ceiling_runner.probes == 1, "the admitted request reached the probe");
@@ -1953,7 +1991,7 @@ int main() {
         auto over = std::make_unique<FakeRunner>();
         FakeRunner& over_runner = *over;
         ImageGenerationService past_limit(std::move(over), refused_store, rows_renderer(4097),
-                                          fixed_provider(), fixed_dims(), fixed_executor());
+                                          fixed_provider(), fixed_dims(), fixed_executor(), {}, {}, {}, fixed_vae_topology());
         const auto outcome = attempt([&] { return past_limit.generate(big_canvas(), 1000); });
         check(outcome.threw && outcome.status == 400 && outcome.code == "image_prompt_too_long",
               "one row past the ceiling is a 400 image_prompt_too_long");
@@ -1977,7 +2015,7 @@ int main() {
         ImageJobStore hopeless_store(8, 1 << 20);
         ImageGenerationService hopeless(std::make_unique<FakeRunner>(), hopeless_store,
                                         rows_renderer(20477), fixed_provider(), fixed_dims(),
-                                        fixed_executor());
+                                        fixed_executor(), {}, {}, {}, fixed_vae_topology());
         const auto hopeless_outcome = attempt([&] { return hopeless.generate(big_canvas(), 1000); });
         check(hopeless_outcome.threw && hopeless_outcome.code == "image_prompt_too_long" &&
                   hopeless_outcome.message.find("no canvas fits") != std::string::npos &&
