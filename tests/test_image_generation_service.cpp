@@ -868,6 +868,13 @@ int main() {
         // The positive control, without which the two above only prove the fake is inert: handed a card,
         // true really pays the rewriter, hands the card back, and is drawn from the REWRITTEN words.
         auto generous_runner   = std::make_unique<FakeRunner>();
+        // "Handed a card" has to be said in the one currency the rewriter can spend: it is a SEPARATE
+        // process (tools/prompt_enhancer/pe_worker.py) whose weights are its own cudaMalloc, so it can
+        // only reach what the driver still has free at the yield. The 24 GiB the fake unmaps into the
+        // engine's own KV and residency pools (the default `freed`) is the in-process picture's to spend
+        // and none of the sidecar's -- leaving device_free at 0 here would make this control prove
+        // nothing but a refused gate.
+        generous_runner->device_free   = 24ULL * FakeRunner::kGiB;
         auto generous_enhancer = std::make_shared<FakeEnhancer>();
         std::string rewritten_seen;
         ImageJobExecutor note  = [&rewritten_seen](const OpenAIImagesRequest& req, std::uint64_t,
@@ -898,6 +905,9 @@ int main() {
         // entirely: a real auto edit on this machine came back 503 image_prompt_enhancer_unavailable
         // after 7 s, while the document and the two branches above promise auto is always served.
         auto dead_runner     = std::make_unique<FakeRunner>();
+        // The card really is there for the sidecar (see the control above), so this case fails for the
+        // reason it means to: the load, not the gate.
+        dead_runner->device_free = 24ULL * FakeRunner::kGiB;
         auto dead_enhancer   = std::make_shared<FakeEnhancer>();
         dead_enhancer->load_throws = true;
         std::string own_words;
@@ -928,6 +938,9 @@ int main() {
         // sidecar must still answer true with the documented 503, or this fix would have quietly
         // turned a promised rewrite into a silent one.
         auto dead_asked_runner  = std::make_unique<FakeRunner>();
+        // Same as the case above: the room is there, so the 503 it must answer is the dead sidecar's and
+        // never a VRAM refusal that would hide it.
+        dead_asked_runner->device_free = 24ULL * FakeRunner::kGiB;
         auto dead_asked         = std::make_shared<FakeEnhancer>();
         dead_asked->load_throws = true;
         ImageGenerationService dead_true(std::move(dead_asked_runner), store, fixed_renderer(),
@@ -1003,6 +1016,87 @@ int main() {
             check(refused.threw && refused.status == 503 &&
                       refused.code == "image_vram_insufficient",
                   "the same pre-probe shortage stays a 503 for a client that believed its words were rewritten");
+        }
+
+        // The gate inside the interlude read the WRONG measurement: it summed what the yield delivered
+        // with `fit.device_free_bytes`, a reading taken BEFORE this job quiesced the LLM -- possibly off a
+        // card another draw had already yielded. So a promise the yield never kept admitted a ~19 GB
+        // rewriter, and the load that follows the gate is the sidecar's own cudaMalloc.
+        //
+        // The rewriter is a SEPARATE PROCESS (tools/prompt_enhancer/pe_worker.py), so it can spend only
+        // what the DRIVER reports free at the yield -- the bytes the engine unmapped from its own KV and
+        // frame pools land where the engine can hand them to the in-process picture, not to a foreign
+        // allocator. Two lies, then, and neither may admit it: a yield that unmapped nothing, and a yield
+        // that unmapped 24 GiB into pools the sidecar cannot allocate from. Both had the probe promise
+        // 24 GiB on both terms, which is exactly what the live engine did on 2026-11-14.
+        {
+            const std::uint64_t promised = 24ULL * FakeRunner::kGiB;
+            struct DeliveredLie {
+                const char*   label;
+                std::uint64_t freed;   // what THIS job's yield unmapped, into the engine's own pools
+                std::uint64_t device_free; // what the driver itself has for a foreign process
+            };
+            const DeliveredLie lies[] = {
+                {"the yield delivered nothing and the card has nothing", 0ULL, 0ULL},
+                {"the yield unmapped 24 GiB of the engine's own pools and the driver has nothing",
+                 promised, 0ULL},
+            };
+            for (const auto& lie : lies) {
+                ImageJobStore lie_store(8, 1 << 20);
+                auto          lie_runner = std::make_unique<FakeRunner>();
+                FakeRunner*   lie_eyes   = lie_runner.get();
+                // The pre-quiesce probe promises more than enough on BOTH of its terms, so the only thing
+                // left to decide the gate is what the yield actually handed this job.
+                lie_runner->probe_answer = FakeRunner::Fit{.fits              = true,
+                                                           .freed_bytes_expected = promised,
+                                                           .device_free_bytes   = promised};
+                lie_runner->freed        = lie.freed;
+                lie_runner->device_free  = lie.device_free;
+                auto          lied       = std::make_shared<FakeEnhancer>();
+                std::string   drawn;
+                ImageJobExecutor note = [&drawn](const OpenAIImagesRequest& req, std::uint64_t,
+                                                 std::span<const std::uint16_t>,
+                                                 std::span<const std::uint16_t>,
+                                                 std::span<const ReferencePlanes>, void*,
+                                                 const std::shared_ptr<ImageJobProgress>&,
+                                                 const EditConditioning*) {
+                    drawn = req.prompt;
+                    return fake_picture(0x06U);
+                };
+                ImageGenerationService service(std::move(lie_runner), lie_store, fixed_renderer(),
+                                              fixed_provider(), fixed_dims(), note, fixed_vision(),
+                                              fixed_reference_renderer(), lied);
+                OpenAIImagesRequest asked  = sample_request();
+                asked.prompt_enhance       = PromptEnhanceMode::On; // an explicit ask may be refused
+                const auto refusal = attempt([&] { return service.generate(asked, 1106); });
+                check(refusal.threw && refusal.status == 503 &&
+                          refusal.code == "image_vram_insufficient",
+                      std::string("an enhancer admitted on a promise is refused, not run: ") +
+                          lie.label);
+                // It must be the REWRITER that was refused (its reserve does not fall with the canvas, so
+                // the picture's own walk never ran) and it must name the bytes the yield DELIVERED, never
+                // the ones the probe promised (the probe said 24 GiB = 24576 MiB free; the card handed
+                // this job none of them). Without the wording this check would also be satisfied by the
+                // picture's own refusal, which is a different refusal over a different number.
+                check(refusal.message.find("0 MiB already free") != std::string::npos &&
+                          refusal.message.find("24576 MiB already free") == std::string::npos &&
+                          refusal.message.find("this need does not fall with the canvas") !=
+                              std::string::npos,
+                      std::string("the rewriter's own refusal counts the delivered bytes, not the probe's "
+                                  "promise: ") +
+                          lie.label);
+                check(lied->loads == 0 && lied->rewrites == 0 && lied->unloads == 0,
+                      std::string("no weights were moved onto a card that has no room: ") + lie.label);
+                check(lie_eyes->probes == 1 && lie_eyes->runs == 1,
+                      std::string("the rewrite was declined inside the one interlude it entered, before the "
+                                  "picture was ever probed: ") +
+                          lie.label);
+                check(drawn.empty(),
+                      std::string("the client is not handed a picture drawn from its own words: ") +
+                          lie.label);
+                check(lie_store.size() == 0U,
+                      std::string("the refused request stores nothing: ") + lie.label);
+            }
         }
 
         // The four endings that need no shortage at all, each with its OWN reason in the record. They

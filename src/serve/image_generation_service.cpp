@@ -931,7 +931,18 @@ RequestJson ImageGenerationService::generate(const OpenAIImagesRequest& request,
                          // enhancer was promised, say so BEFORE it allocates, rather than letting a
                          // foreign process discover the shortage in its own allocator while the LLM is
                          // quiesced.
-                         if (context.freed_bytes + fit.device_free_bytes <
+                         // What the yield ACTUALLY delivered on the card, the same measurement
+                         // the picture's own net applies at :1324-1326. The pre-yield probe is a
+                         // promise about a card that may be somebody else's yielded one.
+                         //
+                         // The freed bytes are not one of the terms, and that is not an oversight: the
+                         // rewriter is a SEPARATE PROCESS (tools/prompt_enhancer/pe_worker.py) whose
+                         // weights are its own cudaMalloc, so it can spend only what the driver still has
+                         // free at the yield. What this job's yield unmapped lands in the engine's own KV
+                         // and residency pools, which the in-process picture can be handed and a foreign
+                         // allocator cannot. A gate that counted them admitted a ~19 GB sidecar onto bytes
+                         // it could never touch, and the load -- not the gate -- discovered the shortage.
+                         if (context.device_free_bytes <
                              kEnhancerReserveBytes + kInterludeMarginBytes + fit.headroom_bytes) {
                              // The same rule the pre-probe applies, and for the same reason: for auto the
                              // card not being there is a SKIP and never a refusal, because the client
@@ -944,7 +955,7 @@ RequestJson ImageGenerationService::generate(const OpenAIImagesRequest& request,
                                      kEnhancerReserveBytes,
                                      ImageInterludeRunner::Fit{.fits = false,
                                                                .freed_bytes_expected = context.freed_bytes,
-                                                               .device_free_bytes = fit.device_free_bytes,
+                                                               .device_free_bytes = context.device_free_bytes,
                                                                .headroom_bytes = fit.headroom_bytes},
                                      // The rewriter's reserve is a fixed amount the picture's size does not
                                      // touch, so a smaller canvas was never the answer here either.
