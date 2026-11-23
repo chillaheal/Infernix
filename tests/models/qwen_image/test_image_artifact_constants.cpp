@@ -14,9 +14,11 @@
 // artifact, read-only through the production reader) and SKIPs when it is absent.
 
 #include "models/qwen_image/artifact_constants.h"
+#include "models/qwen_image/image_weights.h"
 #include "models/qwen_image/rope.h"
 #include "models/qwen_image/scheduler.h"
 
+#include "artifact/binder.h"
 #include "artifact/reader.h"
 
 #include <cmath>
@@ -479,6 +481,40 @@ void gate_real_artifact() {
     } else {
         check(false, "the live artifact declares a dit component");
     }
+
+    // Task 7, carrying Task 9's open item: the no-scheduler refusal is pinned at the PRODUCTION entry,
+    // not only at the reader. The artifact shipped before the converter began packing the scheduler
+    // component IS such an artifact, and it is named by an explicit operator path through the
+    // environment -- never a glob, never "latest". bind_dit must refuse it before any weight is read:
+    // a job drawn on a compiled schedule is exactly what the change exists to make impossible, and the
+    // serving route uses this very entry (src/serve/image_generation_service.cpp:433), so the guarantee
+    // belongs pinned on the bind path.
+    const char* legacy_env = std::getenv("INFERNIX_TEST_ARTIFACT_LEGACY");
+    if (legacy_env == nullptr || legacy_env[0] == '\0') {
+        std::printf("ok: bind_dit legacy refusal SKIPped (INFERNIX_TEST_ARTIFACT_LEGACY not set)\n");
+        return;
+    }
+    std::ifstream legacy_probe(legacy_env, std::ios::binary);
+    if (!legacy_probe) {
+        std::printf("FAIL: bind_dit legacy refusal -- %s absent\n", legacy_env);
+        ++g_failures;
+        return;
+    }
+    legacy_probe.close();
+    bool refused = false;
+    std::string message;
+    try {
+        const infernix::artifact::Reader legacy_reader{std::filesystem::path(legacy_env)};
+        infernix::artifact::Binder binder{legacy_reader};
+        (void)qi::bind_dit(binder);
+    } catch (const std::exception& error) {
+        refused = true;
+        message  = error.what();
+    }
+    check_detail(refused && message.find("scheduler") != std::string::npos,
+                 "bind_dit refuses the legacy artifact that carries no scheduler component",
+                 refused ? ("message: " + message)
+                         : "bind_dit ACCEPTED an artifact without a scheduler component");
 }
 
 } // namespace
