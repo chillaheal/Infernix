@@ -656,7 +656,15 @@ void gate_real_artifact() {
         check_detail(false, "the live artifact's vae component is accepted", live.error());
         return;
     }
-    expect_shipped(*live, "the live artifact");
+    // Stamp the resident calibration the way the binding does before gating: read_vae_topology leaves the
+    // field zero because it is a measurement of THIS build, not a claim of the checkpoint's
+    // (artifact_constants.h:147-152), and bind_image_vae is what sets it
+    // (src/models/qwen_image/image_weights.cpp:640). Gating the raw reader output instead asked the
+    // artifact to declare a number only this build can produce, and the certified 3072 MiB check failed
+    // on a topology that was never meant to carry it.
+    qi::VaeTopology live_stamped = *live;
+    live_stamped.weight_resident_bytes = qi::kQwenImageWeightResidentBytes;
+    expect_shipped(live_stamped, "the live artifact");
     const qi::VaeTopology committed = qt::qwen_image_2_1_topology();
     check(live->latent_channels == committed.latent_channels &&
               live->spatial_downscale == committed.spatial_downscale &&
