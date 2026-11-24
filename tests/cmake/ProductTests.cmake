@@ -87,10 +87,14 @@ infernix_add_test(infernix_prompt_enhancer_test
 # through the PRODUCTION reader over the committed copy of the checkpoint's own vae/config.json
 # (tests/models/qwen_image/vae_topology_fixture.h), so the target needs the source dir and the reader,
 # which returns std::expected (host-only, compiled per target at C++23; the CUDA lane stays at C++20).
+# infernix_serve is here because the ViT half of the ledger is a CLAIM ABOUT THE ROUTE: the suite proves
+# the billed worst reference plane by running the real src/serve snap and the real
+# prepare_reference_planes on encoded PNGs, so a change to the route's geometry moves this suite instead
+# of agreeing with the mistake (tests/test_image_device_need.cpp). Host code only -- no CUDA enters here.
 infernix_add_test(infernix_image_device_need_test
   NEEDS_SOURCE_DIR
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_image_device_need.cpp"
-  LIBRARIES infernix_qwen_image infernix_artifact infernix::json)
+  LIBRARIES infernix_serve infernix_qwen_image infernix_artifact infernix::json)
 target_compile_features(infernix_image_device_need_test PRIVATE cxx_std_23)
 
 # Server-executed chat image tool: injection gating, round feedback shape, caps and error surface,
