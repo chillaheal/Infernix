@@ -167,8 +167,12 @@ VisionTowerOutput run_vision_tower(artifact::Reader& reader, const VisionWeights
     // the CALLER's count, so a count above that number would hold live device bytes no admission decision
     // priced and starve the resident LLM -- which is the blindness this branch exists to close. Refused
     // here, before a single allocation, by the guard that owns the charge; the equality case stays admitted
-    // because that is what the route runs (tests/models/qwen_image/test_image_need_ledger_real.cu drives
-    // exactly 64x64), and the boundary itself is pinned on the host in tests/test_image_device_need.cpp.
+    // because the route's widest reference it still admits lands exactly on it (the 32-grid snap of the
+    // 1024^2-pixel reference target produces 65536x32 = 8192 patches), the square reference is well under
+    // it, and the certified suite drives {1, 64, 64} (tests/models/qwen_image/test_image_need_ledger_real.cu).
+    // The boundary is a backstop for any caller other than the reference route: src/serve refuses a
+    // reference above the same constant with a documented 400 (reference_image.cpp), so a client never
+    // reaches this throw, and a caller that does gets the readable refusal rather than an under-priced run.
     require_patches_within_vision_ledger(patches_count);
     // Every dimension below reaches an op as an int; the arithmetic guards here keep a hostile grid
     // from wrapping into a smaller (and silently wrong) allocation.

@@ -72,35 +72,120 @@ struct VisionLaneDims {
     std::uint32_t out_hidden  = 0; // the merger's output width == the text tower's hidden
 };
 
-// The worst legal reference plane the ViT can ever be fed: prepare_reference_image resizes every
-// reference to the 1024x1024 area target on the 32-grid (reference_image.cpp:21,155-158), so the
-// largest patch grid is 1024/16 x 1024/16. The reference's size is independent of the requested
-// OUTPUT size, which is why this is a constant of the route and not of the geometry.
-inline constexpr std::uint64_t kVisionWorstReferencePatches = 64ULL * 64ULL;
+// The worst legal reference plane the ViT can ever be fed -- DERIVED here rather than asserted, because
+// it is the number the ledger below BILLS the lane at (image_device_need() multiplies vision_peak by it)
+// and the number require_patches_within_vision_ledger enforces, so the two must stay one constant.
+//
+// How the route makes the plane (prepare_reference_planes, src/serve/reference_image.cpp:320-352): from
+// the decoded reference's size (W, H) it computes the two exact targets
+//     exact_w = sqrt(kReferenceTargetArea * W / H)   and   exact_h = sqrt(kReferenceTargetArea * H / W)
+// whose product is exactly kReferenceTargetArea (1024*1024, reference_image.cpp:21), and rounds EACH
+// SIDE INDEPENDENTLY to a multiple of 32 with serve::snap_to_32 (src/serve/openai_images.cpp:75-89 --
+// Python round()'s half-to-even at the 32-grid). It then refuses anything whose snapped side fell below
+// 32 (reference_image.cpp:350-352), and run_vision_tower is handed the plane as a
+// {1, target_h/16, target_w/16} patch grid (patch 16 x spatial_merge 2, src/serve/reference_image.h:56-63).
+// Two consequences, and the second is why this is arithmetic rather than a square:
+//   * the snap moves a side by at most half the grid (16 px) and it can round BOTH sides UP, so a
+//     non-square reference lands ABOVE the target area: a 4:3 reference is 1184x896 = 4144 patches, more
+//     than the square case's 4096. That is what the 64x64 claim this header used to carry got wrong, and
+//     a guard sitting behind that claim turned an ordinary photograph edit into a refusal;
+//   * the widest aspect the route still admits is the one whose SHORT side just clears the gate: its
+//     exact short side must be above 16 (at exactly 16 the half-grid tie rounds to the even 0, which the
+//     route refuses), so its exact long side is kReferenceTargetArea/16 = 65536 and that snaps to 65536
+//     itself -- 65536x32, at the 16-wide patch 4096x2 = 8192 patches, exactly TWICE the square reference.
+//     The lane has to be billed for that plane, not for the square one.
+//
+// The loop below states that arithmetic instead of handing over its answer, and in integers only (no
+// floating point, so no rounding mode can move it): for every snapped side the route's own gate admits
+// as the SHORT side it takes the longest snapped long side whose (side - half-grid slack) still leaves
+// the exact partner inside the target area, and keeps the most patches. Every plane the route can
+// produce meets that condition -- each snapped side is within slack of its exact value and the exact
+// values multiply to the area -- so what is scanned is a SUPERSET: it can over-bill, never under-bill.
+// tests/test_image_device_need.cpp enumerates the REAL route (the exported serve::snap_to_32, and the
+// real prepare_reference_planes on encoded references) to prove the constant is reached and never
+// exceeded, so it is not a padded guess and a change to the route's snapping is caught there.
+//
+// The three route constants below are restated here because src/serve owns them and src/models may not
+// depend on src/serve; that host suite is the tie back to the route, and the serve boundary refuses a
+// plane this header did not bill (reference_image.cpp), so a drift answers the client 400 instead of 500.
+inline constexpr std::uint64_t kReferenceTargetAreaPx = 1024ULL * 1024ULL; // reference_image.cpp:21
+inline constexpr std::uint64_t kReferenceSnapGridPx   = 32ULL;             // serve::snap_to_32's grid
+inline constexpr std::uint64_t kVisionPatchSidePx     = 16ULL;             // the ViT's patch side
+
+[[nodiscard]] inline consteval std::uint64_t worst_reference_plane_patches(
+    std::uint64_t target_area_px, std::uint64_t snap_grid_px, std::uint64_t patch_side_px) noexcept {
+    const std::uint64_t slack = snap_grid_px / 2ULL; // the snap moves a side by at most half a grid
+    std::uint64_t worst = 0ULL;
+    // The route refuses a snapped side below the grid, so that is the shortest side to try; past the
+    // square the two roles have merely swapped, so no bound beyond the area itself is needed.
+    for (std::uint64_t short_px = snap_grid_px; short_px <= target_area_px; short_px += snap_grid_px) {
+        const std::uint64_t short_exact = short_px - slack; // what its exact side cannot fall below
+        if (short_exact == 0ULL) { continue; }
+        // The exact long side is at most area / short_exact, and a snapped side may sit slack above its
+        // exact value: the longest legal snapped long side is the last multiple of the grid whose own
+        // exact floor still fits.
+        const std::uint64_t long_exact = target_area_px / short_exact;
+        const std::uint64_t long_px    = ((long_exact + slack) / snap_grid_px) * snap_grid_px;
+        if (long_px < snap_grid_px) { break; } // no partner left on this side of the square
+        const std::uint64_t patches = (long_px / patch_side_px) * (short_px / patch_side_px);
+        if (patches > worst) { worst = patches; }
+    }
+    return worst;
+}
+
+inline constexpr std::uint64_t kVisionWorstReferencePatches =
+    worst_reference_plane_patches(kReferenceTargetAreaPx, kReferenceSnapGridPx, kVisionPatchSidePx);
+
+// The same promise the way the boundary that produces the plane reads it, in pixels: src/serve has no
+// business knowing the ViT's patch size, and a snapped side is always a multiple of the grid, so the
+// division back to patches is exact.
+inline constexpr std::uint64_t kVisionWorstReferencePlanePixels =
+    kVisionWorstReferencePatches * kVisionPatchSidePx * kVisionPatchSidePx;
+
+// The one thing about this derivation that is not a restatement of its own answer: the snap's slack
+// really does lift the worst plane above the square reference, which is the whole of the C1 finding.
+// (What it is NOT allowed to do is freeze the number -- tests/test_image_device_need.cpp is what proves
+// the derived maximum is reached, and a route change must be re-derived from the route, not tuned here.)
+static_assert(kVisionWorstReferencePatches >
+                  kReferenceTargetAreaPx / kVisionPatchSidePx / kVisionPatchSidePx,
+              "the worst legal reference plane must sit ABOVE the square reference's patch count: the "
+              "32-grid snap rounds each side independently and can round both up, so a non-square "
+              "reference lands outside kReferenceTargetArea. If this fires, the derivation stopped "
+              "modelling the snap.");
 
 // That number is not an estimate the caller may exceed, it is a CHARGE: the ledger below bills
 // need.vision_peak for exactly kVisionWorstReferencePatches patches, and the serving layer yields on the
 // total it bills. A caller handing run_vision_tower a bigger plane therefore holds live device bytes that
-// no admission decision priced -- the joint ceiling admits 20480 merged rows, which would be 81920 patches
-// and several GiB of activations against a bill of ~0.45 GiB -- so the resident LLM starves on a stale
-// number. That is the exact blindness this branch exists to close, and the blindness was in the reader:
+// no admission decision priced -- the joint ceiling admits 20480 merged rows, which would be 81920 patches,
+// ten times the billed plane: ~3.0 GiB of live activations against the 325 MiB this header bills (the
+// per-patch terms at the shipped ViT's shape) -- so the resident LLM starves on a stale number. That is the exact blindness this branch exists to close, and the blindness was in the reader:
 // vision_tower.cu sized every live plane from the CALLER's count and refused only int overflow.
 //
 // The guard therefore lives beside the charge it protects, so the two cannot drift apart, and
 // run_vision_tower calls it on the count its caller hands it BEFORE a single plane is sized
 // (src/models/qwen_image/vision_tower.cu). It is a host function on purpose: the boundary is arithmetic,
-// so the suite that owns the charge (tests/test_image_device_need.cpp) can pin both ends of it -- 4096
-// admitted, 4097 refused -- without CUDA in the way, which the production route itself cannot offer a host
+// so the suite that owns the charge (tests/test_image_device_need.cpp) can pin both ends of it -- the
+// derived worst plane admitted, one patch above it refused -- without CUDA in the way, which the production route itself cannot offer a host
 // test (the CUDA target is deliberately kept out of host tests, see src/models/qwen_image/sources.cmake).
 inline void require_patches_within_vision_ledger(std::uint64_t patches_count) {
     if (patches_count > kVisionWorstReferencePatches) {
-        throw std::runtime_error("vision tower: " + std::to_string(patches_count) +
-                                 " patches is more than the " + std::to_string(kVisionWorstReferencePatches) +
-                                 " the worst legal reference plane has (64x64 patches at the 1024x1024 "
-                                 "reference target of src/serve/reference_image.cpp), which is the number the "
-                                 "VRAM ledger bills the ViT at; a larger plane would hold live device bytes "
-                                 "no admission decision priced, so the route refuses it rather than run the "
-                                 "tower under-priced");
+        // The message is the derivation, not just the number: whoever hits it must be able to tell a
+        // pathological reference (the client's, refused at the serve boundary with a 400 long before
+        // here) from a ledger whose snap stopped matching the route's (the tree's, and the reason the
+        // square 64x64 this guard used to quote was wrong).
+        throw std::runtime_error(
+            "vision tower: " + std::to_string(patches_count) + " patches is more than the " +
+            std::to_string(kVisionWorstReferencePatches) + " the worst legal reference plane produces -- "
+            "the " +
+            std::to_string(kReferenceTargetAreaPx) + "-pixel reference target of "
+            "src/serve/reference_image.cpp, each side snapped to the " +
+            std::to_string(kReferenceSnapGridPx) + "-grid (which rounds UP, and can round both sides up) "
+            "at the " +
+            std::to_string(kVisionPatchSidePx) + "-wide ViT patch, at the widest aspect the route's own "
+            "below-" + std::to_string(kReferenceSnapGridPx) + "-pixel gate still admits (that plane is " +
+            std::to_string(kVisionWorstReferencePlanePixels) + " pixels); and that is the number the VRAM "
+            "ledger bills the ViT at, so a larger plane would hold live device bytes no admission "
+            "decision priced and the route refuses it rather than run the tower under-priced");
     }
 }
 
