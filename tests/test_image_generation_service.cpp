@@ -331,15 +331,91 @@ int main() {
     // no topology provider. The ledger cannot price a decode nobody read and nothing compiled stands in for
     // the artifact's declaration, so the job is refused as unconfigured -- before the busy signal starts and
     // with nothing stored. That is the fail-closed half of the topology seam, and it is why every other
-    // service in this file is built with fixed_vae_topology().
+    // service in this file is built with fixed_vae_topology(). It is not CONFIGURED either: /v1/models and
+    // /v1/capabilities gate on is_configured() (http_server.cpp:643), and a serve that can never complete
+    // an image job must not advertise one.
     {
         ImageJobStore store(8, 1 << 20);
         ImageGenerationService without_decoder(std::make_unique<FakeRunner>(), store, fixed_renderer(),
                                      fixed_provider(), fixed_dims(), fixed_executor(), {}, {}, {});
-        check(without_decoder.is_configured(),
-              "a service without a decoder topology is still configured for everything else");
+        check(!without_decoder.is_configured(),
+              "a service with no decoder topology is not configured, so capabilities stay off");
         expect_precheck("no decoder topology", 503, "image_generation_not_configured", without_decoder);
         check(store.size() == 0U, "a job refused for its missing decoder topology stores nothing");
+    }
+
+    // The same refusal for a provider that is PRESENT AND THROWS, which is the shape production actually
+    // builds: each make_artifact_* provider re-opens the shipped .infernix container on first use and
+    // throws the artifact layer's own error when the component it reads is missing or unreadable
+    // (artifact::ArtifactError). A null provider is a shape apps/serve/main.cpp never constructs, so the
+    // case above alone left the real route untested -- and outside the guard the throw escaped generate()
+    // entirely, where handle_images catches ApiException only and httplib's exception handler answered
+    // 500 internal_error carrying the artifact's text. So all three artifact-delegating seams are pinned
+    // here: the refusal is the documented 503 image_generation_not_configured, the message is the
+    // service's own, and nothing of what the artifact said reaches the client.
+    {
+        namespace qi = infernix::models::qwen_image;
+        // The artifact layer's words, chosen so a leak is unmistakable if one ever appears in the message.
+        const std::string artifact_prose = "artifact has no \"vae\" component: byte range 0 unreadable";
+        enum class Seam { Decoder, DiT, Vision };
+        struct ThrowingSeam {
+            Seam      which;
+            const char* label;
+            bool      with_reference; // the vision lane is only read for an edit
+        };
+        const ThrowingSeam seams[] = {
+            {Seam::Decoder, "the VAE decoder geometry", false},
+            {Seam::DiT, "the DiT dimensions", false},
+            {Seam::Vision, "the vision lane dimensions", true},
+        };
+        const std::string reference = base64_encode_bytes(
+            infernix::media::encode::encode_png_rgba8(
+                64, 48, std::vector<std::uint8_t>(64U * 48U * 4, 90U)));
+        for (const auto& seam : seams) {
+            ImageJobStore store(8, 1 << 20);
+            VaeTopologyProvider    topology = fixed_vae_topology();
+            DiTDimsProvider        dims     = fixed_dims();
+            VisionLaneDimsProvider vision  = fixed_vision();
+            switch (seam.which) {
+                case Seam::Decoder:
+                    topology = [&artifact_prose] -> qi::VaeTopology {
+                        throw std::runtime_error(artifact_prose);
+                    };
+                    break;
+                case Seam::DiT:
+                    dims = [&artifact_prose] -> qi::DiTDims {
+                        throw std::runtime_error(artifact_prose);
+                    };
+                    break;
+                case Seam::Vision:
+                    vision = [&artifact_prose] -> qi::VisionLaneDims {
+                        throw std::runtime_error(artifact_prose);
+                    };
+                    break;
+            }
+            ImageGenerationService service(std::make_unique<FakeRunner>(), store, fixed_renderer(),
+                                          fixed_provider(), std::move(dims), fixed_executor(),
+                                          std::move(vision), fixed_reference_renderer(), nullptr,
+                                          std::move(topology));
+            // A provider that throws is still a provider: is_configured() is a QUERY, so it must not call
+            // one -- and this line is the guard against that, since is_configured() is noexcept and a call
+            // into these providers would take the whole suite down instead of failing a check.
+            check(service.is_configured(), std::string("a service whose ") + seam.label +
+                                               + " provider throws is still configured for everything else");
+            OpenAIImagesRequest request = sample_request();
+            if (seam.with_reference) { request.images = {reference}; }
+            const auto outcome = attempt([&] { return service.generate(request, 1000); });
+            check(outcome.threw && outcome.status == 503 &&
+                      outcome.code == "image_generation_not_configured",
+                  std::string("a throwing ") + seam.label + " provider -> 503 "
+                      "image_generation_not_configured");
+            check(!outcome.message.empty() &&
+                      outcome.message.find(artifact_prose) == std::string::npos,
+                  std::string("the refusal is the service's own words, never the artifact's: ") +
+                      seam.label);
+            check(store.size() == 0U, std::string("a job refused by its ") + seam.label +
+                                          + " provider stores nothing");
+        }
     }
 
     {
@@ -824,14 +900,25 @@ int main() {
     // PROMISED is measured a second time inside the interlude, where the yield has actually unmapped
     // something -- and that second check threw for BOTH modes. So the server's own sentence, "the card
     // cannot be had for one, which for auto is a skip and never a 503", was false on the wire: a real
-    // auto edit came back 503 image_vram_insufficient. The fake drives exactly the split that produces
-    // it -- the probe says yes, the yield delivers enough for the picture and not for the rewriter.
+    // auto edit came back 503 image_vram_insufficient. The shortage the fake drives is the one that gate
+    // actually measures -- the probe says yes, and inside the interlude the rewriter's gate compares
+    // context.device_free_bytes (left at the fake's 0 here) against the reserve plus the margin plus the
+    // headroom. The bytes this job's yield unmapped are NOT a term of that gate and never were: the
+    // rewriter is a separate process (tools/prompt_enhancer/pe_worker.py) that can allocate only from
+    // what the driver itself has free. So the fake is not "the yield fell short for the rewriter" -- it
+    // is "the driver had nothing for a foreign process while the in-process picture was still handed its
+    // pools". Both sides of that have to stay true in the fake, which is what the two fields below are
+    // for; reading this case as a freed-bytes story would teach the next reader to re-add a
+    // context.freed_bytes conjunct to the gate, and the case at the bottom of this block is what proves
+    // such a conjunct would be wrong.
     {
         const auto short_for_rewriter = [](std::uint64_t target_bytes) {
-            // The rewriter asks for its whole reserve -- 19042 MiB, image_generation_service.cpp:67 --
-            // and the picture asks for its own, far smaller, need. Short only for the first, so nothing
-            // else in the request can be the reason for a refusal. The bound sits between the two and has
-            // to be read against that constant: it was 20 GiB while the reserve was 20 GiB, and the
+            // What the yield unmaps, per ask: the rewriter is refused on the driver-free term above, and
+            // this split keeps the OTHER half honest -- the picture, which runs in-process and can be
+            // handed the engine's own pools, must still be given its 24 GiB or it would be the request
+            // that fails rather than the rewrite. The picture's own need is far smaller than the
+            // rewriter's whole reserve (19042 MiB, image_generation_service.cpp:67), so the bound between
+            // the two is what separates the asks. It was 20 GiB while the reserve was 20 GiB, and the
             // reserve dropped under it the day it became the measured peak instead of a second slack.
             return target_bytes >= 16ULL * FakeRunner::kGiB ? 8ULL * FakeRunner::kGiB
                                                             : 24ULL * FakeRunner::kGiB;
@@ -1073,11 +1160,21 @@ int main() {
                 const char*   label;
                 std::uint64_t freed;   // what THIS job's yield unmapped, into the engine's own pools
                 std::uint64_t device_free; // what the driver itself has for a foreign process
+                // Whether these delivered bytes are ENOUGH, and so must be admitted. The first two rows
+                // pin what the gate must refuse; the third pins what it must NOT -- nothing was yielded
+                // into the engine's pools but the driver itself has the whole reserve free, which is
+                // exactly what a ~19 GB foreign sidecar can spend. Without this row a future
+                // `context.freed_bytes` conjunct added back to that gate would pass every other case in
+                // this suite and make prompt_enhance: true permanently unreachable inside an interlude,
+                // because the yield never fills the pools the rewriter cannot reach anyway.
+                bool          admitted = false;
             };
             const DeliveredLie lies[] = {
                 {"the yield delivered nothing and the card has nothing", 0ULL, 0ULL},
                 {"the yield unmapped 24 GiB of the engine's own pools and the driver has nothing",
                  promised, 0ULL},
+                {"nothing to give the picture's pools but the driver has the room", 0ULL, promised,
+                 /*admitted=*/true},
             };
             for (const auto& lie : lies) {
                 ImageJobStore lie_store(8, 1 << 20);
@@ -1107,6 +1204,35 @@ int main() {
                 OpenAIImagesRequest asked  = sample_request();
                 asked.prompt_enhance       = PromptEnhanceMode::On; // an explicit ask may be refused
                 const auto refusal = attempt([&] { return service.generate(asked, 1106); });
+                if (lie.admitted) {
+                    // The other direction of the same gate, and the only case in this suite that says
+                    // what it must never refuse: the driver alone has the room, so the rewrite runs and
+                    // the picture is drawn from the REWRITTEN words. Nothing here asks the yield for
+                    // bytes the sidecar could not have used -- freed stayed 0 the whole way.
+                    check(!refusal.threw,
+                          std::string("the driver's own room is enough to admit the rewrite: ") +
+                              lie.label);
+                    check(lied->loads == 1 && lied->rewrites == 1 && lied->unloads == 1,
+                          std::string("the admitted rewrite loaded, asked and handed the weights back: ") +
+                              lie.label);
+                    check(drawn == "REWRITTEN: " + asked.prompt,
+                          std::string("the picture is drawn from the rewritten words, not the client's "
+                                      "own: ") +
+                              lie.label);
+                    check(refusal.response.contains("prompt_enhance_outcome") &&
+                              refusal.response.at("prompt_enhance_outcome") == "applied",
+                          std::string("the served answer reports the rewrite as applied: ") + lie.label);
+                    const auto admitted_record = lie_store.get("img-1106-1");
+                    check(admitted_record && admitted_record->request.at("prompt_enhance_outcome") ==
+                                                  "applied",
+                          std::string("the record reports the same reason: ") + lie.label);
+                    // One interlude for the rewrite, one for the picture, and one probe each: the
+                    // rewrite did not decline, so the picture paid its ordinary admission.
+                    check(lie_eyes->probes == 2 && lie_eyes->runs == 2,
+                          std::string("the admitted rewrite and the picture each paid one interlude: ") +
+                              lie.label);
+                    continue;
+                }
                 check(refusal.threw && refusal.status == 503 &&
                           refusal.code == "image_vram_insufficient",
                       std::string("an enhancer admitted on a promise is refused, not run: ") +
@@ -1123,6 +1249,11 @@ int main() {
                       std::string("the rewriter's own refusal counts the delivered bytes, not the probe's "
                                   "promise: ") +
                           lie.label);
+                // And it must not advertise a yield the rewriter could never have spent: the freed term is
+                // 0 in this refusal (image_generation_service.cpp), because the gate and the sidecar both
+                // read only the driver-free bytes.
+                check(refusal.message.find("the model can yield 0 MiB") != std::string::npos,
+                      std::string("the rewriter's refusal offers no unspendable bytes: ") + lie.label);
                 check(lied->loads == 0 && lied->rewrites == 0 && lied->unloads == 0,
                       std::string("no weights were moved onto a card that has no room: ") + lie.label);
                 check(lie_eyes->probes == 1 && lie_eyes->runs == 1,

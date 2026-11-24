@@ -188,6 +188,29 @@ std::uint64_t image_need_bytes(std::int64_t width, std::int64_t height, std::siz
                                 "size", "image_vram_insufficient"}};
 }
 
+// One of the three artifact-delegating providers -- the DiT's dimensions, the ViT lane's shape, the
+// VAE's decoder geometry -- called, and its answer handed back. Each of them re-opens the shipped
+// .infernix container on first use (the make_artifact_* providers in this file), so any of them can
+// throw the artifact layer's own error: an artifact with no readable "vae" component is the live case.
+// The documented answer is the 503 image_generation_not_configured this file's header promises and
+// apps/serve/main.cpp configures against -- the same refusal a MISSING provider gets at its own site
+// below, because both are an admission that cannot name the geometry it has to reserve against.
+// The artifact's own text never reaches the client: handle_images catches ApiException only
+// (openai_images_http.cpp:284), so an escaping artifact::ArtifactError would be answered by httplib's
+// exception handler as 500 internal_error carrying it, which is a different contract and an
+// artifact-internal string on the wire.
+template <typename Provider>
+[[nodiscard]] auto read_artifact_declaration(Provider&& provider, const char* what) {
+    try {
+        return provider();
+    } catch (...) {
+        throw ApiException{ApiError{503, "server_error",
+                                    std::string("the image artifact's ") + what +
+                                        " cannot be read, so an image job cannot be sized",
+                                    "image_artifact", "image_generation_not_configured"}};
+    }
+}
+
 // The smallest canvas the server will trade a refused request for (see the walk in generate()). The
 // admission need is dominated by a term that does NOT shrink with the picture -- the topology's resident
 // calibration (VaeTopology::weight_resident_bytes) and the resident block slots -- so a card that can hold
@@ -753,9 +776,16 @@ std::int64_t unix_now() {
 }
 } // namespace
 
+// What this serve can actually complete a job with. Every term is a seam a job cannot run without, and
+// every one is checked WITHOUT being called: this is a query, not IO, and HttpServer gates /v1/models
+// and /v1/capabilities on it (http_server.cpp:643), so a serve that could never draw a picture must not
+// advertise one. `vae_topology_` belongs here for the same reason the others do -- the ledger prices
+// every job's decode from the artifact's own decoder geometry and nothing compiled stands in for it, so
+// a service that was never handed one has no honest answer about whether a job fits and every job it
+// took would end in the refusal generate() raises below.
 bool ImageGenerationService::is_configured() const noexcept {
     return runner_ != nullptr && prompt_renderer_ != nullptr && prompt_embeds_ != nullptr &&
-           dit_dims_ != nullptr && job_executor_ != nullptr;
+           dit_dims_ != nullptr && job_executor_ != nullptr && vae_topology_ != nullptr;
 }
 
 std::size_t ImageGenerationService::in_flight_jobs() const {
@@ -865,6 +895,22 @@ nlohmann::json ImageGenerationService::job_status_json(std::string_view id) cons
 
 RequestJson ImageGenerationService::generate(const OpenAIImagesRequest& request, std::int64_t now,
                                              std::string_view artifact_url_base) {
+    // Every image job needs the artifact's own decoder geometry, because the VRAM ledger prices the decode
+    // from it (image_device_need.h reads the same VaeTopology the CUDA graph decodes with). Nothing
+    // compiled stands in for it: a service that was never given a provider has no topology to reserve
+    // against, and a zero one would reserve for a decode of nothing -- so this is refused as unconfigured
+    // here, before the busy signal starts and before the card is touched, rather than admitted on a guess.
+    // It is asked BEFORE the general question below because it names the missing piece, and an operator
+    // reading a refusal needs the piece; is_configured() checks it too, so a serve in this state never
+    // advertises the image model in /v1/models or /v1/capabilities either (http_server.cpp:643).
+    // (The vision lane has the same shape of refusal further down, but only for requests that carry a
+    // reference; the decode is not optional, so this one is.)
+    if (!vae_topology_) {
+        throw ApiException{ApiError{503, "server_error",
+                                    "the image artifact's VAE decoder geometry is not configured, so an "
+                                    "image job cannot be sized",
+                                    "image_artifact", "image_generation_not_configured"}};
+    }
     if (!is_configured()) {
         throw ApiException{ApiError{503, "server_error", "the image pipeline is not configured",
                                     "image_artifact", "image_generation_not_configured"}};
@@ -878,20 +924,6 @@ RequestJson ImageGenerationService::generate(const OpenAIImagesRequest& request,
         throw ApiException{ApiError{503, "server_error", "the engine is not available", "",
                                     "engine_unavailable"}};
     }
-    // Every image job needs the artifact's own decoder geometry, because the VRAM ledger prices the decode
-    // from it (image_device_need.h reads the same VaeTopology the CUDA graph decodes with). Nothing
-    // compiled stands in for it: a service that was never given a provider has no topology to reserve
-    // against, and a zero one would reserve for a decode of nothing -- so this is refused as unconfigured
-    // here, before the busy signal starts and before the card is touched, rather than admitted on a guess.
-    // (The vision lane has the same shape of refusal further down, but only for requests that carry a
-    // reference; the decode is not optional, so this one is.)
-    if (!vae_topology_) {
-        throw ApiException{ApiError{503, "server_error",
-                                    "the image artifact's VAE decoder geometry is not configured, so an "
-                                    "image job cannot be sized",
-                                    "image_artifact", "image_generation_not_configured"}};
-    }
-
     // From here the card is ours until the function returns, so this is where the busy signal starts:
     // the rewriter's sampling, the yield, the diffusion and the encode all belong to it. /health reads
     // it so a supervisor waits instead of killing a serve that is only busy.
@@ -1003,10 +1035,22 @@ RequestJson ImageGenerationService::generate(const OpenAIImagesRequest& request,
                              // enhancer -- it believed its words were being rewritten, and handing it the
                              // words as written would be the lie the document above forbids.
                              if (!auto_mode) {
+                                 // No freed term here, and that is the honest zero rather than an
+                                 // omission: this gate decided on context.device_free_bytes alone,
+                                 // because the rewriter is a SEPARATE PROCESS whose weights are its own
+                                 // cudaMalloc and can therefore spend only what the driver still has
+                                 // free (see the two comments above). What this job's yield unmapped
+                                 // lands in the engine's own KV and residency pools -- spendable by the
+                                 // in-process picture, not by the sidecar. Reporting it in the refusal
+                                 // would have throw_vram_insufficient print "the model can yield 14400
+                                 // MiB" beside a refusal that never considered those bytes, which reads
+                                 // to an operator as a check too strict instead of as a card with too
+                                 // little driver-free room. The picture lane keeps its own wording and
+                                 // its own delivered-bytes number.
                                  throw_vram_insufficient(
                                      kEnhancerReserveBytes,
                                      ImageInterludeRunner::Fit{.fits = false,
-                                                               .freed_bytes_expected = context.freed_bytes,
+                                                               .freed_bytes_expected = 0ULL,
                                                                .device_free_bytes = context.device_free_bytes,
                                                                .headroom_bytes = fit.headroom_bytes},
                                      // The rewriter's reserve is a fixed amount the picture's size does not
@@ -1197,7 +1241,10 @@ RequestJson ImageGenerationService::generate(const OpenAIImagesRequest& request,
                                         "prompt cannot be rendered",
                                         "image_text_processor", "image_generation_not_configured"}};
         }
-        vision = vision_dims_();
+        // Read through the same guard as the other two: the null case was refused immediately above, and
+        // an artifact that opens but carries no readable vision component throws the artifact layer's
+        // error -- which is the same fact, and gets the same 503 with the service's own words.
+        vision = read_artifact_declaration(vision_dims_, "vision lane dimensions");
     }
     const auto render = [&](const std::string& text) {
         return planes.empty() ? prompt_renderer_(text)
@@ -1283,12 +1330,17 @@ RequestJson ImageGenerationService::generate(const OpenAIImagesRequest& request,
     // the re-walk inside the interlude: the ledger, the reservation this function commits to, and the job's
     // own binding all price the decode from the same artifact-verified topology, so no two readings of the
     // artifact can disagree about how big the planes are. Like dit_dims_() it is host work, outside any
-    // interlude, and a throwing provider (an artifact with no readable "vae" component) refuses the job
-    // the same way one that cannot name the DiT's dimensions does.
-    const qi::VaeTopology vae_topology = vae_topology_();
+    // interlude -- and like dit_dims_() it goes through read_artifact_declaration, because the provider
+    // re-opens the container on first use and an artifact with no readable "vae" component throws the
+    // artifact layer's error there. Outside the guarded region below, such a throw would reach the HTTP
+    // layer as an uncaught exception and be answered 500 with the artifact's own text; through the guard
+    // it is the documented 503 image_generation_not_configured with the service's own words.
+    const qi::VaeTopology vae_topology =
+        read_artifact_declaration(vae_topology_, "VAE decoder geometry");
     const auto need_at = [&](std::uint32_t w, std::uint32_t h) {
         return image_need_bytes(w, h, prompt.tokens(), negative_prompt.tokens(), ref_tokens,
-                                dit_dims_(), vae_topology, vision_tokens, vision);
+                                read_artifact_declaration(dit_dims_, "DiT dimensions"), vae_topology,
+                                vision_tokens, vision);
     };
     const auto step_down = [canvas_step](std::uint32_t& side) {
         side = side > kVramCanvasFloorPx + canvas_step ? side - canvas_step : kVramCanvasFloorPx;
@@ -1416,7 +1468,17 @@ RequestJson ImageGenerationService::generate(const OpenAIImagesRequest& request,
                          store_.advance(record.id, JobUpdate{.to = ImageJobState::Running, .now = now});
                          job_started = true;
                          // `seed` is the submit-time number above: the same one the record carries, so a
-                         // failed job's stored seed redraws the picture it did not produce.
+                         // replay of this job asks for the same noise -- and that is all the pairing
+                         // promises. It does not promise the picture: the one terminal advance that
+                         // rewrites width/height to the canvas the pipeline ACTUALLY drew runs only on the
+                         // way to Succeeded (the record-build comment above), so a job that failed
+                         // here -- or later in the walk below, on the bytes the yield really delivered --
+                         // keeps the canvas the HOST walk settled on. Replaying such a record re-asks at
+                         // the pre-interlude host-walk size, which is not the canvas this route was last
+                         // asked to draw. Nothing reads it today: every failure advance below carries no
+                         // `.request` at all, so the stored canvas of a failed job is used only if
+                         // somebody replays it, and the ask a client can still see is `size_asked` on a
+                         // SERVED response.
                          // Both prompts were already rendered (host work, before the probe); only the
                          // tower forward -- the half that needs device memory -- runs here. With a
                          // reference that forward is the CONDITIONED one and the executor runs it inside
