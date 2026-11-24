@@ -16,6 +16,10 @@ import pytest
 from safetensors.torch import save_file
 import torch
 
+from tools.artifact.framing import HEADER
+from tools.artifact.reader import Artifact
+from tools.artifact.schema import ResourceSpec, decode_directory, encode_directory
+from tools.artifact.writer import ArtifactWriter
 from tools.convert.qwen_image import build_model, is_qwen_image
 from tools.convert.sources.safetensors import SafetensorsSource
 
@@ -231,6 +235,42 @@ def test_scheduler_document_holds_every_field_the_reference_checkpoint_ships(tmp
     assert config["use_karras_sigmas"] is False
 
 
+def test_the_scheduler_document_survives_the_container_round_trip(tmp_path):
+    """The verbatim promise has to hold on the bytes the packer wrote, not only in memory.
+
+    ``test_scheduler_is_the_fourth_component_copied_verbatim`` pins what the converter hands the
+    container; what the C++ lane reads is the directory region of a published ``.ninfer`` file,
+    decoded by ``decode_directory``. So this runs the real packer over the converter's own
+    components (one dummy resource object, because the schema demands a nonempty ``objects``) and
+    then re-reads the file: the scheduler config comes back as the fixture was read, and the raw
+    bytes on disk still carry the checkpoint's own document character for character -- no reordered
+    key, no ``1.0`` written as ``1``, no ``false`` written as ``0``, no number put into an exponent.
+    """
+    model = _model(tmp_path)
+    loaded = json.loads(FIXTURE.read_text())
+
+    path = tmp_path / "image.ninfer"
+    with ArtifactWriter(
+        path, [ResourceSpec("probe", 1)], components=model.components, bindings={}, uses=[]
+    ) as writer:
+        writer.write_object("probe", b"\x00")
+        directory = writer.directory.to_json()
+    assert directory["components"]["scheduler"] == {"config": loaded}
+
+    raw = path.read_bytes()
+    _, json_bytes, _ = HEADER.unpack(raw[: HEADER.size])
+    on_disk = raw[HEADER.size : HEADER.size + json_bytes]
+    # The canonical encoder the writer itself used reproduces the checkpoint's document exactly, and
+    # those bytes are present in the file: a re-encoded, reordered or coerced document would not be.
+    assert encode_directory(loaded) in on_disk
+    decoded = decode_directory(on_disk, entry_name=path.name)
+    assert decoded.components["scheduler"]["config"] == loaded
+    assert list(decoded.components["scheduler"]["config"]) == list(loaded)
+    # And the reader the runtime lane uses sees the same thing through its own open path.
+    with Artifact(path) as reader:
+        assert reader.directory.to_json()["components"]["scheduler"]["config"] == loaded
+
+
 def test_committed_fixture_is_the_reference_checkpoint_file_byte_for_byte():
     if not REFERENCE_SCHEDULER.is_file():
         pytest.skip(
@@ -249,6 +289,31 @@ def test_a_root_without_the_scheduler_config_refuses_conversion(tmp_path):
     message = str(raised.value)
     # No silent omission and no synthesized default: the failure names the file it requires.
     assert str(tmp_path / "artifact" / "scheduler" / "scheduler_config.json") in message
+
+
+def test_a_scheduler_document_that_is_not_valid_json_refuses_conversion(tmp_path):
+    """The file existing is not enough: an unreadable scheduler document stops the conversion.
+
+    Nothing may be synthesized for this component, so a document the converter cannot parse has to
+    refuse the pack rather than be skipped, defaulted or half-read. The refusal is the JSON parser's
+    own ``ValueError`` (the converter adds no wrapper), which is what the CLI turns into a failed
+    run, and it carries the file's own bytes -- proof the refusal is about the pipeline root's
+    scheduler document and not some other config. Detection is not the guard: the root is still
+    recognised as a Qwen-Image pipeline, and the conversion still refuses.
+    """
+    base = pipeline_root(tmp_path / "artifact")
+    malformed = "{ base_shift: 0.5, }"
+    (tmp_path / "artifact" / "scheduler" / "scheduler_config.json").write_text(malformed)
+    try:
+        assert is_qwen_image(base), "the root is still a Qwen-Image pipeline; the guard is the pack"
+        with pytest.raises(json.JSONDecodeError) as raised:
+            build_model(base, components=("dit", "text", "vae"))
+    finally:
+        base.close()
+
+    error = raised.value
+    assert isinstance(error, ValueError), "the CLI refuses a conversion on a ValueError"
+    assert error.doc == malformed, "the refusal carries the scheduler document it could not parse"
 
 
 @pytest.mark.parametrize("components", [(), ("mtp",)])
