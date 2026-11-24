@@ -45,11 +45,22 @@ struct Case {
     // holds both at once -- the encode that produces the conditioning runs on the yielded VRAM -- so
     // the edit route's ledger row has to predict the ViT's live set and this row has to measure it.
     bool          vit = false;
-    // Certified anchors, in MiB, for the rows this suite was certified on. Non-zero means BOTH numbers
-    // must reproduce exactly: the predicted need (the number the serving layer refuses on) and the
-    // measured high-water (what the pipeline really allocated). Zero marks a row with no certified
-    // anchor -- the canvas-sweep rows exist to bound the prediction across every canvas the server
-    // admits, not to freeze a footprint nobody measured on this build.
+    // Certified anchors, in MiB. A non-zero entry must reproduce exactly: the predicted need (the number
+    // the serving layer refuses on) and the measured high-water (what the pipeline really allocated).
+    //
+    // Where BOTH are set, the row is one of the four the plan certifies -- the numbers at
+    // docs/superpowers/plans/2026-11-14-image-fail-closed.md:688,781, reproduced by every sanctioned run
+    // since the scheduler component landed.
+    //
+    // The first five rows pin the MEASURED side only. Their high-water is the 2026-10-23 certification
+    // recorded in .agent/STATE.md:861-862 (1845/2746/2760/2751/4007) and it still reproduces exactly on
+    // this build, so the footprint is frozen there. Their predicted side was recorded by the same older
+    // run (4570/5921/5935/5925/7812) and the current inventory computes 432-1728 MiB less for those five
+    // canvases; that number was never in the plan's certified table, so pinning it would freeze a stale
+    // prediction rather than a certified one. Zero marks an unpinned side, not a missing measurement.
+    //
+    // 1280/1536/1792 carry neither: they exist to bound the prediction across every canvas the server
+    // admits, and no high-water was ever recorded for them on any build.
     std::uint64_t certified_predicted_mib = 0;
     std::uint64_t certified_measured_mib  = 0;
 };
@@ -107,11 +118,14 @@ int main() {
         };
 
         const std::vector<Case> cases = {
-            {512, 0, 0, 0, "the certified route"},
-            {768, 0, 0, 0, "the chat default"},
-            {768, 0, 128, 0, "the review's case: same target plus a reference"},
-            {768, 0, 0, 24, "true CFG (a second, differently sized pass)"},
-            {1024, 0, 0, 0, "one megapixel"},
+            // The measured high-water of these five rows is the 2026-10-23 certification in
+            // .agent/STATE.md:861-862, copied verbatim. The predicted side stays unpinned there for the
+            // reason above; the floor gate (measured + 512 MiB) still bounds it from below.
+            {512, 0, 0, 0, "the certified route", false, 0, 1845},
+            {768, 0, 0, 0, "the chat default", false, 0, 2746},
+            {768, 0, 128, 0, "the review's case: same target plus a reference", false, 0, 2760},
+            {768, 0, 0, 24, "true CFG (a second, differently sized pass)", false, 0, 2751},
+            {1024, 0, 0, 0, "one megapixel", false, 0, 4007},
             // M7's own row: a reference on the 1024^2 area cap (4096 latent tokens == 4 * 1024 vision
             // tokens) whose pad rows are the whole prompt, with the ViT encode measured in the same
             // window. This is the edit route the serving layer admits on this number.
