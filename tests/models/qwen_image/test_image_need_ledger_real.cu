@@ -49,10 +49,11 @@ struct Case {
     // the serving layer refuses on) and the measured high-water (what the pipeline really allocated).
     //
     // Where BOTH are set, the row is one of the four the plan certifies -- the numbers at
-    // docs/superpowers/plans/2026-11-14-image-fail-closed.md:688,781. Both sanctioned runs whose stdout is on
-    // record reproduce them exactly (the fix-round-1 re-certification and the fix-round-2 restored run, in
-    // build-windows\task7_logs\); the first certified run's table was never captured, as disclosed in the
-    // task report, so the claim stops at the two runs that carry evidence.
+    // docs/superpowers/plans/2026-11-14-image-fail-closed.md:688,781. The two sanctioned runs whose stdout
+    // survives on disk reproduce them exactly: the run recorded as
+    // build-windows/task7_logs/gpu_infernix_image_need_ledger_real_test_run.log, and the restored run of the
+    // anchor mutation recorded as ledger_mutation_restored_run.log. Earlier runs' tables were overwritten or
+    // never captured, as disclosed in the task report, so the claim stops at the two logs that are there.
     //
     // The first five rows pin the MEASURED side only. Their high-water is the 2026-10-23 certification
     // recorded in .agent/STATE.md:861-862 (1845/2746/2760/2751/4007) and it still reproduces exactly on
