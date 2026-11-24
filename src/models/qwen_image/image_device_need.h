@@ -16,8 +16,12 @@
 #include "models/qwen_image/image_job.h"
 #include "models/qwen_image/image_weights.h"
 
-#include <cstddef>
+// require_patches_within_vision_ledger below refuses by throwing a std::runtime_error, the same
+// fail-closed refusal the vision tower and every other image-lane guard raises.
 #include <cstdint>
+#include <cstddef>
+#include <stdexcept>
+#include <string>
 
 namespace infernix::models::qwen_image {
 
@@ -73,6 +77,32 @@ struct VisionLaneDims {
 // largest patch grid is 1024/16 x 1024/16. The reference's size is independent of the requested
 // OUTPUT size, which is why this is a constant of the route and not of the geometry.
 inline constexpr std::uint64_t kVisionWorstReferencePatches = 64ULL * 64ULL;
+
+// That number is not an estimate the caller may exceed, it is a CHARGE: the ledger below bills
+// need.vision_peak for exactly kVisionWorstReferencePatches patches, and the serving layer yields on the
+// total it bills. A caller handing run_vision_tower a bigger plane therefore holds live device bytes that
+// no admission decision priced -- the joint ceiling admits 20480 merged rows, which would be 81920 patches
+// and several GiB of activations against a bill of ~0.45 GiB -- so the resident LLM starves on a stale
+// number. That is the exact blindness this branch exists to close, and the blindness was in the reader:
+// vision_tower.cu sized every live plane from the CALLER's count and refused only int overflow.
+//
+// The guard therefore lives beside the charge it protects, so the two cannot drift apart, and
+// run_vision_tower calls it on the count its caller hands it BEFORE a single plane is sized
+// (src/models/qwen_image/vision_tower.cu). It is a host function on purpose: the boundary is arithmetic,
+// so the suite that owns the charge (tests/test_image_device_need.cpp) can pin both ends of it -- 4096
+// admitted, 4097 refused -- without CUDA in the way, which the production route itself cannot offer a host
+// test (the CUDA target is deliberately kept out of host tests, see src/models/qwen_image/sources.cmake).
+inline void require_patches_within_vision_ledger(std::uint64_t patches_count) {
+    if (patches_count > kVisionWorstReferencePatches) {
+        throw std::runtime_error("vision tower: " + std::to_string(patches_count) +
+                                 " patches is more than the " + std::to_string(kVisionWorstReferencePatches) +
+                                 " the worst legal reference plane has (64x64 patches at the 1024x1024 "
+                                 "reference target of src/serve/reference_image.cpp), which is the number the "
+                                 "VRAM ledger bills the ViT at; a larger plane would hold live device bytes "
+                                 "no admission decision priced, so the route refuses it rather than run the "
+                                 "tower under-priced");
+    }
+}
 
 struct ImageDeviceNeedRequest {
     ImageGeometry geometry;             // the target image's snapped geometry

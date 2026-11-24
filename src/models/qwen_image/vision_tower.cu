@@ -11,6 +11,7 @@
 #include "infernix/ops/rope.h"
 #include "infernix/ops/softmax_attention.h"
 #include "infernix/ops/vision_pos_embed.h"
+#include "models/qwen_image/image_device_need.h"
 #include "models/qwen_image/image_device_util.h"
 
 #include <cuda_runtime.h>
@@ -161,6 +162,14 @@ VisionTowerOutput run_vision_tower(artifact::Reader& reader, const VisionWeights
         throw std::runtime_error("vision tower: the grid must be positive and merge-aligned");
     }
     const std::size_t patches_count = std::size_t(grid.temporal) * grid.height * grid.width;
+    // The VRAM ledger bills this lane at a FIXED worst legal reference plane (kVisionWorstReferencePatches,
+    // image_device_need.h), and the serving layer yields on what it bills. Every plane below is sized from
+    // the CALLER's count, so a count above that number would hold live device bytes no admission decision
+    // priced and starve the resident LLM -- which is the blindness this branch exists to close. Refused
+    // here, before a single allocation, by the guard that owns the charge; the equality case stays admitted
+    // because that is what the route runs (tests/models/qwen_image/test_image_need_ledger_real.cu drives
+    // exactly 64x64), and the boundary itself is pinned on the host in tests/test_image_device_need.cpp.
+    require_patches_within_vision_ledger(patches_count);
     // Every dimension below reaches an op as an int; the arithmetic guards here keep a hostile grid
     // from wrapping into a smaller (and silently wrong) allocation.
     if (patches_count > std::size_t(std::numeric_limits<int>::max()) / (dims.hidden + 8)) {
