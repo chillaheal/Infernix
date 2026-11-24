@@ -12,6 +12,16 @@
 // constant -- reading it here is a check on what the artifact CLAIMS, never a value the code adopts.
 #include "models/qwen_image/rope.h"
 
+// calculate_shift: the ONE authority for what the artifact's declared shift window means. The reader
+// below has to ask the same question the schedule itself asks -- what mu does the declared window
+// produce at a token count the lane can actually build -- and mirroring that arithmetic here is how a
+// reader and a scheduler learn to disagree.
+#include "models/qwen_image/scheduler.h"
+
+// ops::kImageJointMaxTokens: the product's one joint-sequence ceiling, which is the largest token count
+// the lane can ever hand the scheduler (a job's canvas tokens are a part of the joint sequence).
+#include "infernix/ops/image_joint_limits.h"
+
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -261,9 +271,13 @@ std::expected<std::int64_t, std::string> vae_required_integer(const Json& config
     if (!value.is_number_integer()) { return std::unexpected(vae_wrong_type(key, value, "a JSON integer")); }
     const std::int64_t declared = value.get<std::int64_t>();
     if (declared >= kVaeLargestPlausibleValue || declared <= -kVaeLargestPlausibleValue) {
+        // The two ends are EXCLUSIVE, because that is what the test above refuses: a declaration exactly
+        // equal to either bound is refused, so the message has to say "more than / less than" rather than
+        // "between ... and", or the value it prints satisfies the bound it is being refused for.
         return std::unexpected(std::string(kVaeDocument) + quoted_key(key) + " is " + dump_safe(value) +
-                               " but must be between " + std::to_string(-kVaeLargestPlausibleValue) +
-                               " and " + std::to_string(kVaeLargestPlausibleValue));
+                               " but must be more than " + std::to_string(-kVaeLargestPlausibleValue) +
+                               " and less than " + std::to_string(kVaeLargestPlausibleValue) +
+                               " (neither end included: a declaration equal to either is refused too)");
     }
     return declared;
 }
@@ -489,6 +503,87 @@ std::expected<SchedulerConstants, std::string> read_scheduler_config(const nlohm
     if (!(out.shift_terminal >= 0.0 && out.shift_terminal < 1.0)) {
         return std::unexpected(out_of_supported_range("shift_terminal", config.at("shift_terminal"),
                                             "a value in [0, 1): the stretch divides by 1 - shift_terminal"));
+    }
+
+    // The two shifts and the timestep count are bounded, not merely checked for finiteness (which
+    // required_float above already did), because nothing downstream looks at what the schedule emits.
+    // calculate_shift extrapolates LINEARLY in the latent token count
+    // (mu = seq_len * m + b, m = (max_shift - base_shift) / (max_image_seq_len - base_image_seq_len)), and
+    // build_schedule then runs std::exp(mu) on it and multiplies the sigmas by num_train_timesteps. An
+    // artifact whose declared window is too narrow to carry the shift it also declares -- the mistyped
+    // "base_image_seq_len": 256, "max_image_seq_len": 257 a hand-edited metadata file produces, or a
+    // "base_shift"/"max_shift" beyond log(DBL_MAX) ~= 709.78 -- makes mu enormous: exp() returns inf, the
+    // float32 cast of it feeds emu / (emu + inv), and EVERY sigma and timestep comes out NaN. The job is
+    // then DRAWN as garbage rather than refused, with no operator-visible reason -- and before this branch
+    // those two numbers were compiled constants, so the hole is the artifact's, not the arithmetic's. The
+    // file already refuses every other unrepresentable declaration this way (kVaeLargestPlausibleValue
+    // bounds every VAE integer, and the divisor checks above are "refused by name rather than computed
+    // with"); the same rule and the same wording apply here, by name, before a single allocation.
+    //
+    // Why these two numbers: exp() overflows double to inf above log(DBL_MAX) = 709.78, so mu must stay
+    // under it for exp(mu) to be finite at all; at the other end the float32 cast of exp(mu) flushes to
+    // 0 below about -87.3, and the first input sigma is exactly 1.0, so emu / (emu + (1/sigma - 1)) would
+    // divide 0 by 0 and produce NaN there too. Both constants sit inside those bounds with room, and they
+    // are far above any shift any checkpoint declares (the shipped document declares 0.5 and 0.9), so an
+    // honest document never meets them -- a refusal here is a mis-authored metadata file, and the message
+    // is the reason the operator can read.
+    constexpr double kLargestFiniteMu = 700.0;
+    constexpr double kSmallestFiniteMu = -80.0;
+    for (const std::string_view key : {"base_shift", "max_shift"}) {
+        const double declared = key == "base_shift" ? out.base_shift : out.max_shift;
+        // Written as the negation of the inclusive test so a NaN that slipped past required_float refuses
+        // too, rather than comparing its way into the schedule.
+        if (!(declared >= kSmallestFiniteMu && declared <= kLargestFiniteMu)) {
+            return std::unexpected(
+                out_of_supported_range(key, config.at(key),
+                                       "a shift at least " + std::to_string(kSmallestFiniteMu) +
+                                           " and at most " + std::to_string(kLargestFiniteMu) +
+                                           ", which is the range std::exp stays finite in and the float32 "
+                                           "cast of it never flushes to zero: outside it every sigma and "
+                                           "timestep of the schedule would be NaN and the picture would be "
+                                           "drawn rather than refused"));
+        }
+    }
+    // The window, on the same terms: mu is LINEAR in the token count, so holding it inside that range at
+    // both ends of the span the lane can hand the scheduler holds it there for every count in between.
+    // ops::kImageJointMaxTokens is the product's one joint-sequence ceiling (include/infernix/ops/
+    // image_joint_limits.h) and a job's canvas tokens are a part of the joint sequence, so 20480 is the
+    // largest count the schedule is ever asked for; 1 is the smallest it can be asked for at all. A
+    // document refused here is one whose declared window cannot keep a real job's schedule finite, which
+    // is exactly the case no later stage checks.
+    for (const std::size_t tokens :
+         {std::size_t{1}, static_cast<std::size_t>(::infernix::ops::kImageJointMaxTokens)}) {
+        const double mu = calculate_shift(out, tokens);
+        if (!(mu >= kSmallestFiniteMu && mu <= kLargestFiniteMu)) {
+            return std::unexpected(
+                prefix() + quoted_key("base_image_seq_len") + " = " +
+                std::to_string(out.base_image_seq_len) + " with " + quoted_key("max_image_seq_len") +
+                " = " + std::to_string(out.max_image_seq_len) + " and " + quoted_key("base_shift") +
+                " = " + std::to_string(out.base_shift) + " with " + quoted_key("max_shift") + " = " +
+                std::to_string(out.max_shift) + " put the schedule's mu at " + std::to_string(mu) +
+                " for a " + std::to_string(tokens) + "-token sequence, outside the range [" +
+                std::to_string(kSmallestFiniteMu) + ", " + std::to_string(kLargestFiniteMu) +
+                "] the schedule can compute: exp(mu) would overflow to inf (or flush to 0 at the other "
+                "end), every sigma and timestep would come out NaN, and the picture would be drawn as "
+                "garbage instead of refused. A window this narrow cannot cover the token counts this "
+                "lane builds -- the two declared token counts and the two declared shifts are one line, "
+                "and all four have to agree on it.");
+        }
+    }
+    // num_train_timesteps has an upper bound for the same reason: it is a JSON integer, and build_schedule
+    // computes timesteps as sigmas * num_train_timesteps in float32, so an enormous declaration reaches
+    // +-inf and the schedule is garbage the same way. The bound is this file's own idiom -- an absurd
+    // declaration is refused by name, not carried into arithmetic to see what happens (the shipped
+    // document declares 1000).
+    constexpr std::int64_t kLargestPlausibleTrainTimesteps = 1LL << 20;
+    if (out.num_train_timesteps > kLargestPlausibleTrainTimesteps) {
+        return std::unexpected(
+            out_of_supported_range("num_train_timesteps", config.at("num_train_timesteps"),
+                                   "a positive count at most " +
+                                       std::to_string(kLargestPlausibleTrainTimesteps) +
+                                       ": the schedule multiplies its sigmas by it in float32, so a larger "
+                                       "declaration would overflow the timesteps to inf and the job would "
+                                       "be drawn rather than refused"));
     }
     return out;
 }
@@ -747,12 +842,22 @@ std::expected<VaeTopology, std::string> read_vae_topology(const nlohmann::json& 
     // so the bound's own arithmetic cannot overflow. conv_out is the term the ledger charges on the FULL
     // pixel canvas, so a truncated one under-charges a whole image, not one stage.
     if (widths.back() > kLargestStorableChannels - out_channels) {
+        // The predicate is on the SUM, so the message prints the sum, the ceiling it is compared against,
+        // and the most out_channels could have been under this same shallowest level. Naming only the
+        // ceiling left a reader to work out whether the refused value actually exceeded it (and this line
+        // once attributed the level width to "decoder_base_dim", which is one of its two factors, not the
+        // result): every number a refusal quotes has to be checkable against the refusal.
         return std::unexpected(std::string(kVaeDocument) + quoted_key("out_channels") + " = " +
-                               std::to_string(out_channels) + " on top of the shallowest level " +
-                               quoted_key("decoder_base_dim") + " = " + std::to_string(widths.back()) +
-                               " is more channels for the final convolution than the " +
-                               std::to_string(kLargestStorableChannels) + " it is stored and priced in, and "
-                               "that stage is charged on the full pixel canvas");
+                               std::to_string(out_channels) + " on top of the shallowest level width " +
+                               std::to_string(widths.back()) + " (the " + quoted_key("decoder_base_dim") +
+                               " = " + std::to_string(base_dim) + " times the shallowest " +
+                               quoted_key("dim_mult") + " entry) is " +
+                               std::to_string(widths.back() + out_channels) + " channels for the final "
+                               "convolution, more than the " + std::to_string(kLargestStorableChannels) +
+                               " it is stored and priced in -- at most " +
+                               std::to_string(kLargestStorableChannels - widths.back()) +
+                               " " + quoted_key("out_channels") + " fits beside that level -- and that "
+                               "stage is charged on the full pixel canvas");
     }
     out.final_channels  = static_cast<std::uint32_t>(widths.back() + out_channels);
     out.denorm_elements = static_cast<std::uint32_t>(latent_channels);
