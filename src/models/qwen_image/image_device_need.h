@@ -8,15 +8,20 @@
 // longer of the two joint sequences (image_pipeline.cu:332-342) and carries the reference block ahead
 // of the target latent (:328).
 //
-// The image ledger (image_device_bytes_peak(), image_pipeline.h:93-99) is the oracle for this model:
+// The image ledger (image_device_bytes_peak(), image_pipeline.h) is the oracle for this model:
 // the qualification test asserts the predicted total is never below the measured peak for the same
-// inputs, and the allowance below is what that test tightens.
+// inputs, and the resident calibration in models/qwen_image/image_weights.h
+// (kQwenImageWeightResidentBytes, carried in on the request's `vae`) is what that test tightens.
 
 #include "models/qwen_image/image_job.h"
 #include "models/qwen_image/image_weights.h"
 
-#include <cstddef>
+// require_patches_within_vision_ledger below refuses by throwing a std::runtime_error, the same
+// fail-closed refusal the vision tower and every other image-lane guard raises.
 #include <cstdint>
+#include <cstddef>
+#include <stdexcept>
+#include <string>
 
 namespace infernix::models::qwen_image {
 
@@ -28,33 +33,10 @@ inline constexpr std::uint64_t kImageMiB          = 1024ULL * 1024ULL;
 // model, the serving layer and the ledger cert must all agree on. The pipeline's CopyLane double-
 // buffers exactly this many slots (a static_assert in image_pipeline.cu pins it to 2), the serving
 // layer stamps it onto ImageDeviceNeedRequest::blocks_resident, and the cert requests the same value
-// the allowance below was calibrated against. A single symbol so `resident_weights` can never drift
-// from the slots actually allocated, nor from the blocks_resident the 3072 MiB allowance measured.
+// the resident calibration was measured with. A single symbol so `resident_weights` can never drift
+// from the slots actually allocated, nor from the blocks_resident that calibration (stamped onto the
+// VaeTopology by the binding, and multiplied by this constant below) was taken against.
 inline constexpr std::uint32_t kImageResidentBlocks = 2;
-
-// The operands and op scratch the inventory above does not enumerate: the DiT's top-level
-// projections, the VAE's weights, and whatever workspace the linear/conv/attention ops take per
-// call. An over-estimated need refuses a job that might have run; an under-estimated one OOMs it.
-//
-// Two calibrations set this term:
-//   - the ledger qualification (test_image_need_ledger_real.cu) proves predicted >= measured for the
-//     certified inputs, and
-//   - the stage bench (image-spike/stage_bench_A_full_overlap.err.log) gives the REAL per-step ledger
-//     peak a live job reaches -- higher than the cert's, because the cert feeds zero-filled trivial
-//     inputs while a served job carries a real prompt/negative/reference. The cert alone would let
-//     this drift below what a live job actually holds.
-//
-// Subtracting the enumerated structural terms (dit_activations + latent_and_velocity + vae_peak +
-// rope_and_tables) from the real peak leaves the residual this term must absorb: ~772 MiB at 512,
-// ~322 at 768, and ~1180 at 768+ref / 768+CFG (the ref/CFG rows, where the real sequence is longest
-// and the cert's trivial inputs understate it most). The 1024 row's structural terms alone already
-// exceed its real peak, so its residual is negative. So the largest residual to cover is ~1184 MiB;
-// 3072 MiB leaves ~1.9 GiB on top of it for the 512 MiB interlude floor plus whatever the KV pool
-// and the LLM restore hold during the interlude. That puts the predicted total at ~1.6-2.5x the real
-// peak on every certified row -- down from the ~4x this term carried when it was the whole-measured-
-// peak proxy (6183, then 5972 after the second resident block was counted explicitly in bundle B
-// fas 2) -- without ever dropping predicted below the measured peak plus the 512 MiB floor.
-inline constexpr std::uint64_t kImageWeightResidentBytes = 3072ULL * kImageMiB;
 
 // One DiT block resident on device: the seven FP8 RowScale roles (four [hidden,hidden] and three
 // [intermediate,hidden], one byte per code) plus the two BF16 head norms. Derived from the bound
@@ -64,31 +46,17 @@ inline constexpr std::uint64_t kImageWeightResidentBytes = 3072ULL * kImageMiB;
     return 4ULL * d * d + 3ULL * mlp * d + 2ULL * dims.head_dim * kImageElementBytes;
 }
 
-// One decoder stage: the channels its widest planes carry and how many full [C,H,W] planes the code
-// holds live at once. The counts are read off image_pipeline.cu: `att` keeps the qkv buffer (3C),
-// its attention output (C) and the still-live input (C) at the spatial_attn call (:207-222);
-// `dup_up` holds the upsampled input, the duplicated shortcut and the conv output at the DOUBLED
-// resolution (:252-264); `dresnet` holds its input, shortcut and two conv outputs (:161-192).
-struct VaeStage {
-    std::uint32_t channels_in;
-    std::uint32_t channels_out;
-    std::uint32_t planes;
-    bool          doubles_side; // the stage works at the doubled side after its upsample
-};
-
-// The decoder's fixed chain as image_pipeline.cu:620-665 runs it (the channels are the recipe's).
-inline constexpr VaeStage kVaeMidStage{1152, 1152, 5, false};
-inline constexpr VaeStage kVaeUpStages[5] = {
-    {1152, 1152, 3, true},
-    {1152, 1152, 3, true},
-    {1152, 576, 3, true},
-    {576, 288, 3, true},
-    {288, 144, 3, false},
-};
-
-// The last two planes of the decode: the norm_out stage (144 channels) and the 4-channel conv_out,
-// both at full pixel resolution.
-inline constexpr std::uint64_t kVaeFinalChannels = 144ULL + 4ULL;
+// The decoder chain this ledger prices is NOT a table kept here: its channels, its latent width, its
+// final conv_out width and its resident calibration are the artifact's own declaration, read by
+// read_vae_topology into the VaeTopology (models/qwen_image/artifact_constants.h) that the family's
+// binding stamps and verifies against every bound weight, and handed in on the request below. The CUDA
+// decode graph reads the SAME object off the bound VaeWeights (image_pipeline.cu), so the bytes the
+// graph allocates and the bytes the ledger reserves can no longer be two different guesses -- and an
+// artifact that declares a decoder this build does not run is refused by the binding instead of being
+// priced against another family's geometry. The one code-owned field the terms below multiply by,
+// VaeStage::planes (how many full [C,H,W] planes the route holds live at a stage), is documented where
+// it is set: it is a measurement of image_pipeline.cu's att()/dup_up()/dresnet(), not a claim of the
+// checkpoint's.
 
 // The bound ViT's shape, as far as the ledger needs it: enough to derive the streamed block's roles
 // and the eleven live planes of vision_tower.cu rather than hardcode a number. All zero (or hidden
@@ -104,11 +72,122 @@ struct VisionLaneDims {
     std::uint32_t out_hidden  = 0; // the merger's output width == the text tower's hidden
 };
 
-// The worst legal reference plane the ViT can ever be fed: prepare_reference_image resizes every
-// reference to the 1024x1024 area target on the 32-grid (reference_image.cpp:21,155-158), so the
-// largest patch grid is 1024/16 x 1024/16. The reference's size is independent of the requested
-// OUTPUT size, which is why this is a constant of the route and not of the geometry.
-inline constexpr std::uint64_t kVisionWorstReferencePatches = 64ULL * 64ULL;
+// The worst legal reference plane the ViT can ever be fed -- DERIVED here rather than asserted, because
+// it is the number the ledger below BILLS the lane at (image_device_need() multiplies vision_peak by it)
+// and the number require_patches_within_vision_ledger enforces, so the two must stay one constant.
+//
+// How the route makes the plane (prepare_reference_planes, src/serve/reference_image.cpp:320-352): from
+// the decoded reference's size (W, H) it computes the two exact targets
+//     exact_w = sqrt(kReferenceTargetArea * W / H)   and   exact_h = sqrt(kReferenceTargetArea * H / W)
+// whose product is exactly kReferenceTargetArea (1024*1024, reference_image.cpp:21), and rounds EACH
+// SIDE INDEPENDENTLY to a multiple of 32 with serve::snap_to_32 (src/serve/openai_images.cpp:75-89 --
+// Python round()'s half-to-even at the 32-grid). It then refuses anything whose snapped side fell below
+// 32 (reference_image.cpp:350-352), and run_vision_tower is handed the plane as a
+// {1, target_h/16, target_w/16} patch grid (patch 16 x spatial_merge 2, src/serve/reference_image.h:56-63).
+// Two consequences, and the second is why this is arithmetic rather than a square:
+//   * the snap moves a side by at most half the grid (16 px) and it can round BOTH sides UP, so a
+//     non-square reference lands ABOVE the target area: a 4:3 reference is 1184x896 = 4144 patches, more
+//     than the square case's 4096. That is what the 64x64 claim this header used to carry got wrong, and
+//     a guard sitting behind that claim turned an ordinary photograph edit into a refusal;
+//   * the widest aspect the route still admits is the one whose SHORT side just clears the gate: its
+//     exact short side must be above 16 (at exactly 16 the half-grid tie rounds to the even 0, which the
+//     route refuses), so its exact long side is kReferenceTargetArea/16 = 65536 and that snaps to 65536
+//     itself -- 65536x32, at the 16-wide patch 4096x2 = 8192 patches, exactly TWICE the square reference.
+//     The lane has to be billed for that plane, not for the square one.
+//
+// The loop below states that arithmetic instead of handing over its answer, and in integers only (no
+// floating point, so no rounding mode can move it): for every snapped side the route's own gate admits
+// as the SHORT side it takes the longest snapped long side whose (side - half-grid slack) still leaves
+// the exact partner inside the target area, and keeps the most patches. Every plane the route can
+// produce meets that condition -- each snapped side is within slack of its exact value and the exact
+// values multiply to the area -- so what is scanned is a SUPERSET: it can over-bill, never under-bill.
+// tests/test_image_device_need.cpp enumerates the REAL route (the exported serve::snap_to_32, and the
+// real prepare_reference_planes on encoded references) to prove the constant is reached and never
+// exceeded, so it is not a padded guess and a change to the route's snapping is caught there.
+//
+// The three route constants below are restated here because src/serve owns them and src/models may not
+// depend on src/serve; that host suite is the tie back to the route, and the serve boundary refuses a
+// plane this header did not bill (reference_image.cpp), so a drift answers the client 400 instead of 500.
+inline constexpr std::uint64_t kReferenceTargetAreaPx = 1024ULL * 1024ULL; // reference_image.cpp:21
+inline constexpr std::uint64_t kReferenceSnapGridPx   = 32ULL;             // serve::snap_to_32's grid
+inline constexpr std::uint64_t kVisionPatchSidePx     = 16ULL;             // the ViT's patch side
+
+[[nodiscard]] inline consteval std::uint64_t worst_reference_plane_patches(
+    std::uint64_t target_area_px, std::uint64_t snap_grid_px, std::uint64_t patch_side_px) noexcept {
+    const std::uint64_t slack = snap_grid_px / 2ULL; // the snap moves a side by at most half a grid
+    std::uint64_t worst = 0ULL;
+    // The route refuses a snapped side below the grid, so that is the shortest side to try; past the
+    // square the two roles have merely swapped, so no bound beyond the area itself is needed.
+    for (std::uint64_t short_px = snap_grid_px; short_px <= target_area_px; short_px += snap_grid_px) {
+        const std::uint64_t short_exact = short_px - slack; // what its exact side cannot fall below
+        if (short_exact == 0ULL) { continue; }
+        // The exact long side is at most area / short_exact, and a snapped side may sit slack above its
+        // exact value: the longest legal snapped long side is the last multiple of the grid whose own
+        // exact floor still fits.
+        const std::uint64_t long_exact = target_area_px / short_exact;
+        const std::uint64_t long_px    = ((long_exact + slack) / snap_grid_px) * snap_grid_px;
+        if (long_px < snap_grid_px) { break; } // no partner left on this side of the square
+        const std::uint64_t patches = (long_px / patch_side_px) * (short_px / patch_side_px);
+        if (patches > worst) { worst = patches; }
+    }
+    return worst;
+}
+
+inline constexpr std::uint64_t kVisionWorstReferencePatches =
+    worst_reference_plane_patches(kReferenceTargetAreaPx, kReferenceSnapGridPx, kVisionPatchSidePx);
+
+// The same promise the way the boundary that produces the plane reads it, in pixels: src/serve has no
+// business knowing the ViT's patch size, and a snapped side is always a multiple of the grid, so the
+// division back to patches is exact.
+inline constexpr std::uint64_t kVisionWorstReferencePlanePixels =
+    kVisionWorstReferencePatches * kVisionPatchSidePx * kVisionPatchSidePx;
+
+// The one thing about this derivation that is not a restatement of its own answer: the snap's slack
+// really does lift the worst plane above the square reference, which is the whole of the C1 finding.
+// (What it is NOT allowed to do is freeze the number -- tests/test_image_device_need.cpp is what proves
+// the derived maximum is reached, and a route change must be re-derived from the route, not tuned here.)
+static_assert(kVisionWorstReferencePatches >
+                  kReferenceTargetAreaPx / kVisionPatchSidePx / kVisionPatchSidePx,
+              "the worst legal reference plane must sit ABOVE the square reference's patch count: the "
+              "32-grid snap rounds each side independently and can round both up, so a non-square "
+              "reference lands outside kReferenceTargetArea. If this fires, the derivation stopped "
+              "modelling the snap.");
+
+// That number is not an estimate the caller may exceed, it is a CHARGE: the ledger below bills
+// need.vision_peak for exactly kVisionWorstReferencePatches patches, and the serving layer yields on the
+// total it bills. A caller handing run_vision_tower a bigger plane therefore holds live device bytes that
+// no admission decision priced -- the joint ceiling admits 20480 merged rows, which would be 81920 patches,
+// ten times the billed plane: ~3.0 GiB of live activations against the 325 MiB this header bills (the
+// per-patch terms at the shipped ViT's shape) -- so the resident LLM starves on a stale number. That is the exact blindness this branch exists to close, and the blindness was in the reader:
+// vision_tower.cu sized every live plane from the CALLER's count and refused only int overflow.
+//
+// The guard therefore lives beside the charge it protects, so the two cannot drift apart, and
+// run_vision_tower calls it on the count its caller hands it BEFORE a single plane is sized
+// (src/models/qwen_image/vision_tower.cu). It is a host function on purpose: the boundary is arithmetic,
+// so the suite that owns the charge (tests/test_image_device_need.cpp) can pin both ends of it -- the
+// derived worst plane admitted, one patch above it refused -- without CUDA in the way, which the production route itself cannot offer a host
+// test (the CUDA target is deliberately kept out of host tests, see src/models/qwen_image/sources.cmake).
+inline void require_patches_within_vision_ledger(std::uint64_t patches_count) {
+    if (patches_count > kVisionWorstReferencePatches) {
+        // The message is the derivation, not just the number: whoever hits it must be able to tell a
+        // pathological reference (the client's, refused at the serve boundary with a 400 long before
+        // here) from a ledger whose snap stopped matching the route's (the tree's, and the reason the
+        // square 64x64 this guard used to quote was wrong).
+        throw std::runtime_error(
+            "vision tower: " + std::to_string(patches_count) + " patches is more than the " +
+            std::to_string(kVisionWorstReferencePatches) + " the worst legal reference plane produces -- "
+            "the " +
+            std::to_string(kReferenceTargetAreaPx) + "-pixel reference target of "
+            "src/serve/reference_image.cpp, each side snapped to the " +
+            std::to_string(kReferenceSnapGridPx) + "-grid (which rounds UP, and can round both sides up) "
+            "at the " +
+            std::to_string(kVisionPatchSidePx) + "-wide ViT patch, at the widest aspect the route's own "
+            "below-" + std::to_string(kReferenceSnapGridPx) + "-pixel gate still admits (that plane is " +
+            std::to_string(kVisionWorstReferencePlanePixels) + " pixels); and that is the number the VRAM "
+            "ledger bills the ViT at, so a larger plane would hold live device bytes no admission "
+            "decision priced and the route refuses it rather than run the tower under-priced");
+    }
+}
 
 struct ImageDeviceNeedRequest {
     ImageGeometry geometry;             // the target image's snapped geometry
@@ -123,12 +202,19 @@ struct ImageDeviceNeedRequest {
     // ref_tokens would count those rows twice (for a portrait reference, ~1014 rows too many).
     std::uint32_t   vision_tokens = 0;
     VisionLaneDims  vision;             // zero == no vision lane, and the vision term is then zero
+    // The decoder geometry the job's OWN artifact declared, read by read_vae_topology and verified against
+    // every bound decoder weight by check_vae_topology (image_weights.cpp) -- the same object the CUDA
+    // graph decodes from, which is why the ledger has no decoder constants of its own any more. A
+    // reference, so the caller cannot hand in a copy that drifted from the bound one, and it has no
+    // default: every construction site must say which artifact's topology it is pricing, and a job whose
+    // binding never ran cannot be admitted at all.
+    const VaeTopology& vae;
 };
 
 struct ImageDeviceNeed {
     std::uint64_t dit_activations     = 0; // block workspace + joint/ping-pong/norm buffers at s_max
     std::uint64_t latent_and_velocity = 0; // [ref+target] latent, its hidden, the text stages
-    std::uint64_t resident_weights    = 0; // the allowance above plus the resident block(s)
+    std::uint64_t resident_weights    = 0; // the topology's resident calibration + the resident block(s)
     std::uint64_t vae_peak            = 0; // the widest simultaneous set of decode planes
     std::uint64_t rope_and_tables     = 0; // both rope tables and the shared constants
     std::uint64_t vision_peak         = 0; // the ViT lane: one streamed block + its live set
@@ -194,8 +280,8 @@ struct ImageDeviceNeed {
     const auto stage_bytes = [](const VaeStage& stage, std::uint64_t sh, std::uint64_t sw) {
         return static_cast<std::uint64_t>(stage.planes) * stage.channels_out * sh * sw * kImageElementBytes;
     };
-    need.vae_peak = stage_bytes(kVaeMidStage, hl, wl);
-    for (const auto& stage : kVaeUpStages) {
+    need.vae_peak = stage_bytes(req.vae.mid_stage, hl, wl);
+    for (const auto& stage : req.vae.up_stages) {
         if (stage.doubles_side) {
             hl *= 2;
             wl *= 2;
@@ -203,7 +289,7 @@ struct ImageDeviceNeed {
         const std::uint64_t bytes = stage_bytes(stage, hl, wl);
         if (bytes > need.vae_peak) { need.vae_peak = bytes; }
     }
-    const std::uint64_t final_planes = kVaeFinalChannels *
+    const std::uint64_t final_planes = req.vae.final_channels *
                                        static_cast<std::uint64_t>(req.geometry.height) *
                                        static_cast<std::uint64_t>(req.geometry.width) *
                                        kImageElementBytes;
@@ -238,7 +324,7 @@ struct ImageDeviceNeed {
              2ULL * req.vision.head_dim * kImageElementBytes);                 // one block's roles
     }
 
-    need.resident_weights = kImageWeightResidentBytes +
+    need.resident_weights = req.vae.weight_resident_bytes +
                             static_cast<std::uint64_t>(req.blocks_resident) * image_block_bytes(req.dims);
     return need;
 }

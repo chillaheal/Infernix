@@ -1,6 +1,7 @@
 // The M5 joint index map (see joint_layout.h). Two passes: the structure walk (repeats, expansion,
 // scatter rows, block ids, target mask) and the rope walk over the segments that walk produced. The
-// rope rows come from rope.{h,cpp}'s own emitter, so this module adds no rotary formula of its own.
+// rope rows come from rope.{h,cpp}'s own emitter, so this module adds no rotary formula and no rope
+// width of its own: the caller hands in the artifact's DitRopeAxes and the emitter sizes every row.
 
 #include "models/qwen_image/joint_layout.h"
 
@@ -27,7 +28,8 @@ struct Segment {
 
 } // namespace
 
-JointLayout build_joint_layout(std::span<const std::uint8_t> image_pad_mask,
+JointLayout build_joint_layout(const DitRopeAxes& axes,
+                               std::span<const std::uint8_t> image_pad_mask,
                                std::span<const ImageShape> img_shapes) {
     if (img_shapes.empty()) { fail("img_shapes must name at least the target grid"); }
 
@@ -123,7 +125,7 @@ JointLayout build_joint_layout(std::span<const std::uint8_t> image_pad_mask,
         fill_rope_grid(frame, height, width, seg.start, s.height, s.width, position);
         position += std::max(s.height, s.width);  // the transformer's per-block frame advance
     }
-    out.rope = emit_rope_rows(frame, height, width);
+    out.rope = emit_rope_rows(axes, frame, height, width);
     return out;
 }
 

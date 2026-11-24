@@ -166,6 +166,10 @@ def quantize_matrix_mse(
     grouped = logical.reshape(geometry.n, geometry.groups_per_row, spec.group_size)
     max_abs = grouped.abs().amax(dim=2)
     base_scales, base_reciprocal = _canonical_scale_words(max_abs, spec.qmax)
+    # The canonical words arrive on the host because CUDA division is not correctly rounded at
+    # binary16 boundaries; the reciprocal is the one consumed by the device operation below, so it
+    # crosses to the target here the way quantize_matrix does.
+    base_reciprocal = base_reciprocal.to(target)
     base_codes = torch.clamp(
         torch.round(grouped * base_reciprocal.unsqueeze(-1)), spec.qmin, spec.qmax
     )

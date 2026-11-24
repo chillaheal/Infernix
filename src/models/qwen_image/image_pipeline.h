@@ -82,6 +82,14 @@ struct GeneratedImage {
     std::vector<std::uint16_t> latent;
 };
 
+// The planes the image route hands back: RGBA, the channel-major [4,H,W] plane the serving layer
+// composites (src/serve/image_generation_service.cpp::rgba_from_generated_channels) and the plane the
+// reference encoder is fed. It is a contract of THIS route, not a field of the checkpoint: the decoder's
+// final convolution is bound at the artifact's own "out_channels" (read_vae_topology adopts it and
+// check_vae_topology verifies it), so an artifact declaring another count writes planes nothing here can
+// hand on -- and the job refuses it instead of compositing a half-image.
+inline constexpr std::uint32_t kImageOutputChannels = 4;
+
 // #75 reference/edit image: one source image encoded to normalized reference latents with the SAME
 // VAE weights the job decodes with. pixels is the caller-prepared RGBA plane in the VAE's own input
 // range: channel-major [4, height_px, width_px] float in [-1,1] where the alpha channel is carried

@@ -235,6 +235,16 @@ using DiTDimsProvider = std::function<infernix::models::qwen_image::DiTDims()>;
 using VisionLaneDimsProvider =
     std::function<infernix::models::qwen_image::VisionLaneDims()>;
 
+// The bound VAE's decoder geometry, read the same host-side way from the SAME artifact the job binds
+// from. The ledger prices the decode's planes from it (image_device_need.h reads the very
+// VaeTopology the CUDA graph decodes from, which the binding verified against every stored decoder
+// weight), so an admission that had to guess those channels would be reserving for a decode that is not
+// the one it runs -- the drift the image lane's fail-closed work removes everywhere else. Unlike the
+// vision lane this is needed by EVERY image job, so a service without one is refused as unconfigured
+// (503) the moment a job is asked of it: there is no compiled default standing in for the artifact's own
+// declaration, and a zero topology would reserve nothing at all.
+using VaeTopologyProvider = std::function<infernix::models::qwen_image::VaeTopology()>;
+
 // The production executor: lazy-binds the DiT + VAE weights and the VAE denormalization constants
 // from one .infernix image artifact (one streamed-only plan) and runs the merged pipeline entry
 // on the caller's stream. A bad artifact throws std::runtime_error on first use. `logger` receives
@@ -254,6 +264,15 @@ using VisionLaneDimsProvider =
 // refuse an `image` request rather than admit one it cannot size.
 [[nodiscard]] VisionLaneDimsProvider
 make_artifact_vision_dims_provider(const std::string& image_artifact_path);
+
+// The host-side decoder geometry of the same artifact, for the ledger's VAE term: the topology
+// read_vae_topology took from the artifact's own "vae" component config and check_vae_topology verified
+// against every bound decoder weight, with the code-owned resident calibration the binding stamps. Same
+// lazy, cached, outside-any-interlude contract as the two providers above; every image job needs it, and
+// it throws when the artifact carries no readable "vae" component -- the caller must then refuse an
+// `image` request rather than admit one whose decode cannot be priced.
+[[nodiscard]] VaeTopologyProvider
+make_artifact_vae_topology_provider(const std::string& image_artifact_path);
 
 // Standard-alphabet base64 (no line breaks), shared by the image route and its tests.
 [[nodiscard]] std::string base64_encode_bytes(std::span<const std::uint8_t> bytes);
@@ -328,12 +347,18 @@ public:
     // `enhancer` is the family's prompt enhancer sidecar (serve/prompt_enhancer.h). Null -- or set but
     // not answering -- keeps `prompt_enhance` on its documented 503, which is why it defaults: every
     // existing caller and host test gets the text-to-image and edit admission unchanged.
+    // `vae_topology` is the artifact's own decoder geometry, which the VRAM ledger prices the decode
+    // from (see VaeTopologyProvider). It defaults for the same reason the three providers above do -- so
+    // every existing caller and host test keeps its signature -- but unlike the vision lane it is needed
+    // by EVERY image job, so a service that was given no topology refuses a job as unconfigured (503)
+    // instead of admitting one it cannot size. Nothing compiled stands in for the artifact here.
     ImageGenerationService(std::unique_ptr<ImageInterludeRunner> runner, ImageJobStore& store,
                            PromptRendererProvider prompt_renderer, PromptEmbedsProvider prompt_embeds,
                            DiTDimsProvider dit_dims, ImageJobExecutor job_executor,
                            VisionLaneDimsProvider vision_dims = {},
                            ReferencePromptRendererProvider reference_prompt_renderer = {},
-                           std::shared_ptr<PromptEnhancer> enhancer = {});
+                           std::shared_ptr<PromptEnhancer> enhancer = {},
+                           VaeTopologyProvider vae_topology = {});
 
     // False when serve started without the image pipeline: the route answers a documented 503.
     [[nodiscard]] bool is_configured() const noexcept;
@@ -386,6 +411,7 @@ private:
     PromptEmbedsProvider prompt_embeds_;
     DiTDimsProvider dit_dims_;
     VisionLaneDimsProvider vision_dims_;
+    VaeTopologyProvider vae_topology_;
     ReferencePromptRendererProvider reference_prompt_renderer_;
     ImageJobExecutor job_executor_;
     std::shared_ptr<PromptEnhancer> enhancer_;

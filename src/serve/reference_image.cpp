@@ -2,6 +2,9 @@
 
 #include "media/decode/decode.h"
 #include "media/decode/png_decode.h"
+// The plan's own charge for the vision lane: the plane produced below is what run_vision_tower is handed,
+// and it is billed for a fixed worst legal reference (see the refusal beside the aspect gate).
+#include "models/qwen_image/image_device_need.h"
 #include "serve/openai_images.h"
 
 #include <algorithm>
@@ -10,8 +13,12 @@
 #include <cstdint>
 #include <span>
 #include <stdexcept>
+#include <string>
 
 namespace infernix::serve {
+
+namespace qi = models::qwen_image;
+
 namespace {
 
 namespace md = media::decode;
@@ -349,6 +356,31 @@ ReferencePlanes prepare_reference_planes(const std::string& payload) {
                                               static_cast<double>(rgba.height) / rgba.width));
     if (target_w < 32 || target_h < 32) {
         throw std::invalid_argument("the reference image aspect ratio is too extreme");
+    }
+
+    // The sibling of that gate, at the other end of the snap. This plane is what the vision tower is
+    // later handed as a {1, target_h/16, target_w/16} patch grid, and the image VRAM ledger bills that
+    // lane for a FIXED worst legal reference plane (qi::kVisionWorstReferencePatches, derived beside the
+    // charge in models/qwen_image/image_device_need.h) because the serving layer has to price the job and
+    // yield the LLM's VRAM before anything runs. A plane above that number therefore has live device
+    // bytes no admission decision took, and run_vision_tower refuses it -- but a std::runtime_error from
+    // the model layer is not an ApiException, so handle_images never sees it and the client gets a 500.
+    // Refusing here, where the route still owns the geometry and the answer is still the serve's to write,
+    // is what makes that mismatch the documented 400 it should be; the model-layer guard stays as the
+    // fail-closed backstop for any other caller. Both sides are multiples of the 32-grid, so the division
+    // is exact and EQUALITY IS SERVED: the widest aspect the gate above admits snaps to 65536x32, which is
+    // precisely the billed worst plane and must paint, not refuse.
+    const std::uint64_t reference_patches =
+        (static_cast<std::uint64_t>(target_w) / qi::kVisionPatchSidePx) *
+        (static_cast<std::uint64_t>(target_h) / qi::kVisionPatchSidePx);
+    if (reference_patches > qi::kVisionWorstReferencePatches) {
+        throw std::invalid_argument(
+            "the reference image snaps to " + std::to_string(target_w) + "x" + std::to_string(target_h) +
+            " = " + std::to_string(reference_patches) + " vision patches, more than the " +
+            std::to_string(qi::kVisionWorstReferencePatches) + " the image VRAM ledger bills the vision "
+            "tower for; the route's own aspect gate normally keeps a reference inside that plane, so this "
+            "is the reference snap and the ledger's derivation disagreeing -- not something cropping the "
+            "picture fixes");
     }
 
     std::vector<std::uint8_t> resized;

@@ -54,9 +54,12 @@
 // The text-to-image route is deliberately NOT exercised here: test_image_pipeline_prod_cuda.cu stays
 // its certified guard, and this file only ever runs with ref_grids non-empty.
 //
-// Skips (77) without INFERNIX_TEST_ARTIFACT or INFERNIX_IMAGE_ORACLE, or when either is absent;
-// returns 2 with no CUDA device. It runs the real pipeline on the real GPU: it must not overlap a
-// live serve.
+// Skips (77) without INFERNIX_TEST_ARTIFACT or INFERNIX_IMAGE_ORACLE, or when either is absent, and
+// skips (77) BEFORE any CUDA call whenever an infernix-serve.exe process holds the card (the shared
+// serve probe, tests/models/qwen_image/serve_probe.h); returns 2 with no CUDA device. It runs the real
+// pipeline on the real GPU: it must not overlap a live serve, and its entry's name carries no "_real",
+// so the suite enforces that itself instead of relying on the "gpu;real" label and RUN_SERIAL that
+// tests/CMakeLists.txt:21-26 grants only to a "_real" name.
 
 #include "artifact/binder.h"
 #include "artifact/reader.h"
@@ -68,6 +71,7 @@
 #include "models/qwen_image/image_weights.h"
 #include "models/qwen_image/joint_layout.h"
 #include "models/qwen_image/qwen_image_oracle_ref.h"
+#include "models/qwen_image/serve_probe.h"
 
 #include <cuda_runtime.h>
 
@@ -221,6 +225,16 @@ void require_finite(const std::vector<float>& v, const std::string& what) {
 } // namespace
 
 int main() {
+    // The serve probe runs before ANYTHING else, so no device context exists yet when the suite decides
+    // to stand aside: this route holds the whole card (a 36-layer DiT resident plus the VAE and the
+    // vision tower), and ctest would record its 77 as a pass either way, so the only way a certified run
+    // beside a live serve cannot happen is for the suite to refuse it itself. The entry's name carries no
+    // "_real", so tests/CMakeLists.txt:21-26 gives it no RUN_SERIAL and no "gpu;real" label to lean on.
+    const infernix::tests::ServeProbe serve = infernix::tests::serve_state();
+    if (serve.running) {
+        std::printf("SKIP: %s\n", serve.reason);
+        return 77;
+    }
     const std::string artifact_path = env_or("INFERNIX_TEST_ARTIFACT", "");
     const std::string oracle_path   = env_or("INFERNIX_IMAGE_ORACLE", "");
     if (artifact_path.empty() || oracle_path.empty()) {
@@ -248,7 +262,9 @@ int main() {
         Binder binder(reader);
         DiTWeights dit = bind_dit(binder);
         VaeWeights vae = bind_image_vae(binder);
-        const VaeDenorm denorm = read_vae_denorm(binder);
+        // Read against the topology that binding verified: its declared z_dim says how long the pair must
+        // be, so the denormalization cannot be adopted at a length nobody declared.
+        const VaeDenorm denorm = read_vae_denorm(binder, vae.topology);
         (void)std::move(binder).finish();
         const std::size_t D = dit.dims.hidden;
         require(D == 4096, "the edit route was authored against hidden 4096, not " + std::to_string(D));
@@ -360,8 +376,10 @@ int main() {
         const std::vector<ImageShape> shapes{
             ImageShape{1, static_cast<long long>(kRefHl), static_cast<long long>(kRefWl)},
             ImageShape{1, static_cast<long long>(kTargetHl), static_cast<long long>(kTargetWl)}};
-        const JointLayout layout = build_joint_layout(std::span<const std::uint8_t>(joint_mask),
-                                                      std::span<const ImageShape>(shapes));
+        // The artifact's own rope axes (DiTWeights::rope, read_dit_rope_axes) -- the same set the route
+        // under test hands build_joint_layout, so this probe assembles the sequence the job assembles.
+        const JointLayout layout = build_joint_layout(dit.rope, std::span<const std::uint8_t>(joint_mask),
+                                                     std::span<const ImageShape>(shapes));
         require(layout.base_len == static_cast<long long>(kKept + kTargetTokens / 4),
                 "the joint layout's base length is not the prompt rows plus the target slots");
         require(layout.expanded_len == static_cast<long long>(kExpanded),

@@ -26,10 +26,12 @@
 #include "models/qwen_image/img_mask.h"
 #include "models/qwen_image/noise.h"
 #include "models/qwen_image/text_embeds.h"
+#include "scheduler_constants_fixture.h"
 
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <exception>
 #include <span>
 #include <string>
 #include <vector>
@@ -37,6 +39,19 @@
 namespace {
 
 using namespace infernix::models::qwen_image;
+
+// The schedule's constants, read once in main from the committed artifact document through the
+// production reader (scheduler_constants_fixture.h): the job this gate assembles is assembled from what
+// the shipped artifact declares, and there is no compiled schedule for a job to fall back to.
+const SchedulerConstants* g_constants = nullptr;
+
+// The DiT rope axes this gate feeds the rope module: {16, 56, 56}, the axes the shipped artifact's "dit"
+// component declares over its 128-wide head. They are an INPUT here, not a constant the gate owns -- the
+// gate's subject is that the modules AGREE with each other (rope rows == mask rows == the geometry's
+// joint length) -- and infernix_image_artifact_constants_test is what qualifies them against
+// read_dit_rope_axes, the committed document and the live artifact's own dit metadata. Nothing falls
+// back: an unread set is refused by run_image_job (src/models/qwen_image/image_pipeline.cu).
+constexpr DitRopeAxes kShippedRopeAxes{{16, 56, 56}};
 
 bool g_ok = true;
 void expect(const std::string& name, bool ok, const std::string& detail) {
@@ -56,7 +71,8 @@ void one_case(std::uint32_t h_px, std::uint32_t w_px, int text_len, std::uint32_
           "hl=" + std::to_string(g.hl) + " wl=" + std::to_string(g.wl) + " tokens=" + std::to_string(g.tokens) +
               " packed=" + std::to_string(packed_tokens));
 
-    const std::vector<float> rope = build_joint_rope(text_len, static_cast<int>(packed_h), static_cast<int>(packed_w));
+    const std::vector<float> rope =
+        build_joint_rope(kShippedRopeAxes, text_len, static_cast<int>(packed_h), static_cast<int>(packed_w));
     const std::size_t joint = static_cast<std::size_t>(text_len) + packed_tokens;
     expect("rope spans joint " + tag, rope.size() == joint * 128,
           "rows=" + std::to_string(rope.size() / 128) + " joint=" + std::to_string(joint));
@@ -73,7 +89,7 @@ void one_case(std::uint32_t h_px, std::uint32_t w_px, int text_len, std::uint32_
     }
     expect("mask text0/target1 " + tag, mask_layout, "[0]*tp + [1]*packed");
 
-    const SchedulerConfig cfg;  // model-fixed config
+    const SchedulerConstants& cfg = *g_constants;  // the artifact's own schedule constants
     ImageJob job; job.height = h_px; job.width = w_px; job.steps = steps;
     const Schedule sch = job.schedule(cfg);
     expect("schedule length tracks steps " + tag,
@@ -117,7 +133,7 @@ void gate_text_len() {
         // CHAIN: the DERIVED text_len -> rope + img_mask at 256x256 (packed 64) -> joint 75.
         const int text_len = te.max_len;
         const std::size_t packed = 64;
-        const std::vector<float> rope = build_joint_rope(text_len, 8, 8);  // hl/2, wl/2
+        const std::vector<float> rope = build_joint_rope(kShippedRopeAxes, text_len, 8, 8);  // hl/2, wl/2
         expect("derived text_len -> rope joint", rope.size() / 128 == static_cast<std::size_t>(text_len) + packed,
                "rows=" + std::to_string(rope.size() / 128) + " = text_len " + std::to_string(text_len) + " + 64");
         const std::vector<std::uint8_t> base(static_cast<std::size_t>(text_len), std::uint8_t{0});
@@ -150,6 +166,16 @@ void gate_text_len() {
 } // namespace
 
 int main() {
+    SchedulerConstants constants;
+    try {
+        constants = infernix::tests::qwen_image::scheduler_constants_from_artifact();
+    } catch (const std::exception& error) {
+        std::printf("  FAIL: the scheduler constants are not readable from the artifact (%s)\n", error.what());
+        std::printf("IMAGE_JOB_ASSEMBLY_TEST: FAIL\n");
+        return 1;
+    }
+    g_constants = &constants;
+
     gate_text_len();
     const struct { std::uint32_t h, w; int tp; std::uint32_t steps; } cases[] = {
         {512, 512, 11, 40},    // oracle geometry -> joint 267 (11 + 256)

@@ -45,6 +45,34 @@ struct Case {
     // holds both at once -- the encode that produces the conditioning runs on the yielded VRAM -- so
     // the edit route's ledger row has to predict the ViT's live set and this row has to measure it.
     bool          vit = false;
+    // Certified anchors, in MiB. A non-zero entry must reproduce exactly: the predicted need (the number
+    // the serving layer refuses on) and the measured high-water (what the pipeline really allocated).
+    //
+    // Where BOTH are set, the row is one of the four the plan certifies -- the numbers at
+    // docs/superpowers/plans/2026-11-14-image-fail-closed.md:688,781. The two sanctioned runs whose stdout
+    // survives on disk reproduce them exactly: the run recorded as
+    // build-windows/task7_logs/gpu_infernix_image_need_ledger_real_test_run.log, and the restored run of the
+    // anchor mutation recorded as ledger_mutation_restored_run.log. Earlier runs' tables were overwritten or
+    // never captured, as disclosed in the task report, so the claim stops at the two logs that are there.
+    //
+    // The first five rows pin the MEASURED side only. Their high-water is the 2026-10-23 certification
+    // recorded in .agent/STATE.md:861-862 (1845/2746/2760/2751/4007) and it still reproduces exactly on
+    // this build, so the footprint is frozen there. Their predicted side was recorded by the same older
+    // run (4570/5921/5935/5925/7812) and the current inventory computes 432-1728 MiB less for those five
+    // canvases; that number was never in the plan's certified table, so pinning it would freeze a stale
+    // prediction rather than a certified one.
+    //
+    // 1280/1536/1792 pin the MEASURED side too, and their source is different in kind: no earlier
+    // certification names them (.agent/STATE.md has no rows for those canvases, and the plan's table does
+    // not), so 5628/7609/9951 MiB are the peaks THIS suite printed on its own sanctioned runs against the
+    // shipped artifact, first recorded here. That makes them a freeze rather than a reproduction -- they
+    // cannot catch a footprint that was already wrong when they were read, only one that drifts from here
+    // -- which is why the predicted side of every row the plan does not certify is left to the two bounds
+    // below (measured must not outgrow the inventory, and the inventory must clear it by the serving
+    // layer's own 512 MiB reservation). Every row pins its measured high-water, so a zero now marks only an
+    // unpinned PREDICTED side.
+    std::uint64_t certified_predicted_mib = 0;
+    std::uint64_t certified_measured_mib  = 0;
 };
 
 void require(bool condition, const std::string& message) {
@@ -77,7 +105,10 @@ int main() {
         Binder        binder(reader);
         DiTWeights    dit = bind_dit(binder);
         VaeWeights    vae = bind_image_vae(binder);
-        const VaeDenorm denorm = read_vae_denorm(binder);
+        // The denormalization pair is read against the topology the binding just verified, so its length
+        // is checked against the artifact's own declared z_dim rather than adopted at whatever length the
+        // blob happens to carry.
+        const VaeDenorm denorm = read_vae_denorm(binder, vae.topology);
         // Bound for the edit row below: the same artifact, the same streamed-only plan. Its dims are
         // what the ledger's vision term is derived from, so the row reserves for the ViT the artifact
         // actually ships rather than for a number written into the header.
@@ -97,25 +128,38 @@ int main() {
         };
 
         const std::vector<Case> cases = {
-            {512, 0, 0, 0, "the certified route"},
-            {768, 0, 0, 0, "the chat default"},
-            {768, 0, 128, 0, "the review's case: same target plus a reference"},
-            {768, 0, 0, 24, "true CFG (a second, differently sized pass)"},
-            {1024, 0, 0, 0, "one megapixel"},
+            // The measured high-water of these five rows is the 2026-10-23 certification in
+            // .agent/STATE.md:861-862, copied verbatim. The predicted side stays unpinned there for the
+            // reason above; the floor gate (measured + 512 MiB) still bounds it from below.
+            {512, 0, 0, 0, "the certified route", false, 0, 1845},
+            {768, 0, 0, 0, "the chat default", false, 0, 2746},
+            {768, 0, 128, 0, "the review's case: same target plus a reference", false, 0, 2760},
+            {768, 0, 0, 24, "true CFG (a second, differently sized pass)", false, 0, 2751},
+            {1024, 0, 0, 0, "one megapixel", false, 0, 4007},
             // M7's own row: a reference on the 1024^2 area cap (4096 latent tokens == 4 * 1024 vision
             // tokens) whose pad rows are the whole prompt, with the ViT encode measured in the same
             // window. This is the edit route the serving layer admits on this number.
-            {768, 0, 1024, 0, "the edit route: a 1024^2 reference, the ViT lane and the joint sequence", true},
+            // The anchors are the certified row for row, with one revision that has to be stated: the
+            // reservation now bills the ViT lane for the DERIVED worst-case reference plane
+            // (kVisionWorstReferencePatches in image_device_need.h, enumerated with integer arithmetic
+            // from the serving route's own snap-to-32 target area) instead of for the plane this row
+            // happens to serve. Widening the bound raises the prediction -- from the 6010 MiB the
+            // pre-scheduler artifact was certified with to 6163 MiB -- and cannot lower it, so coverage
+            // gets strictly safer here. The measured side is untouched: this row really encodes a
+            // 1024^2 reference, so the high-water stays the certified 3634 MiB and the row still clears
+            // it by 2529 MiB.
+            {768, 0, 1024, 0, "the edit route: a 1024^2 reference, the ViT lane and the joint sequence", true,
+             6163, 3634},
             // The canvas-scaled sweep: every certified square the serving layer can be asked for, so
             // the prediction-vs-measured row exists for the exact canvases the walk and the net decide
             // on. Pure geometry (no reference, no CFG, no vision): the four canvas-scaled terms are all
             // that change across these rows, which is what makes the comparison attributable to them.
-            {1024, 1152, 0, 0, "the trained edit canvas 1024x1152"},
-            {1280, 0, 0, 0, "certified 1280"},
-            {1536, 0, 0, 0, "certified 1536"},
-            {1792, 0, 0, 0, "certified 1792"},
-            {2016, 0, 0, 0, "certified 2016"},
-            {2048, 0, 0, 0, "certified 2048"},
+            {1024, 1152, 0, 0, "the trained edit canvas 1024x1152", false, 6409, 4367},
+            {1280, 0, 0, 0, "certified 1280", false, 0, 5628},
+            {1536, 0, 0, 0, "certified 1536", false, 0, 7609},
+            {1792, 0, 0, 0, "certified 1792", false, 0, 9951},
+            {2016, 0, 0, 0, "certified 2016", false, 13548, 12295},
+            {2048, 0, 0, 0, "certified 2048", false, 13869, 12653},
         };
 
         cudaStream_t stream = nullptr;
@@ -133,7 +177,9 @@ int main() {
             inputs.height_px     = geom.height;
             inputs.width_px      = geom.width;
             inputs.init_latent   = zero_bits(static_cast<std::size_t>(geom.tokens) * dit.dims.image_in);
-            const Schedule sched = ImageJob{geom.height, geom.width, kSteps}.schedule(SchedulerConfig{});
+            // The artifact's own constants, bound with the weights above: the need this row predicts is
+            // the need of a job drawn on the schedule the artifact declares.
+            const Schedule sched = ImageJob{geom.height, geom.width, kSteps}.schedule(dit.scheduler);
             inputs.timesteps = sched.timesteps;
             inputs.sigmas    = sched.sigmas;
             if (c.ref_side != 0) {
@@ -157,17 +203,24 @@ int main() {
                 inputs.true_cfg_scale         = 3.5F;
             }
 
-            ImageDeviceNeedRequest req;
-            req.geometry        = geom;
-            req.dims            = dit.dims;
-            // The prompt's kept rows, read back from what the job is actually handed: a reference grew
-            // the prompt by its pad rows above, and the ledger must size the same sequence the job builds.
-            req.text_tokens     = static_cast<std::uint32_t>(inputs.prompt_embeds.size() /
-                                                             static_cast<std::size_t>(dit.dims.hidden));
-            req.negative_tokens = c.neg_tokens;
-            req.ref_tokens      = static_cast<std::uint32_t>(inputs.ref_latents.size() / dit.dims.image_in);
-            req.blocks_resident = kImageResidentBlocks; // same symbol the serving layer and the
-                             // pipeline's CopyLane assert; the allowance was calibrated at this value
+            // The topology is the one THIS artifact's binding produced and verified against every stored
+            // decoder weight -- the same object the job decodes with two statements below -- so the
+            // prediction this row compares against the measured peak is priced from the decoder that
+            // actually ran, not from a table this file could have kept stale.
+            ImageDeviceNeedRequest req{
+                .geometry        = geom,
+                .dims            = dit.dims,
+                // The prompt's kept rows, read back from what the job is actually handed: a reference
+                // grew the prompt by its pad rows above, and the ledger must size the same sequence the
+                // job builds.
+                .text_tokens     = static_cast<std::uint32_t>(inputs.prompt_embeds.size() /
+                                                             static_cast<std::size_t>(dit.dims.hidden)),
+                .negative_tokens = c.neg_tokens,
+                .ref_tokens      = static_cast<std::uint32_t>(inputs.ref_latents.size() / dit.dims.image_in),
+                .blocks_resident = kImageResidentBlocks, // same symbol the serving layer and the
+                             // pipeline's CopyLane assert; the calibration was measured at this value
+                .vae             = vae.topology,
+            };
             if (c.vit) {
                 // The reference's vision tokens are the prompt here: 4096 patches merge to 1024 rows,
                 // all of them <|image_pad|>, so the joint sequence is 0 text + 4096 reference + target.
@@ -206,6 +259,23 @@ int main() {
                       << " res " << need.resident_weights / mib
                       << " vision " << need.vision_peak / mib
                       << "], measured peak " << measured / mib << " MiB\n";
+            // The certified equality, enforced here rather than eyeballed in a transcript. The two
+            // bounds below cannot catch a shrinking prediction: "measured > predicted" only fails when
+            // the footprint OUTGROWS the inventory, and the reservation floor only fails when the
+            // slack drops under 512 MiB -- so a row could lose 511 MiB of prediction (an inventory term
+            // dropped from image_device_need.h, the resident calibration re-lowered) and the suite stay
+            // green. Nor is the measured side ever compared to a constant. These pins are what make the
+            // row identical to the certification instead of merely compatible with it.
+            if (c.certified_predicted_mib != 0 && predicted / mib != c.certified_predicted_mib) {
+                std::cout << "FAIL: " << c.what << " predicts " << predicted / mib
+                          << " MiB, the certified number is " << c.certified_predicted_mib << " MiB\n";
+                ++failures;
+            }
+            if (c.certified_measured_mib != 0 && measured / mib != c.certified_measured_mib) {
+                std::cout << "FAIL: " << c.what << " measured " << measured / mib
+                          << " MiB, the certified high-water is " << c.certified_measured_mib << " MiB\n";
+                ++failures;
+            }
             if (measured > predicted) {
                 std::cout << "FAIL: the measured peak exceeds the predicted need by "
                           << (measured - predicted) / mib << " MiB\n";
@@ -213,9 +283,10 @@ int main() {
             }
             // Reservation floor. The serving layer keeps 512 MiB between the predicted need and the
             // device it yields (kInterludeMarginBytes), so a row that clears the real peak by less than
-            // that means kImageWeightResidentBytes was cut below the footprint plus its reservation. This
-            // is the pair to "predicted >= measured": it catches the next change that lowers the constant
-            // too far, exactly the mistake the 3072 MiB tightening must not be re-lowered into.
+            // that means the topology's resident calibration was cut below the footprint plus its
+            // reservation. This is the pair to "predicted >= measured": it catches the next change that
+            // lowers the constant too far, exactly the mistake the 3072 MiB tightening must not be
+            // re-lowered into.
             const std::uint64_t kFloor = 512ULL * mib;
             if (predicted >= measured && predicted < measured + kFloor) {
                 std::cout << "FAIL: " << c.what << " clears the measured peak by only "
@@ -231,8 +302,9 @@ int main() {
         }
         cudaStreamDestroy(stream);
         if (failures != 0) {
-            std::cout << failures << " case(s) failed; lower kImageWeightResidentBytes or widen the "
-                         "inventory in image_device_need.h\n";
+            std::cout << failures << " case(s) failed; lower the resident calibration "
+                         "(kQwenImageWeightResidentBytes, which the binding stamps onto the topology) or "
+                         "widen the inventory in image_device_need.h\n";
             return 1;
         }
         std::cout << "the computed need covers every measured peak\n";

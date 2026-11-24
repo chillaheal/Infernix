@@ -376,31 +376,42 @@ std::uint64_t host_block_cache_bytes(const artifact::Reader& reader, const DiTWe
     return one_block * dit.blocks.size();
 }
 
+// The rope width this build's Op rotates: ops::rope_c64 fixes the DiT head at 128 channels -- 64
+// interleaved (cos, sin) pairs -- and dit_block.cpp builds every head, q/k and rope view at exactly that
+// width (include/infernix/ops/rope_c64.h, src/models/qwen_image/dit_block.cpp). RUNTIME IMPLEMENTATION
+// FACT, not an artifact declaration: the artifact's own numbers are the axes, which read_dit_rope_axes
+// reads and the emitter sizes every row from. The gate below refuses an artifact whose axes do not
+// describe the head this kernel can rotate, instead of uploading a table the Op would misread.
+constexpr std::size_t kRopeC64HeadRowFloats = 128;
+
 GeneratedImage run_image_job(artifact::Reader& reader, const DiTWeights& dit, const VaeWeights& vae,
                              const ImageJobInputs& inputs, cudaStream_t stream,
                              ImageJobProgressView* progress,
                              std::function<void(const std::string&)> log_line) {
-    // The stage telemetry goes through the caller's sink (the serving route's logger, serialized
-    // against the console's stats panel); with no sink the certified route prints nothing.
-    // The ledger is the module's own account of what it holds; the driver free and the stream-ordered
-    // pool's reserved bytes are what the NEXT allocator (the LLM's restore, plain cudaMalloc) can
-    // actually get. Reporting all three per stage is what separates a leak from a release that is still
-    // queued on the image stream: live 0 with a large pool reserved means the latter.
-    const auto log_mem = [&](const char* stage) {
-        if (!log_line) { return; }
-        std::size_t driver_free = 0, driver_total = 0;
-        (void)cudaMemGetInfo(&driver_free, &driver_total);
-        std::size_t pool_reserved = 0;
-        cudaMemPool_t pool = nullptr;
-        if (cudaDeviceGetDefaultMemPool(&pool, 0) == cudaSuccess && pool != nullptr) {
-            (void)cudaMemPoolGetAttribute(pool, cudaMemPoolAttrReservedMemCurrent, &pool_reserved);
-        }
-        log_line("image job: " + std::string(stage) + " | ledger live " +
-                 std::to_string(g_image_device_live.load() / (1024 * 1024)) + " MiB peak " +
-                 std::to_string(g_image_device_peak.load() / (1024 * 1024)) +
-                 " MiB | driver free " + std::to_string(driver_free / (1024 * 1024)) +
-                 " MiB pool reserved " + std::to_string(pool_reserved / (1024 * 1024)) + " MiB");
-    };
+    // The schedule gate, first statement of the job: the six constants are the artifact's own and only
+    // bind_dit produces them, so a set that was never read is the zero-initialised one -- an artifact
+    // that said nothing about the denoise scheme. Nothing may be drawn with such a schedule and there is
+    // no compiled value to fall back to, so this refuses before the ledger's first query, before any
+    // quiesce or yield, and before any CUDA allocation or partially initialised model state.
+    if (dit.scheduler.base_image_seq_len <= 0 || dit.scheduler.max_image_seq_len <= dit.scheduler.base_image_seq_len ||
+        dit.scheduler.num_train_timesteps <= 0 || !(dit.scheduler.shift_terminal >= 0.0 && dit.scheduler.shift_terminal < 1.0) ||
+        !std::isfinite(dit.scheduler.base_shift) || !std::isfinite(dit.scheduler.max_shift)) {
+        throw std::runtime_error(
+            "image job: the artifact's scheduler constants were never read, so this build would draw the "
+            "job with a denoise schedule the artifact did not declare");
+    }
+    // The rope gate, same statement and same reason: the three axes are the artifact's own and only
+    // bind_dit produces them, so a zero axis is an artifact that said nothing about the rotary scheme,
+    // and a set that does not add up to this build's head (kRopeC64HeadRowFloats above) is an
+    // architecture ops::rope_c64 cannot rotate. Refused before the first ledger query, before any
+    // quiesce or yield, and before any CUDA allocation -- no joint sequence is assembled from guessed
+    // positions.
+    if (dit.rope.axes[0] == 0 || dit.rope.axes[1] == 0 || dit.rope.axes[2] == 0 ||
+        rope_row_floats(dit.rope) != kRopeC64HeadRowFloats) {
+        throw std::runtime_error(
+            "image job: the artifact's DiT rope axes were never read, or they describe a head this "
+            "build's rope Op cannot rotate");
+    }
     // Bundle B's attribution, measured only when a sink exists. In fas 2 the block copies are
     // asynchronous on a copy stream, so a host clock around the enqueue is meaningless; the transfer
     // time is measured on the device (one block's copy bracketed by events) and extrapolated over the
@@ -413,25 +424,67 @@ GeneratedImage run_image_job(artifact::Reader& reader, const DiTWeights& dit, co
         }
     };
     // A stalled throw unwinds the same RAII buffers as any other failure: the job's device
-    // memory is freed before the interlude restores the LLM's pools.
+    // memory is freed before the interlude restores the LLM's pools. The scope takes the region's
+    // device FROM THE STREAM, binds this thread to it, and borrows that device's default pool for the
+    // region -- lowering its release threshold and writing the found value back on close -- so the lane
+    // never keeps a global setting it only needed while it held the stream. It lives here, before any
+    // Buf, because the Bufs destroyed at the end of this scope must retire while the threshold is still
+    // 0 or their bytes stay in the pool.
     ImageStreamScope stream_scope(stream);
-    cudaMemPool_t pool = nullptr;
-    if (cudaDeviceGetDefaultMemPool(&pool, 0) == cudaSuccess && pool != nullptr) {
-        // Release retired buffers to the driver once their stream passes them: the arena and the
-        // LLM's restore allocate with plain cudaMalloc and cannot take bytes the pool keeps.
-        std::uint64_t threshold = 0;
-        cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold, static_cast<void*>(&threshold));
-    }
+
+    // The stage telemetry goes through the caller's sink (the serving route's logger, serialized
+    // against the console's stats panel); with no sink the certified route prints nothing.
+    // The ledger is the module's own account of what it holds; the driver free and the stream-ordered
+    // pool's reserved bytes are what the NEXT allocator (the LLM's restore, plain cudaMalloc) can
+    // actually get. Reporting all three per stage is what separates a leak from a release that is still
+    // queued on the image stream: live 0 with a large pool reserved means the latter. The driver and
+    // pool figures are the REGION's device's: cudaMemGetInfo answers for the calling thread's current
+    // device (which the scope bound), and the pool is asked for by number rather than assumed.
+    const auto log_mem = [&](const char* stage) {
+        if (!log_line) { return; }
+        std::size_t driver_free = 0, driver_total = 0;
+        (void)cudaMemGetInfo(&driver_free, &driver_total);
+        std::size_t pool_reserved = 0;
+        cudaMemPool_t pool = nullptr;
+        if (cudaDeviceGetDefaultMemPool(&pool, stream_scope.device()) == cudaSuccess && pool != nullptr) {
+            (void)cudaMemPoolGetAttribute(pool, cudaMemPoolAttrReservedMemCurrent, &pool_reserved);
+        }
+        log_line("image job: " + std::string(stage) + " | ledger live " +
+                 std::to_string(g_image_device_live.load() / (1024 * 1024)) + " MiB peak " +
+                 std::to_string(g_image_device_peak.load() / (1024 * 1024)) +
+                 " MiB | driver free " + std::to_string(driver_free / (1024 * 1024)) +
+                 " MiB pool reserved " + std::to_string(pool_reserved / (1024 * 1024)) + " MiB");
+    };
     const std::size_t D     = dit.dims.hidden;
     const std::size_t heads = dit.dims.heads;
     const std::size_t mlp0  = dit.dims.intermediate;
     const std::size_t Cin   = dit.dims.image_in;
     const float eps         = dit.dims.eps;
-    if (D == 0 || heads == 0 || mlp0 == 0 || Cin == 0 || dit.blocks.empty() || inputs.height_px % 16 ||
-        inputs.width_px % 16 || inputs.height_px == 0 || inputs.width_px == 0) {
+    // The decoder geometry belongs to the artifact: the channels every stage below runs at, the latent
+    // plane it reads, the pixels per latent row it expands to and the resident bytes the ledger priced
+    // all come from this one object -- read by read_vae_topology from the artifact's own "vae" component
+    // config and verified against every bound decoder weight by check_vae_topology (image_weights.cpp),
+    // which is what makes this graph and that ledger unable to disagree about a stage. What the check
+    // here adds is the seam the binding cannot see: the DiT's latent plane and the VAE's have to be the
+    // same plane (they were bound from the same artifact or they were not), and a topology nobody read
+    // -- every field zero -- would otherwise divide the geometry by nothing and convolve zero-wide
+    // tensors.
+    const VaeTopology& topo = vae.topology;
+    if (topo.latent_channels == 0 || topo.spatial_downscale == 0 || topo.denorm_elements == 0 ||
+        topo.denorm_elements != topo.latent_channels || topo.weight_resident_bytes == 0 ||
+        topo.mid_stage.channels_out == 0 || topo.up_stages.size() != kQwenImageVaeUpBlocks ||
+        Cin != static_cast<std::size_t>(topo.latent_channels) ||
+        topo.final_channels - topo.up_stages.back().channels_out != kImageOutputChannels) {
+        throw std::runtime_error("image job: the bound VAE topology does not describe the DiT's latent plane "
+                                 "or the RGBA plane this route hands back");
+    }
+    if (D == 0 || heads == 0 || mlp0 == 0 || Cin == 0 || dit.blocks.empty() ||
+        inputs.height_px % topo.spatial_downscale || inputs.width_px % topo.spatial_downscale ||
+        inputs.height_px == 0 || inputs.width_px == 0) {
         throw std::runtime_error("image job: dims or job size are unusable");
     }
-    const std::size_t Hl = inputs.height_px / 16, Wl = inputs.width_px / 16;
+    const std::size_t Hl = inputs.height_px / topo.spatial_downscale,
+                      Wl = inputs.width_px / topo.spatial_downscale;
     const std::size_t img_tokens = Hl * Wl;
     const std::size_t tp = D == 0 ? 0 : inputs.prompt_embeds.size() / D;
     std::size_t ref_tokens = 0; // #75: the reference/edit-image block (0 = plain text-to-image)
@@ -501,7 +554,7 @@ GeneratedImage run_image_job(artifact::Reader& reader, const DiTWeights& dit, co
         edit_route = true;
         const std::vector<ImageShape> shapes    = joint_shapes();
         const std::vector<std::uint8_t> mask    = joint_mask(inputs.prompt_image_pad_mask, tp, "prompt");
-        layout   = build_joint_layout(mask, shapes);
+        layout   = build_joint_layout(dit.rope, mask, shapes);
         neg_edit = use_cfg;
         // The negative pass is the same references with its OWN prompt rows, so it carries its own mask:
         // a CFG run without one cannot be assembled (its image slots and its text rows are both unknown),
@@ -509,7 +562,7 @@ GeneratedImage run_image_job(artifact::Reader& reader, const DiTWeights& dit, co
         if (neg_edit) {
             const std::vector<std::uint8_t> mask_neg =
                 joint_mask(inputs.negative_prompt_image_pad_mask, tp_neg, "negative prompt");
-            layout_neg = build_joint_layout(mask_neg, shapes);
+            layout_neg = build_joint_layout(dit.rope, mask_neg, shapes);
         }
         // What the job already summed from its own inputs and what the layout derived from the mask
         // have to be the same numbers: they disagree only when the reference plane and the prompt were
@@ -610,26 +663,30 @@ GeneratedImage run_image_job(artifact::Reader& reader, const DiTWeights& dit, co
     std::vector<std::pair<int, int>> ref_grids_i;
     for (const auto& g : inputs.ref_grids) ref_grids_i.emplace_back(static_cast<int>(g.first), static_cast<int>(g.second));
     // The joint rope table. The text-to-image route asks the host rope module for it; the edit route
-    // already holds the [expanded_len,64,2] (cos,sin)-interleaved table that build_joint_layout walked
-    // with rope.{h,cpp}'s own emitter -- the very layout ops::rope_c64 uploads -- so it hands that
-    // straight over and adds no rope walk of its own.
+    // already holds the [expanded_len, rope_row/2, 2] (cos,sin)-interleaved table that build_joint_layout
+    // walked with rope.{h,cpp}'s own emitter -- the very layout ops::rope_c64 uploads -- so it hands that
+    // straight over and adds no rope walk of its own. Both routes get their rows from the SAME source:
+    // the artifact's own DiTWeights::rope, which the gate at the top of this job already proved was read
+    // and is exactly as wide as this build's Op rotates, so this module names no rope width of its own.
+    const std::size_t rope_row = rope_row_floats(dit.rope);
     if (edit_route) {
-        if (layout.rope.size() != static_cast<std::size_t>(layout.expanded_len) * 64 * 2) {
+        if (layout.rope.size() != static_cast<std::size_t>(layout.expanded_len) * rope_row) {
             throw std::runtime_error("image job: edit rope table size differs from the expanded sequence");
         }
         const auto bits = bits_of(layout.rope);
         drot.alloc(bits.size() * 2);
         h2d(drot.d, bits.data(), bits.size() * 2);
     } else {
-        const std::vector<float> rot = build_joint_rope_blocks(tp_i, ref_grids_i, static_cast<int>(Hl), static_cast<int>(Wl));
-        if (rot.size() != S * 64 * 2) { throw std::runtime_error("image job: rope table size differs from S"); }
+        const std::vector<float> rot =
+            build_joint_rope_blocks(dit.rope, tp_i, ref_grids_i, static_cast<int>(Hl), static_cast<int>(Wl));
+        if (rot.size() != S * rope_row) { throw std::runtime_error("image job: rope table size differs from S"); }
         const auto bits = bits_of(rot);
         drot.alloc(bits.size() * 2);
         h2d(drot.d, bits.data(), bits.size() * 2);
     }
     Buf drot_neg;
     if (neg_edit) {
-        if (layout_neg.rope.size() != static_cast<std::size_t>(layout_neg.expanded_len) * 64 * 2) {
+        if (layout_neg.rope.size() != static_cast<std::size_t>(layout_neg.expanded_len) * rope_row) {
             throw std::runtime_error("image job: negative edit rope table size differs from the sequence");
         }
         const auto bits = bits_of(layout_neg.rope);
@@ -637,9 +694,9 @@ GeneratedImage run_image_job(artifact::Reader& reader, const DiTWeights& dit, co
         h2d(drot_neg.d, bits.data(), bits.size() * 2);
     } else if (use_cfg) {
         const std::vector<float> rot_neg =
-            build_joint_rope_blocks(static_cast<int>(tp_neg), ref_grids_i, static_cast<int>(Hl),
+            build_joint_rope_blocks(dit.rope, static_cast<int>(tp_neg), ref_grids_i, static_cast<int>(Hl),
                                     static_cast<int>(Wl));
-        if (rot_neg.size() != S_neg * 64 * 2) {
+        if (rot_neg.size() != S_neg * rope_row) {
             throw std::runtime_error("image job: negative rope table size differs from the sequence");
         }
         const auto bits = bits_of(rot_neg);
@@ -1091,7 +1148,9 @@ GeneratedImage run_image_job(artifact::Reader& reader, const DiTWeights& dit, co
         static int s_async_engine = -1;
         if (s_async_engine < 0) {
             cudaDeviceProp prop{};
-            s_async_engine = (cudaGetDeviceProperties(&prop, 0) == cudaSuccess) ? prop.asyncEngineCount : 0;
+            s_async_engine = (cudaGetDeviceProperties(&prop, stream_scope.device()) == cudaSuccess)
+                                 ? prop.asyncEngineCount
+                                 : 0;
         }
         char loopb[32], copyb[32];
         std::snprintf(loopb, sizeof(loopb), "%.0f", loop_ms);
@@ -1132,16 +1191,30 @@ GeneratedImage run_image_job(artifact::Reader& reader, const DiTWeights& dit, co
     // by encode_reference_image, #75).
     VaeGraph vg{reader, vae, stream};
 
-    // run the decode: [Cin,Hl,Wl] -> post_quant -> conv_in -> mid -> 5 up -> norm_out -> conv_out.
-    const struct UpCfg { int cin, cout; bool temporal, up; } cfg[5] = {
-        {1152, 1152, true, true}, {1152, 1152, true, true}, {1152, 576, true, true},
-        {576, 288, false, true}, {288, 144, false, false},
-    };
-    int Hh = static_cast<int>(Hl), Ww = static_cast<int>(Wl);
+    // run the decode: [Cin,Hl,Wl] -> post_quant -> conv_in -> mid -> the artifact's up chain -> norm_out ->
+    // conv_out.
+    //
+    // Every channel width below is a field of the topology the binding read from the artifact's own "vae"
+    // component document and verified against the bound weights (check_vae_topology, image_weights.cpp) --
+    // the same object the VRAM ledger charged (image_device_need.h), so a stage's width can no longer be
+    // 1152 here and something else there, and a VAE of another geometry decodes at the widths its own
+    // checkpoint declares. The 1152-channel deepest level, its halving to 144 and the 4-channel conv_out
+    // were the literals this replaced; they are the shipped artifact's declaration, read through
+    // read_vae_topology (tests/convert/fixtures/qwen_image_vae_config.json carries the same document the
+    // live artifact packs, which is what the host gate checks). What stays code-owned is what THIS build
+    // runs and the artifact is only allowed to CONFIRM: the per-block resnet count, the single mid-block
+    // attention, the doubling pattern, and dupup3d's shortcut factor (kQwenImageVaeUpBlockTemporal, whose
+    // encoder-side claim the reader verified against the artifact's "temperal_downsample").
+    const int mid_channels = static_cast<int>(topo.mid_stage.channels_out);
+    const int final_in     = static_cast<int>(topo.up_stages.back().channels_out);
+    const int final_out    = static_cast<int>(topo.final_channels) - final_in;
+    const int Hli          = static_cast<int>(Hl), Wli = static_cast<int>(Wl);
+    int Hh = Hli, Ww = Wli;
     void* vx = d_vae.d; // [Cin,Hl,Wl] channel-major
     {
         // post_quant_conv is a linear on the token-major view (the qualified bridge: transpose to
-        // [P,C], linear, transpose back).
+        // [P,C], linear, transpose back). Cin is the DiT's latent plane, which the guard above proved is
+        // the very plane the artifact's z_dim says post_quant_conv takes.
         void* xt = vg.alloc(Cin * (Hl * Wl) * 2);
         vg.xT(vx, xt, static_cast<int>(Cin), static_cast<int>(Hl * Wl));
         d_vae.retire(stream);
@@ -1155,34 +1228,46 @@ GeneratedImage run_image_job(artifact::Reader& reader, const DiTWeights& dit, co
         vg.xT(x1t, x1, static_cast<int>(Hl * Wl), static_cast<int>(Cin));
         vg.retire(x1t);
         vx = x1;
-        void* x2 = vg.alloc(static_cast<std::size_t>(1152) * Hl * Wl * 2);
-        Tensor x2_v = view(x2, 1152, static_cast<int>(Hl), static_cast<int>(Wl));
-        ops::conv2d(view(x1, static_cast<int>(Cin), static_cast<int>(Hl), static_cast<int>(Wl)),
-                    vg.d3("vae/decoder.conv_in.weight", 1152, static_cast<int>(Cin), 3, 3),
-                    vg.d3("vae/decoder.conv_in.bias", 1152, 1, 1, 1), nullptr, x2_v, stream);
+        void* x2 = vg.alloc(static_cast<std::size_t>(mid_channels) * Hl * Wl * 2);
+        Tensor x2_v = view(x2, mid_channels, Hli, Wli);
+        ops::conv2d(view(x1, static_cast<int>(Cin), Hli, Wli),
+                    vg.d3("vae/decoder.conv_in.weight", mid_channels, static_cast<int>(Cin), 3, 3),
+                    vg.d3("vae/decoder.conv_in.bias", mid_channels, 1, 1, 1), nullptr, x2_v, stream);
         vg.retire(x1);
         vx = x2;
-        vx = vg.dresnet(vx, 1152, 1152, static_cast<int>(Hl), static_cast<int>(Wl), "vae/decoder.mid_block.resnets.0.", false, true);
-        vx = vg.att(vx, 1152, "vae/decoder.mid_block.attentions.0.", static_cast<int>(Hl), static_cast<int>(Wl));
-        vx = vg.dresnet(vx, 1152, 1152, static_cast<int>(Hl), static_cast<int>(Wl), "vae/decoder.mid_block.resnets.1.", false, true);
-        for (int b = 0; b < 5; ++b) {
-            const std::string pre = "vae/decoder.up_blocks." + std::to_string(b) + ".";
-            vx = vg.dup_up(vx, cfg[b].cin, cfg[b].cout, Hh, Ww, cfg[b].temporal, cfg[b].up, pre);
-            if (cfg[b].up) { Hh *= 2; Ww *= 2; }
+        // The mid block: the route's one spatial attention, between the resnets, at the deepest level's
+        // width -- the number of resnets is the chain fact the reader verified the artifact's
+        // "num_res_blocks" against.
+        vx = vg.dresnet(vx, mid_channels, mid_channels, Hli, Wli, "vae/decoder.mid_block.resnets.0.", false,
+                        true);
+        vx = vg.att(vx, mid_channels, "vae/decoder.mid_block.attentions.0.", Hli, Wli);
+        for (std::uint32_t r = 1; r < kQwenImageVaeMidBlockResnets; ++r) {
+            vx = vg.dresnet(vx, mid_channels, mid_channels, Hli, Wli,
+                            "vae/decoder.mid_block.resnets." + std::to_string(r) + ".", false, true);
         }
-        void* n = vg.drms(vx, 144, Hh * Ww, "vae/decoder.norm_out.gamma");
+        for (std::size_t b = 0; b < topo.up_stages.size(); ++b) {
+            const VaeStage& stage = topo.up_stages[b];
+            const std::string pre = "vae/decoder.up_blocks." + std::to_string(b) + ".";
+            vx = vg.dup_up(vx, static_cast<int>(stage.channels_in), static_cast<int>(stage.channels_out), Hh,
+                           Ww, kQwenImageVaeUpBlockTemporal[b], stage.doubles_side, pre);
+            if (stage.doubles_side) { Hh *= 2; Ww *= 2; }
+        }
+        // norm_out normalizes and conv_out convolves at the shallowest level's width, writing the RGBA the
+        // route hands back: both are the topology's, and the graph charges the same planes the ledger
+        // enumerated for them.
+        void* n = vg.drms(vx, final_in, Hh * Ww, "vae/decoder.norm_out.gamma");
         vg.retire(vx);
-        Tensor n_flat = view(n, 144, Hh * Ww);
+        Tensor n_flat = view(n, final_in, Hh * Ww);
         ops::silu(n_flat, stream);
-        void* fin = vg.alloc(4 * static_cast<std::size_t>(Hh) * Ww * 2);
-        Tensor fin_v = view(fin, 4, Hh, Ww);
-        ops::conv2d(view(n, 144, Hh, Ww), vg.d3("vae/decoder.conv_out.weight", 4, 144, 3, 3),
-                    vg.d3("vae/decoder.conv_out.bias", 4, 1, 1, 1), nullptr, fin_v, stream);
+        void* fin = vg.alloc(static_cast<std::size_t>(final_out) * static_cast<std::size_t>(Hh) * Ww * 2);
+        Tensor fin_v = view(fin, final_out, Hh, Ww);
+        ops::conv2d(view(n, final_in, Hh, Ww), vg.d3("vae/decoder.conv_out.weight", final_out, final_in, 3, 3),
+                    vg.d3("vae/decoder.conv_out.bias", final_out, 1, 1, 1), nullptr, fin_v, stream);
         vg.retire(n);
         cuda_ok(cudaStreamSynchronize(stream), "VAE decode did not complete");
         log_mem("VAE decode done");
         step(progress_units);
-        const std::size_t fout = 4 * static_cast<std::size_t>(Hh) * Ww;
+        const std::size_t fout = static_cast<std::size_t>(final_out) * static_cast<std::size_t>(Hh) * Ww;
         std::vector<std::uint16_t> fin_bits(fout);
         cuda_ok(cudaMemcpy(fin_bits.data(), fin, fout * 2, cudaMemcpyDeviceToHost), "image D2H");
         vg.retire(fin);
@@ -1208,10 +1293,30 @@ EncodedReference encode_reference_image(artifact::Reader& reader, const VaeWeigh
                                         const ReferenceEncodeInputs& in, cudaStream_t stream) {
     ImageStreamScope stream_scope(stream);
     const std::uint32_t H = in.height_px, W = in.width_px;
-    if (H == 0 || W == 0 || H % 16 || W % 16 || in.pixels.size() != 4ULL * H * W ||
-        in.latents_mean.size() != 64 || in.latents_std.size() != 64) {
-        throw std::runtime_error("reference encode: image size must be a positive multiple of 16 "
-                                 "with [4,H,W] pixels and 64-wide latent stats");
+    // The same artifact-owned geometry the decode runs from, and the same reason it is checked: this
+    // route samples the first `latent_channels` of quant_conv's [mean | logvar] pair and normalizes each
+    // plane by the caller's statistics, so the plane width, the statistics pair and the pixels per latent
+    // row all have to be what the bound artifact declares -- and the pair the route allocates has to be
+    // twice the plane it samples, or the slice reads past the tensor. What stays the route's own literal
+    // is the encoder's per-block channel list (96/192/384/768) and the quant_conv/conv_out width it
+    // writes: the published VaeTopology describes the DECODER, which is what the ledger and the decode
+    // graph share, and the encoder's geometry is not a claim the image route adopts (disclosed). That
+    // literal lives where it is bound, in image_weights.cpp's bind_image_vae under the marker
+    // "RETAINED COMPILED LITERAL", which says the same thing at the other end of this route.
+    const VaeTopology& topo = vae.topology;
+    constexpr std::size_t kEncoderLatentRows = 128; // [mean | logvar]: twice the plane this route samples
+    if (topo.latent_channels == 0 || topo.spatial_downscale == 0 || topo.denorm_elements == 0 ||
+        topo.denorm_elements != topo.latent_channels || topo.weight_resident_bytes == 0 ||
+        static_cast<std::size_t>(topo.latent_channels) * 2ULL != kEncoderLatentRows) {
+        throw std::runtime_error("reference encode: the bound VAE topology does not describe the latent "
+                                 "plane this route samples");
+    }
+    if (H == 0 || W == 0 || H % topo.spatial_downscale || W % topo.spatial_downscale ||
+        in.pixels.size() != static_cast<std::size_t>(kImageOutputChannels) * H * W ||
+        in.latents_mean.size() != topo.denorm_elements || in.latents_std.size() != topo.denorm_elements) {
+        throw std::runtime_error("reference encode: image size must be a positive multiple of the VAE's "
+                                 "spatial downscale, with [4,H,W] pixels and one latent statistics pair per "
+                                 "declared latent channel");
     }
     int Hs = static_cast<int>(H), Ws = static_cast<int>(W);
     VaeGraph vg{reader, vae, stream};
@@ -1333,14 +1438,17 @@ EncodedReference encode_reference_image(artifact::Reader& reader, const VaeWeigh
     EncodedReference out;
     out.height_lat = static_cast<std::uint32_t>(Hs);
     out.width_lat  = static_cast<std::uint32_t>(Ws);
-    out.latents.resize(static_cast<std::size_t>(P) * 64);
-    // mode sample = first 64 channels; normalize in the reference's BF16 operation order:
-    // bf16(x - mean) then bf16(that / std), x already the represented BF16 value.
+    // mode sample = the first `latent_channels` of the [mean | logvar] pair -- the artifact's own plane
+    // width, which the guard above proved is exactly half of what quant_conv writes -- normalized in the
+    // reference's BF16 operation order: bf16(x - mean) then bf16(that / std), x already the represented
+    // BF16 value. The statistics pair is the caller's, already length-checked against denorm_elements.
+    const int latent_planes = static_cast<int>(topo.latent_channels);
+    out.latents.resize(static_cast<std::size_t>(P) * latent_planes);
     for (int t = 0; t < P; ++t) {
-        for (int c = 0; c < 64; ++c) {
-            const std::uint16_t raw = qbits[static_cast<std::size_t>(t) * 128 + c];
+        for (int c = 0; c < latent_planes; ++c) {
+            const std::uint16_t raw = qbits[static_cast<std::size_t>(t) * kEncoderLatentRows + c];
             const float d = from_bf16(to_bf16(from_bf16(raw) - in.latents_mean[c]));
-            out.latents[static_cast<std::size_t>(t) * 64 + c] = to_bf16(d / in.latents_std[c]);
+            out.latents[static_cast<std::size_t>(t) * latent_planes + c] = to_bf16(d / in.latents_std[c]);
         }
     }
     if (stage_stats) {

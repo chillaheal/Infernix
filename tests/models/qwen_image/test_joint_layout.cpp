@@ -4,10 +4,11 @@
 // transformer_qwenimage21.py's forward (repeats, x4 expansion, img_in scatter rows, target_token_mask,
 // image block ids, rope walk):
 //   (A) TEXT-ONLY EQUALITY: the mask [0]*tp + [1]*(H*W/4) with one img_shapes entry must produce the
-//       rope table build_joint_rope(tp,H,W) BIT-FOR-BIT (rel Frobenius 0, exact ==) across the
-//       geometries the certified rope test uses, plus the structural fields ([text][target], scatter
-//       rows 0..H*W-1, target mask on the target only). The interleaved route must not move the
-//       certified text-to-image assembly.
+//       rope table build_joint_rope(axes,tp,H,W) BIT-FOR-BIT (rel Frobenius 0, exact ==) across the
+//       geometries the certified rope test uses -- both calls handed the SAME artifact axes (kShippedAxes
+//       below; infernix_image_artifact_constants_test is what qualifies what the artifact declares) --
+//       plus the structural fields ([text][target], scatter rows 0..H*W-1, target mask on the target
+//       only). The interleaved route must not move the certified text-to-image assembly.
 //   (B) PORTRAIT ROW: the M1 geometry, interleaved -- 30 text, a 4056-token reference block (1014
 //       vision slots), 12 trailer text, a 4096-token target. Expanded length 30+4056+12+4096; block ids
 //       -1/0/1; scatter rows text -1, ref 0..4055, target 4056..8151; the rope frame advances by
@@ -41,6 +42,16 @@ using infernix::models::qwen_image::build_joint_rope;
 using infernix::models::qwen_image::ImageShape;
 using infernix::models::qwen_image::JointLayout;
 
+// The DiT rope axes the layout and the reference builder are both handed: the artifact's own
+// "dit" component declaration (DiTWeights::rope, produced by read_dit_rope_axes in
+// artifact_constants.{h,cpp}). This guard's job is the index arithmetic, so it passes the shipped
+// architecture and expects its numbers -- the row width below is written from the axes by hand, not
+// taken from the module under test. What the artifact really declares, and every refusal of a document
+// that declares something else, is qualified by infernix_image_artifact_constants_test.
+constexpr std::uint32_t kFrameAxis = 16, kHeightAxis = 56, kWidthAxis = 56;
+const infernix::models::qwen_image::DitRopeAxes kShippedAxes{{kFrameAxis, kHeightAxis, kWidthAxis}};
+constexpr std::size_t kRowFloats = kFrameAxis + kHeightAxis + kWidthAxis;  // 128 floats = 64 (cos, sin) pairs
+
 bool g_ok = true;
 void check(const std::string& name, bool ok, const std::string& detail) {
     std::printf("  %-34s %s  %s\n", name.c_str(), ok ? "OK" : "FAIL", detail.c_str());
@@ -62,7 +73,7 @@ std::vector<std::uint8_t> mask_of(std::vector<long long> runs) {
 // is verified by comparing its first (cos,sin) pair against (cos v, sin v). Global cols: frame 0..7,
 // height 8..35, width 36..63.
 bool axis_value_is(const std::vector<float>& rope, long long row, int axis_col, long long v) {
-    const float* r = rope.data() + static_cast<std::size_t>(row) * 128 + axis_col * 2;
+    const float* r = rope.data() + static_cast<std::size_t>(row) * kRowFloats + axis_col * 2;
     const double a = static_cast<double>(v);
     return std::fabs(r[0] - std::cos(a)) < 1e-6 && std::fabs(r[1] - std::sin(a)) < 1e-6;
 }
@@ -83,8 +94,8 @@ void gate_text_only() {
         const long long tp = g[0], H = g[1], W = g[2];
         const std::vector<std::uint8_t> m = mask_of({tp, H * W / 4});
         const std::vector<ImageShape> shapes{ImageShape{1, H, W}};
-        const JointLayout L = build_joint_layout(m, shapes);
-        const std::vector<float> want = build_joint_rope(static_cast<int>(tp), static_cast<int>(H),
+        const JointLayout L = build_joint_layout(kShippedAxes, m, shapes);
+        const std::vector<float> want = build_joint_rope(kShippedAxes, static_cast<int>(tp), static_cast<int>(H),
                                                          static_cast<int>(W));
         if (L.rope != want) {
             rope_exact = false;
@@ -93,7 +104,7 @@ void gate_text_only() {
         }
         const long long S = tp + H * W;
         if (L.expanded_len != S || L.text_tokens != tp || L.ref_tokens != 0 || L.target_tokens != H * W ||
-            L.base_len != tp + H * W / 4 || L.rope.size() != static_cast<std::size_t>(S) * 128 ||
+            L.base_len != tp + H * W / 4 || L.rope.size() != static_cast<std::size_t>(S) * kRowFloats ||
             static_cast<long long>(L.repeats.size()) != L.base_len ||
             static_cast<long long>(L.scatter_row.size()) != S) {
             fields_ok = false;
@@ -125,7 +136,7 @@ void gate_portrait() {
     const std::vector<std::uint8_t> m = mask_of({prefix, ref_vision, trailer, target / 4});
     const ImageShape ref{1, 52, 78}, tgt{1, 64, 64};
     const std::vector<ImageShape> shapes{ref, tgt};
-    const JointLayout L = build_joint_layout(m, shapes);
+    const JointLayout L = build_joint_layout(kShippedAxes, m, shapes);
 
     const long long S = prefix + ref_tokens + trailer + target;
     check("portrait expanded len", L.expanded_len == S && L.base_len == prefix + ref_vision + trailer + target / 4,
@@ -215,7 +226,7 @@ void gate_adjacent_images() {
     const std::vector<std::uint8_t> m = mask_of({5, 7});
     const ImageShape a{1, 2, 2}, b{1, 4, 2}, t{1, 4, 4};
     const std::vector<ImageShape> shapes{a, b, t};
-    const JointLayout L = build_joint_layout(m, shapes);
+    const JointLayout L = build_joint_layout(kShippedAxes, m, shapes);
     check("adjacent expanded len", L.expanded_len == 5 + 4 + 8 + 16 && L.ref_tokens == 12 &&
                                        L.target_tokens == 16,
           "5+4+8+16 = 33 expanded, ref 12 = 4+8");
@@ -256,20 +267,20 @@ void gate_invariants() {
     // host-side instead of assembling a sequence whose slots cannot all be filled.
     throws("slots x4 mismatch throws", [] {
         const std::vector<ImageShape> shapes{ImageShape{1, 52, 78}, ImageShape{1, 64, 64}};
-        return build_joint_layout(mask_of({30, 8}), shapes);
+        return build_joint_layout(kShippedAxes, mask_of({30, 8}), shapes);
     });
     throws("empty img_shapes throws", [] {
         const std::vector<ImageShape> none;
-        return build_joint_layout(mask_of({4, 4}), none);
+        return build_joint_layout(kShippedAxes, mask_of({4, 4}), none);
     });
     throws("temporal extent throws", [] {
         const std::vector<ImageShape> shapes{ImageShape{2, 2, 2}};
-        return build_joint_layout(mask_of({4, 4}), shapes);
+        return build_joint_layout(kShippedAxes, mask_of({4, 4}), shapes);
     });
     throws("all-text mask throws", [] {
         const std::vector<ImageShape> shapes{ImageShape{1, 4, 4}};
         const std::vector<std::uint8_t> all_text(8, 0);
-        return build_joint_layout(all_text, shapes);
+        return build_joint_layout(kShippedAxes, all_text, shapes);
     });
 }
 
@@ -323,7 +334,7 @@ void gate_against_reference() {
     std::vector<std::uint8_t> mask(base.size());
     for (std::size_t i = 0; i < base.size(); ++i) { mask[i] = base[i] != 0.0 ? 1U : 0U; }
     const std::vector<ImageShape> shapes{ImageShape{1, 14, 22}, ImageShape{1, 14, 22}};
-    const JointLayout L = build_joint_layout(mask, shapes);
+    const JointLayout L = build_joint_layout(kShippedAxes, mask, shapes);
     check("reference layout shape", L.expanded_len == 637 && L.text_tokens == 21 &&
                                           L.ref_tokens == 308 && L.target_tokens == 308,
           "expanded=" + std::to_string(L.expanded_len) + " text=" + std::to_string(L.text_tokens) +
@@ -402,7 +413,7 @@ void gate_token_count() {
     };
     for (const Case& c : cases) {
         const std::vector<std::uint8_t> m = mask_of(c.runs);
-        const JointLayout L = build_joint_layout(m, c.shapes);
+        const JointLayout L = build_joint_layout(kShippedAxes, m, c.shapes);
         // prompt_rows is what the RENDERED prompt carries (it includes the expanded vision rows);
         // vision_tokens is what of them carries the picture. The mask's last target_slots ones are
         // the target's packed slots, so everything before them is the prompt.

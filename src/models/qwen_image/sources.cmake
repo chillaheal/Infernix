@@ -8,10 +8,15 @@ add_library(infernix_qwen_image STATIC
   "${CMAKE_CURRENT_LIST_DIR}/rope.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/img_mask.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/image_weights.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/artifact_constants.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/joint_layout.cpp")
 infernix_internal_includes(infernix_qwen_image)
 # The production weight loader binds logical parameters from the .infernix Directory.
 target_link_libraries(infernix_qwen_image PUBLIC infernix_artifact)
+# The artifact readers return std::expected, which this compiler only provides above C++20; this is a
+# host-only library, so the CUDA runtime target stays at the project's C++20. The records in
+# models/qwen_image/artifact_constants.h are plain data and stay visible to the C++20 lane.
+target_compile_features(infernix_qwen_image PRIVATE cxx_std_23)
 
 # The shared DiT block forward and the production image-job CUDA execution, calling the CUDA op
 # layer. Separate from the host-only config lib so the image execution and its tests link it without

@@ -190,6 +190,19 @@ int main() {
         qo::require(lat_final_ref.size() == img_tokens * 64 && lat_mean.size() == 64 && lat_std.size() == 64,
                     "VAE reference sizes");
 
+        // ---- production weights: real artifact, one streamed-only plan (device/pinned 0) ----
+        // Bound BEFORE the schedule below: the schedule a job is drawn with comes from the artifact's own
+        // "scheduler" component (DiTWeights::scheduler, refused by the strict reader when the artifact does
+        // not declare the supported scheme), so the oracle comparison is against the schedule that ships.
+        art::Reader reader(image_artifact);  // non-const: run_image_job consumes Reader&
+        art::Binder binder(reader);
+        const qi::DiTWeights dit = qi::bind_dit(binder);
+        const qi::VaeWeights vae = qi::bind_image_vae(binder);
+        const art::MaterializationPlan plan = std::move(binder).finish();
+        check(plan.device_objects.empty() && plan.device_capacity_bytes == 0 && plan.pinned_objects.empty()
+                  && plan.pinned_capacity_bytes == 0,
+              "the image job plan places nothing on device or pinned host before the interlude");
+
         // ---- production inputs: ImageJob geometry + the production scheduler ----
         qi::ImageJob job_desc;
         job_desc.height = (std::uint32_t)H;
@@ -199,7 +212,7 @@ int main() {
         check(geom.height == (std::uint32_t)H && geom.width == (std::uint32_t)W,
               "the oracle job size is already on the geometry grid");
         check(geom.tokens == (std::uint32_t)img_tokens, "ImageGeometry tokens match the latent token count");
-        const qi::Schedule sched = job_desc.schedule(qi::SchedulerConfig{});
+        const qi::Schedule sched = job_desc.schedule(dit.scheduler);
         qo::require(sched.timesteps.size() == timesteps_ref.size() && sched.sigmas.size() == sigmas_ref.size(),
                     "production schedule has a different length than the oracle's");
         double dt = 0.0, ds = 0.0;
@@ -221,16 +234,6 @@ int main() {
         inputs.latents_std   = lat_std;
         inputs.height_px     = geom.height;
         inputs.width_px      = geom.width;
-
-        // ---- production weights: real artifact, one streamed-only plan (device/pinned 0) ----
-        art::Reader reader(image_artifact);  // non-const: run_image_job consumes Reader&
-        art::Binder binder(reader);
-        const qi::DiTWeights dit = qi::bind_dit(binder);
-        const qi::VaeWeights vae = qi::bind_image_vae(binder);
-        const art::MaterializationPlan plan = std::move(binder).finish();
-        check(plan.device_objects.empty() && plan.device_capacity_bytes == 0 && plan.pinned_objects.empty()
-                  && plan.pinned_capacity_bytes == 0,
-              "the image job plan places nothing on device or pinned host before the interlude");
 
         ledger("baseline (LLM resident)");
         check(qi::image_device_bytes_live() == 0, "the image ledger is empty before any job");
@@ -254,6 +257,20 @@ int main() {
                 check(ctx.freed_bytes > 0, "the interlude yield freed "
                                                + std::to_string(ctx.freed_bytes >> 20) + " MiB");
                 check(ctx.image_stream != nullptr, "the interlude handed the job a dedicated stream");
+                // THE guard on the production line: a cudaStream_t belongs to the device of the thread
+                // that created it, and the lane's Bufs allocate with cudaMallocAsync, which the runtime
+                // documents as allocating "from the memory pool associated with the stream's device". So
+                // the stream the interlude DELIVERS has to be the engine's own device's -- the device
+                // this test built the Engine with -- or the job's bytes and the LLM's restore that goes
+                // looking for them land on a card nobody picked.
+                int  delivered_device = -1;
+                const cudaError_t delivered =
+                    cudaStreamGetDevice(static_cast<cudaStream_t>(ctx.image_stream), &delivered_device);
+                check(delivered == cudaSuccess,
+                      "cudaStreamGetDevice reports the stream the interlude delivered");
+                check(delivered == cudaSuccess && delivered_device == options.device,
+                      "the interlude's stream lives on the device the Engine was built with (device " +
+                          std::to_string(options.device) + ")");
                 check(infernix::models::qwen4_exp::testing::image_interlude_state() == 3,
                       "the Program is Leased while the job runs");
                 check(!infernix::models::qwen4_exp::testing::image_interlude_submit_open(),

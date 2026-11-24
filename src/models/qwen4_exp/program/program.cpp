@@ -222,18 +222,96 @@ std::uint64_t Program::run_image_interlude(std::uint64_t target_bytes, std::uint
     };
 
     cudaStream_t image_stream = nullptr;
+    // A cudaStream_t takes the current device of the thread that CREATES it, and this thread is
+    // whichever serving worker asked for a picture: src/core/device.cu binds a DeviceContext to the
+    // thread that builds it and nothing else, so this worker had no chosen device at all. The lane's
+    // Bufs allocate with cudaMallocAsync, which the runtime documents as allocating "from the memory
+    // pool associated with the stream's device", so a stream left on the worker's default would put the
+    // image job's bytes -- and the LLM's restore, which goes looking for them with plain cudaMalloc --
+    // on a device the engine never picked. The engine's own DeviceContext is the source of that choice
+    // (the Engine built it from EngineOptions::device); the thread is put straight back afterwards.
+    const int engine_device = impl_->device_.device;
+    int       thread_device = -1;
+    // False until the cudaGetDevice below has actually read thread_device. Without it a failed probe would
+    // leave the sentinel -1 in place and teardown would report a bogus "cudaSetDevice (the serving worker
+    // back to device -1)" beside the real cause; there is no thread binding to put back when none was read.
+    bool thread_known = false;
+
+    // cudaStreamDestroy is as device-bound as cudaStreamCreate, so the teardown binds the same way and
+    // never leaves this worker thread switched. Best effort and never silent: if the bind to the engine's
+    // device itself fails the stream is still destroyed (on whatever device this thread holds) rather than
+    // skipped, because a leaked stream strands bytes the lane's single account of the card can no longer
+    // name -- and every refusal comes back as text the caller folds into the interlude error.
+    auto destroy_image_stream = [&]() -> std::string {
+        if (image_stream == nullptr) { return {}; }
+        std::string report;
+        bool        ours = false; // did a call below produce a sticky error that is OURS to consume?
+        const cudaError_t bind = cudaSetDevice(engine_device);
+        if (bind != cudaSuccess) {
+            ours   = true;
+            report = "cudaSetDevice (the engine's device " + std::to_string(engine_device) +
+                     " for the teardown): " + cudaGetErrorString(bind);
+        }
+        if (const cudaError_t destroyed = cudaStreamDestroy(image_stream); destroyed != cudaSuccess) {
+            ours = true;
+            if (!report.empty()) { report += "; "; }
+            report += std::string("cudaStreamDestroy (the image stream of device ") +
+                      std::to_string(engine_device) + "): " + cudaGetErrorString(destroyed);
+        }
+        // Only tried when this thread was actually moved AND its original device was read: otherwise it was
+        // never switched by us and the worker's binding is nobody else's to change. The thread_known test
+        // keeps a never-read sentinel out of the message rather than asking CUDA about device -1.
+        if (bind == cudaSuccess && thread_known) {
+            if (const cudaError_t back = cudaSetDevice(thread_device); back != cudaSuccess) {
+                ours = true;
+                if (!report.empty()) { report += "; "; }
+                report += "cudaSetDevice (the serving worker back to device " + std::to_string(thread_device) +
+                          "): " + cudaGetErrorString(back);
+            }
+        }
+        if (ours) { (void)cudaGetLastError(); } // all of it is in the text returned
+        image_stream = nullptr;
+        return report;
+    };
+
+    // Every device call here is an INTERLUDE failure, never an exception that reaches the server's
+    // worker thread: the stream (if any) is destroyed, the yield is unwound through restore_and_reopen
+    // -- which parks the Program Degraded when the restoration is uncertain -- and the folded reason
+    // becomes the interlude error the caller reports. The refusal's own CUDA flag is consumed because
+    // it is already in the text thrown, and a sticky one would be charged to the next unrelated call.
+    auto interlude_device_failure = [&](const char* call, cudaError_t error) {
+        const std::string teardown    = destroy_image_stream();
+        (void)cudaGetLastError(); // the caller's failing call raised it, and it is in the text thrown below
+        const std::string restoration = restore_and_reopen();
+        std::string tail = restoration.empty() ? std::string("the LLM pools were restored") : restoration;
+        if (!teardown.empty()) { tail = teardown + "; " + tail; } // folded, never dropped
+        throw std::runtime_error("image interlude: " + std::string(call) + " on the engine's device " +
+                                 std::to_string(engine_device) + " failed (" + cudaGetErrorString(error) +
+                                 "); " + tail);
+    };
+
+    if (const cudaError_t probe = cudaGetDevice(&thread_device); probe != cudaSuccess) {
+        interlude_device_failure("reading the calling thread's current device (cudaGetDevice)", probe);
+    }
+    thread_known = true; // thread_device now holds the device this worker actually stood on
     // Blocking stream (not cudaStreamNonBlocking): the legacy default stream orders against it, so
     // image work the job submits on either route stays sequenced without cross-stream events.
-    if (cudaStreamCreate(&image_stream) != cudaSuccess) {
-        const std::string restoration = restore_and_reopen();
-        throw std::runtime_error("image interlude: the image stream could not be created; " +
-                                 (restoration.empty() ? std::string("the LLM pools were restored") : restoration));
+    if (const cudaError_t bind = cudaSetDevice(engine_device); bind != cudaSuccess) {
+        interlude_device_failure("binding the creating thread (cudaSetDevice)", bind);
+    }
+    if (const cudaError_t created = cudaStreamCreate(&image_stream); created != cudaSuccess) {
+        interlude_device_failure("cudaStreamCreate", created);
+    }
+    if (const cudaError_t back = cudaSetDevice(thread_device); back != cudaSuccess) {
+        // The stream exists on the engine's device; handing it back before refusing keeps the lane's
+        // single account of the card clean, and the worker's binding is what could not be restored.
+        interlude_device_failure("restoring the calling thread's device (cudaSetDevice)", back);
     }
     ImageInterludeContext context{lease.freed_bytes, lease.device_free_bytes, image_stream};
     try {
         job(context);
     } catch (...) {
-        cudaStreamDestroy(image_stream);
+        const std::string teardown = destroy_image_stream();
         std::string job_message = "non-standard job exception";
         try {
             std::rethrow_exception(std::current_exception());
@@ -242,17 +320,31 @@ std::uint64_t Program::run_image_interlude(std::uint64_t target_bytes, std::uint
         }
         const std::string restoration = restore_and_reopen();
         if (restoration.empty()) {
-            throw; // job failed but healthy: the job's own exception propagates, the LLM resumed
+            if (teardown.empty()) {
+                throw; // job failed but healthy: the job's own exception propagates, the LLM resumed
+            }
+            // The LLM resumed, so this is not a Degraded parking and the job's exception still stands --
+            // but a stream or a worker binding the lane could not hand back is not the job's fault either,
+            // so it is reported beside the job's text instead of being swallowed by the rethrow.
+            throw std::runtime_error("image interlude job failed: " + job_message + "; " + teardown +
+                                     "; the LLM pools were restored and the Program is Running");
         }
-        // The store of record keeps BOTH failures; so does the thrown error.
+        // The store of record keeps BOTH failures; so does the thrown error, and the teardown's too.
         throw std::runtime_error("image interlude job failed: " + job_message + "; " + restoration +
+                                 (teardown.empty() ? std::string() : "; " + teardown) +
                                  "; the Program is Degraded until process restart");
     }
-    cudaStreamDestroy(image_stream);
+    const std::string teardown = destroy_image_stream();
     // Success is never published before the restoration is confirmed.
     if (const std::string restoration = restore_and_reopen(); !restoration.empty()) {
-        throw std::runtime_error("image interlude job completed but: " + restoration +
+        throw std::runtime_error("image interlude job completed but: " +
+                                 (teardown.empty() ? restoration : teardown + "; " + restoration) +
                                  "; the Program is Degraded until process restart");
+    }
+    if (!teardown.empty()) {
+        // The job succeeded and the LLM is whole again, so the only doubt left is the lane's own teardown.
+        throw std::runtime_error("image interlude job completed but: " + teardown +
+                                 "; the LLM pools were restored and the Program is Running");
     }
     return lease.freed_bytes;
 }

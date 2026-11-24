@@ -1139,11 +1139,18 @@ The step schedule itself (sigmas, timesteps) is derived by the Engine from the r
 `steps`; it is not a request field.
 
 With `image`, the decoded plane is snapped to the reference geometry the pipeline computes from the source
-aspect ratio at a 1024² pixel budget (rounded to multiples of 32) and resized with the reference
-pipeline's bilinear mapping; alpha is carried raw, never composited. The VAE encoder turns that plane into
+aspect ratio at a 1024² pixel budget (each side then snapped to the 32-grid) and resized with the reference
+pipeline's Lanczos mapping; alpha is carried raw, never composited. The budget is what the two EXACT sides
+multiply to: each side is rounded to the nearest multiple of 32 on its own, so both can round up and the
+plane is larger than the budget for every aspect but the square (4:3 draws 1184x896, 16:9 draws 1376x768,
+and the widest aspect the route still admits draws 65536x32). The VAE encoder turns that plane into
 the constant reference block of the joint DiT sequence, while the generated image keeps the requested
 `size`. The decode, budget check and resize are host work finished before the interlude yields VRAM, so an
-undecodable or oversized reference answers `400` without touching the resident model.
+undecodable or oversized reference answers `400` without touching the resident model. So does a reference
+the route cannot price: a snapped side below 32 px (an aspect too extreme to draw) or a snapped plane above
+the worst reference plane the image VRAM ledger bills the vision tower for -- 8192 patches, the 65536x32
+plane above, at the shipped budget -- answers `400 image_decode_failed` before the resize, and the picture
+is never silently cropped to fit it.
 
 Above `true_cfg_scale` 1 each step runs the DiT twice — once over `prompt`, once over `negative_prompt`,
 each with its own text length and position table — and the velocity becomes
@@ -1187,7 +1194,10 @@ Every failure names its code in the standard OpenAI error envelope:
 |---|---|---|
 | 400 | `unsupported_parameter`, `image_size_invalid`, `image_steps_invalid`, `image_n_not_supported`, `response_format_not_supported`, `string_above_max_length` | the request asks for behavior outside the accepted subset |
 | 400 | `image_cfg_scale_invalid`, `image_negative_prompt_required` | `true_cfg_scale` is outside `[1, 20]`, or it is above 1 with no `negative_prompt` |
-| 400 | `image_decode_failed`, `image_too_large`, `image_url_not_supported`, `image_data_uri_not_base64`, `image_count_invalid` | the `image` payload is not a base64 PNG/JPEG inside the byte budget, is sent as a URL, is a non-base64 `data:` URI, or is more or fewer references than this build draws (see `image` above). The decoders' own messages are never echoed |
+| 400 | `image_decode_failed`, `image_too_large`, `image_url_not_supported`, `image_data_uri_not_base64`, `image_count_invalid` | the `image` payload is not a base64 PNG/JPEG inside the byte budget, is sent as a URL, is a non-base64 `data:` URI, or is more or fewer references than this build draws (see `image` above); the same code also answers a
+reference whose snapped geometry the route cannot price -- a side below the 32-grid, or a plane above the
+worst reference the VRAM ledger bills the vision tower for -- which is likewise refused before the resize.
+The decoders' own messages are never echoed |
 | 503 | `image_generation_not_configured` | the server started without the image options |
 | 503 | `image_interlude_unsupported` | the loaded model has no image interlude (only Qwen3.8-Flash-Next does) |
 | 503 | `image_vram_insufficient` | the request's size, reference image or CFG pass needs more VRAM than the model can yield right now; refused before anything is yielded, so the message can name the need and what the device could give. Retry a smaller `size`, without `image`, or with `true_cfg_scale` 1 |

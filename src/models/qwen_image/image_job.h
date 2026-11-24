@@ -44,8 +44,11 @@ struct ImageJob {
 
     [[nodiscard]] ImageGeometry geometry() const noexcept { return ImageGeometry::derive(height, width); }
 
-    // The resolution-dependent denoise schedule for this job (mu from the latent token count).
-    [[nodiscard]] Schedule schedule(const SchedulerConfig& cfg) const {
+    // The resolution-dependent denoise schedule for this job (mu from the latent token count). The
+    // constants must be the artifact's own (DiTWeights::scheduler, produced by read_scheduler_config):
+    // zero means NEVER READ, and an unread set is refused by run_image_job before it allocates
+    // anything. Nothing here supplies a compiled value in its place.
+    [[nodiscard]] Schedule schedule(const SchedulerConstants& cfg) const {
         const ImageGeometry g = geometry();
         return build_schedule(cfg, steps, calculate_shift(cfg, g.tokens));
     }

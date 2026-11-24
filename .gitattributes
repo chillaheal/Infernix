@@ -14,6 +14,14 @@
 /eval/corpora/** eol=lf
 /tools/freq_corpus/fixtures/** eol=lf
 /tools/chat_templates/** eol=lf
+# The image converter's scheduler fixture is the reference checkpoint's own document, committed and
+# compared byte-for-byte by tests/convert/test_qwen_image_scheduler.py, so every checkout keeps the
+# committed LF bytes instead of Git for Windows' core.autocrlf=true CRLF translation.
+/tests/convert/fixtures/qwen_image_scheduler_config.json eol=lf
+# The VAE topology fixture is the same kind of input: the reference checkpoint's own vae/config.json,
+# committed byte-for-byte and read through the production reader by tests/models/qwen_image, so the
+# digest the task-5 report quotes has to survive a checkout.
+/tests/convert/fixtures/qwen_image_vae_config.json eol=lf
 # Binary fixtures under those paths stay untouched.
 /bench/fixtures/**/*.png binary
 /tools/freq_corpus/fixtures/**/*.i64 binary
