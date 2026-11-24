@@ -548,7 +548,16 @@ std::expected<SchedulerConstants, std::string> read_scheduler_config(const nlohm
     // both ends of the span the lane can hand the scheduler holds it there for every count in between.
     // ops::kImageJointMaxTokens is the product's one joint-sequence ceiling (include/infernix/ops/
     // image_joint_limits.h) and a job's canvas tokens are a part of the joint sequence, so 20480 is the
-    // largest count the schedule is ever asked for; 1 is the smallest it can be asked for at all. A
+    // largest count the schedule is ever asked for. The LOW end is deliberately below what the lane ever
+    // asks for: the smallest canvas the serving layer admits is kVramCanvasFloorPx (256 px a side,
+    // src/serve/image_generation_service.cpp:220), which at the 8x latent downsample and the 2x2 patchify
+    // is 256 latent tokens, so the true floor of the probe is 256 and 1 is one probe the route never
+    // needs. It stays because mu is LINEAR in the token count: holding it inside the range at 1 and at
+    // 20480 brackets every count in [1, 20480], which strictly CONTAINS the counts the lane can build, and
+    // an extra point on a monotone segment can only ever refuse more -- never admit a schedule the 256
+    // probe would have caught. Over-refusal here means one mis-authored metadata document that no honest
+    // document meets (the shipped window is 256/8192 with shifts 0.5/0.9, whose mu(1) is 0.4871), and
+    // under-refusal means a drawn picture of NaNs; the conservatism is the side to err on. A
     // document refused here is one whose declared window cannot keep a real job's schedule finite, which
     // is exactly the case no later stage checks.
     for (const std::size_t tokens :
