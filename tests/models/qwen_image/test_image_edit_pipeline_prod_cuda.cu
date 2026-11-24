@@ -54,9 +54,12 @@
 // The text-to-image route is deliberately NOT exercised here: test_image_pipeline_prod_cuda.cu stays
 // its certified guard, and this file only ever runs with ref_grids non-empty.
 //
-// Skips (77) without INFERNIX_TEST_ARTIFACT or INFERNIX_IMAGE_ORACLE, or when either is absent;
-// returns 2 with no CUDA device. It runs the real pipeline on the real GPU: it must not overlap a
-// live serve.
+// Skips (77) without INFERNIX_TEST_ARTIFACT or INFERNIX_IMAGE_ORACLE, or when either is absent, and
+// skips (77) BEFORE any CUDA call whenever an infernix-serve.exe process holds the card (the shared
+// serve probe, tests/models/qwen_image/serve_probe.h); returns 2 with no CUDA device. It runs the real
+// pipeline on the real GPU: it must not overlap a live serve, and its entry's name carries no "_real",
+// so the suite enforces that itself instead of relying on the "gpu;real" label and RUN_SERIAL that
+// tests/CMakeLists.txt:21-26 grants only to a "_real" name.
 
 #include "artifact/binder.h"
 #include "artifact/reader.h"
@@ -68,6 +71,7 @@
 #include "models/qwen_image/image_weights.h"
 #include "models/qwen_image/joint_layout.h"
 #include "models/qwen_image/qwen_image_oracle_ref.h"
+#include "models/qwen_image/serve_probe.h"
 
 #include <cuda_runtime.h>
 
@@ -221,6 +225,16 @@ void require_finite(const std::vector<float>& v, const std::string& what) {
 } // namespace
 
 int main() {
+    // The serve probe runs before ANYTHING else, so no device context exists yet when the suite decides
+    // to stand aside: this route holds the whole card (a 36-layer DiT resident plus the VAE and the
+    // vision tower), and ctest would record its 77 as a pass either way, so the only way a certified run
+    // beside a live serve cannot happen is for the suite to refuse it itself. The entry's name carries no
+    // "_real", so tests/CMakeLists.txt:21-26 gives it no RUN_SERIAL and no "gpu;real" label to lean on.
+    const infernix::tests::ServeProbe serve = infernix::tests::serve_state();
+    if (serve.running) {
+        std::printf("SKIP: %s\n", serve.reason);
+        return 77;
+    }
     const std::string artifact_path = env_or("INFERNIX_TEST_ARTIFACT", "");
     const std::string oracle_path   = env_or("INFERNIX_IMAGE_ORACLE", "");
     if (artifact_path.empty() || oracle_path.empty()) {

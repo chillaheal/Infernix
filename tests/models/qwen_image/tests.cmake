@@ -51,9 +51,11 @@ infernix_add_op_test(infernix_image_scheduler_test
 # supported FlowMatchEulerDiscrete path cannot express -- a JSON float where an integer is required,
 # an integer where a boolean is required, a non-finite float, a flipped mode flag, an unknown scheme
 # key, another sampler class, a missing key, a zero/negative divisor -- must be refused by name, with
-# the offending value. The last section reads the live artifact through the production reader and
-# SKIPs when INFERNIX_TEST_ARTIFACT is absent. Host-only, no GPU, no server. The readers return
-# std::expected, which this tree compiles per target at C++23 (the CUDA lane stays at C++20).
+# the offending value. The last section reads the live artifact through the production reader and FAILS
+# (exit 1) when INFERNIX_TEST_ARTIFACT is unset or names an unreadable file: it does not exit the skip
+# code, so a run that never opened the shipped container cannot report a clean pass. Host-only, no GPU, no
+# server. The readers return std::expected, which this tree compiles per target at C++23 (the CUDA lane
+# stays at C++20).
 infernix_add_op_test(infernix_image_artifact_constants_test
   NEEDS_SOURCE_DIR
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_image_artifact_constants.cpp"
@@ -70,9 +72,10 @@ target_compile_features(infernix_image_artifact_constants_test PRIVATE cxx_std_2
 # reader's refusals (a missing key, a JSON float where an integer is required, a chain whose resnet
 # count or spatial downscale or temporal scheme the graph does not run, a denormalization pair that
 # disagrees with z_dim) must name the key and the observed value. The last section reads the live
-# artifact through the production reader and SKIPs when INFERNIX_TEST_ARTIFACT is absent. Host-only, no
-# GPU, no server, no artifact on disk. The reader returns std::expected, which this tree compiles per
-# target at C++23 (the CUDA lane stays at C++20).
+# artifact through the production reader and FAILS (exit 1) when INFERNIX_TEST_ARTIFACT is unset or names
+# an unreadable file: it does not exit the skip code, so a run that never opened the shipped container
+# cannot report a clean pass. Host-only, no GPU, no server, no device allocation. The reader returns
+# std::expected, which this tree compiles per target at C++23 (the CUDA lane stays at C++20).
 infernix_add_op_test(infernix_image_vae_topology_test
   NEEDS_SOURCE_DIR
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_image_vae_topology.cpp"
@@ -229,11 +232,18 @@ set_tests_properties(infernix_image_edit_prompt_cuda_test PROPERTIES SKIP_RETURN
 # reference slot carries img_in(reference latents) and measurably NOT the VLM merger row, and the #17 ledger
 # returns to zero on the success path AND under each refused/inconsistent input. The certified
 # text-to-image step test stays the guard for the empty-ref branch. Skips (77) without
-# INFERNIX_TEST_ARTIFACT / INFERNIX_IMAGE_ORACLE; returns 2 with no CUDA device.
+# INFERNIX_TEST_ARTIFACT / INFERNIX_IMAGE_ORACLE, skips (77) before any CUDA call while an
+# infernix-serve.exe process holds the card (tests/models/qwen_image/serve_probe.h), and returns 2 with
+# no CUDA device. It takes the whole card, so it runs alone and is excluded from a run without the real
+# device lanes: RUN_SERIAL plus the "gpu;real" labels, the scheduling tests/CMakeLists.txt:21-26 applies
+# to every "_real" name, spelled out here because this entry's name does not carry "_real". The host
+# serve_probe_host.cpp is linked in so the CUDA translation unit never parses <windows.h>.
 infernix_add_op_test(infernix_image_edit_pipeline_prod_cuda_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_image_edit_pipeline_prod_cuda.cu"
+          "${CMAKE_CURRENT_LIST_DIR}/serve_probe_host.cpp"
   LIBRARIES infernix_ops infernix_qwen_image infernix_qwen_image_runtime)
-set_tests_properties(infernix_image_edit_pipeline_prod_cuda_test PROPERTIES SKIP_RETURN_CODE 77)
+set_tests_properties(infernix_image_edit_pipeline_prod_cuda_test
+  PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real")
 
 # GPU production-route qualification, VAE DECODER: the full Qwen-Image-2.1 single-frame VAE decoder
 # (AutoencoderKLQwenImage21, T=1 first-chunk) composed from production ops (ops::conv2d, ops::silu,
@@ -477,12 +487,20 @@ target_compile_features(infernix_image_job_assembly_test PRIVATE cxx_std_23)
 # and a test-local SSIM), the subject held inside the round-trip tolerance, and the effect the
 # sentence names (a red field outside the square / a green band across the top). No VLM, no judge.
 # Links infernix_serve for the host halves the serving layer itself uses. Skips (77) without
-# INFERNIX_TEST_ARTIFACT / INFERNIX_QWENVL_PROCESSOR; returns 2 with no CUDA device. It runs the real
-# pipeline on the real GPU, so it never runs beside a live serve.
+# INFERNIX_TEST_ARTIFACT / INFERNIX_QWENVL_PROCESSOR, skips (77) before any CUDA call while an
+# infernix-serve.exe process holds the card (tests/models/qwen_image/serve_probe.h), and returns 2 with
+# no CUDA device. It runs the real pipeline on the real GPU, so it never runs beside a live serve -- and
+# because the sanctioned runner's window is shared, that is enforced by the probe rather than by hope.
+# It takes the whole card, so it runs alone and is excluded from a run without the real device lanes:
+# RUN_SERIAL plus the "gpu;real" labels, the scheduling tests/CMakeLists.txt:21-26 applies to every
+# "_real" name, stated here because this entry's name does not carry "_real". The host
+# serve_probe_host.cpp is linked in so the CUDA translation unit never parses <windows.h>.
 infernix_add_op_test(infernix_image_edit_behavior_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_image_edit_behavior.cu"
+          "${CMAKE_CURRENT_LIST_DIR}/serve_probe_host.cpp"
   LIBRARIES infernix_ops infernix_qwen_image infernix_qwen_image_runtime infernix_serve)
-set_tests_properties(infernix_image_edit_behavior_test PROPERTIES SKIP_RETURN_CODE 77)
+set_tests_properties(infernix_image_edit_behavior_test
+  PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real")
 
 # Task 6 (image fail-closed): the interlude's stream is created on the ENGINE's device and the lane's
 # ImageStreamScope governs that device's default memory pool -- reading its release threshold, lowering

@@ -247,9 +247,16 @@ struct TestInterlude {
             (void)cudaGetLastError(); // the refusal of this test's own call, already in the text thrown
             die("cudaStreamCreate (the interlude's stream): " + std::string(cudaGetErrorString(created)));
         }
-        ok_or(cudaSetDevice(thread_device), "cudaSetDevice (put the calling thread back)");
-        ok_or(cudaSetDevice(thread_park_device_), "cudaSetDevice (park this thread away from the stream's device)");
+        // Everything after the stream exists is inside the handler that gives it back: a partially
+        // constructed object never runs ~TestInterlude, so a throw from either park (or from the scope's
+        // own construction) used to leak the test's OWN stream -- and a leaked stream holds device bytes
+        // and a live thread parking that every later "no image bytes live" premise in this suite reads as
+        // the lane's doing. destroy_stream() is the same teardown the destructor applies, and it puts this
+        // thread back where the test found it, so a refusal here fails honestly instead of poisoning the
+        // hygiene assertions downstream.
         try {
+            ok_or(cudaSetDevice(thread_device), "cudaSetDevice (put the calling thread back)");
+            ok_or(cudaSetDevice(thread_park_device_), "cudaSetDevice (park this thread away from the stream's device)");
             scope = std::make_unique<qi::ImageStreamScope>(lane_stream);
         } catch (...) {
             destroy_stream();

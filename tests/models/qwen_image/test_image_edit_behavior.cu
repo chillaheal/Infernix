@@ -41,8 +41,11 @@
 // This is the gate for the `reference_image` capability: the flag stays false until this CTest is
 // green on a named artifact, and a red run keeps it false.
 //
-// Skips (77) without INFERNIX_TEST_ARTIFACT or INFERNIX_QWENVL_PROCESSOR, or when either is absent;
-// returns 2 with no CUDA device.
+// Skips (77) without INFERNIX_TEST_ARTIFACT or INFERNIX_QWENVL_PROCESSOR, or when either is absent, and
+// skips (77) BEFORE any CUDA call whenever an infernix-serve.exe process holds the card (the shared serve
+// probe, tests/models/qwen_image/serve_probe.h); returns 2 with no CUDA device. Its entry's name carries
+// no "_real", so the suite enforces standing aside beside a live serve itself rather than leaning on the
+// RUN_SERIAL and "gpu;real" label that tests/CMakeLists.txt:21-26 grants only to a "_real" name.
 
 #include "artifact/binder.h"
 #include "artifact/reader.h"
@@ -51,6 +54,7 @@
 #include "models/qwen_image/image_pipeline.h"
 #include "models/qwen_image/image_weights.h"
 #include "models/qwen_image/noise.h"
+#include "models/qwen_image/serve_probe.h"
 #include "serve/image_text_tower.h"
 #include "serve/reference_image.h"
 
@@ -390,6 +394,16 @@ void grade(const GeneratedImage& out, const Instruction& ins, std::vector<std::s
 } // namespace
 
 int main() {
+    // The serve probe runs before ANYTHING else, so no device context exists yet when the suite decides
+    // to stand aside. This is the ship gate: the real route on the real GPU, the whole card resident, and
+    // ctest records a 77 as a pass whether it meant "no artifact" or "took the card beside a live serve",
+    // so standing aside has to be the suite's own decision. The entry's name carries no "_real", so
+    // tests/CMakeLists.txt:21-26 gives it no RUN_SERIAL and no "gpu;real" label to lean on.
+    const infernix::tests::ServeProbe serve = infernix::tests::serve_state();
+    if (serve.running) {
+        std::cout << "SKIP: " << serve.reason << "\n";
+        return 77;
+    }
     try {
         const std::string artifact_path  = env_or("INFERNIX_TEST_ARTIFACT", "");
         const std::string processor_dir  = env_or("INFERNIX_QWENVL_PROCESSOR", "");
