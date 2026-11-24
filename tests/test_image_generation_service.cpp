@@ -214,7 +214,7 @@ VaeTopologyProvider fixed_vae_topology() {
 
 // The edit route's host half: the ti2i render, counted the way the genuine renderer counts -- the
 // text rows plus one run of tokens_per_image[0] <|image_pad|> rows. The admission sizes the joint
-// sequence on THESE ids (the ledger subtracts the pad rows itself, image_device_need.h:120-125), so a
+// sequence on THESE ids (the ledger subtracts the pad rows itself, image_device_need.h:145-160), so a
 // fake that ignored the pads would hide a route that under-reserves the yield.
 ReferencePromptRendererProvider fixed_reference_renderer() {
     return [](const std::string& prompt, const std::vector<std::uint64_t>& tokens_per_image) {

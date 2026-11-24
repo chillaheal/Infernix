@@ -1,8 +1,18 @@
 // The scheduler constants the certified schedule guards qualify the production code against, read from
-// the COMMITTED artifact document (tests/convert/fixtures/qwen_image_scheduler_config.json -- the
-// converter's verbatim copy of the reference checkpoint's own scheduler/scheduler_config.json, pinned
-// by SHA-256 in tests/convert/test_convert_qwen_image_metadata.py) through the PRODUCTION reader
-// (src/models/qwen_image/artifact_constants.cpp), not from literals in a test.
+// the COMMITTED artifact document (tests/convert/fixtures/qwen_image_scheduler_config.json) through the
+// PRODUCTION reader (src/models/qwen_image/artifact_constants.cpp), not from literals in a test.
+//
+// That fixture is the converter's verbatim copy of the reference checkpoint's own
+// scheduler/scheduler_config.json, and the converter lane owns the two facts this guard leans on:
+// tests/convert/test_qwen_image_scheduler.py pins the document's shipped values field by field
+// (test_scheduler_document_holds_every_field_the_reference_checkpoint_ships), pins that the converter
+// packs it as the artifact's fourth component with nothing added, dropped, renamed or coerced
+// (test_scheduler_is_the_fourth_component_copied_verbatim, and the same after the bytes are on disk in
+// a published container: test_the_scheduler_document_survives_the_container_round_trip), and compares
+// the committed bytes against the reference checkpoint file when it is beside this checkout
+// (test_committed_fixture_is_the_reference_checkpoint_file_byte_for_byte, which skips when
+// ../image-spike/artifact/scheduler/scheduler_config.json is absent -- so on a checkout without the
+// checkpoint, the pinned values above are the authority, not a byte comparison).
 //
 // Why: the shipped image artifact carries that document as its "scheduler" component and the serve route
 // builds every schedule from it (DiTWeights::scheduler). A guard that carried its own copy of the six

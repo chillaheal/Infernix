@@ -10,10 +10,15 @@
 // these numbers. A test that pasted its own copy would pass on a hand-written JSON while the shipped
 // artifact said something else.
 //
-// Host-only, no GPU, no server. The last section is gated on INFERNIX_TEST_ARTIFACT (the live
-// artifact, read-only through the production reader) and SKIPs when it is absent. Once that gate opens,
-// INFERNIX_TEST_ARTIFACT_LEGACY is NOT optional: the bind_dit no-scheduler refusal is a check, so a run
-// that names the live artifact and not the legacy one FAILS rather than skipping green.
+// Host-only, no GPU, no server. The last section reads the live artifact through the production reader
+// and is named by INFERNIX_TEST_ARTIFACT: unset or unreadable FAILS (exit 1), it does not skip. The
+// registration helper grants the entry a SKIP_RETURN_CODE of 77 (tests/cmake/InfernixTests.cmake:32-36),
+// but that code is honoured only when the test itself exits 77, and this suite no longer does that for a
+// missing artifact: ctest suppresses stdout on success, so a suite that exited 77 while never opening the
+// shipped container had reported a clean pass. INFERNIX_TEST_ARTIFACT_LEGACY is likewise not optional
+// once the live artifact is named: the
+// bind_dit no-scheduler refusal is a check, so a run that names one artifact and not the other FAILS
+// rather than skipping green.
 
 #include "models/qwen_image/artifact_constants.h"
 #include "models/qwen_image/image_weights.h"
@@ -437,17 +442,128 @@ void gate_rope_axes() {
     }
 }
 
-// ---- the live artifact through the production reader (skips when absent) ----
+// ---- the declared numbers must be able to PRODUCE a schedule (fail-closed at the reader) ----
+//
+// The six constants are not merely read, they are USED: calculate_shift extrapolates LINEARLY in the
+// latent token count, and build_schedule runs std::exp(mu) on the result and multiplies the sigmas by
+// num_train_timesteps in float32. So a hand-edited metadata file can declare a document that reads
+// perfectly and draws garbage. The concrete case is one mistyped last digit -- base_image_seq_len 256
+// with max_image_seq_len 257 beside the shipped base_shift 0.5 / max_shift 0.9 puts mu at ~1221 for an
+// ordinary 1024-token job, exp() returns inf, the float32 cast feeds emu / (emu + inv), and EVERY sigma
+// and timestep comes out NaN. Nothing downstream ever looks at the schedule it emits, and before this
+// branch the two shifts were compiled constants, so the hole belongs to the artifact. These cases pin
+// that the reader refuses such a document BY NAME at read time -- which is bind_dit's first statement
+// (src/models/qwen_image/image_weights.cpp), before any allocation or yield -- and that the bound is the
+// artifact's to satisfy rather than an accident of the shipped file: the legal extremes still bind.
+
+void gate_schedule_is_computable() {
+    const nlohmann::json base = supported_config();
+
+    // The reviewer's document: a one-token window the declared shifts cannot fit inside. Refused naming
+    // all four keys the window is made of, the mu it produces, and the range it fell outside -- an
+    // operator editing the file has to be able to read WHICH of the four to fix.
+    {
+        nlohmann::json j = base;
+        j["base_image_seq_len"] = 256;
+        j["max_image_seq_len"]  = 257;
+        expect_refuses(j, "a window too narrow to carry the shift it declares is refused",
+                       {"base_image_seq_len", "max_image_seq_len", "base_shift", "max_shift", "mu"});
+    }
+    // The same route from the shift side: each float beyond what the schedule can compute, refused by the
+    // key that is out of range, and the message printing the bound it actually enforces (both ends, since
+    // the predicate is inclusive -- a value exactly at an end is admitted, see below).
+    for (const char* key : {"base_shift", "max_shift"}) {
+        for (const double bad : {709.0, 1.0e6, -90.0, -1.0e6}) {
+            nlohmann::json j = base;
+            j[key] = bad;
+            expect_refuses(j,
+                           std::string(key) + " outside the range the schedule can compute is refused",
+                           {key, "700.0", "-80.0"});
+        }
+    }
+    // num_train_timesteps: the sigmas are multiplied by it in float32, so an absurd declaration reaches
+    // inf. Bound by name, the way every VAE integer in this file is.
+    {
+        nlohmann::json j = base;
+        j["num_train_timesteps"] = 2000000;
+        expect_refuses(j, "a num_train_timesteps the float32 timesteps cannot hold is refused",
+                       {"num_train_timesteps", "1048576"});
+    }
+    // What the bounds must NOT do is refuse an honest artifact: the shipped document (and every
+    // legitimate value at the edges of the admitted range) still binds, or the guard would have traded a
+    // hole for a refusal of the only checkpoint the product ships.
+    {
+        const auto shipped = qi::read_scheduler_config(base);
+        if (shipped.has_value()) {
+            expect_scheduler_values(*shipped, "the shipped document still binds under the schedule bounds");
+        } else {
+            check_detail(false, "the shipped document still binds under the schedule bounds",
+                         shipped.error());
+        }
+    }
+    for (const double legal : {-80.0, 700.0}) {
+        nlohmann::json j = base;
+        j["base_shift"] = legal;
+        j["max_shift"]  = legal;
+        const auto ok = qi::read_scheduler_config(j);
+        check_detail(ok.has_value(),
+                     "a shift exactly at a bound the schedule can compute still binds",
+                     ok.has_value() ? ("base_shift = max_shift = " + std::to_string(legal)) : ok.error());
+    }
+    {
+        nlohmann::json j = base;
+        j["num_train_timesteps"] = 1048576; // exactly the bound; the check above refuses one more
+        const auto ok = qi::read_scheduler_config(j);
+        check_detail(ok.has_value() && ok->num_train_timesteps == 1048576,
+                     "num_train_timesteps exactly at the bound still binds",
+                     ok.has_value() ? "accepted" : ok.error());
+    }
+    // The window is checked at BOTH ends of the span the lane can build, because mu is linear in the
+    // token count: a document whose mu is legal at 1024 tokens but explodes at the joint ceiling must
+    // still be refused, and one that is legal at the ceiling must not be refused for a count it never
+    // sees. ops::kImageJointMaxTokens (20480) is that ceiling, so this is the 20480 end of it.
+    {
+        // m = (700 - 0) / (4096 - 1), so mu = 0 exactly at one token (legal) and ~3501 at the joint
+        // ceiling: the two declared shifts are themselves inside what the reader admits, and the small
+        // canvas is fine -- only the largest sequence the product can build blows past exp()'s bound.
+        nlohmann::json j = base;
+        j["base_image_seq_len"] = 1;
+        j["max_image_seq_len"]  = 4096;
+        j["base_shift"]         = 0.0;
+        j["max_shift"]          = 700.0;
+        expect_refuses(j, "a window legal at a small canvas but not at the joint ceiling is refused",
+                       {"base_image_seq_len", "max_image_seq_len", "base_shift", "max_shift", "mu",
+                        "20480"});
+    }
+}
+
+// ---- the live artifact through the production reader (fails closed when the artifact is absent) ----
 
 void gate_real_artifact() {
+    // No quiet skip. The registration helper does grant this host-only entry a SKIP_RETURN_CODE of 77
+    // (tests/cmake/InfernixTests.cmake:32-36), but that code counts only when the test EXITS 77, and this
+    // gate no longer does that for a missing artifact: ctest suppresses stdout on success, so a run that
+    // exited 77 without ever opening the shipped .infernix container reported a clean pass with every
+    // artifact-backed pin in this section unexecuted. The harness that certifies the
+    // image lane names the artifact through the environment and existence-checks it, so an unset or absent
+    // INFERNIX_TEST_ARTIFACT here is a misconfigured run rather than a legitimate host-only run, and it
+    // FAILS: the precedent is the legacy-artifact refusal below, which already refuses to pass without the
+    // artifact its bind_dit pin needs. The fixture-only gates in main() ran before this point, so a host
+    // without the container still gets the reader's typing and mode-flag verdicts -- it simply cannot also
+    // claim the shipped artifact was verified.
     const char* env = std::getenv("INFERNIX_TEST_ARTIFACT");
     if (env == nullptr || env[0] == '\0') {
-        std::printf("ok: real-artifact section SKIPped (INFERNIX_TEST_ARTIFACT not set)\n");
+        check_detail(false, "the artifact-backed gates have an artifact to open",
+                     "INFERNIX_TEST_ARTIFACT is not set, so the live container's scheduler and dit "
+                     "component pins did not run -- this suite does not pass while skipping its real work");
         return;
     }
     std::ifstream probe(env, std::ios::binary);
     if (!probe) {
-        std::printf("ok: real-artifact section SKIPped (%s absent)\n", env);
+        check_detail(false, "the artifact-backed gates can open the artifact they were named",
+                     std::string("INFERNIX_TEST_ARTIFACT names ") + env +
+                         ", which is not a readable file, so the live scheduler and dit component pins did "
+                         "not run");
         return;
     }
     probe.close();
@@ -533,6 +649,7 @@ int main() {
     gate_shipped_metadata();
     gate_strict_typing();
     gate_mode_flags();
+    gate_schedule_is_computable();
     gate_rope_axes();
     gate_real_artifact();
     if (g_failures != 0) {

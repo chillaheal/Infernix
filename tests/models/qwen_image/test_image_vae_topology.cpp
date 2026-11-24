@@ -16,8 +16,14 @@
 // than derived from the topology, so the acceptance is a comparison of two independent representations
 // and not a tautology.
 //
-// Host-only: no GPU, no server, no artifact on disk (the last section is gated on INFERNIX_TEST_ARTIFACT
-// and SKIPs when it is absent). Nothing here allocates device memory.
+// Host-only: no GPU, no server, no device allocation. The last section opens the live .infernix container
+// named by INFERNIX_TEST_ARTIFACT through the production reader and FAILS (exit 1) when that variable is
+// unset or names an unreadable file. The registration helper grants the entry a SKIP_RETURN_CODE of 77
+// (tests/cmake/InfernixTests.cmake:32-36), but that code counts only when the test exits 77 and this gate
+// no longer does that for a missing artifact -- ctest suppresses stdout on success, and a suite that
+// reported a clean pass while never opening the shipped container certified nothing.
+// The fixture-only gates above still run first, so a host without the container gets the
+// reader's and the ledger's verdicts -- it just cannot also claim the shipped artifact was verified.
 
 #include "artifact/binder.h"
 #include "artifact/reader.h"
@@ -624,17 +630,32 @@ void gate_bound_shapes() {
     }
 }
 
-// ---- the live artifact through the production reader (skips when absent) ----
+// ---- the live artifact through the production reader (fails closed when the artifact is absent) ----
 
 void gate_real_artifact() {
+    // No quiet skip. The registration helper does grant this host-only entry a SKIP_RETURN_CODE of 77
+    // (tests/cmake/InfernixTests.cmake:32-36), but that code counts only when the test EXITS 77, and this
+    // gate no longer does that for a missing artifact: ctest suppresses stdout on success, so a run that
+    // exited 77 without ever opening the shipped .infernix container reported a clean pass with the two
+    // pins below unexecuted, which is precisely the blindness the certified VAE
+    // topology exists to remove. The harness that certifies the image lane names the artifact through the
+    // environment and existence-checks it, so an unset or absent INFERNIX_TEST_ARTIFACT here is a
+    // misconfigured run rather than a legitimate host-only run, and it FAILS. The precedent is the
+    // sibling suite's artifact gate (tests/models/qwen_image/test_image_artifact_constants.cpp), and the
+    // fixture-only gates in main() ran before this point, so a host without the container still gets the
+    // reader's and the ledger's verdicts -- it simply cannot also claim the shipped artifact was verified.
     const char* env = std::getenv("INFERNIX_TEST_ARTIFACT");
     if (env == nullptr || env[0] == '\0') {
-        std::printf("ok: real-artifact section SKIPped (INFERNIX_TEST_ARTIFACT not set)\n");
+        check_detail(false, "the artifact-backed gates have an artifact to open",
+                     "INFERNIX_TEST_ARTIFACT is not set, so the live container's decoder topology was "
+                     "never read -- this suite does not pass while skipping its real work");
         return;
     }
     std::ifstream probe(env, std::ios::binary);
     if (!probe) {
-        std::printf("ok: real-artifact section SKIPped (%s absent)\n", env);
+        check_detail(false, "the artifact-backed gates can open the artifact they were named",
+                     std::string("INFERNIX_TEST_ARTIFACT names ") + env +
+                         ", which is not a readable file, so the live decoder topology was never read");
         return;
     }
     probe.close();

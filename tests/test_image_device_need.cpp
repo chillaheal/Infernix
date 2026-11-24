@@ -14,6 +14,7 @@
 
 #include <cstdio>
 #include <exception>
+#include <string>
 
 namespace qi = infernix::models::qwen_image;
 namespace qt = infernix::tests::qwen_image;
@@ -219,6 +220,59 @@ int main() {
                     static_cast<unsigned long long>(declared.total() / qi::kImageMiB),
                     static_cast<unsigned long long>(declared.vision_peak / qi::kImageMiB),
                     static_cast<unsigned long long>(delta / qi::kImageMiB));
+    }
+
+    // ---- the ViT charge is a cap, not an estimate ----
+    // Everything above prices the vision lane at kVisionWorstReferencePatches, and the serving layer
+    // yields on the total it prices. That promise is only worth what the lane ENFORCES: run_vision_tower
+    // sizes every live plane from the count its caller hands it (src/models/qwen_image/vision_tower.cu),
+    // so a count above the number this header bills would hold live device bytes no admission decision
+    // took -- the resident LLM starves on a stale figure, which is the blindness this branch exists to
+    // close. The guard therefore sits beside the charge (require_patches_within_vision_ledger,
+    // image_device_need.h) and is exercised HERE rather than in the CUDA lane: the boundary is
+    // arithmetic, so the host suite can pin both ends of it without a device in the way -- and the
+    // production route cannot be called from a host test at all, because the CUDA target is deliberately
+    // kept out of host tests (src/models/qwen_image/sources.cmake). The equality case must stay admitted:
+    // the route runs exactly 64x64 (tests/models/qwen_image/test_image_need_ledger_real.cu drives it).
+    {
+        const auto refused = [](std::uint64_t patches) -> std::string {
+            try {
+                qi::require_patches_within_vision_ledger(patches);
+                return {};
+            } catch (const std::exception& error) {
+                return error.what();
+            }
+        };
+        constexpr std::uint64_t kCap = qi::kVisionWorstReferencePatches;
+        // The number the ledger bills and the number the guard enforces are the same constant, and it is
+        // what the reference route's own geometry derives (1024x1024 area target on the 32-grid at the
+        // 16-wide patch, src/serve/reference_image.cpp) -- not a figure this file may move on its own.
+        check(kCap == 64ULL * 64ULL && kCap == (1024ULL / 16ULL) * (1024ULL / 16ULL),
+              "the ViT charge is the worst legal reference plane, 64x64 patches");
+        check(refused(kCap).empty(), "the worst legal reference plane the ledger bills is admitted");
+        const std::string one_over = refused(kCap + 1ULL);
+        check(!one_over.empty(), "one patch above the billed worst case is refused");
+        // The refusal must be readable by whoever hit it: its own count, the cap it ran into, and the
+        // route the cap comes from. A bare "too big" would leave the operator to find the constant.
+        const auto names = [&](const std::string& text, const char* needle) {
+            return !text.empty() && text.find(needle) != std::string::npos;
+        };
+        check(names(one_over, std::to_string(kCap + 1ULL).c_str()),
+              "the refusal prints the caller's patch count it refused");
+        check(names(one_over, std::to_string(kCap).c_str()),
+              "the refusal prints the bound it enforces");
+        check(names(one_over, "reference_image.cpp") && names(one_over, "ledger"),
+              "the refusal says which route's promise the cap is and what it prices");
+        // The case the review found: the joint ceiling alone would admit 20480 merged rows, i.e. 81920
+        // patches, which would have held ~2.6 GiB live against a bill of ~0.45 GiB. Refused, and refused
+        // with the same readable reason rather than as an int-overflow accident.
+        const std::string joint = refused(81920ULL);
+        check(names(joint, "81920") && names(joint, std::to_string(kCap).c_str()),
+              "a joint-ceiling-sized plane is refused by name, not by an overflow guard");
+        // Nothing below the cap is refused, so the admitted route cannot be squeezed out of its own
+        // geometry by the guard: every legal snapped reference size on the 32-grid passes.
+        check(refused(0ULL).empty() && refused(1ULL).empty() && refused(4095ULL).empty(),
+              "the guard refuses only what the ledger does not bill");
     }
 
     // Printed before the verdict so a broken golden constant can be read off a failing run.
