@@ -45,6 +45,13 @@ struct Case {
     // holds both at once -- the encode that produces the conditioning runs on the yielded VRAM -- so
     // the edit route's ledger row has to predict the ViT's live set and this row has to measure it.
     bool          vit = false;
+    // Certified anchors, in MiB, for the rows this suite was certified on. Non-zero means BOTH numbers
+    // must reproduce exactly: the predicted need (the number the serving layer refuses on) and the
+    // measured high-water (what the pipeline really allocated). Zero marks a row with no certified
+    // anchor -- the canvas-sweep rows exist to bound the prediction across every canvas the server
+    // admits, not to freeze a footprint nobody measured on this build.
+    std::uint64_t certified_predicted_mib = 0;
+    std::uint64_t certified_measured_mib  = 0;
 };
 
 void require(bool condition, const std::string& message) {
@@ -108,17 +115,20 @@ int main() {
             // M7's own row: a reference on the 1024^2 area cap (4096 latent tokens == 4 * 1024 vision
             // tokens) whose pad rows are the whole prompt, with the ViT encode measured in the same
             // window. This is the edit route the serving layer admits on this number.
-            {768, 0, 1024, 0, "the edit route: a 1024^2 reference, the ViT lane and the joint sequence", true},
+            // The anchors are the certified row for row: prediction 6010 MiB against a measured
+            // 3634 MiB, the numbers the pre-scheduler artifact was certified with.
+            {768, 0, 1024, 0, "the edit route: a 1024^2 reference, the ViT lane and the joint sequence", true,
+             6010, 3634},
             // The canvas-scaled sweep: every certified square the serving layer can be asked for, so
             // the prediction-vs-measured row exists for the exact canvases the walk and the net decide
             // on. Pure geometry (no reference, no CFG, no vision): the four canvas-scaled terms are all
             // that change across these rows, which is what makes the comparison attributable to them.
-            {1024, 1152, 0, 0, "the trained edit canvas 1024x1152"},
+            {1024, 1152, 0, 0, "the trained edit canvas 1024x1152", false, 6409, 4367},
             {1280, 0, 0, 0, "certified 1280"},
             {1536, 0, 0, 0, "certified 1536"},
             {1792, 0, 0, 0, "certified 1792"},
-            {2016, 0, 0, 0, "certified 2016"},
-            {2048, 0, 0, 0, "certified 2048"},
+            {2016, 0, 0, 0, "certified 2016", false, 13548, 12295},
+            {2048, 0, 0, 0, "certified 2048", false, 13869, 12653},
         };
 
         cudaStream_t stream = nullptr;
@@ -218,6 +228,23 @@ int main() {
                       << " res " << need.resident_weights / mib
                       << " vision " << need.vision_peak / mib
                       << "], measured peak " << measured / mib << " MiB\n";
+            // The certified equality, enforced here rather than eyeballed in a transcript. The two
+            // bounds below cannot catch a shrinking prediction: "measured > predicted" only fails when
+            // the footprint OUTGROWS the inventory, and the reservation floor only fails when the
+            // slack drops under 512 MiB -- so a row could lose 511 MiB of prediction (an inventory term
+            // dropped from image_device_need.h, the resident calibration re-lowered) and the suite stay
+            // green. Nor is the measured side ever compared to a constant. These pins are what make the
+            // row identical to the certification instead of merely compatible with it.
+            if (c.certified_predicted_mib != 0 && predicted / mib != c.certified_predicted_mib) {
+                std::cout << "FAIL: " << c.what << " predicts " << predicted / mib
+                          << " MiB, the certified number is " << c.certified_predicted_mib << " MiB\n";
+                ++failures;
+            }
+            if (c.certified_measured_mib != 0 && measured / mib != c.certified_measured_mib) {
+                std::cout << "FAIL: " << c.what << " measured " << measured / mib
+                          << " MiB, the certified high-water is " << c.certified_measured_mib << " MiB\n";
+                ++failures;
+            }
             if (measured > predicted) {
                 std::cout << "FAIL: the measured peak exceeds the predicted need by "
                           << (measured - predicted) / mib << " MiB\n";

@@ -11,7 +11,9 @@
 // artifact said something else.
 //
 // Host-only, no GPU, no server. The last section is gated on INFERNIX_TEST_ARTIFACT (the live
-// artifact, read-only through the production reader) and SKIPs when it is absent.
+// artifact, read-only through the production reader) and SKIPs when it is absent. Once that gate opens,
+// INFERNIX_TEST_ARTIFACT_LEGACY is NOT optional: the bind_dit no-scheduler refusal is a check, so a run
+// that names the live artifact and not the legacy one FAILS rather than skipping green.
 
 #include "models/qwen_image/artifact_constants.h"
 #include "models/qwen_image/image_weights.h"
@@ -491,7 +493,15 @@ void gate_real_artifact() {
     // belongs pinned on the bind path.
     const char* legacy_env = std::getenv("INFERNIX_TEST_ARTIFACT_LEGACY");
     if (legacy_env == nullptr || legacy_env[0] == '\0') {
-        std::printf("ok: bind_dit legacy refusal SKIPped (INFERNIX_TEST_ARTIFACT_LEGACY not set)\n");
+        // No quiet skip. This point is only reached because the harness named the LIVE artifact, and
+        // the same harness is required to name the pre-scheduler artifact the production refusal is
+        // pinned against -- so a run that has one and not the other is a misconfigured harness, not a
+        // legitimate host-only run. Printing "ok:" and returning here used to leave Task 7's bind_dit
+        // pin unexecuted while the suite still exited 0, which is exactly the green-without-evidence
+        // the harness must refuse.
+        check_detail(false, "bind_dit legacy refusal has an artifact to refuse",
+                     "INFERNIX_TEST_ARTIFACT is set but INFERNIX_TEST_ARTIFACT_LEGACY is not, so the "
+                     "no-scheduler refusal at the production entry is unpinned");
         return;
     }
     std::ifstream legacy_probe(legacy_env, std::ios::binary);
