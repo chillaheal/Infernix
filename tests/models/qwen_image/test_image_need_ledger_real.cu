@@ -49,18 +49,27 @@ struct Case {
     // the serving layer refuses on) and the measured high-water (what the pipeline really allocated).
     //
     // Where BOTH are set, the row is one of the four the plan certifies -- the numbers at
-    // docs/superpowers/plans/2026-11-14-image-fail-closed.md:688,781, reproduced by every sanctioned run
-    // since the scheduler component landed.
+    // docs/superpowers/plans/2026-11-14-image-fail-closed.md:688,781. Both sanctioned runs whose stdout is on
+    // record reproduce them exactly (the fix-round-1 re-certification and the fix-round-2 restored run, in
+    // build-windows\task7_logs\); the first certified run's table was never captured, as disclosed in the
+    // task report, so the claim stops at the two runs that carry evidence.
     //
     // The first five rows pin the MEASURED side only. Their high-water is the 2026-10-23 certification
     // recorded in .agent/STATE.md:861-862 (1845/2746/2760/2751/4007) and it still reproduces exactly on
     // this build, so the footprint is frozen there. Their predicted side was recorded by the same older
     // run (4570/5921/5935/5925/7812) and the current inventory computes 432-1728 MiB less for those five
     // canvases; that number was never in the plan's certified table, so pinning it would freeze a stale
-    // prediction rather than a certified one. Zero marks an unpinned side, not a missing measurement.
+    // prediction rather than a certified one.
     //
-    // 1280/1536/1792 carry neither: they exist to bound the prediction across every canvas the server
-    // admits, and no high-water was ever recorded for them on any build.
+    // 1280/1536/1792 pin the MEASURED side too, and their source is different in kind: no earlier
+    // certification names them (.agent/STATE.md has no rows for those canvases, and the plan's table does
+    // not), so 5628/7609/9951 MiB are the peaks THIS suite printed on its own sanctioned runs against the
+    // shipped artifact, first recorded here. That makes them a freeze rather than a reproduction -- they
+    // cannot catch a footprint that was already wrong when they were read, only one that drifts from here
+    // -- which is why the predicted side of every row the plan does not certify is left to the two bounds
+    // below (measured must not outgrow the inventory, and the inventory must clear it by the serving
+    // layer's own 512 MiB reservation). Every row pins its measured high-water, so a zero now marks only an
+    // unpinned PREDICTED side.
     std::uint64_t certified_predicted_mib = 0;
     std::uint64_t certified_measured_mib  = 0;
 };
@@ -138,9 +147,9 @@ int main() {
             // on. Pure geometry (no reference, no CFG, no vision): the four canvas-scaled terms are all
             // that change across these rows, which is what makes the comparison attributable to them.
             {1024, 1152, 0, 0, "the trained edit canvas 1024x1152", false, 6409, 4367},
-            {1280, 0, 0, 0, "certified 1280"},
-            {1536, 0, 0, 0, "certified 1536"},
-            {1792, 0, 0, 0, "certified 1792"},
+            {1280, 0, 0, 0, "certified 1280", false, 0, 5628},
+            {1536, 0, 0, 0, "certified 1536", false, 0, 7609},
+            {1792, 0, 0, 0, "certified 1792", false, 0, 9951},
             {2016, 0, 0, 0, "certified 2016", false, 13548, 12295},
             {2048, 0, 0, 0, "certified 2048", false, 13869, 12653},
         };
