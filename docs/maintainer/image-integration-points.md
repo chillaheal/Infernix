@@ -171,15 +171,20 @@ Nothing here has an upstream counterpart; a replay copies them whole and builds.
 `ours-only` rows, so a build and the suites are the only evidence they are intact.
 
 **The authority for what gets copied is [`image-lane.copy-set.json`](image-lane.copy-set.json)**, not
-this page. It is generated from CMake's own generated projects by
+this page. It is generated from CMake's own build files by
 
 ```
-py -3.13 -I tools/image_lane_copy_set.py --upstream <sha> --build-dir build-windows --write-json docs/maintainer/image-lane.copy-set.json
+py -3.13 -I tools/image_lane_copy_set.py --upstream <sha> --build-dir <configured build dir> --write-json docs/maintainer/image-lane.copy-set.json
 ```
 
-which reads the lane's own `.cmake` files, takes the target names out of them, reads each target's
-`<target>.vcxproj` (the exact `ClCompile`/`ClInclude`/`CudaCompile`/`None` item set and
-`AdditionalIncludeDirectories` CMake resolved) and closes the `#include` graph over those directories.
+which reads the lane's own `.cmake` files, takes the target names out of them, and reads what CMake
+generated for each of those targets: the `<target>.vcxproj` item set and `AdditionalIncludeDirectories`
+under the Visual Studio generator, or the `CXX_COMPILER__<target>_..._<Config>` /
+`CUDA_COMPILER__<target>_..._<Config>` edges and their `INCLUDES` variables in the build directory's
+`.ninja` files under the Ninja generator. (Both are CMake's own output, so an MSVC tree and a Ninja tree
+gate the same way; a lane target the build dir never configures - a bench or suite target behind an
+option - falls back to the sources its own `add_executable`/`add_library` names.) It then closes the
+`#include` graph over those directories.
 Everything the result reaches that the upstream ref lacks is copied - headers, `.cu` kernels, JSON
 fixtures and the two Python tools the serve invokes. A target whose sources are all ours-only is taken
 whole; a target upstream also builds (`infernix_serve`, `infernix_ops`, ...) contributes only the files a

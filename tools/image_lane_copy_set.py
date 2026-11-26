@@ -3,9 +3,12 @@
 
 The port driver (tools/port_lane.ps1) copies files. Which files? Not a hand-kept list: this tool asks
 the build system. It reads the lane's own ours-only .cmake files, takes the TARGET NAMES out of them,
-reads each target's generated <target>.vcxproj under the build directory (CMake's own output: the exact
-ClCompile/ClInclude/CudaCompile/None item set and the AdditionalIncludeDirectories), and closes the
-quoted/angle #include graph over those include directories. Everything the result contains that the
+then reads what CMake itself generated for each of those targets under the build directory -- the
+<target>.vcxproj item set and AdditionalIncludeDirectories for the Visual Studio generator, or the
+<CXX,CUDA>_COMPILER__<target>_..._Release edges and their INCLUDES variables in impl-<Config>.ninja for
+the Ninja generator -- and closes the quoted/angle #include graph over those include directories.
+Both are CMake's own output, so neither is a guess and a configured Ninja tree gates like an MSVC one.
+Everything the result contains that the
 upstream ref lacks is a file the port must copy -- headers, CUDA kernels, fixtures and Python tools
 included. A target whose sources are all ours-only is entirely lane and is taken whole; a target
 upstream also builds is filtered to the files a lane cmake file actually names, so the port carries
@@ -56,9 +59,204 @@ LIB_RE = re.compile(r"\binfernix_[a-z0-9_]+")
 HELPER_RE = re.compile(r"\binfernix_add_[a-z_]*test\s*\(\s*([A-Za-z0-9_][A-Za-z0-9_\-.]*)")
 HELPER_NAME_RE = re.compile(r"^infernix_add_[a-z_]*test$")
 FILE_TOKEN_RE = re.compile(r"[A-Za-z0-9_./\\-]+\.(?:cpp|cu|c|cc|h|hpp|cuh)")
+# Two more things the cmake text itself carries, used only when the build dir has no source list for a
+# target: the files a target declares in its own add_executable/add_library, and the names that are
+# merely foreach loop variables rather than targets.
+ADD_BLOCK_RE = re.compile(r"\badd_(?:executable|library)\s*\(\s*([A-Za-z0-9_][A-Za-z0-9_\-.]*)\s+(.*?)\)",
+                          re.S | re.I)
+FOREACH_RE = re.compile(r"\bforeach\s*\(\s*([A-Za-z0-9_][A-Za-z0-9_\-.]*)", re.I)
+CMAKE_VAR_RE = re.compile(r"\$\{([A-Za-z0-9_]+)\}")
 INC_ATTR_RE = re.compile(r'<(?:ClCompile|ClInclude|CudaCompile|Cuda|None|CustomBuild|Image)\s+Include="([^"]+)"')
 DIRS_TAG_RE = re.compile(r"<AdditionalIncludeDirectories>(.*?)</AdditionalIncludeDirectories>", re.S)
 INCLUDE_LINE_RE = re.compile(r"^\s*#\s*include\s*[\"<]([^\">]+)[\">]", re.M)
+
+# The Ninja generator writes no per-target project file. Its equivalent of the item list is one edge
+# per compiled source, named by the rule it runs: CMake's own rule names carry the target and the
+# configuration, and an optional "unscanned" marker (the MSVC front end CMake uses for CUDA). Edges
+# and their INCLUDES variables live in the build directory's generated .ninja files.
+NINJA_LANGS = ("CXX", "CUDA", "C", "OBJCXX", "OBJC")
+NINJA_CONFIGS = ("Release", "Debug", "RelWithDebInfo", "MinSizeRel")
+NINJA_RULE_RE = re.compile(r"^([A-Z]+)_COMPILER__(.+)$")
+NINJA_BUILD_RE = re.compile(r"^build\s")
+NINJA_INCLUDE_RE = re.compile(r'-(?:external:I|isystem|I)\s*(?:"([^"]+)"|([^\s"]+))')
+
+
+def ninja_split(line):
+    """Split a build statement on whitespace that is not escaped: '$ ' belongs to the path, a bare
+    space ends a token. Splitting first and unescaping after would tear every path that holds a space."""
+    toks, cur, i = [], [], 0
+    while i < len(line):
+        ch = line[i]
+        if ch == "$" and i + 1 < len(line):
+            cur.append(ch)
+            cur.append(line[i + 1])
+            i += 2
+            continue
+        if ch in " \t":
+            if cur:
+                toks.append("".join(cur))
+                cur = []
+            i += 1
+            continue
+        cur.append(ch)
+        i += 1
+    if cur:
+        toks.append("".join(cur))
+    return [tok.replace("$ ", " ").replace("$:", ":").replace("$$", "$").replace("$|", "|")
+            for tok in toks]
+
+
+def ninja_rule_target(rule):
+    """The target a CMake compile rule belongs to, or None when it compiles nothing."""
+    m = NINJA_RULE_RE.match(rule)
+    if not m or m.group(1) not in NINJA_LANGS:
+        return None
+    rest = m.group(2)
+    for cfg in NINJA_CONFIGS:
+        for suffix in ("_unscanned_" + cfg, "_" + cfg):
+            if rest.endswith(suffix):
+                return rest[: -len(suffix)]
+    return None
+
+
+def to_repo(rel, rootfwd):
+    """A generated path is repo-relative posix, whichever form CMake wrote it in."""
+    q = rel.replace("\\", "/")
+    if len(q) > 1 and q[1] == ":":
+        q = posixpath.relpath(q, rootfwd)
+    return posixpath.normpath(q)
+
+
+CUR_DIR_VARS = {"CMAKE_CURRENT_LIST_DIR", "CMAKE_CURRENT_SOURCE_DIR"}
+ROOT_DIR_VARS = {"CMAKE_SOURCE_DIR", "PROJECT_SOURCE_DIR"}
+
+
+def declared_sources(seeds, read, rootfwd):
+    """{target: {files}} for every add_executable/add_library in the lane's own cmake files, with the
+    directory variables resolved against the file that names them. This is the source of truth for a
+    target the build directory does not configure (an optional bench or suite target): the cmake that
+    declares the target still says what it compiles, and nothing else does."""
+    out = {}
+    for s in seeds:
+        text = read(s)
+        if "add_" not in text:
+            continue
+        seed_dir = posixpath.dirname(s)
+        for name, blob in ADD_BLOCK_RE.findall(text):
+            if name.endswith((".cpp", ".cu", ".h", ".cmake", ".py")):
+                continue
+            bucket = out.setdefault(name, set())
+            for tok in blob.replace("\n", " ").split():
+                tok = tok.strip().strip('"').strip("'")
+                if not tok or tok.startswith(("$<", "-")):
+                    continue
+                names = [m.group(1) for m in CMAKE_VAR_RE.finditer(tok)]
+                if any(v not in CUR_DIR_VARS | ROOT_DIR_VARS for v in names):
+                    continue
+                # A token that carried a directory variable is already rooted at the repo; one that
+                # did not is relative to the cmake file's own directory, per CMake's own rule.
+                rooted = bool(names)
+                tok = CMAKE_VAR_RE.sub(
+                    lambda m: seed_dir if m.group(1) in CUR_DIR_VARS else "", tok)
+                if len(tok) > 1 and tok[1] == ":":
+                    p = posixpath.relpath(tok, rootfwd)
+                elif tok.startswith("/"):
+                    p = posixpath.normpath(tok[1:])
+                elif rooted:
+                    p = posixpath.normpath(tok)
+                else:
+                    p = posixpath.normpath(posixpath.join(seed_dir, tok))
+                if p.endswith(SOURCE_EXT):
+                    bucket.add(p)
+    return {k: v for k, v in out.items() if v}
+
+
+def vcxproj_scan(repo, vindex, targets, rootfwd):
+    """Per-target item set and include directories, read out of CMake's own generated projects."""
+    per_target, incdirs, unknown = {}, set(), []
+    for name in sorted(targets):
+        path = vindex.get(name)
+        if not path:
+            unknown.append(name)
+            continue
+        # Generated item paths are relative to the PROJECT file's own directory, which lives under
+        # build-windows (itself under the repo root): express it against the repo root, or the
+        # "..\..\..\src\..." CUDA items land one level above the tree and silently vanish.
+        rel_dir = posixpath.dirname(os.path.relpath(path, repo).replace("\\", "/"))
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+        items = set()
+        for m in INC_ATTR_RE.findall(text):
+            q = m.replace("\\", "/")
+            if len(q) > 1 and q[1] == ":":
+                items.add(posixpath.relpath(q, rootfwd))
+            else:
+                items.add(posixpath.normpath(posixpath.join(rel_dir, q)))
+        per_target[name] = items
+        for blob in DIRS_TAG_RE.findall(text):
+            for d in blob.split(";"):
+                d = d.strip().replace("\\", "/")
+                if not d or any(tok in d for tok in ("$(", "@(", "%(", "<<")):
+                    continue
+                if len(d) > 1 and d[1] == ":":
+                    d = posixpath.relpath(d, rootfwd)
+                elif not posixpath.isabs(d):
+                    d = posixpath.normpath(posixpath.join(rel_dir, d))
+                if posixpath.isdir(os.path.join(repo, d.replace("/", os.sep))):
+                    incdirs.add(d)
+    return per_target, incdirs, unknown
+
+
+def ninja_scan(repo, build, targets, rootfwd):
+    """The same two things from the Ninja generator's edges: the sources each lane target compiles and
+    the include directories it is handed. Generated headers are not sources, so an edge input counts
+    only when it carries a compile extension; explicit dependencies never do."""
+    per_target, incdirs, seen = {}, set(), set()
+    for dirpath, _dn, filenames in os.walk(build):
+        for name in filenames:
+            if not name.endswith(".ninja"):
+                continue
+            with open(os.path.join(dirpath, name), encoding="utf-8", errors="replace") as fh:
+                lines = fh.read().splitlines()
+            target = None
+            for line in lines:
+                if NINJA_BUILD_RE.match(line):
+                    target = None
+                    tail = line.partition(":")[2]
+                    toks = ninja_split(tail)
+                    if not toks:
+                        continue
+                    target = ninja_rule_target(toks[0])
+                    if target is None or target not in targets:
+                        target = None
+                        continue
+                    seen.add(target)
+                    bucket = per_target.setdefault(target, set())
+                    for tok in toks[1:]:
+                        if tok.startswith("|"):
+                            break
+                        src = tok.replace("\\", "/")
+                        if src.endswith(COMPILE_EXT):
+                            bucket.add(to_repo(src, rootfwd))
+                    continue
+                if target is None or not line.startswith("  "):
+                    continue
+                key, sep, value = line[2:].partition(" = ")
+                if not sep or key.strip() != "INCLUDES":
+                    continue
+                for quoted, bare in NINJA_INCLUDE_RE.findall(value):
+                    d = (quoted or bare).strip()
+                    if not d:
+                        continue
+                    d = d.replace("\\", "/")
+                    if len(d) > 1 and d[1] == ":":
+                        d = posixpath.relpath(d, rootfwd)
+                    elif not posixpath.isabs(d):
+                        continue
+                    if posixpath.isdir(os.path.join(repo, d.replace("/", os.sep))):
+                        incdirs.add(d)
+    unknown = sorted(t for t in targets if t not in seen)
+    return per_target, incdirs, unknown
 
 
 def git_files(repo, ref):
@@ -124,9 +322,14 @@ def main():
         targets.update(TARGET_RE.findall(text))
         targets.update(LIB_RE.findall(text))
         targets.update(HELPER_RE.findall(text))
+    loopvars = set()
+    for s in seeds:
+        loopvars.update(FOREACH_RE.findall(read(s)))
     targets = {t for t in targets
                if "/" not in t and not t.endswith((".cpp", ".cu", ".h", ".cmake", ".py"))
-               and not HELPER_NAME_RE.match(t) and t != "infernix_internal_includes"}
+               and not HELPER_NAME_RE.match(t) and t != "infernix_internal_includes"
+               and t not in loopvars}
+    declared = declared_sources(seeds, read, repo.replace("\\", "/"))
 
     vindex = {}
     for dirpath, _dn, filenames in os.walk(build):
@@ -135,37 +338,24 @@ def main():
                 vindex.setdefault(name[: -len(".vcxproj")], os.path.join(dirpath, name))
 
     rootfwd = repo.replace("\\", "/")
-    per_target, incdirs, unknown = {}, set(), []
-    for name in sorted(targets):
-        path = vindex.get(name)
-        if not path:
-            unknown.append(name)
-            continue
-        # Generated item paths are relative to the PROJECT file's own directory, which lives under
-        # build-windows (itself under the repo root): express it against the repo root, or the
-        # "..\..\..\src\..." CUDA items land one level above the tree and silently vanish.
-        rel_dir = posixpath.dirname(os.path.relpath(path, repo).replace("\\", "/"))
-        with open(path, encoding="utf-8", errors="replace") as fh:
-            text = fh.read()
-        items = set()
-        for m in INC_ATTR_RE.findall(text):
-            q = m.replace("\\", "/")
-            if len(q) > 1 and q[1] == ":":
-                items.add(posixpath.relpath(q, rootfwd))
-            else:
-                items.add(posixpath.normpath(posixpath.join(rel_dir, q)))
-        per_target[name] = items
-        for blob in DIRS_TAG_RE.findall(text):
-            for d in blob.split(";"):
-                d = d.strip().replace("\\", "/")
-                if not d or any(tok in d for tok in ("$(", "@(", "%(", "<<")):
-                    continue
-                if len(d) > 1 and d[1] == ":":
-                    d = posixpath.relpath(d, rootfwd)
-                elif not posixpath.isabs(d):
-                    d = posixpath.normpath(posixpath.join(rel_dir, d))
-                if posixpath.isdir(os.path.join(repo, d.replace("/", os.sep))):
-                    incdirs.add(d)
+    if vindex:
+        per_target, incdirs, unknown = vcxproj_scan(repo, vindex, targets, rootfwd)
+        source_of_truth = "generated Visual Studio projects"
+    else:
+        per_target, incdirs, unknown = ninja_scan(repo, build, targets, rootfwd)
+        source_of_truth = "generated Ninja edges"
+        if not per_target:
+            raise SystemExit("%s holds no .vcxproj and no compile edge for any lane target: it is not "
+                             "a configured CMake build directory of this tree" % build)
+
+    # A lane target the build directory never configured (an optional bench or suite target behind an
+    # option) has no generated item set at all. Its own cmake declaration names its sources, so that
+    # is what the copy set carries -- the port has to ship the file whether or not this tree builds it.
+    for name in list(unknown):
+        got = declared.get(name)
+        if got:
+            per_target[name] = {f for f in got if is_file(f)}
+            unknown.remove(name)
 
     seed_text = "\n".join(read(s) for s in seeds)
     seed_names = {posixpath.basename(m) for m in FILE_TOKEN_RE.findall(seed_text)}
@@ -230,10 +420,11 @@ def main():
 
     if not args.quiet:
         print("seeds      : %d ours-only cmake file(s)" % len(seeds))
-        print("targets    : %d resolved, %d entirely lane, %d shared, %d without a project file"
+        print("source     : %s" % source_of_truth)
+        print("targets    : %d resolved, %d entirely lane, %d shared, %d without a source list"
               % (len(targets), len(lane_only), len(shared), len(unknown)))
         if unknown:
-            print("  no project: %s" % ", ".join(sorted(unknown)[:12]))
+            print("  no sources: %s" % ", ".join(sorted(unknown)[:12]))
         print("copy set   : %d file(s) to carry across" % len(copy_set))
         print("excluded   : %d (each justified in the JSON)" % len(EXCLUSIONS))
 
