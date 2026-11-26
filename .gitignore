@@ -95,3 +95,4 @@ profiles/
 /image-spike/*.exe
 /image-spike/*.out
 /image-spike/*.err
+/image-edit/
