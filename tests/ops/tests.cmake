@@ -668,5 +668,10 @@ infernix_add_family_op_test(infernix_inkling2_vision_test FAMILY inkling2
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_inkling2_vision.cu"
   LIBRARIES infernix_ops)
 
+# The image lane's own op suites (tests/ops/image_lane.tests.cmake). One line, in the place the
+# suites themselves used to occupy; the lane's sources are ours-only pure re-adds
+# (docs/maintainer/image-integration-points.md, "Ours-only lane files").
+include("${CMAKE_CURRENT_LIST_DIR}/image_lane.tests.cmake")
+
 # The family executables of every op test above (infernix_ops_<family>_test).
 infernix_finish_op_families()

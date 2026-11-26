@@ -2744,4 +2744,31 @@ struct LoadSummary {
     } prefix_cache;
 };
 
+// The image lane's LLM<->image VRAM coexistence contract (docs/maintainer/image-integration-points.md,
+// the lease rows): one picture job runs as an INTERLUDE inside the Engine, so the public types it needs
+// are public Engine data, not serve data. Re-added by hand on this port because the fork's own hunk of
+// this file also carries unrelated chat-model work that must not come across.
+struct ImageInterludeContext {
+    std::uint64_t freed_bytes       = 0;
+    std::uint64_t device_free_bytes = 0; // free at the yield, AFTER the pools moved
+    void* image_stream              = nullptr;
+};
+
+struct ImageYieldProbe {
+    bool fits = false;
+    // Why a false `fits` deserves to be doubted, and the only thing that makes it so. The yield plan keeps
+    // the frame pool WHOLE while the LLM holds a residency lease (plan_image_yield's frames_movable is
+    // false), so the promise above is then a KV-only number -- not the frontier this job would get, because
+    // an interlude starts by taking the ring back (begin_image_quiesce) and only then yields. A serving
+    // layer must not refuse on that no: it must let the job in and let the post-yield net, which measures
+    // the bytes the yield ACTUALLY delivered, decide. Set only when a lease is genuinely out AND the plan
+    // freed no frames: a pool that is down to its never-lent quarter is an honest no, and stays one.
+    bool expert_pool_frozen_by_lease = false;
+    std::uint64_t target_bytes         = 0;
+    std::uint64_t margin_bytes         = 0;
+    std::uint64_t freed_bytes_expected = 0; // plan_image_yield's total_freed, on the pools' own grids
+    std::uint64_t device_free_bytes    = 0; // free before anything is unmapped
+    std::uint64_t headroom_bytes       = 0; // the display headroom the sizing path reserves
+};
+
 } // namespace infernix

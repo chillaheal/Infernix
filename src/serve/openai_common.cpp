@@ -269,6 +269,16 @@ GenerationRequest template_probe_request(std::string tool_name) {
     return request;
 }
 
+// The image pipeline's entry. It is a routeable resource (POST /v1/images/generations with this id,
+// GET /v1/images/<id> for its pictures), not a claim that the chat model emits images, so it carries
+// only what an OpenAI model object is defined to carry.
+Json make_image_model_object_json(std::string_view image_model_id, std::int64_t created) {
+    return Json{{"id", image_model_id},
+                {"object", "model"},
+                {"created", created},
+                {"owned_by", "infernix"}};
+}
+
 } // namespace
 
 ChatTemplateCaps
@@ -291,12 +301,16 @@ probe_chat_template_caps(const std::function<int(const GenerationRequest&)>& cou
 
 std::string make_models_list(const std::string& model_id, std::int64_t created,
                              std::uint32_t max_model_len, const ModelMetadata& metadata,
-                             const ChatTemplateCaps& caps) {
+                             const ChatTemplateCaps& caps, std::string_view image_model_id) {
     // vLLM/llama.cpp-compatible discovery metadata for the configured per-request context limit.
     // Codex CLI's model-catalog refresh decodes a top-level `models` field and falls back to
     // guessed metadata without it, so the same array is written under both keys.
-    const Json models = Json::array(
+    // PORT(ported tree): the image lane's second entry, re-added by hand onto upstream's two-key shape
+    // (the fork appended to its single `data` array): an attached image pipeline is listed beside the
+    // chat model, and nothing is added when none is attached, so the list stays byte-identical.
+    Json models = Json::array(
         {make_model_object_json(model_id, created, max_model_len, metadata, caps)});
+    if (!image_model_id.empty()) { models.push_back(make_image_model_object_json(image_model_id, created)); }
     const Json payload = {{"object", "list"}, {"data", models}, {"models", models}};
     return payload.dump();
 }
@@ -305,6 +319,12 @@ std::string make_model_object(const std::string& model_id, std::int64_t created,
                               std::uint32_t max_model_len, const ModelMetadata& metadata,
                               const ChatTemplateCaps& caps) {
     return make_model_object_json(model_id, created, max_model_len, metadata, caps).dump();
+}
+
+// PORT(ported tree): the image lane's public single-model form of the file-local object builder above,
+// re-added by hand (the fork's openai_common.cpp:280), for GET /v1/models/<image id>.
+std::string make_image_model_object(std::string_view image_model_id, std::int64_t created) {
+    return make_image_model_object_json(image_model_id, created).dump();
 }
 
 std::string make_error_body(const ApiError& error) {
@@ -320,6 +340,21 @@ std::int64_t unix_time_now() {
     return std::chrono::duration_cast<std::chrono::seconds>(
                std::chrono::system_clock::now().time_since_epoch())
         .count();
+}
+
+// PORT(ported tree): the image lane's strict model gate, re-added by hand (ours-only, docs/maintainer/
+// image-integration-points.md), verbatim from the fork's openai_common.cpp:297.
+void validate_openai_model(std::string_view requested, std::initializer_list<std::string_view> available) {
+    for (const std::string_view known : available) {
+        if (known == requested) { return; }
+    }
+    ApiError error;
+    error.status  = 404;
+    error.type    = "invalid_request_error";
+    error.param   = "model";
+    error.code    = "model_not_found";
+    error.message = "model '" + std::string(requested) + "' not found";
+    throw ApiException(std::move(error));
 }
 
 std::string resolve_openai_model(std::string_view requested, std::string_view available, bool any_name) {

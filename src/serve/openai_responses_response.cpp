@@ -2,6 +2,7 @@
 #include "product/constraint_observation.h"
 
 #include "serve/generation_service.h"
+#include "serve/image_chat_hook.h" // the image lane's own field and hidden-call rule
 #include "serve/openai_common.h"
 
 #include <algorithm>
@@ -412,6 +413,9 @@ BuiltOpenAIResponse build_response(const std::string& id, std::int64_t created_a
     built.body = std::move(response);
     if (final_outcome.constraint)
         built.body["constraint"] = product::constraint_observation_json(final_outcome.constraint);
+    // Inside the response object, which is where the Responses protocol puts everything about the
+    // response: the streaming terminal event ships this same body, so one write covers both shapes.
+    add_chat_image_attempts(built.body, final_outcome);
     return built;
 }
 
@@ -744,13 +748,28 @@ public:
                       std::make_move_iterator(message.end()));
         const CallKind kind     = streamed_kind(delta.name);
         const std::size_t index = delta.index;
+        // PORT(ported tree): re-adds the lane's hidden-call rule of Fork
+        // src/serve/openai_responses_response.cpp:652, which the automated pass left out. The call this
+        // process runs for itself is recorded, because the round's result counts it by position and the
+        // ids above stay in step with the Engine's numbering, but it is never an Item: it earns no output
+        // index and no `response.output_item.added`, so the Items around it do not notice it exists.
+        // Upstream tip has no such call at its base and its Impl::StreamedCall carries no `hidden` flag;
+        // the fork kept one (with `engine_index`) in this file's own state, and upstream tip now aligns
+        // the two by `delta.index`, so the flag is asked of the lane instead of stored.
+        const bool hidden       = chat_image_tool_hidden(delta.name);
         ids.function_calls.resize(index + 1U);
         ids.call_ids.resize(index + 1U);
         ids.search_outputs.resize(index + 1U);
         ids.function_calls[index] = new_openai_response_item_id(call_item_prefix(kind));
         ids.call_ids[index] =
             kind == CallKind::HostedSearch ? ids.function_calls[index] : new_openai_response_item_id("call");
-        calls.push_back(StreamedCall{.name = delta.name, .kind = kind, .output_index = next_output_index++});
+        calls.push_back(StreamedCall{.name = delta.name, .kind = kind,
+                                     .output_index = hidden ? -1 : next_output_index++});
+        if (hidden) {
+            // Recorded, and silent: the reasoning and answer Items this call closes are upstream's own
+            // events above, and stay on the wire.
+            return events;
+        }
         events.push_back(sse(event("response.output_item.added",
                                    Json{{"output_index", calls.back().output_index},
                                         {"item", streamed_item(index, "in_progress", true)}})));
@@ -776,6 +795,23 @@ public:
         std::vector<std::string> events;
         const GenerationOutcome& outcome = *round.outcome;
         const std::size_t count          = outcome.tool_calls.size();
+        // PORT(ported tree): the other half of the lane's hidden-call rule of Fork
+        // src/serve/openai_responses_response.cpp:757. A call this process runs for itself is only part of
+        // the answer of the round that streamed it: the picture rounds replace that round's answer with the
+        // prose one (serve/chat_image_tool.cpp), so the Response the client gets carries no call at all and
+        // upstream's positional check below would fail on a call it never published an Item for. The fork
+        // kept that bookkeeping in Impl::StreamedCall::hidden; it is asked of the lane here, and a hidden
+        // call the result really does still carry stays, because the round's result counted it by position.
+        for (std::size_t index = calls.size(); index-- > 0;) {
+            const std::string& name = calls[index].name;
+            if (!chat_image_tool_hidden(name)) { continue; }
+            const bool carried = std::any_of(outcome.tool_calls.begin(), outcome.tool_calls.end(),
+                                             [&](const infernix::GeneratedToolCall& call) {
+                                                 return call.name == name &&
+                                                        call.arguments_json == calls[index].arguments;
+                                             });
+            if (!carried) { calls.erase(calls.begin() + static_cast<std::ptrdiff_t>(index)); }
+        }
         if (!calls.empty()) {
             bool matches = calls.size() == count || (calls.size() == count + 1U && !calls.back().complete);
             for (std::size_t position = 0; matches && position < count; ++position) {
@@ -987,6 +1023,15 @@ std::vector<std::string> OpenAIResponsesEventStream::tool_call_delta(const infer
     if (opens) { events = s.open_call(delta); }
     auto& call = s.calls.back();
     call.arguments += delta.arguments;
+    // PORT(ported tree): re-adds the silent half of that same rule of Fork
+    // src/serve/openai_responses_response.cpp:935: the call the server runs for itself still records
+    // what it streamed (the round's result is matched against it by position below), and publishes
+    // nothing -- neither its arguments delta nor its done events, which upstream would carry on the
+    // output index the lane gave it as no Item at all.
+    if (chat_image_tool_hidden(call.name)) {
+        if (delta.complete) { call.complete = true; }
+        return events;
+    }
     if (call.kind == CallKind::Function && !delta.arguments.empty()) {
         events.push_back(sse(s.event("response.function_call_arguments.delta",
                                      Json{{"item_id", s.ids.function_calls[delta.index]},

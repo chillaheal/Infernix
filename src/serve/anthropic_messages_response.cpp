@@ -4,6 +4,7 @@
 #include "serve/citations.h"
 #include "serve/completion_timings.h"
 #include "serve/generation_service.h"
+#include "serve/image_chat_hook.h" // the image lane's own field and hidden-call rule
 #include "text/unicode.h"
 
 #include <nlohmann/json.hpp>
@@ -476,6 +477,14 @@ std::string make_anthropic_messages_response(const AnthropicResponseIdentity& id
                          {"usage", final_usage(totals)}};
     if (final_outcome.constraint)
         response["constraint"] = product::constraint_observation_json(final_outcome.constraint);
+    // PORT(ported tree): re-adds the carrier the fork's Messages body carried at
+    // FORK src/serve/anthropic_messages_response.cpp:365, which the automated pass left out. This is the one
+    // protocol whose body is the file-local ordered document, so it reaches the lane through the
+    // `ordered_json` overload of add_chat_image_attempts (serve/image_chat_hook.h); the attempts are still
+    // read through the sorted document first, which is what keeps one written attempt's keys in the same
+    // order on all three protocols. A request that drew no picture writes no field, so the body stays the
+    // bytes upstream gives it.
+    add_chat_image_attempts(response, final_outcome);
     response["timings"] = timings_json(outcome_timings(totals));
     return response.dump();
 }
@@ -704,12 +713,30 @@ std::vector<std::string> AnthropicMessagesStream::tool_call_delta(const infernix
     }
     std::vector<std::string> events;
     if (opens) {
-        append(events, close_thinking());
-        append(events, flush_citations());
-        append(events, close_text());
+        // PORT(ported tree): re-adds the lane's hidden-call rule of Fork
+        // src/serve/anthropic_messages_response.cpp:542, which the automated pass left out. The call this
+        // process runs for itself earns no content block and no index -- a block the client never sees must
+        // not close the thinking or text block either, because the visible call that follows, or the end of
+        // the generation, closes those with the blocks it owns -- and it stays recorded, because the
+        // generation's result counts it and the checks below match the result's calls against this list by
+        // position. Upstream tip has no such call at its base: its StreamedCall has no `hidden` flag (the
+        // fork kept one, with `engine_index`, in this class), so the rule is asked of the lane here and the
+        // no-block sentinel is the `index` this file already owns.
+        const bool hidden = chat_image_tool_hidden(delta.name);
+        if (!hidden) {
+            append(events, close_thinking());
+            append(events, flush_citations());
+            append(events, close_text());
+        }
         calls_.push_back(StreamedCall{
             .call  = ToolCall{.id = anthropic_call_id(searches_, delta.name), .name = delta.name},
-            .index = next_index_++});
+            .index = hidden ? -1 : next_index_++});
+        if (hidden) {
+            StreamedCall& silent = calls_.back();
+            silent.call.arguments_json += delta.arguments;
+            silent.complete            = delta.complete;
+            return events;
+        }
         const char* type = is_search_tool(searches_, delta.name) ? "server_tool_use" : "tool_use";
         events.push_back(event("content_block_start",
                                Json{{"type", "content_block_start"},
@@ -721,6 +748,14 @@ std::vector<std::string> AnthropicMessagesStream::tool_call_delta(const infernix
     }
     StreamedCall& call = calls_.back();
     call.call.arguments_json += delta.arguments;
+    // PORT(ported tree): the silent half of that same rule of Fork
+    // src/serve/anthropic_messages_response.cpp:573: a call the server runs for itself still records what
+    // it streamed, and publishes neither an input_json_delta nor a content_block_stop for a block the
+    // client never saw open.
+    if (chat_image_tool_hidden(call.call.name)) {
+        if (delta.complete) { call.complete = true; }
+        return events;
+    }
     if (!delta.arguments.empty()) {
         events.push_back(event("content_block_delta",
                                Json{{"type", "content_block_delta"},
@@ -747,6 +782,24 @@ std::vector<ToolCall> AnthropicMessagesStream::identify_calls(const GenerationOu
 std::vector<std::string> AnthropicMessagesStream::call_blocks(const AnthropicResponseSegment& segment) {
     validate_segment(segment);
     std::vector<std::string> events;
+    // PORT(ported tree): the other half of the lane's hidden-call rule of Fork
+    // src/serve/anthropic_messages_response.cpp:555. A call this process runs for itself is only part of the
+    // answer of the generation that streamed it: the picture rounds replace that generation's answer with
+    // the prose one (serve/chat_image_tool.cpp), so the message the client gets carries no call at all and
+    // upstream's positional check below would fail on a block it never published. The fork kept that
+    // bookkeeping in StreamedCall::hidden (in the handler's own copy of it, too); it is asked of the lane
+    // here, and a hidden call the segment really does still carry stays, because the generation counted it
+    // by position.
+    for (std::size_t index = calls_.size(); index-- > 0;) {
+        const std::string& name = calls_[index].call.name;
+        if (!chat_image_tool_hidden(name)) { continue; }
+        const bool carried = std::any_of(segment.calls.begin(), segment.calls.end(),
+                                         [&](const ToolCall& call) {
+                                             return call.name == name &&
+                                                    call.arguments_json == calls_[index].call.arguments_json;
+                                         });
+        if (!carried) { calls_.erase(calls_.begin() + static_cast<std::ptrdiff_t>(index)); }
+    }
     if (!calls_.empty()) {
         // Streamed calls are the segment's, and at most one more that the turn's end cut: its block
         // closes now.
@@ -834,6 +887,9 @@ std::vector<std::string> AnthropicMessagesStream::finish(const AnthropicResponse
                   {"usage", final_usage(totals)}};
     if (outcome.constraint)
         terminal["constraint"] = product::constraint_observation_json(outcome.constraint);
+    // Beside usage and stop_reason, in the one event that closes the message: content blocks are
+    // already on the wire and indexed, and this is not content -- it is what the server did.
+    add_chat_image_attempts(terminal, outcome);
     terminal["timings"] = timings_json(outcome_timings(totals));
     events.push_back(event("message_delta", std::move(terminal)));
     events.push_back(event("message_stop", Json{{"type", "message_stop"}}));

@@ -2,6 +2,7 @@
 
 #include "serve/http_stream_driver.h"
 #include "serve/http_transport.h"
+#include "serve/image_chat_hook.h" // the image lane's one attach point on this route
 #include "serve/openai_common.h"
 #include "serve/openai_responses.h"
 #include "serve/request_validation.h"
@@ -393,6 +394,26 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
     }
 
     const std::uint64_t req_id = ++request_seq_;
+    // PORT(ported tree): re-adds the TOOL_INJECTION seam of FORK src/serve/openai_responses_http.cpp:386,
+    // which the automated pass dropped: the hook, the tool it injects, the observation the rounds share, and
+    // the two `chat_image_replay_needed` asks below. What the lane decides -- that the `generate_image` tool
+    // is offered, when a round is owed, what the drawn picture's URL suffix says, what the SSE silence
+    // carries while a draw runs, and what a chat draw is filed under in the request log -- lives in
+    // serve/image_chat_hook.cpp; this file keeps its own request, its `service_`, its re-prepare/re-run
+    // callbacks, its route label, and the two reads of its private state the lane cannot make (`images_`,
+    // `run_image_job`), handed over as the typed ChatImageDoors. A serve with no --image-artifact gets a null
+    // hook: no tool, no round, no field, and the two asks below keep upstream's own moves. NOT the lane and
+    // untouched here: `redact_input_image_urls`, the `include=message.input_image.image_url` query and
+    // `PromptProgress`, which are upstream's chat-vision input handling.
+    auto hook = make_chat_image_hook(
+        *this, req, "openai_responses", req_id, options_,
+        ChatImageDoors{
+            [this] { return static_cast<void*>(images_); },
+            [this](const auto& image_request, std::string_view base, std::string_view source,
+                   std::string_view protocol, std::string correlation) {
+                return run_image_job(image_request, base, source, protocol, std::move(correlation));
+            }});
+    inject_chat_image_tool(hook, resolved.generation);
     const RequestLogMetadata metadata{
         .http_request_id                   = res.get_header_value("x-request-id"),
         .response_id                       = id,
@@ -401,6 +422,23 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
         .output_tokens_explicit            = request.requested_max_output_tokens.has_value(),
         .preserve_thinking_semantic_change = resolved.preserve_thinking_semantic_change,
         .label                             = request_label(req),
+    };
+    // PORT(ported tree): re-adds the shared observation of FORK src/serve/openai_responses_http.cpp:407,
+    // which the rounds below re-prepare with: every round of one request is one HTTP request, with the same
+    // observation wiring and the same request log, so a round the server runs itself stays part of this
+    // request. Upstream tip passes the object as an inline literal at the first prepare and has added
+    // `.progress` since the fork was written, so its fields are copied from upstream's own literal --
+    // upstream's literal is left exactly as it stands -- and everything read is captured by value because a
+    // streaming provider runs after this handler has returned. Named apart from the handler's own
+    // `http_request_id` below, which the continuation preparer keeps for the hosted searches.
+    const std::string first_http_request_id = metadata.http_request_id;
+    const auto make_observation             = [this, req_id, first_http_request_id] {
+        return infernix::GenerationObservationOptions{
+            .phase_timings = true,
+            .scheduling    = scheduling_observer(req_id, first_http_request_id),
+            .first_token   = first_token_observer(),
+            .progress      = progress_observer(req_id),
+        };
     };
     PreparedRequest prepared;
     try {
@@ -455,9 +493,23 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
     ResponseRounds rounds;
     // Only a hosted tool search continues the conversation; otherwise its copy is not needed.
     if (request.prompt.tool_search && request.prompt.tool_search->server) {
-        rounds.continuation = std::move(resolved.generation);
+        // PORT(ported tree): re-adds the first of the two `chat_image_replay_needed` asks of FORK
+        // src/serve/openai_responses_http.cpp:457, which the automated pass dropped: a request this process
+        // could still answer with a picture has to keep its conversation whole for the rounds that would
+        // re-render it, so the copy the hosted search takes is a copy and the request stays behind for the
+        // rounds. The rule for when this applies is the lane's (serve/image_chat_hook.h); what it costs this
+        // route is this route's, which is why the ask is here. With a null hook upstream's own move runs
+        // unchanged.
+        if (chat_image_replay_needed(hook)) {
+            rounds.continuation = resolved.generation;
+        } else {
+            rounds.continuation = std::move(resolved.generation);
+        }
     }
-    resolved.generation.messages.clear();
+    // PORT(ported tree): the second of those two asks of FORK src/serve/openai_responses_http.cpp:465: the
+    // prompt is submitted, so its text is dead weight -- unless a picture round has to re-render this
+    // conversation, which needs the turns back. Null hook, upstream's clear unchanged.
+    if (!chat_image_replay_needed(hook)) { resolved.generation.messages.clear(); }
 
     if (!request.stream) {
         const std::function<bool()> cancelled = [&req] { return client_disconnected(req); };
@@ -465,6 +517,28 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
             run_openai_response(*service_, request, rounds, prepared, nullptr, cancelled,
                                 continuation_preparer(cancelled), {},
                                 [](std::size_t) { return new_openai_response_item_id("tsc"); });
+            // PORT(ported tree): re-adds the aggregate picture rounds of FORK
+            // src/serve/openai_responses_http.cpp:473 (the automated pass kept this one): the lane runs the
+            // calls the model made to the server's own tool, and a new round takes over this request's
+            // generation and its lifetime. The answer must carry the picture, so any URL it still does not
+            // quote is appended by the lane. Null hook, null work.
+            if (chat_image_round_needed(hook, rounds.final_outcome)) {
+                auto pictures = run_chat_image_rounds(
+                    *hook, resolved.generation, std::move(rounds.final_outcome),
+                    [&] {
+                        // A new round takes over this request's generation, and with it the lifetime
+                        // that keeps media alive until the response is written.
+                        prepared = service_->prepare(resolved.generation,
+                                                     GenerationConsumerMode::Aggregate,
+                                                     make_observation(),
+                                                     [&req] { return client_disconnected(req); });
+                        return service_->run(prepared, nullptr,
+                                             [&req] { return client_disconnected(req); });
+                    });
+                rounds.final_outcome       = std::move(pictures.answer);
+                rounds.final_outcome.text += chat_image_missing_url_suffix(
+                    *hook, rounds.final_outcome.text, pictures.urls);
+            }
         } catch (const ApiException& exception) {
             const ApiError error = responses_error(exception.error());
             lifecycle->failure(make_generation_request_failure(error));
@@ -553,6 +627,12 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
     }
 
     try {
+        // PORT(ported tree): re-adds the owned request of FORK src/serve/openai_responses_http.cpp:575, which
+        // the streaming rounds below extend: the provider runs after this handler returns, so the request has
+        // to outlive it. The aggregate branch above returned already, and with a null hook the rounds never
+        // read it, which is where upstream's own move of it (for a hosted search) left it whole or taken --
+        // unchanged either way.
+        auto generation                  = std::make_shared<GenerationRequest>(std::move(resolved.generation));
         auto stream                      = std::make_shared<StreamingResponse>();
         stream->prepared                 = std::move(prepared);
         stream->rounds                   = std::move(rounds);
@@ -566,9 +646,14 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
             id, created, std::move(request), runtime_values(stream->prepared));
 
         prepare_sse_response(res);
+        // PORT(ported tree): the capture gains the three things the picture rounds need to re-prepare and
+        // re-run this request after the provider outlives the handler -- the request, the hook it draws
+        // through, and the observation every round of this request shares -- exactly as in FORK
+        // src/serve/openai_responses_http.cpp:591. A null hook carries nothing.
         res.set_chunked_content_provider(
             "text/event-stream",
-            [this, stream, id, lifecycle, search_request,
+            [this, stream, id, lifecycle, generation, hook,
+             make_observation, search_request,
              continuation_preparer](std::size_t, httplib::DataSink& sink) -> bool {
                 if (stream->started.exchange(true, std::memory_order_acq_rel)) {
                     sink.done();
@@ -612,6 +697,50 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                                              [&] { return stream->encoder->round(round); });
                         },
                         [&](std::size_t index) { return stream->encoder->hosted_search_id(index); });
+
+                    // PORT(ported tree): re-adds the streamed picture rounds of FORK
+                    // src/serve/openai_responses_http.cpp:693, which the automated pass dropped, in upstream
+                    // tip's own position (inside this try, so a round's failure ends the stream the way
+                    // upstream ends it). A picture round streams nothing of its own: its deltas would open a
+                    // second reasoning or text Item inside the response Item already started, and its text
+                    // reaches the client as the answer's tail, so it runs on a sink that carries nothing but
+                    // cancellation. The lane says what the silence while a picture is drawn carries on the
+                    // wire. Two mechanisms, because they cover different spans: the lane's own
+                    // HeartbeatTicker (serve/http_transport.h, re-added by hand verbatim from FORK
+                    // src/serve/openai_responses_http.cpp:699) is the stream's only traffic while the draw
+                    // itself blocks this thread -- upstream tip's poll()-driven heartbeat cannot run then --
+                    // and upstream tip's single heartbeat slot carries the same note through the rounds'
+                    // re-prepare and re-run, where the Engine wait loop does call poll(), with upstream's own
+                    // in_progress keep-alive put back after them. Null hook, null work.
+                    if (chat_image_round_needed(hook, stream->rounds.final_outcome)) {
+                        // The ticker is also the stall watchdog's only observer: only this thread can see
+                        // that the job stopped reporting, and only the lane knows when that means a wedge
+                        // (serve/image_job_progress.h, armed by src/models/qwen_image/image_pipeline.cu).
+                        HeartbeatTicker ticker(
+                            transport,
+                            [&hook]() -> std::string { return chat_image_progress_note(*hook); },
+                            [&hook]() -> std::shared_ptr<ImageJobProgress> {
+                                return chat_image_watch_progress(*hook);
+                            });
+                        transport.set_heartbeat([&] {
+                            const std::string note = chat_image_progress_note(*hook);
+                            return note.empty() ? stream->encoder->keep_alive() : note;
+                        });
+                        auto pictures = run_chat_image_rounds(
+                            *hook, *generation, std::move(stream->rounds.final_outcome),
+                            [&] {
+                                stream->prepared = service_->prepare(
+                                    *generation, GenerationConsumerMode::Streaming,
+                                    make_observation(), [&] { return transport.poll(); });
+                                StreamSink quiet;
+                                quiet.is_cancelled = [&] { return transport.poll(); };
+                                return service_->run(stream->prepared, &quiet);
+                            });
+                        stream->rounds.final_outcome       = std::move(pictures.answer);
+                        stream->rounds.final_outcome.text += chat_image_missing_url_suffix(
+                            *hook, stream->rounds.final_outcome.text, pictures.urls);
+                        transport.set_heartbeat([&] { return stream->encoder->keep_alive(); });
+                    }
                 } catch (...) {
                     return end_failed_stream_generation(*lifecycle, responses_error, server_error, send_failed);
                 }

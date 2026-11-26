@@ -1,4 +1,5 @@
 #include "serve/serve_options.h"
+#include "serve/image_serve_options.h"
 #include "product/config/config_file.h"
 #include "product/kv_window_options.h"
 #include "product/logits_options.h"
@@ -160,7 +161,8 @@ const ServeOptionArity* find_option(std::string_view name) noexcept {
     const auto found =
         std::find_if(kServeOptionArities.begin(), kServeOptionArities.end(),
                      [&](const ServeOptionArity& option) { return option.name == name; });
-    return found == kServeOptionArities.end() ? nullptr : &*found;
+    if (found != kServeOptionArities.end()) { return &*found; }
+    return image_option_arity(name); // the image lane's own options: serve/image_serve_options.h
 }
 
 // infernix-serve's --config: top-level keys and the [serve] table; [cli] is infernix's.
@@ -765,6 +767,7 @@ std::string serve_usage_text(const char* argv0) {
            "                             trace to FILE (offloaded experts only)\n"
            "  --response-store-max-records N Responses-state record cap (default 1024)\n"
            "  --response-store-max-mib N      Responses-state byte cap in MiB (default 256)\n"
+           + image_help_text() + // the image lane's options: serve/image_serve_options.h
            "  --log-stats-interval-ms N  throughput-log interval in ms\n"
            "                             (default 5000; 0 disables)\n"
            "  --log-colours on|off       colour the console stats lines (default off; on\n"
@@ -906,6 +909,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.cpu_rates_saved = mode == "saved";
             continue;
         }
+        // The image lane owns its four options, value checks and diagnostics alike:
+        // serve/image_serve_options.h. Nothing else is accepted before it, as before.
+        if (parse_image_option(arg, options, require_value, parse_nonnegative_int)) { continue; }
         if (arg == "--host") {
             options.host = require_value("--host");
         } else if (arg == "--port") {

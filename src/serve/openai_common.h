@@ -9,6 +9,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <initializer_list>
 #include <string>
 #include <string_view>
 
@@ -50,12 +51,19 @@ struct ChatTemplateCaps {
 [[nodiscard]] ChatTemplateCaps
 probe_chat_template_caps(const std::function<int(const GenerationRequest&)>& count_prompt_tokens);
 
+// PORT(ported tree): the image lane's /v1/models entries, re-added by hand -- upstream tip has no image
+// model at all, so the 6th parameter and the image object are ours-only (docs/maintainer/
+// image-integration-points.md, the ours-only names table).
+// The /v1/models list. `image_model_id` is the image resource's public id, empty when no image
+// pipeline is attached. It is listed as a bare model object because the fields that describe a
+// language model (max_model_len, n_ctx, ftype) say nothing true about a diffusion pipeline.
 std::string make_models_list(const std::string& model_id, std::int64_t created,
                              std::uint32_t max_model_len, const ModelMetadata& metadata,
-                             const ChatTemplateCaps& caps);
+                             const ChatTemplateCaps& caps, std::string_view image_model_id = {});
 std::string make_model_object(const std::string& model_id, std::int64_t created,
                               std::uint32_t max_model_len, const ModelMetadata& metadata,
                               const ChatTemplateCaps& caps);
+std::string make_image_model_object(std::string_view image_model_id, std::int64_t created);
 std::string make_error_body(const ApiError& error);
 std::int64_t unix_time_now();
 
@@ -64,6 +72,14 @@ std::int64_t unix_time_now();
 // model_not_found. Responses and request logs report the returned name.
 [[nodiscard]] std::string resolve_openai_model(std::string_view requested, std::string_view available,
                                                bool any_name);
+
+// PORT(ported tree): the image lane's strict form, re-added by hand (ours-only, docs/maintainer/
+// image-integration-points.md) -- upstream tip has no second servable id to check against.
+// 404 model_not_found unless `requested` names one of the ids this process actually serves. The
+// image route keeps this strict form: a chat name and an image name are both servable ids there,
+// and --any-model-name never widens which artifact a picture is drawn from.
+void validate_openai_model(std::string_view requested,
+                           std::initializer_list<std::string_view> available);
 
 std::string new_openai_chat_completion_id();
 std::string new_openai_chat_tool_call_id();

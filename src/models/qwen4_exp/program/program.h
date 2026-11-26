@@ -611,6 +611,21 @@ public:
     // Between rounds while requests run, when a waker asked (runtime/contract/program.h): the RAM tiers' resize
     // advances or starts (--ram-resize auto); nothing else outside rounds runs here.
     void maintain_busy();
+
+    // The Engine worker's half of the LLM<->image interlude handshake (see run_image_interlude below). The
+    // common EngineCore tests for these with its kProgramInterlude contract, so a Program with no interlude
+    // (Inkling 2) is unaffected. While the submit door is closed the worker starts NO execution work at all:
+    // the interlude owns the device, and queued, active and cancelled work resumes at the reopening. The
+    // preemption pair is the other direction -- the Program asks (request epoch), the worker pauses every
+    // Prefill lane replay-safe until an image yield would no longer freeze the expert pool, then acks the
+    // same epoch. The worker must never need the Program's execution lock to answer, so these are atomic
+    // reads and a plain store; interlude_yieldable() is read only from a quiesced window.
+    [[nodiscard]] bool submit_door_open() const noexcept;
+    [[nodiscard]] bool interlude_degraded() const noexcept;
+    [[nodiscard]] bool interlude_preempt_outstanding() const noexcept;
+    [[nodiscard]] std::uint64_t interlude_preempt_epoch() const noexcept;
+    void signal_interlude_quiesced(std::uint64_t epoch) noexcept;
+    [[nodiscard]] bool interlude_yieldable() const noexcept;
     // The Engine's round thread runs unpinned: Flash-Next's CPU expert team leaves it no core of its own
     // (runtime/contract/program.h; Qwen3.5's offloaded experts do).
     [[nodiscard]] std::uint64_t engine_thread_cpus() const noexcept { return 0; }
@@ -757,6 +772,37 @@ public:
     [[nodiscard]] PhysicalUsageSnapshot physical_usage() const noexcept;
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
     void reset_memory_peaks() noexcept {}
+
+    // LLM<->image VRAM coexistence (production driver over the interlude methods the device tests
+    // qualified): ONE interlude in flight, and nothing waits behind this gate -- a concurrent caller
+    // gets "another interlude is already in flight", which the serving layer answers with 429. Closes
+    // the LLM submit
+    // door, drains every LLM stream within `drain_deadline_ms` and invalidates the captured graphs
+    // (Quiesced), yields physical VRAM toward the image job's `target_bytes` plus a `margin_bytes`
+    // kept below the headroom (Leased), creates the image's dedicated CUDA stream, runs `job` with
+    // the LLM unable to execute (it receives the ImageInterludeContext: the bytes actually freed and
+    // that stream, and allocates the image's scratch in the freed region), then destroys the stream,
+    // restores the pools and reopens the door (Running) BEFORE returning success. The stream is
+    // blocking, so the legacy default stream orders against it and image work submitted on either
+    // route stays sequenced. The three CUDA-failure outcomes:
+    //  - drain deadline: the quiesce is unwound to Running (nothing was moved yet), the job throws
+    //    and the Engine stays healthy;
+    //  - `job` throws but the restoration succeeds: the pools are restored, the door reopens, and
+    //    the job's own exception propagates -- job failed, Engine healthy;
+    //  - the restoration itself fails (or the yield half-moved the pools and threw): the door STAYS
+    //    closed, the Program is Degraded until process restart, and the thrown error names BOTH the
+    //    job failure and the restoration failure. Success is never published before the
+    //    restoration is confirmed.
+    // A job reporting false still restores everything. Returns the bytes freed.
+    std::uint64_t run_image_interlude(std::uint64_t target_bytes, std::uint64_t margin_bytes,
+                                      const std::function<bool(const ImageInterludeContext&)>& job,
+                                      std::uint64_t drain_deadline_ms = 60000);
+
+    // Whether a job wanting `target_bytes` (plus `margin_bytes`) would fit: the pure yield plan over
+    // the live pools plus the device's own free bytes, with nothing quiesced, drained or unmapped.
+    // Legal while serving, and from outside an interlude (which holds the VRAM lock it reads).
+    [[nodiscard]] ImageYieldProbe probe_image_yield(std::uint64_t target_bytes,
+                                                   std::uint64_t margin_bytes) const;
 
 private:
     std::unique_ptr<detail::ProgramImpl> impl_;

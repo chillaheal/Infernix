@@ -23,4 +23,18 @@ ImageInfo png_image_info(std::span<const std::uint8_t> bytes, std::uint64_t max_
 // Error(ErrorKind::BudgetExceeded) when the pixel budget is exceeded.
 Image decode_png(std::span<const std::uint8_t> bytes, std::uint64_t max_decoded_pixels, bool keep_alpha = false);
 
+// The image lane's RGBA reader (decode/png_decode_rgba.cpp), re-added by hand on this port: this header is
+// upstream-owned, so the lane's declaration is appended rather than the fork's whole file replayed.
+// RGBA8 raster; alpha is a real fourth channel (never composited).
+struct RgbaImage {
+    int width  = 0;
+    int height = 0;
+    std::vector<std::uint8_t> rgba; // 4 bytes per pixel, row-major
+};
+
+// Decode a non-interlaced PNG into raw RGBA8. Same container support as decode_png; unlike it,
+// alpha is preserved as the fourth channel (types 0/2 and non-tRNS palette entries get alpha 255)
+// because the image-VAE reference path consumes alpha directly. Same error contract as decode_png.
+RgbaImage decode_png_rgba(std::span<const std::uint8_t> bytes, std::uint64_t max_decoded_pixels);
+
 } // namespace infernix::media::decode

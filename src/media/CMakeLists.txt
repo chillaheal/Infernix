@@ -28,3 +28,25 @@ if(INFERNIX_HAVE_PDFIUM)
   target_link_libraries(infernix_media_pdf PRIVATE pdfium)
   target_compile_definitions(infernix_media_pdf PRIVATE INFERNIX_HAVE_PDFIUM)
 endif()
+
+# The image lane's PNG writer (encode/png_encode.cpp): ours-only, so it is a pure add here
+# (docs/maintainer/image-integration-points.md, "Ours-only lane files"). The zlib INTERFACE target
+# above keeps upstream's own shape; the encoder only adds the include dir it needs for <zlib.h>.
+add_library(infernix_media_encode STATIC
+  encode/png_encode.cpp
+)
+infernix_internal_includes(infernix_media_encode)
+if(WIN32)
+  # The encoder compresses IDAT with the same zlib the decoder inflates with; without it the
+  # encoder still emits a valid PNG through stored DEFLATE blocks. PUBLIC because the encoder
+  # test asserts on the compressed size and must be able to ask whether this build compresses.
+  target_include_directories(infernix_media_encode PRIVATE "${FFMPEG_VCPKG_TREE}/include")
+  target_link_libraries(infernix_media_encode PRIVATE infernix_zlib)
+  target_compile_definitions(infernix_media_encode PUBLIC INFERNIX_MEDIA_ZLIB_ENCODER)
+endif()
+
+# The image lane's RGBA PNG reader (decode/png_decode_rgba.cpp): ours-only, and it is built on upstream's
+# decode_png, so it joins upstream's decoder target wherever that target has the native PNG path.
+if(WIN32)
+  target_sources(infernix_media_decode PRIVATE decode/png_decode_rgba.cpp)
+endif()

@@ -174,6 +174,12 @@ public:
     // Bytes that may be lent now as one run: the largest of the pools' runs (backed, not lent,
     // above the quarter each pool always keeps).
     [[nodiscard]] std::uint64_t lendable_bytes() const noexcept;
+    // Whether the LLM is holding frames right now: any pool with a lease out. This is the fact
+    // lendable_bytes() == 0 cannot carry by itself -- a pool at its never-lent quarter reads the same
+    // there and is an honest answer, not a frozen one.
+    // The image lane's read of the residency ring (docs/maintainer/image-integration-points.md); this
+    // header had no seam row of its own, so the port re-adds it here by hand.
+    [[nodiscard]] bool any_lease_out() const noexcept;
     // The pitch of the pool a lease comes from (the one with the most lendable bytes), and its layers.
     [[nodiscard]] std::uint64_t lend_pitch() const noexcept;
     [[nodiscard]] std::uint32_t lend_layers() const noexcept;
