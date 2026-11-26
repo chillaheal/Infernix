@@ -1,9 +1,9 @@
 #include "serve/anthropic_messages.h"
 #include "product/constraint_observation.h"
 
-#include "serve/chat_image_tool.h" // chat_image_attempts_for_response
 #include "serve/completion_timings.h"
 #include "serve/generation_service.h"
+#include "serve/image_chat_hook.h" // the image lane's own field and hidden-call rule
 
 #include <nlohmann/json.hpp>
 
@@ -317,21 +317,6 @@ std::vector<ToolCall> identify_anthropic_tool_calls(const GenerationOutcome& out
     return result;
 }
 
-namespace {
-
-// What the server-executed image tool tried, in the field every protocol carries under the same name.
-// The string is this process's own writing (serve/chat_image_tool.cpp), never socket input, so a parse
-// that fails is a bug -- and the answer to a bug here is no field, not a failed response. Absent when
-// this request drew no picture, which is what keeps a plain answer's bytes unchanged.
-[[nodiscard]] Json image_tool_attempts_json(const GenerationOutcome& outcome) {
-    if (!outcome.image_tool_attempts_json) { return nullptr; }
-    Json parsed = Json::parse(*outcome.image_tool_attempts_json, nullptr, false);
-    if (parsed.is_discarded()) { return nullptr; }
-    return parsed;
-}
-
-} // namespace
-
 std::string make_anthropic_messages_response(const AnthropicResponseIdentity& identity,
                                              const GenerationOutcome& outcome, bool hide_thinking) {
     const AnthropicResponseSegment segment = client_segment(outcome);
@@ -377,10 +362,7 @@ std::string make_anthropic_messages_response(const AnthropicResponseIdentity& id
                          {"usage", final_usage(totals)}};
     if (final_outcome.constraint)
         response["constraint"] = product::constraint_observation_json(final_outcome.constraint);
-    // A sibling of usage, not a content block: the picture's fate is a fact about this request, and a
-    // client must be able to read it without believing anything the model said about it.
-    if (Json attempts = image_tool_attempts_json(final_outcome); !attempts.is_null())
-        response["image_tool_attempts"] = std::move(attempts);
+    add_chat_image_attempts(response, final_outcome);
     response["timings"] = timings_json(outcome_timings(totals));
     return response.dump();
 }
@@ -557,7 +539,7 @@ AnthropicToolCallEvents AnthropicMessagesStream::tool_call_delta(
 
     std::vector<std::string> events;
     if (opens) {
-        const bool hidden = delta.name == kChatImageToolName;
+        const bool hidden = chat_image_tool_hidden(delta.name);
         if (!hidden) {
             // A block the client never sees must not close the text block either: the visible call
             // that follows, or the end of the generation, does that with the blocks it owns.
@@ -592,6 +574,9 @@ AnthropicToolCallEvents AnthropicMessagesStream::tool_call_delta(
     StreamedCall& call = calls_[position];
     call.call.arguments_json += delta.arguments;
     if (call.hidden) {
+        // Still bookkeeping, never the wire: the round's result is matched against this list by
+        // position, and that match demands the call's own completeness, which only this delta carries.
+        if (delta.complete) { call.complete = true; }
         return {std::move(events), AnthropicProtocolError::None};
     }
     if (!delta.arguments.empty()) {
@@ -620,6 +605,21 @@ std::vector<ToolCall> AnthropicMessagesStream::identify_calls(const GenerationOu
 std::vector<std::string> AnthropicMessagesStream::call_blocks(const AnthropicResponseSegment& segment) {
     validate_segment(segment);
     std::vector<std::string> events;
+    // The other half of the hidden-call rule of tool_call_delta above. A call this process runs for
+    // itself is only part of the answer of the generation that streamed it: the picture rounds replace
+    // that generation's answer with the prose one (serve/chat_image_tool.cpp), so the message the client
+    // gets carries no call at all and the match below would fail on a block it never published. A hidden
+    // call the segment really does still carry stays, because that generation counted it by position.
+    for (std::size_t index = calls_.size(); index-- > 0;) {
+        if (!calls_[index].hidden) { continue; }
+        const std::string& name = calls_[index].call.name;
+        const bool carried      = std::any_of(segment.calls.begin(), segment.calls.end(),
+                                              [&](const ToolCall& call) {
+                                                  return call.name == name &&
+                                                         call.arguments_json == calls_[index].call.arguments_json;
+                                              });
+        if (!carried) { calls_.erase(calls_.begin() + static_cast<std::ptrdiff_t>(index)); }
+    }
     if (!calls_.empty()) {
         // Streamed calls are the segment's, and at most one more that the turn's end cut: its block
         // closes now.
@@ -709,8 +709,7 @@ std::vector<std::string> AnthropicMessagesStream::finish(const AnthropicResponse
         terminal["constraint"] = product::constraint_observation_json(outcome.constraint);
     // Beside usage and stop_reason, in the one event that closes the message: content blocks are
     // already on the wire and indexed, and this is not content -- it is what the server did.
-    if (Json attempts = image_tool_attempts_json(outcome); !attempts.is_null())
-        terminal["image_tool_attempts"] = std::move(attempts);
+    add_chat_image_attempts(terminal, outcome);
     terminal["timings"] = timings_json(outcome_timings(totals));
     events.push_back(event("message_delta", std::move(terminal)));
     events.push_back(event("message_stop", Json{{"type", "message_stop"}}));

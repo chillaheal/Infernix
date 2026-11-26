@@ -1,8 +1,8 @@
 #include "serve/openai_responses.h"
 #include "product/constraint_observation.h"
 
-#include "serve/chat_image_tool.h" // chat_image_attempts_for_response
 #include "serve/generation_service.h"
+#include "serve/image_chat_hook.h" // the image lane's own field and hidden-call rule
 #include "serve/openai_common.h"
 
 #include <algorithm>
@@ -383,8 +383,7 @@ BuiltOpenAIResponse build_response(const std::string& id, std::int64_t created_a
         built.body["constraint"] = product::constraint_observation_json(final_outcome.constraint);
     // Inside the response object, which is where the Responses protocol puts everything about the
     // response: the streaming terminal event ships this same body, so one write covers both shapes.
-    if (Json attempts = chat_image_attempts_for_response(final_outcome); !attempts.is_null())
-        built.body["image_tool_attempts"] = std::move(attempts);
+    add_chat_image_attempts(built.body, final_outcome);
     return built;
 }
 
@@ -650,7 +649,7 @@ public:
                       std::make_move_iterator(message.end()));
         const CallKind kind     = streamed_kind(delta.name);
         const std::size_t index = delta.index;
-        const bool hidden       = delta.name == kChatImageToolName;
+        const bool hidden       = chat_image_tool_hidden(delta.name);
         ids.function_calls.resize(index + 1U);
         ids.call_ids.resize(index + 1U);
         ids.search_outputs.resize(index + 1U);
@@ -692,6 +691,22 @@ public:
         std::vector<std::string> events;
         const GenerationOutcome& outcome = *round.outcome;
         const std::size_t count          = outcome.tool_calls.size();
+        // The other half of the hidden-call rule of this file's tool-call delta: a call this process
+        // runs for itself is only part of the answer of the round that streamed it. The picture rounds
+        // replace that round's answer with the prose one (serve/chat_image_tool.cpp), so the Response
+        // the client gets carries no call at all and the match below would fail on a call it never
+        // published an Item for. A hidden call the result still carries stays, because that round's
+        // result really did count it by position.
+        for (std::size_t index = calls.size(); index-- > 0;) {
+            if (!calls[index].hidden) { continue; }
+            const std::string& name = calls[index].name;
+            const bool carried      = std::any_of(outcome.tool_calls.begin(), outcome.tool_calls.end(),
+                                                  [&](const infernix::GeneratedToolCall& call) {
+                                                      return call.name == name &&
+                                                             call.arguments_json == calls[index].arguments;
+                                                  });
+            if (!carried) { calls.erase(calls.begin() + static_cast<std::ptrdiff_t>(index)); }
+        }
         if (!calls.empty()) {
             bool matches = calls.size() == count || (calls.size() == count + 1U && !calls.back().complete);
             for (std::size_t position = 0; matches && position < count; ++position) {

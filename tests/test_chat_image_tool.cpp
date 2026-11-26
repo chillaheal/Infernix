@@ -2,14 +2,24 @@
 // left tool choice free, a round is fed back as the same assistant+tool turns a client round-trip
 // would send, the per-request picture cap and bad arguments become tool errors instead of pictures,
 // and so does a failing pipeline -- the model's request was for an answer, not for the HTTP status
-// of a draw. The round loop ends in one answer that carries every URL.
+// of a draw. The round loop ends in one answer that carries every URL. And the renderer half, which
+// the handlers cannot check for themselves: the call this process runs for itself never reaches the
+// client on any of the three protocols, while the internal witness keeps it.
 // CHAT_IMAGE_TOOL_TEST: PASS
 #include "serve/chat_image_tool.h"
 #include "product/media_acquire/source.h"
 #include "serve/image_generation_service.h"
 
+// The three protocol renderers the hidden-call rule is asserted against, and the lane's own doors
+// they all read it through (serve/image_chat_hook.h).
+#include "serve/anthropic_messages.h"
+#include "serve/image_chat_hook.h"
+#include "serve/openai_chat.h"
+#include "serve/openai_responses.h"
+
 #include <infernix/types.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -17,7 +27,9 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <system_error>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -692,6 +704,569 @@ void test_attempts_are_reported() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The renderer half of the hidden-call rule.
+//
+// A call this process runs for itself is decided by `chat_image_tool_hidden` in each of the three
+// protocol renderers -- not by the handlers, which have no view of what they wrote to the socket. A
+// replay onto upstream tip can lose the call in one renderer, in one half of a renderer, or in one of
+// the two carriers a stream ships the witness on, and no compiler reports any of it: the stream builds,
+// answers, and either leaks the server's own call to the client or loses the picture's fate with it. So
+// these cases drive the renderers the way serve/openai_chat_http.cpp, serve/anthropic_messages_http.cpp
+// and serve/openai_responses_http.cpp do -- the deltas of the picture round included -- and read only the
+// bytes a client is handed.
+// ---------------------------------------------------------------------------
+
+// What one tool-call delta published, whatever shape this tree's adapter answers with. This fork's
+// adapters refuse an unusable delta with an error instead of throwing, which upstream tip has no notion
+// of, and a suppressed call costs the empty chunk: so only the bytes that reached the wire travel on,
+// and a delta this suite fed badly is said so rather than read as a silence.
+template <class Rendered>
+[[nodiscard]] std::vector<std::string> published(Rendered&& rendered) {
+    using Value = std::decay_t<Rendered>;
+    std::vector<std::string> chunks;
+    if constexpr (std::is_same_v<Value, std::string>) {
+        if (!rendered.empty()) { chunks.push_back(std::move(rendered)); }
+    } else if constexpr (std::is_same_v<Value, std::vector<std::string>>) {
+        for (std::string& line : rendered) {
+            if (!line.empty()) { chunks.push_back(std::move(line)); }
+        }
+    } else {
+        if constexpr (requires { rendered.ok(); }) {
+            check(rendered.ok(), "a tool-call delta of the shape the handlers feed was refused");
+        }
+        if constexpr (requires { rendered.chunk; }) {
+            if (!rendered.chunk.empty()) { chunks.push_back(std::move(rendered.chunk)); }
+        } else {
+            for (std::string& line : rendered.events) {
+                if (!line.empty()) { chunks.push_back(std::move(line)); }
+            }
+        }
+    }
+    return chunks;
+}
+
+template <class Value>
+void append_all(std::vector<Value>& wire, std::vector<Value> next) {
+    wire.insert(wire.end(), std::make_move_iterator(next.begin()), std::make_move_iterator(next.end()));
+}
+
+// The bytes of one tool call as the constrained route emits them, which is the form the renderer's own
+// positional check matches by: the first delta names it, the next carry the argument bytes, the last
+// completes it, and the whole of it concatenates to the arguments the round's result holds.
+template <class Stream>
+void stream_call(Stream& stream, std::vector<std::string>& wire, std::uint32_t engine_index,
+                 std::string_view name, std::string_view arguments) {
+    const std::size_t half = arguments.size() / 2U;
+    append_all(wire, published(stream.tool_call_delta(
+                         {.index     = engine_index,
+                          .name      = std::string(name),
+                          .arguments = std::string(arguments.substr(0, half))})));
+    append_all(wire, published(stream.tool_call_delta(
+                         {.index     = engine_index,
+                          .arguments = std::string(arguments.substr(half))})));
+    append_all(wire, published(stream.tool_call_delta(
+                         {.index = engine_index, .complete = true})));
+}
+
+// One SSE frame's document. The two OpenAI protocols ship `data: <json>` on its own; the Messages
+// route and the Responses route prefix the same line with their own `event:` line, and a Chat stream
+// closes with the terminator rather than a document.
+[[nodiscard]] std::string_view data_of(std::string_view frame) {
+    std::size_t start = 0;
+    if (frame.starts_with("data: ")) {
+        start = 6;
+    } else if (frame.starts_with("event: ")) {
+        const std::size_t line = frame.find("\ndata: ");
+        if (line == std::string_view::npos) { return {}; }
+        start = line + 1 + 6;
+    } else {
+        return {};
+    }
+    std::string_view data = frame.substr(start);
+    if (data.ends_with("\n\n")) { data.remove_suffix(2); }
+    return data == "[DONE]" ? std::string_view{} : data;
+}
+
+[[nodiscard]] bool is_frame(const std::string& wire) { return !data_of(wire).empty(); }
+
+[[nodiscard]] RequestJson frame_of(const std::string& wire) {
+    return RequestJson::parse(std::string(data_of(wire)));
+}
+
+// The lane's own field, wherever a protocol's document hides it: the Chat chunk carries it beside
+// usage, the Anthropic terminal event beside stop_reason, the Responses terminal event inside its
+// response. It is the one part of a response allowed to speak of the draw, so it comes out before the
+// wire is searched for the call, and a client reads it once per response.
+void collect_field(RequestJson& document, std::string_view field, std::vector<RequestJson>& found) {
+    const std::string key(field);
+    if (document.is_object()) {
+        if (document.contains(key)) {
+            found.push_back(document.at(key));
+            document.erase(key);
+        }
+        for (auto& entry : document) { collect_field(entry, field, found); }
+    } else if (document.is_array()) {
+        for (auto& element : document) { collect_field(element, field, found); }
+    }
+}
+
+[[nodiscard]] std::vector<RequestJson> witnesses_in(RequestJson document, std::string_view field) {
+    std::vector<RequestJson> found;
+    collect_field(document, field, found);
+    return found;
+}
+
+void strip_field(RequestJson& document, std::string_view field) {
+    std::vector<RequestJson> kept;
+    collect_field(document, field, kept);
+}
+
+[[nodiscard]] std::vector<RequestJson> witnesses_of(const std::vector<std::string>& frames,
+                                                    std::string_view field) {
+    std::vector<RequestJson> found;
+    for (const std::string& frame : frames) {
+        if (!is_frame(frame)) { continue; }
+        append_all(found, witnesses_in(frame_of(frame), field));
+    }
+    return found;
+}
+
+// Everything a client was handed for this response, with the witness taken out and the protocol's
+// framing stripped, so a hit is a name or an argument byte that rode some field it never belonged on.
+[[nodiscard]] std::string client_text(const std::vector<std::string>& frames, std::string_view field) {
+    std::string text;
+    for (const std::string& frame : frames) {
+        if (!is_frame(frame)) { continue; }
+        RequestJson document = frame_of(frame);
+        document.erase("usage"); // the client's own prompt, which is not the server's call
+        strip_field(document, field);
+        text += document.dump();
+    }
+    return text;
+}
+
+// Reading what a renderer wrote: a field the protocol did not put there costs a failed check, never
+// the suite, because what is under test is the shape of the whole response rather than one key.
+[[nodiscard]] RequestJson at_or_null(const RequestJson& document, const char* key) {
+    return document.is_object() && document.contains(key) ? document.at(key) : RequestJson();
+}
+
+[[nodiscard]] std::string text_at(const RequestJson& document, const char* key) {
+    const RequestJson value = at_or_null(document, key);
+    return value.is_string() ? value.get<std::string>() : std::string();
+}
+
+[[nodiscard]] int int_at(const RequestJson& document, const char* key) {
+    const RequestJson value = at_or_null(document, key);
+    return value.is_number_integer() ? value.get<int>() : -1;
+}
+
+// The delta of one streamed Chat chunk, whose answer a client accumulates. A usage-only chunk carries
+// no choice at all, which is why this is read rather than indexed.
+[[nodiscard]] RequestJson delta_of(const RequestJson& document) {
+    const RequestJson choices = at_or_null(document, "choices");
+    if (!choices.is_array() || choices.empty() || !choices.at(0).is_object()) { return RequestJson(); }
+    return at_or_null(choices.at(0), "delta");
+}
+
+// A renderer's refusal of a call sequence it cannot reconcile is a std::logic_error, which a handler
+// turns into one terminal error event: on the wire that is a committed stream that never got its answer.
+// So the suite asks for the throw and for its words, which name the rule that was not met -- and takes
+// any other escape from the renderer as a failed check too, rather than letting it end the suite.
+[[nodiscard]] std::string throw_from(const std::function<void()>& action) {
+    try {
+        action();
+    } catch (const std::exception& error) {
+        return error.what();
+    }
+    return {};
+}
+
+// One hidden call the lane really ran, so the renderer's cases read the tool's own writing: the picture
+// drawn, the round numbered, the attempt tied to the call id that asked for it, and the prose answer the
+// round was replaced by.
+struct PictureRound {
+    GenerationRequest request;
+    FakeGenerator generator;
+    ChatImageRounds rounds;
+};
+
+[[nodiscard]] PictureRound drew_one_picture(std::string_view arguments, std::string_view prose) {
+    PictureRound state;
+    state.request.messages.push_back(ChatTurn{.role = infernix::ChatRole::User});
+    state.rounds = run_chat_image_rounds(
+        state.request, image_call_outcome({std::string(arguments)}), kImageModel, kUrlBase, 0,
+        observer_of(state.generator), [&] { return prose_outcome(std::string(prose)); });
+    return state;
+}
+
+// The name every protocol puts the draw's fate under, and the whole record one drawn picture leaves
+// there: the ask as the call named it, the artifact the server handed back, the round and the call id
+// that tie them. The renderer is what has to carry it while carrying no call for it.
+constexpr std::string_view kAttemptField = "image_tool_attempts";
+
+void check_attempt_keeps_the_draw(const RequestJson& witness, const std::string& url) {
+    if (!witness.is_array() || witness.size() != 1) {
+        check(false, "the draw's witness is not the one record this response owes the client");
+        return;
+    }
+    const RequestJson item = witness.at(0);
+    check(text_at(item, "outcome") == "succeeded" && int_at(item, "round") == 1 &&
+              text_at(item, "tool_call_id") == "infernix_img_0",
+          "the internal witness lost the round and the call the server ran for itself");
+    const RequestJson asked = at_or_null(item, "request");
+    check(text_at(asked, "size") == "512x512" && int_at(asked, "steps") == 4,
+          "the internal witness lost the ask the call named");
+    check(text_at(at_or_null(item, "result"), "url") == url, "the internal witness lost the picture it drew");
+    check(!item.contains("error"), "a picture that came is reported to the client as an error");
+}
+
+// The Chat renderer, streaming, on the answer the picture rounds left behind: no frame of the response
+// carries the server's own call in any field, the renderer's own bookkeeping does not keep it either,
+// and the one chunk that closes the stream is the one that carries what really happened.
+void test_chat_renderer_hides_the_server_run_call() {
+    const std::string arguments = R"({"prompt":"a red fox","size":"512x512","steps":4})";
+    PictureRound picture        = drew_one_picture(arguments, " and here it is");
+    check(picture.rounds.rounds == 1 && picture.rounds.generations == 1 &&
+              picture.rounds.attempts.size() == 1 && picture.rounds.answer.tool_calls.empty(),
+          "the renderer case is not standing on the round it means");
+
+    const OpenAIChatResponseIdentity identity = make_openai_chat_response_identity("infernix");
+    OpenAIChatStream stream(identity, /*include_usage =*/true);
+    std::vector<std::string> wire;
+    append_all(wire, published(stream.start()));
+    append_all(wire, published(stream.content_delta("Drawing that now.")));
+    // The handler feeds every delta of the live round to the encoder, the server's own call included:
+    // keeping it off the wire is the renderer's job and nobody else's.
+    stream_call(stream, wire, 0, kChatImageToolName, arguments);
+
+    std::vector<std::string> terminal;
+    const std::string refused =
+        throw_from([&] { terminal = stream.finish(picture.rounds.answer); });
+    // The round replaced its own answer, so the answer this stream closes on names no call at all.
+    // Upstream's positional check has to be settled by the lane's hidden-call rule rather than by a
+    // throw, which would end a committed stream with an error event and no answer.
+    check(refused.empty(),
+          "the chat renderer refused the replaced answer of a picture round: " + refused);
+    append_all(wire, terminal);
+    check(!wire.empty() && wire.back() == "data: [DONE]\n\n",
+          "the chat stream ended without closing as an answered one");
+
+    check(client_text(wire, kAttemptField).find(std::string(kChatImageToolName)) == std::string::npos,
+          "a chunk reached the client naming the tool this process runs for itself");
+    check(client_text(wire, kAttemptField).find("512x512") == std::string::npos,
+          "a chunk reached the client carrying the hidden call's arguments");
+    bool published_a_call = false;
+    for (const std::string& frame : wire) {
+        if (!is_frame(frame)) { continue; }
+        published_a_call = published_a_call || delta_of(frame_of(frame)).contains("tool_calls");
+    }
+    check(!published_a_call, "the terminal answer of a picture round published a tool call");
+    check(stream.tool_call_ids().empty(),
+          "the chat renderer's own call bookkeeping kept the call the client never saw");
+
+    const std::vector<RequestJson> witnesses = witnesses_of(wire, kAttemptField);
+    check(witnesses.size() == 1,
+          "the chat stream did not carry the picture's fate to the client exactly once");
+    if (witnesses.size() == 1) { check_attempt_keeps_the_draw(witnesses[0], picture.rounds.urls[0]); }
+
+    // The same answer on the non-streaming route, which is the other reader of the lane's two doors.
+    const RequestJson body =
+        RequestJson::parse(make_chat_completion_response(identity, picture.rounds.answer));
+    const std::vector<RequestJson> aggregate = witnesses_in(body, kAttemptField);
+    const RequestJson choice = at_or_null(body, "choices").is_array() && !at_or_null(body, "choices").empty()
+                                   ? at_or_null(body, "choices").at(0)
+                                   : RequestJson();
+    check(aggregate.size() == 1 && !at_or_null(choice, "message").contains("tool_calls") &&
+              text_at(choice, "finish_reason") == "stop",
+          "the aggregate chat answer either lost the draw's fate or answered with a call for it");
+    if (aggregate.size() == 1) { check_attempt_keeps_the_draw(aggregate[0], picture.rounds.urls[0]); }
+}
+
+// The other half of the same rule, and the half a renderer can lose while the first still holds: the
+// hidden call earns no published index, so the calls the client does execute are numbered as if it had
+// never been in the turn. A round that mixes a client tool in is the handler's own round, and it carries
+// both calls, which is the shape the renderer's positional check is written for.
+void test_chat_renderer_keeps_client_call_numbering_dense() {
+    const std::string lookup_first  = R"({"q":"one"})";
+    const std::string lookup_second = R"({"q":"two"})";
+    const std::string hidden        = R"({"prompt":"a whale","size":"512x512","steps":4})";
+
+    GenerationOutcome mixed = image_call_outcome({hidden});
+    mixed.text              = "";
+    mixed.tool_calls.insert(
+        mixed.tool_calls.begin(),
+        infernix::GeneratedToolCall{.name = "lookup", .arguments_json = lookup_first});
+    mixed.tool_calls.push_back(
+        infernix::GeneratedToolCall{.name = "lookup", .arguments_json = lookup_second});
+
+    const OpenAIChatResponseIdentity identity = make_openai_chat_response_identity("infernix");
+    OpenAIChatStream stream(identity, /*include_usage =*/false);
+    std::vector<std::string> wire;
+    append_all(wire, published(stream.start()));
+    stream_call(stream, wire, 0, "lookup", lookup_first);
+    // The Engine numbers a turn's calls from zero and counts the server's own call among them: a
+    // renderer that published the Engine's number, or that let the hidden call take a published one,
+    // leaves this round's client calls at 1 and 2 on a protocol whose clients index them from 0.
+    stream_call(stream, wire, 1, kChatImageToolName, hidden);
+    stream_call(stream, wire, 2, "lookup", lookup_second);
+
+    std::vector<std::string> terminal;
+    const std::string refused = throw_from([&] { terminal = stream.finish(mixed); });
+    check(refused.empty(), "the chat renderer refused a round it was handed: " + refused);
+    append_all(wire, terminal);
+
+    std::vector<std::pair<int, std::string>> opened;
+    std::vector<std::string> published_ids;
+    std::string arguments_of_client_calls;
+    for (const std::string& frame : wire) {
+        if (!is_frame(frame)) { continue; }
+        const RequestJson delta = delta_of(frame_of(frame));
+        if (!delta.contains("tool_calls")) { continue; }
+        for (const RequestJson& call : delta.at("tool_calls")) {
+            const RequestJson function = at_or_null(call, "function");
+            arguments_of_client_calls += text_at(function, "arguments");
+            const std::string id = text_at(call, "id");
+            if (id.empty()) { continue; } // a continuation chunk: it reopens nothing
+            opened.emplace_back(int_at(call, "index"), text_at(function, "name"));
+            check(id.starts_with("call_"),
+                  "a published call carried an id the client cannot answer with");
+            published_ids.push_back(id);
+        }
+    }
+    const std::vector<std::pair<int, std::string>> expected{
+        {0, "lookup"}, {1, "lookup"}};
+    check(opened == expected,
+          "the calls a client has to execute were not numbered 0,1 with the server's own call between "
+          "them");
+    // Each call's chunks concatenate to the arguments its tool was declared with, which is what a
+    // client executes them from, and what the renderer matched the result against.
+    check(arguments_of_client_calls == lookup_first + lookup_second,
+          "a client call lost or gained argument bytes on the way to the client");
+    // Two calls opened, so two identifiers earned: the hidden call took no chunk and therefore none
+    // of its own, and the client's two are the ones the renderer reports back to its handler.
+    const std::vector<std::string> bookkeeping = stream.tool_call_ids();
+    check(published_ids.size() == 2 && published_ids[0] != published_ids[1] &&
+              std::find(bookkeeping.begin(), bookkeeping.end(), published_ids[0]) !=
+                  bookkeeping.end() &&
+              std::find(bookkeeping.begin(), bookkeeping.end(), published_ids[1]) !=
+                  bookkeeping.end(),
+          "the calls the renderer reports to its handler are not the ones it published");
+    check(client_text(wire, kAttemptField).find(std::string(kChatImageToolName)) == std::string::npos &&
+              client_text(wire, kAttemptField).find("a whale") == std::string::npos,
+          "the server's own call named itself, or carried its ask, on a wire the client reads");
+}
+
+// The Messages route, which is the one protocol whose body and terminal event are the request's own
+// ordered document: it reaches the lane through the `ordered_json` half of `add_chat_image_attempts`,
+// and a call the server runs for itself earns no content block at all -- not even the block that would
+// have closed the text block beside it.
+void test_anthropic_renderer_hides_the_server_run_call() {
+    const std::string arguments = R"({"prompt":"a red fox","size":"512x512","steps":4})";
+    PictureRound picture        = drew_one_picture(arguments, " and here it is");
+
+    const AnthropicResponseIdentity identity = make_anthropic_response_identity("req_hidden", "claude-local");
+    AnthropicMessagesStream stream(identity, /*input_tokens =*/10);
+    std::vector<std::string> wire{stream.start()};
+    append_all(wire, published(stream.content_delta("Drawing that now.")));
+    stream_call(stream, wire, 0, kChatImageToolName, arguments);
+
+    std::vector<std::string> terminal;
+    const std::string refused =
+        throw_from([&] { terminal = stream.finish(picture.rounds.answer); });
+    check(refused.empty(),
+          "the Messages renderer refused the replaced answer of a picture round: " + refused);
+    append_all(wire, terminal);
+
+    // The text blocks the prose streamed as are the response's whole content: a call the server ran
+    // for itself earns neither a `tool_use` block of its own nor the block that would close the text
+    // beside it.
+    int tool_blocks = 0;
+    for (const std::string& frame : wire) {
+        if (!is_frame(frame)) { continue; }
+        const RequestJson event = frame_of(frame);
+        if (text_at(event, "type") != "content_block_start") { continue; }
+        const std::string kind = text_at(at_or_null(event, "content_block"), "type");
+        if (kind == "tool_use" || kind == "server_tool_use") { ++tool_blocks; }
+    }
+    check(client_text(wire, kAttemptField).find(std::string(kChatImageToolName)) == std::string::npos,
+          "a Messages content block named the tool this process runs for itself");
+    check(client_text(wire, kAttemptField).find("512x512") == std::string::npos,
+          "a Messages block carried the hidden call's input");
+    check(tool_blocks == 0, "the server's own picture call earned the client a content block");
+
+    const std::vector<RequestJson> witnesses = witnesses_of(wire, kAttemptField);
+    check(witnesses.size() == 1,
+          "the Messages stream did not carry the picture's fate to the client exactly once");
+    if (witnesses.size() == 1) { check_attempt_keeps_the_draw(witnesses[0], picture.rounds.urls[0]); }
+
+    const RequestJson body =
+        RequestJson::parse(make_anthropic_messages_response(identity, picture.rounds.answer));
+    const std::vector<RequestJson> aggregate = witnesses_in(body, kAttemptField);
+    int aggregate_blocks = 0;
+    if (at_or_null(body, "content").is_array()) {
+        for (const RequestJson& block : body.at("content")) {
+            const std::string kind = text_at(block, "type");
+            if (kind == "tool_use" || kind == "server_tool_use") { ++aggregate_blocks; }
+        }
+    }
+    check(aggregate.size() == 1 && aggregate_blocks == 0 && text_at(body, "stop_reason") == "end_turn",
+          "the aggregate Messages answer either lost the draw's fate or answered with a block for it");
+    if (aggregate.size() == 1) { check_attempt_keeps_the_draw(aggregate[0], picture.rounds.urls[0]); }
+
+    // A round that mixes a client tool in is handed over as the segment it generated, and that is where
+    // the hidden call can still do damage: it must earn no block and no position, so the client's call
+    // keeps the index the text block left it and its input still arrives whole.
+    const std::string lookup_arguments = R"({"q":"one"})";
+    AnthropicMessagesStream mixed_stream(identity, /*input_tokens =*/10);
+    std::vector<std::string> mixed_wire{mixed_stream.start()};
+    append_all(mixed_wire, published(mixed_stream.content_delta("One moment.")));
+    stream_call(mixed_stream, mixed_wire, 0, kChatImageToolName, arguments);
+    stream_call(mixed_stream, mixed_wire, 1, "lookup", lookup_arguments);
+
+    // The calls in the order the round streamed them, because that is the order the renderer's own
+    // positional check matches by.
+    GenerationOutcome mixed = image_call_outcome({arguments});
+    mixed.text              = "One moment.";
+    mixed.tool_calls.push_back(
+        infernix::GeneratedToolCall{.name = "lookup", .arguments_json = lookup_arguments});
+    std::vector<std::string> mixed_terminal;
+    const std::string mixed_refused =
+        throw_from([&] { mixed_terminal = mixed_stream.finish(mixed); });
+    check(mixed_refused.empty(), "the Messages renderer refused a round it was handed: " + mixed_refused);
+    append_all(mixed_wire, mixed_terminal);
+
+    int mixed_tool_blocks                 = 0;
+    int published_block_index             = -1;
+    std::string delivered_input;
+    for (const std::string& frame : mixed_wire) {
+        if (!is_frame(frame)) { continue; }
+        const RequestJson event = frame_of(frame);
+        const std::string type  = text_at(event, "type");
+        if (type == "content_block_start") {
+            const RequestJson block = at_or_null(event, "content_block");
+            if (text_at(block, "type") != "tool_use") { continue; }
+            ++mixed_tool_blocks;
+            published_block_index = int_at(event, "index");
+            check(text_at(block, "name") == "lookup" && text_at(block, "id").starts_with("toolu_"),
+                  "the block a client has to execute was not named and identified as its own");
+        } else if (type == "content_block_delta" &&
+                   text_at(at_or_null(event, "delta"), "type") == "input_json_delta") {
+            delivered_input += text_at(at_or_null(event, "delta"), "partial_json");
+        }
+    }
+    check(mixed_tool_blocks == 1 && published_block_index == 1 && delivered_input == lookup_arguments,
+          "the server's own call took a content block or a block index from the client's call");
+    check(client_text(mixed_wire, kAttemptField).find("a red fox") == std::string::npos &&
+              client_text(mixed_wire, kAttemptField).find(std::string(kChatImageToolName)) ==
+                  std::string::npos,
+          "the hidden call's ask or name reached the client beside the call that did");
+}
+
+// The Responses route, where the same rule is a whole Item that must not exist: a hidden call is
+// recorded, its round's result counts it, and no `response.output_item.added`, no argument delta and no
+// terminal Item ever names it -- while the Items around it never notice it was there.
+void test_responses_renderer_hides_the_server_run_call() {
+    const RequestJson body =
+        RequestJson{{"model", "m"},
+                    {"input", "draw a fox"},
+                    {"tools", RequestJson::array({RequestJson{
+                                  {"type", "function"},
+                                  {"name", "lookup"},
+                                  {"parameters", RequestJson{{"type", "object"},
+                                                             {"properties",
+                                                              RequestJson{{"q", RequestJson{
+                                                                  {"type", "string"}}}}}}}}})}};
+    const OpenAIResponsesCreateRequest request =
+        parse_openai_responses_create_request(body, RequestLimits{});
+    const std::string hidden_arguments = R"({"prompt":"a whale","size":"512x512","steps":4})";
+    const std::string lookup_arguments = R"({"q":"one"})";
+
+    // One hidden call the lane ran, for the answer the renderer closes on.
+    PictureRound picture = drew_one_picture(hidden_arguments, " and here it is");
+
+    OpenAIResponsesEventStream hidden_only("resp_hidden", 1, request, {});
+    std::vector<std::string> wire = hidden_only.start();
+    append_all(wire, published(hidden_only.content_delta("Drawing that now.")));
+    stream_call(hidden_only, wire, 0, kChatImageToolName, hidden_arguments);
+    OpenAIResponsesStreamFinish finish;
+    const std::string refused = throw_from([&] { finish = hidden_only.finish(picture.rounds.answer); });
+    check(refused.empty(),
+          "the Responses renderer refused the replaced answer of a picture round: " + refused);
+    append_all(wire, finish.events_before_terminal);
+    if (refused.empty()) { append_all(wire, {hidden_only.terminal(finish.response)}); }
+
+    check(client_text(wire, kAttemptField).find(std::string(kChatImageToolName)) == std::string::npos &&
+              client_text(wire, kAttemptField).find("a whale") == std::string::npos,
+          "a Responses event named the server's own call, or carried its ask");
+    for (const std::string& frame : wire) {
+        if (!is_frame(frame)) { continue; }
+        const RequestJson event = frame_of(frame);
+        if (text_at(event, "type") != "response.output_item.added") { continue; }
+        check(text_at(at_or_null(event, "item"), "name") != std::string(kChatImageToolName),
+              "the server's own call became an Item the client has to answer");
+    }
+    const std::vector<RequestJson> witnesses = witnesses_of(wire, kAttemptField);
+    check(witnesses.size() == 1,
+          "the Responses stream did not carry the picture's fate to the client exactly once");
+    if (witnesses.size() == 1) { check_attempt_keeps_the_draw(witnesses[0], picture.rounds.urls[0]); }
+
+    // A round that mixes a client call in is handed over as it is, and this is the half of the rule that
+    // a hidden call in the middle of it can break: the client's call keeps the output position it would
+    // have had, and its arguments still arrive.
+    OpenAIResponsesEventStream mixed("resp_mixed", 1, request, {});
+    std::vector<std::string> mixed_wire = mixed.start();
+    append_all(mixed_wire, published(mixed.content_delta("One moment.")));
+    stream_call(mixed, mixed_wire, 0, kChatImageToolName, hidden_arguments);
+    stream_call(mixed, mixed_wire, 1, "lookup", lookup_arguments);
+
+    GenerationOutcome round = image_call_outcome({hidden_arguments});
+    round.text              = "One moment.";
+    round.tool_calls.push_back(
+        infernix::GeneratedToolCall{.name = "lookup", .arguments_json = lookup_arguments});
+    OpenAIResponsesStreamFinish mixed_finish;
+    const std::string mixed_refused = throw_from([&] { mixed_finish = mixed.finish(round); });
+    check(mixed_refused.empty(), "the Responses renderer refused a round it was handed: " + mixed_refused);
+    append_all(mixed_wire, mixed_finish.events_before_terminal);
+    if (mixed_refused.empty()) { append_all(mixed_wire, {mixed.terminal(mixed_finish.response)}); }
+
+    std::vector<int> call_positions;
+    std::string delivered_arguments;
+    for (const std::string& frame : mixed_wire) {
+        if (!is_frame(frame)) { continue; }
+        const RequestJson event = frame_of(frame);
+        const std::string type  = text_at(event, "type");
+        if (type == "response.output_item.added" &&
+            text_at(at_or_null(event, "item"), "type") == "function_call") {
+            call_positions.push_back(int_at(event, "output_index"));
+            check(text_at(at_or_null(event, "item"), "name") == "lookup",
+                  "a Responses Item named a tool the client never declared");
+        } else if (type == "response.function_call_arguments.delta") {
+            delivered_arguments += text_at(event, "delta");
+        }
+    }
+    check(call_positions == std::vector<int>{1} && delivered_arguments == lookup_arguments,
+          "the client's call lost its output position, or its arguments, to the server's own call "
+          "beside it");
+
+    const BuiltOpenAIResponse aggregate =
+        make_openai_response_object("resp_aggregate", 1, request, OpenAIResponsesRuntimeValues{},
+                                    picture.rounds.answer);
+    // The Responses route builds its body as a plain document, not the request's ordered one, so it is
+    // read back as the bytes a client parses rather than as this suite's own document type.
+    const RequestJson built_body       = RequestJson::parse(aggregate.body.dump());
+    const std::vector<RequestJson> aggregate_witnesses = witnesses_in(built_body, kAttemptField);
+    const RequestJson output = at_or_null(built_body, "output");
+    check(aggregate_witnesses.size() == 1 && output.is_array() && output.size() == 1 &&
+              text_at(output.at(0), "type") == "message",
+          "the aggregate Response either lost the draw's fate or published an Item for the server's own "
+          "call");
+    if (aggregate_witnesses.size() == 1) {
+        check_attempt_keeps_the_draw(aggregate_witnesses[0], picture.rounds.urls[0]);
+    }
+}
+
 } // namespace
 
 // The rewriter's switch on the chat path. The tool's arguments are parsed by the images route's own
@@ -769,6 +1344,10 @@ int main() {
     test_url_suffix();
     test_round_loop();
     test_round_bound_and_cancellation();
+    test_chat_renderer_hides_the_server_run_call();
+    test_chat_renderer_keeps_client_call_numbering_dense();
+    test_anthropic_renderer_hides_the_server_run_call();
+    test_responses_renderer_hides_the_server_run_call();
 
     std::cout << (failures == 0 ? "CHAT_IMAGE_TOOL_TEST: PASS" : "CHAT_IMAGE_TOOL_TEST: FAIL")
               << " (" << (failures == 0 ? "all" : std::to_string(failures) + " failed") << ")\n";

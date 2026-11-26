@@ -1,9 +1,9 @@
 #include "serve/openai_chat.h"
 #include "product/constraint_observation.h"
 
-#include "serve/chat_image_tool.h" // chat_image_attempts_for_response
 #include "serve/completion_timings.h"
 #include "serve/generation_service.h"
+#include "serve/image_chat_hook.h" // the image lane's own field and hidden-call rule
 #include "serve/openai_common.h"
 
 #include <nlohmann/json.hpp>
@@ -126,42 +126,30 @@ Json stream_choice(Json delta, Json finish_reason = nullptr) {
 
 std::string event(Json payload) { return "data: " + payload.dump() + "\n\n"; }
 
+// `outcome` is the answer whose picture work this chunk closes the stream on: only the chunk that
+// carries it says anything about that work, and the lane decides whether there is anything to say.
 std::string chunk(const OpenAIChatResponseIdentity& identity, Json delta, Json finish_reason,
                   bool include_usage, Json timings = nullptr, Json constraint = nullptr,
-                  Json image_tool_attempts = nullptr) {
+                  const GenerationOutcome* outcome = nullptr) {
     Json payload       = base_payload(identity, "chat.completion.chunk");
     payload["choices"] = Json::array({stream_choice(std::move(delta), std::move(finish_reason))});
     if (include_usage) { payload["usage"] = nullptr; }
     if (!timings.is_null()) { payload["timings"] = std::move(timings); }
     if (!constraint.is_null()) payload["constraint"] = std::move(constraint);
-    // The hidden tool's attempts belong on the terminal chunk only, beside usage and timings: they
-    // describe work that is finished, and a client accumulating deltas should read them once.
-    if (!image_tool_attempts.is_null()) {
-        payload["image_tool_attempts"] = std::move(image_tool_attempts);
-    }
+    if (outcome != nullptr) { add_chat_image_attempts(payload, *outcome); }
     return event(std::move(payload));
 }
 
 std::string usage_chunk(const OpenAIChatResponseIdentity& identity, const CompletionUsage& usage,
                         Json timings, Json constraint, bool with_choice,
-                        Json image_tool_attempts = nullptr) {
+                        const GenerationOutcome* outcome = nullptr) {
     Json payload       = base_payload(identity, "chat.completion.chunk");
     payload["choices"] = with_choice ? Json::array({stream_choice(Json::object())}) : Json::array();
     payload["usage"]   = usage_json(usage);
     payload["timings"] = std::move(timings);
     if (!constraint.is_null()) payload["constraint"] = std::move(constraint);
-    if (!image_tool_attempts.is_null()) {
-        payload["image_tool_attempts"] = std::move(image_tool_attempts);
-    }
+    if (outcome != nullptr) { add_chat_image_attempts(payload, *outcome); }
     return event(std::move(payload));
-}
-
-// The attempt array, or null when this request drew no picture -- and null means the field is not
-// emitted at all, which is the whole reason a plain chat answer is the same bytes it was before the
-// field existed. The reading itself belongs to the tool that writes the string: see
-// chat_image_attempts_for_response.
-[[nodiscard]] Json image_tool_attempts_json(const GenerationOutcome& outcome) {
-    return chat_image_attempts_for_response(outcome);
 }
 
 void require_prefix(std::string_view complete, std::string_view streamed, const char* channel) {
@@ -205,11 +193,7 @@ std::string make_chat_completion_response(const OpenAIChatResponseIdentity& iden
     payload["timings"] = timings_json(outcome_timings(outcome));
     if (outcome.constraint)
         payload["constraint"] = product::constraint_observation_json(outcome.constraint);
-    // Additive, and absent whenever this request drew no picture: the picture's fate is the server's
-    // own record, and the client is not left to take the model's word for it.
-    if (Json attempts = image_tool_attempts_json(outcome); !attempts.is_null()) {
-        payload["image_tool_attempts"] = std::move(attempts);
-    }
+    add_chat_image_attempts(payload, outcome);
     return payload.dump();
 }
 
@@ -352,7 +336,7 @@ OpenAIChatToolCallChunk OpenAIChatStream::tool_call_delta(const infernix::ToolCa
     if (opens) {
         calls_.push_back(StreamedCall{.engine_index    = delta.index,
                                       .published_index = 0,
-                                      .hidden          = delta.name == kChatImageToolName,
+                                      .hidden          = chat_image_tool_hidden(delta.name),
                                       .id              = new_openai_chat_tool_call_id(),
                                       .name            = delta.name});
         position = calls_.size() - 1U;
@@ -387,6 +371,21 @@ std::vector<std::string> OpenAIChatStream::finish(const GenerationOutcome& outco
     finished_ = true;
     require_prefix(outcome.reasoning, reasoning_, "reasoning");
     require_prefix(outcome.text, content_, "content");
+    // The other half of the hidden-call rule of tool_call_delta above. A call this process runs for
+    // itself is only part of the answer of the round that streamed it: the picture rounds replace that
+    // round's answer with the prose one (serve/chat_image_tool.cpp), so the message the client reads
+    // carries no call at all and the check below would fail on a call it never published. A hidden call
+    // the result still carries stays, because that round's result really did count it by position.
+    for (std::size_t index = calls_.size(); index-- > 0;) {
+        if (!calls_[index].hidden) { continue; }
+        const std::string& name = calls_[index].name;
+        const bool carried      = std::any_of(outcome.tool_calls.begin(), outcome.tool_calls.end(),
+                                              [&](const infernix::GeneratedToolCall& call) {
+                                                  return call.name == name &&
+                                                         call.arguments_json == calls_[index].arguments;
+                                              });
+        if (!carried) { calls_.erase(calls_.begin() + static_cast<std::ptrdiff_t>(index)); }
+    }
     // Streamed calls are the result's, and at most one more that the turn's end cut.
     if (!calls_.empty()) {
         bool matches = calls_.size() == outcome.tool_calls.size() ||
@@ -403,7 +402,6 @@ std::vector<std::string> OpenAIChatStream::finish(const GenerationOutcome& outco
     const Json output_timings = timings_per_token_ ? final_timings : Json(nullptr);
     // Once, on whichever chunk closes the stream: the usage chunk when the client asked for usage,
     // the finish-reason chunk otherwise. A client that reads both still sees the field exactly once.
-    const Json attempts       = image_tool_attempts_json(outcome);
     std::vector<std::string> events;
     const std::string reasoning_suffix = outcome.reasoning.substr(reasoning_.size());
     if (!reasoning_suffix.empty()) {
@@ -432,16 +430,16 @@ std::vector<std::string> OpenAIChatStream::finish(const GenerationOutcome& outco
         events.push_back(chunk(identity_, Json::object(), finish_reason(outcome), include_usage_,
                                include_usage_ ? Json(nullptr) : final_timings,
                                include_usage_ ? Json(nullptr) : constraint,
-                               include_usage_ ? Json(nullptr) : attempts));
+                               include_usage_ ? nullptr : &outcome));
     } else {
         events.push_back(chunk(identity_, Json::object(), finish_reason(outcome.finish_reason),
                                include_usage_, include_usage_ ? Json(nullptr) : final_timings,
                                include_usage_ ? Json(nullptr) : constraint,
-                               include_usage_ ? Json(nullptr) : attempts));
+                               include_usage_ ? nullptr : &outcome));
     }
     if (include_usage_) {
         events.push_back(usage_chunk(identity_, usage_from(outcome), final_timings, constraint,
-                                     usage_chunk_choice_, attempts));
+                                     usage_chunk_choice_, &outcome));
     }
     events.emplace_back("data: [DONE]\n\n");
     return events;
