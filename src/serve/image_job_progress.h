@@ -5,7 +5,8 @@
 // lock-free readers. The ticker's stall watchdog is the only writer of `stalled`: a job whose
 // percent and last_progress stand still past the stall bound is failed at the pipeline's next
 // step boundary, which is the only point where unwinding is safe (the interlude still owns the
-// yielded VRAM).
+// yielded VRAM). It measures only a job that has called arm() -- see `armed` below for why the span
+// before the first DiT step is not a span whose silence means a wedged draw.
 
 #include <atomic>
 #include <chrono>
@@ -30,10 +31,24 @@ struct ImageJobProgress {
             std::chrono::steady_clock::now().time_since_epoch())
             .count()};
     std::atomic<bool> stalled{false};
+    // The gate on the watchdog: `last_progress` is stamped when the job is constructed, and the span
+    // before the first DiT step is not a span where standing still means a wedged draw -- the job may be
+    // in the prompt enhancer's sidecar call, the weight upload or the text tower, any of which
+    // legitimately runs past the stall bound. So the ticker measures only from arm(), which the pipeline
+    // calls as it enters the loop, and arm() re-stamps the clock so the first step has its whole bound.
+    // Sticky in both directions: a later advance() must not clear a stall, and nothing disarms one.
+    std::atomic<bool> armed{false};
+
+    // Begins the monitored phase: stamps the clock and lets the watchdog measure this job.
+    void arm(long long at_ns = progress_clock_now()) {
+        last_progress.store(at_ns, std::memory_order_relaxed);
+        armed.store(true, std::memory_order_relaxed);
+    }
 
     // Records one step. Returns false once the watchdog has flagged the job: the pipeline hook
     // throws at that point rather than continuing a wedged generation. `at_ns` lets a test move
-    // the stamp without moving the real clock.
+    // the stamp without moving the real clock. Every step re-stamps it, whether or not the
+    // displayed percent moved: an unchanged integer percent is still liveness.
     bool advance(int pct, long long at_ns = progress_clock_now()) {
         percent.store(pct, std::memory_order_relaxed);
         last_progress.store(at_ns, std::memory_order_relaxed);

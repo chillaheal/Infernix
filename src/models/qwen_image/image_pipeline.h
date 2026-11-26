@@ -141,6 +141,12 @@ class ImageJobProgressView {
 public:
     virtual ~ImageJobProgressView() = default;
     [[nodiscard]] virtual bool step(std::size_t units_done, std::size_t units_total) = 0;
+    // Opens the serving watchdog's stall window, called once as the job enters the DiT loop: the first
+    // point where a step is overdue and standing still means the draw has wedged. Everything before it -
+    // the prompt enhancer's sidecar call, the weight upload, the text tower - is legitimate work with no
+    // DiT units to report, so the watchdog does not measure it. Absent by default: a caller without a
+    // watchdog, and the certified route, stay exactly as they were.
+    virtual void arm() {}
 };
 
 // The Host bytes one job page-locks for its DiT block cache: every block's nine roles, held for the

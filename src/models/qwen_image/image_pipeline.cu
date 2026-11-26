@@ -1070,6 +1070,14 @@ GeneratedImage run_image_job(artifact::Reader& reader, const DiTWeights& dit, co
 
     // ---- the flow-match denoise loop ----
     const auto loop_t0 = std::chrono::steady_clock::now();
+    // The lane opens its own stall window here and nowhere earlier. From this line on, a step is overdue
+    // and a job that stops reporting has wedged with the interlude still holding the yielded VRAM; before
+    // it, the same silence is the prompt enhancer's sidecar call, the weight upload or the text tower
+    // doing legitimate work with no DiT unit to report. serve/http_transport.h's ticker is the only reader
+    // of this, and it measures nothing until it is armed.
+    if (progress) {
+        progress->arm();
+    }
     const std::size_t n_steps = inputs.timesteps.size();
     for (std::size_t i = 0; i < n_steps; ++i) {
         const double sigma = inputs.sigmas[i], sigma_next = inputs.sigmas[i + 1];
