@@ -321,6 +321,9 @@ public:
             [[nodiscard]] bool step(std::size_t units_done, std::size_t units_total) override {
                 return state_->advance(static_cast<int>(units_done * 100 / units_total));
             }
+            // Opens this job's stall window as the DiT loop begins. serve/http_transport.h's ticker
+            // measures nothing before this; serve/image_job_progress.h says why.
+            void arm() override { state_->arm(); }
             ImageJobProgress* state_;
         } view(progress.get());
 

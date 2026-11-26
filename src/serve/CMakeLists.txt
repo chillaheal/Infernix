@@ -17,14 +17,6 @@ add_library(infernix_serve STATIC
   tool_search.cpp
   server_tools.cpp
   openai_responses_store.cpp
-  image_job_store.cpp
-  openai_images.cpp
-  reference_image.cpp
-  openai_images_http.cpp
-  chat_image_tool.cpp
-  image_generation_service.cpp
-  prompt_enhancer.cpp
-  image_text_tower.cpp
   translate.cpp
   generation_service.cpp
   prefix_miss.cpp
@@ -44,5 +36,8 @@ infernix_internal_includes(infernix_serve)
 target_link_libraries(infernix_serve
   PUBLIC infernix_engine Threads::Threads infernix::json infernix::httplib
   PRIVATE infernix_product_config infernix_media_acquire infernix_media_decode infernix_product_logging
-          infernix_grammar infernix_text infernix_cuda_runtime infernix_qwen_image infernix_qwen_image_runtime
-          infernix_media_encode)
+          infernix_grammar infernix_text infernix_cuda_runtime)
+
+# The image lane's own sources and the three libraries only it needs: src/serve/image_lane.sources.cmake.
+# One line, appended, so this file carries no lane entry of its own.
+include("${CMAKE_CURRENT_SOURCE_DIR}/image_lane.sources.cmake")

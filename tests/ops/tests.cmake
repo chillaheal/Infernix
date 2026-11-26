@@ -152,32 +152,9 @@ infernix_add_family_op_test(infernix_candidate_selector_test FAMILY sampling
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_candidate_selector.cpp"
   LIBRARIES infernix_ops)
 
-# DiT complex 3-axis RoPE (use_real=false): synthetic BF16 q/k against a FP64 complex oracle over a
-# real positional cis table. Skips (77) with no CUDA device.
-infernix_add_op_test(infernix_rope_c64_test
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_rope_c64.cu"
-  LIBRARIES infernix_ops)
-
-# DiT joint block-causal attention against a FP64 masked-softmax oracle over random BF16 q/k/v.
-# Skips (77) with no CUDA device.
-infernix_add_op_test(infernix_attn_dit_joint_test
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_attn_dit_joint.cu"
-  LIBRARIES infernix_ops)
-set_tests_properties(infernix_attn_dit_joint_test PROPERTIES SKIP_RETURN_CODE 77)
-
-# DiT AdaLN-Zero modulation (adaln_scale, adaln_gate_add) against a FP64 oracle over random BF16
-# activations and a [M,2] modulation table. Skips (77) with no CUDA device.
-infernix_add_op_test(infernix_dit_adaln_test
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_dit_adaln.cu"
-  LIBRARIES infernix_ops)
-set_tests_properties(infernix_dit_adaln_test PROPERTIES SKIP_RETURN_CODE 77)
-
-# One joint-sequence ceiling, shared by the image ops, /v1/capabilities and the chat tool
-# schema. Host-only: the ops' token check runs before any device work is enqueued, so the
-# refusals need no CUDA device and the suite must never skip.
-infernix_add_test(infernix_image_joint_limits_test
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_image_joint_limits.cpp"
-  LIBRARIES infernix_ops infernix_serve)
+# The image lane's own op suites (the DiT kernels and the joint-sequence ceiling):
+# tests/ops/image_lane.tests.cmake. One line, in the place the suites themselves used to occupy.
+include("${CMAKE_CURRENT_LIST_DIR}/image_lane.tests.cmake")
 
 infernix_add_family_op_test(infernix_softmax_attention_test FAMILY attention
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/softmax_attention/main.cpp"

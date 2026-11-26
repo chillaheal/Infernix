@@ -1,8 +1,7 @@
 #include "serve/http_server.h"
 
-#include "serve/chat_image_tool.h"
 #include "serve/http_transport.h"
-#include "serve/image_generation_service.h"
+#include "serve/image_chat_hook.h"
 #include "serve/openai_common.h"
 #include "serve/openai_responses.h"
 #include "serve/request_validation.h"
@@ -380,24 +379,19 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
         return;
     }
 
-    // With an image pipeline in this process the request also carries the server-executed image
-    // tool, so the picture rounds below are the ones a client would otherwise have to run. The URL
-    // base and the model id are read here because a streaming provider runs after this handler has
-    // returned, and the generator is bound to this request's Host so the URL resolves for that client.
-    const bool images_configured = images_ != nullptr;
-    append_chat_image_tool(resolved.generation, images_configured);
-    const std::string image_url_base =
-        images_configured ? artifact_url_base(req, options_) : std::string();
-    const std::string image_model = image_model_id();
     const std::uint64_t req_id = ++request_seq_;
-    // The tool's pictures go through the same witness the images route uses -- one door, one record --
-    // and they carry the chat request that asked for them, so one log line names both halves of what
-    // the client experiences as one call. Built after `req_id` for exactly that reason.
-    const ChatImageGenerator make_picture = [this, url_base = image_url_base, req_id](
-                                                const OpenAIImagesRequest& image_request) {
-        return run_image_job(image_request, url_base, "chat_tool", "openai_responses",
-                             std::to_string(req_id));
-    };
+    // The lane's two reads of this process, which only a member of HttpServer can make: the attached
+    // pipeline and the one door a picture goes through. Everything they are used for -- the tool, the
+    // rounds, the witness line a chat draw is filed under -- is the lane's: serve/image_chat_hook.h.
+    auto hook = make_chat_image_hook(
+        *this, req, "openai_responses", req_id, options_,
+        ChatImageDoors{
+            [this] { return static_cast<void*>(images_); },
+            [this](const auto& image_request, std::string_view base, std::string_view source,
+                   std::string_view protocol, std::string correlation) {
+                return run_image_job(image_request, base, source, protocol, std::move(correlation));
+            }});
+    inject_chat_image_tool(hook, resolved.generation);
     const RequestLogMetadata metadata{
         .http_request_id                   = res.get_header_value("x-request-id"),
         .response_id                       = id,
@@ -408,7 +402,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
         .label                             = request_label(req),
     };
     // Every round of one request is one HTTP request: the same observation wiring, and the same
-    // request log, so an image round is visible as part of this request rather than as a new one.
+    // request log, so a round the server runs itself stays part of this request.
     // Captured by value because a streaming provider runs after this handler has returned.
     const auto make_observation = [this, req_id, http_request_id = metadata.http_request_id] {
         return infernix::GenerationObservationOptions{
@@ -457,12 +451,10 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
     };
     ResponseRounds rounds;
     // Only a hosted tool search continues the conversation; otherwise its copy is not needed.
-    // With an image pipeline the conversation is also re-rendered by picture rounds, which read
-    // `resolved.generation` itself: then the search keeps a copy instead of taking it.
     const bool tool_search_continues =
         request.prompt.tool_search && request.prompt.tool_search->server;
     if (tool_search_continues) {
-        if (images_configured) {
+        if (chat_image_replay_needed(hook)) {
             rounds.continuation = resolved.generation;
         } else {
             rounds.continuation = std::move(resolved.generation);
@@ -470,7 +462,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
     }
     // The prompt is submitted, so its text is dead weight — unless a picture round has to re-render
     // this conversation, which needs the turns back.
-    if (!images_configured) { resolved.generation.messages.clear(); }
+    if (!chat_image_replay_needed(hook)) { resolved.generation.messages.clear(); }
 
     if (!request.stream) {
         const std::function<bool()> cancelled = [&req] { return client_disconnected(req); };
@@ -478,10 +470,9 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
             run_openai_response(*service_, request, rounds, prepared, nullptr, cancelled,
                                 continuation_preparer(cancelled), {},
                                 [](std::size_t) { return new_openai_response_item_id("tsc"); });
-            if (images_configured && outcome_is_chat_image_tool_round(rounds.final_outcome)) {
-                ChatImageRounds pictures = run_chat_image_rounds(
-                    resolved.generation, std::move(rounds.final_outcome), image_model,
-                    image_url_base, unix_time_now(), make_picture,
+            if (chat_image_round_needed(hook, rounds.final_outcome)) {
+                auto pictures = run_chat_image_rounds(
+                    *hook, resolved.generation, std::move(rounds.final_outcome),
                     [&] {
                         // A new round takes over this request's generation, and with it the lifetime
                         // that keeps media alive until the response is written.
@@ -493,8 +484,8 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                                              [&req] { return client_disconnected(req); });
                     });
                 rounds.final_outcome       = std::move(pictures.answer);
-                rounds.final_outcome.text += missing_image_url_suffix(rounds.final_outcome.text,
-                                                                      pictures.urls);
+                rounds.final_outcome.text += chat_image_missing_url_suffix(
+                    *hook, rounds.final_outcome.text, pictures.urls);
             }
         } catch (const ApiException& exception) {
             const ApiError error = responses_error(exception.error());
@@ -597,8 +588,8 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
         prepare_sse_response(res);
         res.set_chunked_content_provider(
             "text/event-stream",
-            [this, stream, id, lifecycle, generation, images_configured, image_model, image_url_base,
-             make_picture, make_observation, search_request,
+            [this, stream, id, lifecycle, generation, hook,
+             make_observation, search_request,
              continuation_preparer](std::size_t, httplib::DataSink& sink) -> bool {
                 if (stream->started.exchange(true, std::memory_order_acq_rel)) {
                     sink.done();
@@ -699,26 +690,23 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                                         protocol_failure_detail;
                         return send_failed(error);
                     }
-                    if (images_configured &&
-                        outcome_is_chat_image_tool_round(stream->rounds.final_outcome)) {
-                        // The picture draws with the Engine loop stopped: this ticker is the
-                        // stream's only traffic while it runs, and it carries the job's real
-                        // percent as an SSE comment. A picture round streams nothing of its own:
+                    if (chat_image_round_needed(hook, stream->rounds.final_outcome)) {
+                        // The lane says what the silence while a picture is drawn carries on the wire.
+                        // A picture round streams nothing of its own:
                         // its deltas would open a second reasoning/text item inside the response
                         // item already started, and its text reaches the client as the answer's
                         // tail.
+                        // The ticker is also the stall watchdog's only observer: only this thread can see
+                        // that the job stopped reporting, and only the lane knows when that means a wedge
+                        // (serve/image_job_progress.h, armed by src/models/qwen_image/image_pipeline.cu).
                         HeartbeatTicker ticker(
-                            transport, [this]() -> std::string {
-                                const auto progress =
-                                    images_ != nullptr ? images_->last_job_progress() : nullptr;
-                                if (progress == nullptr) { return {}; }
-                                const int percent = progress->percent.load(std::memory_order_relaxed);
-                                if (percent < 0) { return {}; }
-                                return ": image " + std::to_string(percent) + "%\n\n";
+                            transport,
+                            [&hook]() -> std::string { return chat_image_progress_note(*hook); },
+                            [&hook]() -> std::shared_ptr<ImageJobProgress> {
+                                return chat_image_watch_progress(*hook);
                             });
-                        ChatImageRounds pictures = run_chat_image_rounds(
-                            *generation, std::move(stream->rounds.final_outcome), image_model,
-                            image_url_base, unix_time_now(), make_picture,
+                        auto pictures = run_chat_image_rounds(
+                            *hook, *generation, std::move(stream->rounds.final_outcome),
                             [&] {
                                 stream->prepared = service_->prepare(
                                     *generation, GenerationConsumerMode::Streaming,
@@ -728,8 +716,8 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                                 return service_->run(stream->prepared, &quiet);
                             });
                         stream->rounds.final_outcome       = std::move(pictures.answer);
-                        stream->rounds.final_outcome.text += missing_image_url_suffix(
-                            stream->rounds.final_outcome.text, pictures.urls);
+                        stream->rounds.final_outcome.text += chat_image_missing_url_suffix(
+                            *hook, stream->rounds.final_outcome.text, pictures.urls);
                     }
                 } catch (const ClientDisconnected&) {
                     lifecycle->failure(

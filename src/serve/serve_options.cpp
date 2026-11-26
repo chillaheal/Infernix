@@ -1,4 +1,5 @@
 #include "serve/serve_options.h"
+#include "serve/image_serve_options.h"
 #include "product/config/config_file.h"
 #include "product/logits_options.h"
 #include "product/speculative_options.h"
@@ -100,10 +101,6 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--default-thinking-budget"},
     ServeOptionArity{"--thinking-budget-message"},
     ServeOptionArity{"--thinking-budget-policy"},
-    ServeOptionArity{"--image-artifact"},
-    ServeOptionArity{"--image-text-processor"},
-    ServeOptionArity{"--image-prompt-enhancer-url"},
-    ServeOptionArity{"--image-retention-days"},
     ServeOptionArity{"--no-thinking-answer-room", false},
     ServeOptionArity{"--reasoning-loop"},
     ServeOptionArity{"--vision", false},
@@ -134,7 +131,8 @@ const ServeOptionArity* find_option(std::string_view name) noexcept {
     const auto found =
         std::find_if(kServeOptionArities.begin(), kServeOptionArities.end(),
                      [&](const ServeOptionArity& option) { return option.name == name; });
-    return found == kServeOptionArities.end() ? nullptr : &*found;
+    if (found != kServeOptionArities.end()) { return &*found; }
+    return image_option_arity(name); // the image lane's own options: serve/image_serve_options.h
 }
 
 // infernix-serve's --config: top-level keys and the [serve] table; [cli] is infernix's.
@@ -575,24 +573,7 @@ std::string serve_usage_text(const char* argv0) {
            "                             trace to FILE (offloaded experts only)\n"
            "  --response-store-max-records N Responses-state record cap (default 1024)\n"
            "  --response-store-max-mib N      Responses-state byte cap in MiB (default 256)\n"
-           "  --image-artifact PATH      .infernix image artifact for the synchronous\n"
-           "                             POST /v1/images/generations (default: the route\n"
-           "                             answers 503 image_generation_not_configured)\n"
-           "  --image-text-processor PATH\n"
-           "                             HF Qwen3-VL processor directory (tokenizer.json,\n"
-           "                             tokenizer_config.json, chat_template.jinja) that\n"
-           "                             turns the raw prompt into the tower conditioning\n"
-           "                             (default: the route stays 503 not_configured)\n"
-           "  --image-prompt-enhancer-url HOST:PORT\n"
-           "                             loopback address of the Qwen/Qwen-Image-2.1-PE-I2I\n"
-           "                             worker (tools/prompt_enhancer/pe_worker.py) that\n"
-           "                             rewrites an edit instruction before the DiT sees\n"
-           "                             it; accept 127.0.0.1 or localhost, and without it\n"
-           "                             prompt_enhance answers 503 unavailable\n"
-           "  --image-retention-days N   days a generated picture stays on disk, which is\n"
-           "                             how long its /v1/images/<id> URL answers; after\n"
-           "                             that the file is swept and the URL is 404\n"
-           "                             (default 14; 0 keeps every picture forever)\n"
+           + image_help_text() + // the image lane's options: serve/image_serve_options.h
            "  --log-stats-interval-ms N  throughput-log interval in ms\n"
            "                             (default 5000; 0 disables)\n"
            "  --log-colours on|off       colour the console stats lines (default off; on\n"
@@ -678,6 +659,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             return arguments[i].c_str();
         };
         if (find_option(arg) == nullptr) { throw std::invalid_argument("unknown argument: " + arg); }
+        // The image lane owns its four options, value checks and diagnostics alike:
+        // serve/image_serve_options.h. Nothing else is accepted before it, as before.
+        if (parse_image_option(arg, options, require_value, parse_nonnegative_int)) { continue; }
         if (arg == "--host") {
             options.host = require_value("--host");
         } else if (arg == "--port") {
@@ -914,40 +898,6 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 throw std::invalid_argument("--response-store-max-mib is out of range");
             }
             options.response_store_max_bytes = static_cast<std::size_t>(mib << 20);
-        } else if (arg == "--image-artifact") {
-            options.image_artifact_path = require_value("--image-artifact");
-            if (options.image_artifact_path.empty()) {
-                throw std::invalid_argument("--image-artifact must not be empty");
-            }
-        } else if (arg == "--image-retention-days") {
-            options.image_retention_days = parse_nonnegative_int(
-                require_value("--image-retention-days"), "image-retention-days");
-            if (options.image_retention_days > 3650) {
-                throw std::invalid_argument("--image-retention-days must be at most 3650");
-            }
-        } else if (arg == "--image-text-processor") {
-            options.image_text_processor_path = require_value("--image-text-processor");
-            if (options.image_text_processor_path.empty()) {
-                throw std::invalid_argument("--image-text-processor must not be empty");
-            }
-        } else if (arg == "--image-prompt-enhancer-url") {
-            options.image_prompt_enhancer_url = require_value("--image-prompt-enhancer-url");
-            // Loopback only, and only the two literal spellings of it: the sidecar receives this
-            // route's raw pictures and asks the card for about 20 GB, so a routable address is a
-            // misconfiguration rather than a deployment choice. Resolving a name to decide is not the
-            // option parser's job, so no name other than these two is accepted.
-            std::string host = options.image_prompt_enhancer_url;
-            if (const auto scheme = host.find("://"); scheme != std::string::npos) {
-                host = host.substr(scheme + 3);
-            }
-            const auto colon = host.rfind(':');
-            const std::string name = colon == std::string::npos ? host : host.substr(0, colon);
-            if (options.image_prompt_enhancer_url.empty() || colon == std::string::npos ||
-                host.find('/') != std::string::npos ||
-                (name != "127.0.0.1" && name != "localhost")) {
-                throw std::invalid_argument(
-                    "--image-prompt-enhancer-url must be 127.0.0.1:PORT or localhost:PORT");
-            }
         } else if (arg == "--device") {
             options.device = parse_nonnegative_int(require_value("--device"), "device");
         } else if (arg == "--ram-headroom-mib") {
