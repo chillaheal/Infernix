@@ -3,6 +3,7 @@
 
 #include "serve/completion_timings.h"
 #include "serve/generation_service.h"
+#include "serve/image_chat_hook.h" // the image lane's own field and hidden-call rule
 #include "serve/openai_common.h"
 
 #include <nlohmann/json.hpp>
@@ -125,23 +126,35 @@ Json stream_choice(Json delta, Json finish_reason = nullptr) {
 
 std::string event(Json payload) { return "data: " + payload.dump() + "\n\n"; }
 
+// PORT(ported tree): re-adds the carrier parameter the fork's chunk() and usage_chunk() took
+// (FORK src/serve/openai_chat_response.cpp:131 and :143) where the automated pass left it out. The
+// picture work of this request is written by the lane once per response, so exactly one of the two
+// carriers is handed the outcome pointer per stream and the lane decides whether there is anything to
+// say (serve/image_chat_hook.h). Upstream tip has no such parameter, and a null pointer -- which is
+// what every chunk of every stream that never touched the image tool passes -- writes no field at all,
+// so those chunks stay the exact bytes upstream writes.
+// `outcome` is the answer whose picture work this chunk closes the stream on.
 std::string chunk(const OpenAIChatResponseIdentity& identity, Json delta, Json finish_reason,
-                  bool include_usage, Json timings = nullptr, Json constraint = nullptr) {
+                  bool include_usage, Json timings = nullptr, Json constraint = nullptr,
+                  const GenerationOutcome* outcome = nullptr) {
     Json payload       = base_payload(identity, "chat.completion.chunk");
     payload["choices"] = Json::array({stream_choice(std::move(delta), std::move(finish_reason))});
     if (include_usage) { payload["usage"] = nullptr; }
     if (!timings.is_null()) { payload["timings"] = std::move(timings); }
     if (!constraint.is_null()) payload["constraint"] = std::move(constraint);
+    if (outcome != nullptr) { add_chat_image_attempts(payload, *outcome); }
     return event(std::move(payload));
 }
 
 std::string usage_chunk(const OpenAIChatResponseIdentity& identity, const CompletionUsage& usage,
-                        Json timings, Json constraint, bool with_choice) {
+                        Json timings, Json constraint, bool with_choice,
+                        const GenerationOutcome* outcome = nullptr) {
     Json payload       = base_payload(identity, "chat.completion.chunk");
     payload["choices"] = with_choice ? Json::array({stream_choice(Json::object())}) : Json::array();
     payload["usage"]   = usage_json(usage);
     payload["timings"] = std::move(timings);
     if (!constraint.is_null()) payload["constraint"] = std::move(constraint);
+    if (outcome != nullptr) { add_chat_image_attempts(payload, *outcome); }
     return event(std::move(payload));
 }
 
@@ -190,6 +203,7 @@ std::string make_chat_completion_response(const OpenAIChatResponseIdentity& iden
     payload["timings"] = timings_json(outcome_timings(outcome));
     if (outcome.constraint)
         payload["constraint"] = product::constraint_observation_json(outcome.constraint);
+    add_chat_image_attempts(payload, outcome);
     return payload.dump();
 }
 
@@ -312,6 +326,22 @@ std::string OpenAIChatStream::tool_call_delta(const infernix::ToolCallDelta& del
     }
     calls_.back().arguments += delta.arguments;
     calls_.back().complete = delta.complete;
+    // PORT(ported tree): re-adds the lane's hidden-call rule of Fork src/serve/openai_chat_response.cpp
+    // :339 and :349. The call this process runs for itself stays in this list -- the round's result
+    // counts it, and finish() below matches the result's calls against this list by position -- but it
+    // earns no chunk, and the calls that do reach the client keep dense numbers. Upstream tip publishes
+    // `delta.index` because at its base no call was ever hidden, and the fork's density came from
+    // StreamedCall::published_index in serve/openai_chat.h, which upstream has no notion of and this
+    // port does not change; it is recomputed here from the lane's own rule instead. A suppressed call's
+    // chunk is the empty string, which the handler writes as nothing.
+    // Asked of the call this delta belongs to, not of `delta.name`: only the opening delta carries a
+    // name, so the continuation and the closing delta of a hidden call would otherwise be published.
+    if (chat_image_tool_hidden(calls_[delta.index].name)) { return {}; }
+    const auto published = std::count_if(
+        calls_.begin(),
+        calls_.begin() + static_cast<std::ptrdiff_t>(delta.index + 1U),
+        [](const StreamedCall& entry) { return !chat_image_tool_hidden(entry.name); });
+    call["index"] = static_cast<int>(published - 1);
     return chunk(identity_, Json{{"tool_calls", Json::array({std::move(call)})}}, nullptr,
                  include_usage_, live_timings_json());
 }
@@ -323,6 +353,24 @@ std::vector<std::string> OpenAIChatStream::finish(const GenerationOutcome& outco
     finished_ = true;
     require_prefix(outcome.reasoning, reasoning_, "reasoning");
     require_prefix(outcome.text, content_, "content");
+    // PORT(ported tree): re-adds the other half of the lane's hidden-call rule of Fork
+    // src/serve/openai_chat_response.cpp:337. A call this process runs for itself is only part of the
+    // answer of the round that streamed it: the picture rounds replace that round's answer with the
+    // prose one (serve/chat_image_tool.cpp), so the message the client reads carries no call at all and
+    // upstream's positional check below would fail on a call it never published. The fork kept that
+    // bookkeeping in StreamedCall::hidden, which lives in serve/openai_chat.h and is not this port's to
+    // change, so the calls are asked of the lane here: a hidden call the result still carries stays,
+    // because the round's result really did count it by position.
+    for (std::size_t index = calls_.size(); index-- > 0;) {
+        const std::string& name = calls_[index].name;
+        if (!chat_image_tool_hidden(name)) { continue; }
+        const bool carried = std::any_of(outcome.tool_calls.begin(), outcome.tool_calls.end(),
+                                         [&](const infernix::GeneratedToolCall& call) {
+                                             return call.name == name &&
+                                                    call.arguments_json == calls_[index].arguments;
+                                         });
+        if (!carried) { calls_.erase(calls_.begin() + static_cast<std::ptrdiff_t>(index)); }
+    }
     // Streamed calls are the result's, and at most one more that the turn's end cut.
     if (!calls_.empty()) {
         bool matches = calls_.size() == outcome.tool_calls.size() ||
@@ -359,17 +407,23 @@ std::vector<std::string> OpenAIChatStream::finish(const GenerationOutcome& outco
         } else {
             for (std::size_t index = 0; index < outcome.tool_calls.size(); ++index) { call_ids_.push_back(calls_[index].id); }
         }
+        // PORT(ported tree): re-adds the single-carrier rule of Fork src/serve/openai_chat_response.cpp
+        // :415: whichever chunk closes the stream carries the answer's pointer, the usage chunk when the
+        // client asked for usage and the finish-reason chunk otherwise, so the field is read exactly once
+        // per response. The lane writes nothing for an answer that drew no picture.
         events.push_back(chunk(identity_, Json::object(), finish_reason(outcome), include_usage_,
                                include_usage_ ? Json(nullptr) : final_timings,
-                               include_usage_ ? Json(nullptr) : constraint));
+                               include_usage_ ? Json(nullptr) : constraint,
+                               include_usage_ ? nullptr : &outcome));
     } else {
         events.push_back(chunk(identity_, Json::object(), finish_reason(outcome.finish_reason),
                                include_usage_, include_usage_ ? Json(nullptr) : final_timings,
-                               include_usage_ ? Json(nullptr) : constraint));
+                               include_usage_ ? Json(nullptr) : constraint,
+                               include_usage_ ? nullptr : &outcome));
     }
     if (include_usage_) {
         events.push_back(usage_chunk(identity_, usage_from(outcome), final_timings, constraint,
-                                     usage_chunk_choice_));
+                                     usage_chunk_choice_, &outcome));
     }
     events.emplace_back("data: [DONE]\n\n");
     return events;

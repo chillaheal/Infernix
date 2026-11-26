@@ -645,6 +645,33 @@ Engine::~Engine()                            = default;
 Engine::Engine(Engine&&) noexcept            = default;
 Engine& Engine::operator=(Engine&&) noexcept = default;
 
+// LLM<->image VRAM coexistence. Only Qwen4Exp's Program owns the two elastic pools the image pipeline
+// borrows from, so this route exists for that family alone: Inkling 2 stays wholly resident in VRAM and
+// never sets `qwen4`, and Qwen3.5 owns no Program of its own here, so both report no support and get an
+// error rather than a silent no-op -- a caller that assumed support from a false answer would otherwise
+// hand the image an unmet byte promise and fail its draw for a reason nothing can report.
+bool Engine::supports_image_interlude() const noexcept {
+    return impl_ != nullptr && impl_->qwen4 != nullptr;
+}
+
+std::uint64_t Engine::run_image_interlude(std::uint64_t target_bytes, std::uint64_t margin_bytes,
+                                          const std::function<bool(const ImageInterludeContext&)>& job,
+                                          std::uint64_t drain_deadline_ms) {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    if (impl_->qwen4 == nullptr || impl_->qwen4->program == nullptr) {
+        throw std::logic_error("Engine: this model's Program supports no image interlude");
+    }
+    return impl_->qwen4->program->run_image_interlude(target_bytes, margin_bytes, job, drain_deadline_ms);
+}
+
+ImageYieldProbe Engine::probe_image_yield(std::uint64_t target_bytes, std::uint64_t margin_bytes) const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    if (impl_->qwen4 == nullptr || impl_->qwen4->program == nullptr) {
+        throw std::logic_error("Engine: this model's Program supports no image interlude");
+    }
+    return impl_->qwen4->program->probe_image_yield(target_bytes, margin_bytes);
+}
+
 PreparedPrompt Engine::prepare(PromptInput input, const PreparationControl& control) const {
     nvtx::ScopedRange prepare_range(nvtx::Name::FrontendPrepare, nvtx::Category::Runtime);
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }

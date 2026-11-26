@@ -3,6 +3,7 @@
 #include "serve/anthropic_messages.h"
 #include "serve/http_stream_driver.h"
 #include "serve/http_transport.h"
+#include "serve/image_chat_hook.h" // the image lane's one attach point on this route
 #include "serve/server_tools.h"
 
 #include <atomic>
@@ -182,6 +183,22 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
     const AnthropicMessagesRequest& request = state->request;
 
     const std::uint64_t req_id = ++request_seq_;
+    // PORT(ported tree): re-adds the TOOL_INJECTION seam of FORK src/serve/anthropic_messages_http.cpp:201,
+    // which the automated pass dropped: the hook, the tool it injects, and the observation the rounds share.
+    // The lane owns the tool's text and every rule about it (serve/image_chat_hook.cpp); this file keeps its
+    // own request, its `service_`, its re-prepare/re-run callbacks, its route label, and the two reads of its
+    // private state the lane cannot make (`images_`, `run_image_job`), handed over as the typed
+    // ChatImageDoors. Upstream tip reads the request through the const reference below, so the lane's two
+    // calls name `state->request.generation`, which is the same object the fork's non-const reference was.
+    auto hook = make_chat_image_hook(
+        *this, req, "anthropic_messages", req_id, options_,
+        ChatImageDoors{
+            [this] { return static_cast<void*>(images_); },
+            [this](const auto& image_request, std::string_view base, std::string_view source,
+                   std::string_view protocol, std::string correlation) {
+                return run_image_job(image_request, base, source, protocol, std::move(correlation));
+            }});
+    inject_chat_image_tool(hook, state->request.generation);
     RequestLogMetadata metadata{.http_request_id        = request_id,
                                 .model                  = request.model,
                                 .stream                 = request.stream,
@@ -189,6 +206,22 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                                 .label                  = request_label(req)};
     const GenerationConsumerMode consumer_mode =
         request.stream ? GenerationConsumerMode::Streaming : GenerationConsumerMode::Aggregate;
+    // PORT(ported tree): re-adds the shared observation of FORK src/serve/anthropic_messages_http.cpp:220,
+    // which the rounds below re-prepare with: every round of one request is one HTTP request, with the same
+    // observation wiring and the same request log, so a round the server runs itself stays part of this
+    // request. Upstream tip passes the object as an inline literal at the first prepare and has added
+    // `.progress` since the fork was written, so its fields are copied from upstream's own literal --
+    // upstream's literal is left exactly as it stands -- and everything read is captured by value because a
+    // streaming provider runs after this handler has returned.
+    const std::string first_http_request_id = metadata.http_request_id;
+    const auto make_observation             = [this, req_id, first_http_request_id] {
+        return infernix::GenerationObservationOptions{
+            .phase_timings = true,
+            .scheduling    = scheduling_observer(req_id, first_http_request_id),
+            .first_token   = first_token_observer(),
+            .progress      = progress_observer(req_id),
+        };
+    };
     PreparedRequest prepared;
     try {
         prepared = service_->prepare(request.generation, consumer_mode,
@@ -248,6 +281,36 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                                    [&](const GenerationOutcome& outcome) {
                                        return identify_anthropic_tool_calls(outcome, request.tool_searches);
                                    });
+            // PORT(ported tree): re-adds the aggregate picture rounds of FORK
+            // src/serve/anthropic_messages_http.cpp:278 (the automated pass kept this one). The lane runs the
+            // calls the model made to the server's own tool and the answer replaces itself, so the handler
+            // re-derives its own call bookkeeping from the answer that comes back: the hidden image call of
+            // the round before is no longer part of this one, and any call the answer now carries is a client
+            // call (what the rounds were, and why they are needed, is in serve/image_chat_hook.cpp). Upstream
+            // tip reads the request through a const reference, so the generation is named through `state`,
+            // which is the same object the fork's non-const `request` referred to.
+            if (chat_image_round_needed(hook, state->final_outcome)) {
+                auto pictures = run_chat_image_rounds(
+                    *hook, state->request.generation, std::move(state->final_outcome),
+                    [&] {
+                        // A new round takes over this request's generation, and with it the lifetime
+                        // that keeps media alive until the response is written.
+                        prepared = service_->prepare(state->request.generation, consumer_mode,
+                                                     make_observation(),
+                                                     [&req] { return client_disconnected(req); });
+                        return service_->run(prepared, nullptr,
+                                             [&req] { return client_disconnected(req); });
+                    });
+                state->final_outcome       = std::move(pictures.answer);
+                state->final_outcome.text += chat_image_missing_url_suffix(
+                    *hook, state->final_outcome.text, pictures.urls);
+                // The segment's calls follow its generation, and any call the answer now carries is a
+                // client call.
+                state->final_calls   = identify_anthropic_tool_calls(state->final_outcome,
+                                                                    request.tool_searches);
+                state->final_results = std::vector<std::optional<RequestJson>>(
+                    state->final_calls.size());
+            }
         } catch (const ApiException& exception) {
             const ApiError error = normalize_anthropic_error(exception.error());
             lifecycle->failure(make_generation_request_failure(error));
@@ -326,9 +389,15 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
             options_.claude_code_usage_compat, citations);
 
         prepare_sse_response(res);
+        // PORT(ported tree): the capture gains the two things the picture rounds need to re-prepare and
+        // re-run this request after the provider outlives the handler -- the hook it draws through (the
+        // request its rounds extend already lives in `state`, which is captured) and the observation every
+        // round of this request shares -- exactly as in FORK src/serve/anthropic_messages_http.cpp:370. A
+        // null hook carries nothing.
         res.set_chunked_content_provider(
             "text/event-stream",
-            [this, stream, encoder, lifecycle, state,
+            [this, stream, encoder, lifecycle, state, hook,
+             make_observation,
              continuation_preparer](std::size_t, httplib::DataSink& sink) -> bool {
                 if (stream->started.exchange(true, std::memory_order_acq_rel)) {
                     sink.done();
@@ -372,6 +441,54 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                             render_and_write(transport, [&] { return encoder->segment(segment); });
                         },
                         [&](const GenerationOutcome& outcome) { return encoder->identify_calls(outcome); });
+
+                    // PORT(ported tree): re-adds the streamed picture rounds of FORK
+                    // src/serve/anthropic_messages_http.cpp:466, which the automated pass dropped, in
+                    // upstream tip's own position (inside this try, so a round's failure ends the stream the
+                    // way upstream ends it). A picture round streams nothing of its own: its start would open
+                    // a second message inside the streamed one and its text reaches the client as the answer's
+                    // tail, so it runs on a sink that carries nothing but cancellation. The lane says what the
+                    // silence while a picture is drawn carries on the wire. Two mechanisms, because they
+                    // cover different spans: the lane's own HeartbeatTicker (serve/http_transport.h,
+                    // re-added by hand verbatim from FORK src/serve/anthropic_messages_http.cpp:471) is the
+                    // stream's only traffic while the draw itself blocks this thread -- upstream tip's
+                    // poll()-driven heartbeat cannot run then -- and upstream tip's single heartbeat slot
+                    // carries the same note through the rounds' re-prepare and re-run, where the Engine wait
+                    // loop does call poll(), with upstream's own ping put back after them. The answer
+                    // replaces itself, so the handler re-derives its own call bookkeeping from it: the hidden
+                    // image call of the round before is no longer part of this one. Null hook, null work.
+                    if (chat_image_round_needed(hook, state->final_outcome)) {
+                        // The ticker is also the stall watchdog's only observer: only this thread can see
+                        // that the job stopped reporting, and only the lane knows when that means a wedge
+                        // (serve/image_job_progress.h, armed by src/models/qwen_image/image_pipeline.cu).
+                        HeartbeatTicker ticker(
+                            transport,
+                            [&hook]() -> std::string { return chat_image_progress_note(*hook); },
+                            [&hook]() -> std::shared_ptr<ImageJobProgress> {
+                                return chat_image_watch_progress(*hook);
+                            });
+                        transport.set_heartbeat([&] {
+                            const std::string note = chat_image_progress_note(*hook);
+                            return note.empty() ? encoder->ping() : note;
+                        });
+                        auto pictures = run_chat_image_rounds(
+                            *hook, state->request.generation, std::move(state->final_outcome),
+                            [&] {
+                                stream->prepared = service_->prepare(
+                                    state->request.generation, GenerationConsumerMode::Streaming,
+                                    make_observation(), [&] { return transport.poll(); });
+                                StreamSink quiet;
+                                quiet.is_cancelled = [&] { return transport.poll(); };
+                                return service_->run(stream->prepared, &quiet);
+                            });
+                        state->final_outcome       = std::move(pictures.answer);
+                        state->final_outcome.text += chat_image_missing_url_suffix(
+                            *hook, state->final_outcome.text, pictures.urls);
+                        state->final_calls   = encoder->identify_calls(state->final_outcome);
+                        state->final_results = std::vector<std::optional<RequestJson>>(
+                            state->final_calls.size());
+                        transport.set_heartbeat([&] { return encoder->ping(); });
+                    }
                 } catch (...) {
                     return end_failed_stream_generation(*lifecycle, normalize_anthropic_error,
                                                         anthropic_internal_error, send_error);

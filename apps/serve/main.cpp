@@ -4,6 +4,9 @@
 #include "product/logging/logging.h"
 #include "product/logging/engine_diagnostics.h"
 #include "product/logging/startup_log.h"
+// PORT(ported tree): the image lane's own startup header (the MAIN_WIRING seam's include, which the
+// hunk selector dropped at 6a648048 -- the call below is ours-only and its declaration lives here).
+#include "serve/image_startup.h"
 #include "serve/operational_log.h"
 #include "serve/generation_service.h"
 #include "serve/http_server.h"
@@ -371,6 +374,11 @@ int main(int argc, char** argv) {
         operational_log.warmup_complete(
             std::chrono::duration<double>(Clock::now() - warmup_started).count());
         server.attach(service);
+
+        // The image lane owns its own startup, its providers and its shutdown order:
+        // serve/image_startup.h. Kept alive until after listen() returns, as before.
+        auto image_lane = infernix::serve::start_image_lane(server, service, options, logger);
+
         const ServingScope serving_scope(stop_control, server);
 
         serving = true;

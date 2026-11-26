@@ -42,3 +42,7 @@ target_link_libraries(infernix_serve
   PUBLIC infernix_engine Threads::Threads infernix::json infernix::httplib
   PRIVATE infernix_product_config infernix_media_acquire infernix_media_decode infernix_media_pdf infernix_core
           infernix_product_logging infernix_grammar infernix_text infernix_cuda_runtime)
+
+# The image lane's own sources and the three libraries only it needs: src/serve/image_lane.sources.cmake.
+# One line, appended, so this file carries no lane entry of its own.
+include("${CMAKE_CURRENT_SOURCE_DIR}/image_lane.sources.cmake")

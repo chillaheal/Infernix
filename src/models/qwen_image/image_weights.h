@@ -1,0 +1,266 @@
+#pragma once
+
+// Host-side binding of the Qwen-Image-2.1 image job's weights from a production .infernix artifact.
+// The logical parameter names, shapes and representations are the converter recipe's contract
+// (tools/convert/qwen_image.py): the recipe's header makes those names the operand authority the
+// loader binds to, and it derives every shape from the artifact's own component config. All
+// parameters bind at Residency::Streamed -- the weights stay in the artifact's files and an image
+// job reads each object through bounded staging (peak == one object) and uploads it into the VRAM
+// its interlude yielded; nothing weight-sized is materialized up front.
+//
+// This binding IS the loader gate: a missing binding, a shape that differs from the Binding
+// coverage, or a representation that differs from the recipe's (the 17 quantized roles are FP8 E4M3
+// row-scaled, everything else direct BF16) throws artifact::ArtifactError when the plan is built --
+// before any quiesce, yield or device work.
+
+#include "artifact/binder.h"
+#include "models/qwen_image/artifact_constants.h"
+
+#include <array>
+#include <cstdint>
+#include <map>
+#include <string>
+#include <vector>
+
+namespace infernix::models::qwen_image {
+
+// The DiT architecture dimensions, derived from the artifact's "dit" component config with the
+// recipe's own expressions.
+struct DiTDims {
+    std::uint32_t layers  = 0;
+    std::uint32_t heads   = 0;
+    std::uint32_t head_dim = 0;
+    std::uint32_t hidden  = 0; // heads * head_dim
+    std::uint32_t intermediate = 0; // hidden * mlp_ratio
+    std::uint32_t image_in  = 0; // in_channels * patch_size^2 (dit/img_in columns)
+    std::uint32_t image_out = 0; // out_channels * patch_size^2 (dit/proj_out rows)
+    std::uint32_t context_in = 0;
+    float eps = 0.0F;
+};
+
+struct TextTowerDims {
+    std::uint32_t layers  = 0;
+    std::uint32_t hidden  = 0;
+    std::uint32_t heads   = 0;
+    std::uint32_t kv_heads = 0;
+    std::uint32_t head_dim = 0;
+    std::uint32_t intermediate = 0;
+    std::uint32_t vocab   = 0;
+    float rope_theta = 0.0F;
+    float eps        = 0.0F; // rms_norm_eps
+    // text_config.rope_scaling, read from the artifact and never defaulted: the M-RoPE axis split (T, H,
+    // W pair counts over the head's head_dim/2 pairs) and whether pairs are assigned to axes by the
+    // interleaved walk (pair i -> axis i % 3) that the tower's rotation kernel implements. A tower whose
+    // rotation the engine cannot describe from its own config is a tower that must not run --
+    // text_tower.cu's checked_dims refuses these fields when they are absent or do not describe the
+    // head, which is what "fail closed" means here.
+    std::array<std::uint32_t, 3> mrope_section{};
+    bool mrope_interleaved = false;
+};
+
+// One streamed reference per DiT-block role (the seven recipe-quantized linears plus the two
+// BF16 QK norms the qualified block forward consumes).
+struct DiTBlockWeights {
+    artifact::ParameterReference q, k, v, attention_output, query_norm, key_norm;
+    artifact::ParameterReference mlp_gate, mlp_up, mlp_down;
+};
+
+struct DiTWeights {
+    DiTDims dims;
+    // The denoise schedule's constants, read from the artifact's "scheduler" component by
+    // read_scheduler_config while the plan is being built. An artifact that cannot express the
+    // supported FlowMatchEulerDiscrete scheme never gets here: bind_dit refuses it, so a zero set
+    // (NEVER READ) cannot reach a job. docs/maintainer/qwen-image-2-1-variables.md.
+    SchedulerConstants scheduler;
+    // The three rope axes the joint sequence is rotated on, read from the artifact's own "dit"
+    // component config by read_dit_rope_axes: the checkpoint's transformer/config.json declares them
+    // (the shipped architecture {16, 56, 56} over a 128-wide head) and the rope emitter sizes every row
+    // from them. An artifact whose axes do not describe a scheme this build rotates never gets here --
+    // bind_dit refuses it -- so a zero set (NEVER READ) cannot reach a job. The rotary BASE is not here:
+    // rope.h's kQwenImageRopeTheta is a pipeline implementation default the artifact is never asked to
+    // declare, and an artifact that does declare a "rope_theta" is refused by the same reader unless it
+    // agrees with that constant (verified, never adopted).
+    DitRopeAxes rope{};
+    artifact::ParameterReference img_in, proj_out, modulation, norm_out;
+    artifact::ParameterReference txt_in_in, txt_in_out, txt_in_norm;
+    artifact::ParameterReference time_linear_1, time_linear_2;
+    std::vector<DiTBlockWeights> blocks;
+    // Streaming bounds of the plan: the largest single object any demand addresses.
+    std::uint64_t max_object_bytes       = 0;
+    std::uint64_t max_block_object_bytes = 0; // one block's nine roles (one block resident at a time)
+};
+
+struct TextTowerWeights {
+    TextTowerDims dims;
+    artifact::ParameterReference embed_tokens, final_norm;
+    struct Layer {
+        artifact::ParameterReference input_norm, post_attention_norm;
+        artifact::ParameterReference q, k, v, query_norm, key_norm, attention_output;
+        artifact::ParameterReference mlp_gate, mlp_up, mlp_down;
+    };
+    std::vector<Layer> layers;
+    std::uint64_t max_object_bytes = 0;
+};
+
+// The Qwen3-VL vision tower's geometry, derived from the artifact's "text" component config's
+// "vision_config" with the converter's own expressions (tools/convert/qwen_image.py::_build_vision).
+// Read here rather than through models/qwen3_5/config.cpp: that parser requires the LLM route's
+// member set and rejects the members this architecture carries (out_hidden_size,
+// deepstack_visual_indexes), and its merger width is taken from a TextConfig the image route has.
+struct VisionDims {
+    std::uint32_t depth        = 0;
+    std::uint32_t hidden       = 0;
+    std::uint32_t intermediate = 0;
+    std::uint32_t heads        = 0;
+    std::uint32_t head_dim     = 0; // hidden / heads
+    std::uint32_t patch        = 0;
+    std::uint32_t temporal     = 0;
+    std::uint32_t merge        = 0; // spatial_merge_size
+    std::uint32_t position_rows = 0; // num_position_embeddings
+    std::uint32_t position_grid_side = 0; // sqrt(position_rows)
+    std::uint32_t out_hidden   = 0; // the merger's output width (the text tower's hidden)
+    std::uint32_t patch_width  = 0; // 3 * temporal * patch * patch (vision/patch_embedding columns)
+    std::uint32_t merger_width = 0; // merge^2 * hidden (the deepstack LayerNorm's width)
+    // vision_config.deepstack_visual_indexes: the zero-based vision block AFTER which that block's
+    // hidden states are tapped and pushed through deepstack merger #index. Empty == no taps.
+    std::vector<std::uint32_t> deepstack_indexes;
+};
+
+// One vision encoder block: the two LayerNorms, the three QKV roles the converter split out of the
+// fused source row band (each with its own bias slice), the attention projection and the MLP.
+struct VisionBlockWeights {
+    artifact::ParameterReference norm1_weight, norm1_bias, norm2_weight, norm2_bias;
+    artifact::ParameterReference q, q_bias, k, k_bias, v, v_bias;
+    artifact::ParameterReference attention_output, attention_output_bias;
+    artifact::ParameterReference fc1, fc1_bias, fc2, fc2_bias;
+};
+
+// One Qwen3VLVisionPatchMerger: LayerNorm, fc1 + bias, exact GELU, fc2 + bias. The LayerNorm's width
+// is the difference between the two variants -- the main merger normalizes the pre-merge hidden
+// (hidden), a deepstack merger the merged row (merger_width); both keep fc1 at merger_width and fc2
+// at out_hidden. Qwen3VLVisionPatchMerger.forward normalizes the merged view only when its
+// use_postshuffle_norm is set, so which of the two widths applies follows from the width itself.
+struct VisionMergerWeights {
+    artifact::ParameterReference norm_weight, norm_bias, fc1, fc1_bias, fc2, fc2_bias;
+};
+
+struct VisionWeights {
+    VisionDims dims;
+    artifact::ParameterReference patch_embedding, patch_embedding_bias, position_embedding;
+    std::vector<VisionBlockWeights> blocks;
+    VisionMergerWeights merger;                 // norm width == dims.hidden
+    std::vector<VisionMergerWeights> deepstack; // norm width == dims.merger_width, one per index
+    std::uint64_t max_object_bytes = 0;
+};
+
+// The operands and op scratch the ledger's inventory does not enumerate: the DiT's top-level
+// projections, the VAE's weights, and whatever workspace the linear/conv/attention ops take per
+// call. An over-estimated need refuses a job that might have run; an under-estimated one OOMs it.
+//
+// It is a calibration of THIS build -- its allocator, its ops, its interlude floor -- never a claim of
+// the checkpoint's, which is why the value lives with the binding that produces the measurement rather
+// than with the ledger's arithmetic, why read_vae_topology leaves VaeTopology::weight_resident_bytes
+// zero, why the binding stamps this number into the topology it returns, and why check_vae_topology
+// refuses an unstamped one: an admission decision taken from a zero allowance would refuse nothing at
+// all. It is the term the image ledger's own qualification drives (see
+// src/models/qwen_image/image_device_need.h for the term it feeds).
+//
+// Two calibrations set it:
+//   - the ledger qualification (tests/models/qwen_image/test_image_need_ledger_real.cu) proves predicted
+//     >= measured for the certified inputs, and
+//   - the stage bench (image-spike/stage_bench_A_full_overlap.err.log) gives the REAL per-step ledger
+//     peak a live job reaches -- higher than the cert's, because the cert feeds zero-filled trivial
+//     inputs while a served job carries a real prompt/negative/reference. The cert alone would let
+//     this drift below what a live job actually holds.
+//
+// Subtracting the enumerated structural terms (dit_activations + latent_and_velocity + vae_peak +
+// rope_and_tables) from the real peak leaves the residual this term must absorb: ~772 MiB at 512,
+// ~322 at 768, and ~1180 at 768+ref / 768+CFG (the ref/CFG rows, where the real sequence is longest
+// and the cert's trivial inputs understate it most). The 1024 row's structural terms alone already
+// exceed its real peak, so its residual is negative. So the largest residual to cover is ~1184 MiB;
+// 3072 MiB leaves ~1.9 GiB on top of it for the 512 MiB interlude floor plus whatever the KV pool
+// and the LLM restore hold during the interlude. That puts the predicted total at ~1.6-2.5x the real
+// peak on every certified row -- down from the ~4x this term carried when it was the whole-measured-
+// peak proxy (6183, then 5972 after the second resident block was counted explicitly in bundle B
+// fas 2) -- without ever dropping predicted below the measured peak plus the 512 MiB floor.
+inline constexpr std::uint64_t kQwenImageWeightResidentBytes = 3072ULL * 1024ULL * 1024ULL;
+
+// The named VAE-decoder parameters the production decode route consumes, keyed by their artifact binding
+// names ("vae/..." -- the recipe maps every VAE source tensor one-to-one as a direct BF16 parameter, so
+// the source key IS the contract), together with the decoder geometry the artifact declared them under.
+// The decode walks a fixed chain: every operand it needs is a key here, bound at the shape the topology
+// says it has, and a role the artifact no longer stores throws at bind time, not mid-decode. The
+// topology is the ONE copy of the channel widths in the build: the CUDA decode graph reads it off this
+// object (image_pipeline.cu) and the VRAM ledger charges for exactly the same fields
+// (image_device_need.h), so nothing in the tree keeps a second literal of a width this artifact owns.
+struct VaeWeights {
+    VaeTopology topology;
+    std::map<std::string, artifact::ParameterReference> by_name;
+    std::uint64_t max_object_bytes = 0;
+};
+
+// The VAE per-channel latent denormalization pair (docs/maintainer/qwen-image-2-1-variables.md
+// "Fixed model constants"): the artifact's "vae" component config carries the recipe's stored
+// arrays; resolution-independent, read once and never a per-job input.
+struct VaeDenorm {
+    std::vector<float> mean; // [image_in]
+    std::vector<float> std;  // [image_in]
+};
+
+// Read the denormalization pair from the artifact's "vae" component config. A missing key, a non-array
+// value, a non-number entry or a length mismatch throws artifact::ArtifactError -- including a pair whose
+// length disagrees with the bound topology's denorm_elements, which is the artifact-owned latent width
+// read_vae_topology verified against the checkpoint's own "z_dim": the statistics and the latent plane are
+// one declaration, and the caller passes the topology the SAME binding produced (never a defaulted one),
+// so the route can never denormalize a plane against a pair the artifact did not describe.
+[[nodiscard]] VaeDenorm read_vae_denorm(artifact::Binder& binder, const VaeTopology& topology);
+
+// Resolve every logical DiT / text-tower / VAE (decoder + #75 encoder/quant_conv) parameter through
+// the caller's Binder (so the caller's finish() sees one combined, streamed-only MaterializationPlan).
+[[nodiscard]] DiTWeights bind_dit(artifact::Binder& binder);
+[[nodiscard]] TextTowerWeights bind_text_encoder(artifact::Binder& binder);
+[[nodiscard]] VaeWeights bind_image_vae(artifact::Binder& binder);
+
+// The FP8 RowScale text/embed_tokens plane decoded ONCE into [vocab, hidden] row-major BF16 bits --
+// value = e4m3 code * the row's BF16 scale, rounded to BF16 (the production route's quantization
+// error, disclosed with the tower's device gate). run_text_tower and run_conditioned_text_tower gather
+// from exactly this, so the dequantization the serve route caches is the same code the tower tests gate.
+// A plane that is not [codes][scales] FP8 RowScale, or one shorter than its geometry, throws
+// std::runtime_error.
+[[nodiscard]] std::vector<std::byte> dequantize_embed_table(artifact::Reader& reader, const TextTowerWeights& tower);
+// The vision tower an edit conditions the text tower on: every vision/* parameter of the recipe
+// (patch embedding, position table, the depth blocks, the main merger and one merger per
+// deepstack_visual_indexes entry), all direct BF16 -- the FP8 recipe never names a vision role. A
+// component config without vision_config, a role the artifact does not store, or a shape that
+// differs from the recipe throws artifact::ArtifactError when the plan is built.
+[[nodiscard]] VisionWeights bind_image_vision(artifact::Binder& binder);
+
+} // namespace infernix::models::qwen_image
+
+// check_vae_topology returns std::expected, which -- exactly as in artifact_constants.h -- the project
+// compiles only where it builds at C++23 (the CUDA lane is pinned to C++20, whose standard library does
+// not provide it). The record it checks is plain data and stays visible to every translation unit; the
+// check itself is called from the host binding path, before bind_image_vae returns, and never from a
+// device translation unit.
+#ifdef INFERNIX_IMAGE_READS_ARTIFACT_CONSTANTS
+#    include <expected>
+
+namespace infernix::models::qwen_image {
+
+// Verify the artifact-declared decoder topology against the references the binding actually resolved:
+// every operand the CUDA decode graph consumes must be bound at exactly the shape the topology says it
+// has, and the topology must be self-consistent with the one chain this build runs (a stage that does not
+// continue its predecessor's channels, a doubling pattern other than "every up block except the last", or
+// an unstamped calibration is a topology nothing ran). The first deviation is returned naming the role,
+// its stage and index, and the expected-versus-bound shape -- never the first one that happens to match.
+//
+// It is a hard gate, not a report: bind_image_vae calls it before returning, so a refusal stops the
+// binding the same way a missing role does, and no job is ever decoded with a geometry the artifact did
+// not declare. Three representations have to agree for it to pass -- the artifact's declared config, the
+// shapes the Binder resolved from the stored bytes, and this comparison -- so a pass is verification
+// rather than a tautology, and a topology that was never read (every field zero) is refused outright.
+[[nodiscard]] std::expected<void, std::string> check_vae_topology(const VaeTopology& topology,
+                                                                  const VaeWeights& weights);
+
+} // namespace infernix::models::qwen_image
+#endif // INFERNIX_IMAGE_READS_ARTIFACT_CONSTANTS

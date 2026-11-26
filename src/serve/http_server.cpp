@@ -5,6 +5,10 @@
 #include "serve/anthropic_messages.h"
 #include "serve/cors_headers.h"
 #include "serve/http_transport.h"
+// PORT(ported tree): ours-only -- the lane's two headers, reached here by the CAPABILITIES seam
+// (add_image_capabilities) and by the /health and artifact handlers' reads on ImageGenerationService.
+#include "serve/image_capabilities.h"
+#include "serve/image_generation_service.h"
 #include "serve/openai_common.h"
 #include "serve/request_log.h"
 
@@ -16,6 +20,11 @@
 #include <cstdint>
 #include <cstdio>
 #include <exception>
+// PORT(ported tree): ours-only -- what the lane's handle_image_artifact reads a finished picture
+// with (std::filesystem::path, std::ifstream, std::istreambuf_iterator).
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -606,6 +615,29 @@ void HttpServer::register_routes() {
     server_.Get("/health", [this](const httplib::Request&, httplib::Response& res) {
         const bool available = service_ != nullptr && service_->is_available();
         res.status           = available ? 200 : 503;
+        // PORT(ported tree): ours-only -- upstream's /health asks nothing about pictures, so the
+        // lane's figure is answered ahead of upstream's own reply below and returns: with no image
+        // pipeline attached (a serve without --image-artifact) upstream's statement is the one that
+        // runs, byte for byte.
+        // The busy signal. A keepalive that only asks "does the chat model answer" cannot tell a
+        // drawing engine from a dead one: a chat request queued behind a two-minute picture waits
+        // through the whole interlude and times out, and killing the serve at that moment destroys a
+        // job that was succeeding -- measured on 2026-11-01 22:30. Only this server knows whether a
+        // picture is in flight, so it says so here, where a supervisor looks first. Omitted entirely
+        // when no image pipeline was configured, rather than promising a zero nobody can distinguish
+        // from an answer.
+        if (images_ != nullptr) {
+            const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                                 std::chrono::system_clock::now().time_since_epoch())
+                                 .count();
+            nlohmann::json body = {{"status", available ? "ok" : "unavailable"}};
+            body["image_jobs"] = {{"in_flight", images_->in_flight_jobs()},
+                                  {"oldest_age_seconds",
+                                   images_->oldest_in_flight_age_seconds(
+                                       static_cast<std::int64_t>(now))}};
+            res.set_content(body.dump(), "application/json");
+            return;
+        }
         res.set_content(nlohmann::json{{"status", available ? "ok" : "unavailable"}}.dump(),
                         "application/json");
     });
@@ -646,6 +678,32 @@ void HttpServer::register_routes() {
                  [this](const httplib::Request& req, httplib::Response& res) {
                      handle_chat_completions(req, res);
                  });
+    // PORT(ported tree): ours-only -- upstream tip registers no image and no capabilities route at
+    // all, so this whole route surface is hand-added in the fork's place and order. Each goes through
+    // api_route_pattern like upstream's own routes (the doubled /v1/v1 form answers too), and each
+    // takes upstream's own credential gate: the set_pre_routing_handler above is what authenticates
+    // them, exempting only /health and OPTIONS as it does for every other route.
+    server_.Post(api_route_pattern("/images/generations"),
+                 [this](const httplib::Request& req, httplib::Response& res) {
+                     handle_images_generations(req, res);
+                 });
+    // The OpenAI images/edits name, honored: same fields, and a reference that must be there. It
+    // is a route of its own rather than a flag on generations because that is what makes forgetting
+    // the picture a refusal instead of a text-to-image surprise.
+    server_.Post(api_route_pattern("/images/edits"),
+                 [this](const httplib::Request& req, httplib::Response& res) {
+                     handle_images_edits(req, res);
+                 });
+    // The finished picture, addressed by the artifact id the generation returned. The id is validated
+    // against its stored shape before any path is built, so a request cannot name a file.
+    server_.Get(api_route_pattern(R"(/images/([^/]+))"),
+                [this](const httplib::Request& req, httplib::Response& res) {
+                    handle_image_artifact(req, res);
+                });
+    server_.Get(api_route_pattern("/capabilities"),
+                [this](const httplib::Request& req, httplib::Response& res) {
+                    handle_capabilities(req, res);
+                });
     server_.Post(api_route_pattern("/responses"),
                  [this](const httplib::Request& req, httplib::Response& res) {
                      handle_responses(req, res);
@@ -704,14 +762,214 @@ void HttpServer::require_generation() const {
     }
 }
 
+// PORT(ported tree): ours-only -- upstream has no image resource to name, so this is hand-added; it
+// is the gate every lane branch on the image surface reads.
+std::string HttpServer::image_model_id() const {
+    if (images_ == nullptr || !images_->is_configured()) { return {}; }
+    return image_model_id_from_artifact(options_.image_artifact_path);
+}
+
+// PORT(ported tree): ours-only addition -- upstream's own arguments are unchanged (tip reads
+// max_context from the attached backend's engine options, which the fork predates); the lane's
+// `image_model_id` is the only added argument, and it is empty whenever no image pipeline is
+// attached. It needs the lane's sixth parameter of make_models_list, which belongs to the
+// serve/openai_common.h seam.
 void HttpServer::handle_models(const httplib::Request&, httplib::Response& res) const {
     res.set_content(make_models_list(public_model_id_, unix_time_now(), service_->engine_options().max_context,
-                                     model_metadata_, chat_template_caps_),
+                                     model_metadata_, chat_template_caps_, image_model_id()),
                     "application/json");
+}
+
+// PORT(ported tree): ours-only -- GET /v1/capabilities, which upstream does not have. It is answered
+// by the free function below, so a test can build the same document without a server.
+void HttpServer::handle_capabilities(const httplib::Request&, httplib::Response& res) const {
+    res.set_content(make_capabilities_json(options_, public_model_id_, image_model_id()),
+                    "application/json");
+}
+
+// PORT(ported tree): ours-only -- the document upstream has no notion of, carried from the fork with
+// its shape byte-for-byte (its image blocks were moved out to serve/image_capabilities.cpp and are
+// reached by the single typed call at the end). Nothing here reads the Engine: `options`, the two
+// public ids and the decide/vision facts are all this process already knows.
+std::string make_capabilities_json(const ServeOptions& options, std::string_view chat_model_id,
+                                   std::string_view image_model_id) {
+    using Json = nlohmann::json;
+    Json payload = {
+        {"object", "infernix.capabilities"},
+        {"chat_model", chat_model_id},
+        {"vision_input", options.enable_vision},
+        // The decide route is the third surface a client with no files can post to, and the document
+        // said nothing about it. It shares no prefix with the image_ and canvas_ codes, so the
+        // coverage probe could not even see it, and the route answers a caller's failure THREE ways
+        // (decide_http.cpp:202-217): a 400 for a malformed question, an error object riding inside
+        // the 200 as that question's answer, and an engine fault raised per question. A client that
+        // read those as one category retries a request it has to rewrite, or trusts a run that never
+        // produced an answer. Every entry below is copied from the call that answers it.
+        {"decide", Json{{"endpoint", "/v1/decide"},
+                        {"alias", "POST /v1/systemone is the same request under the other name: one "
+                                  "handler answers both, so a client written for that API changes only "
+                                  "the URL"},
+                        {"request", Json{
+                            {"model", "optional string, one of the ids /v1/models lists"},
+                            {"state", "required: the evidence every question is answered over, either a "
+                                      "JSON value or an array of content parts. A point or a box needs "
+                                      "exactly one image in it, since both are scaled by its sides. "
+                                      "Omitting it is the one 400 that carries no code at all -- match it "
+                                      "on its param instead"},
+                            {"questions", "required: a non-empty object of question id to question. The "
+                                          "answers come back under those same ids"},
+                            {"question_fields", Json::array({"type", "instructions", "question", "criteria",
+                                                             "options", "digits"})},
+                            {"question_types", Json::array({"noul", "choice", "score", "number", "scalar",
+                                                            "point", "box"})},
+                            {"options", "at most 256 of them, and in practice fewer: a question with more "
+                                        "options than the loaded tokenizer can name as single, distinct "
+                                        "tokens is refused rather than served with two options sharing a "
+                                        "token"},
+                            {"digits", "the field width for number, point and box (default 3, at most 6) "
+                                       "and the ceiling for scalar (default 8, at most 15); outside those "
+                                       "it is the digits_out_of_range 400. point and box are answered in "
+                                       "the submitted picture's own pixels"},
+                            {"thinking", "enable_thinking is refused: a decision is read at the position "
+                                         "the prompt ends, where a thinking prompt would open a reasoning "
+                                         "block instead of an answer"},
+                        }},
+                        {"answers", "an object keyed by each question's id. EVERY question gets an entry, "
+                                    "an answer or an error object, never a missing key, so a caller can "
+                                    "walk the request it sent"},
+                        {"answer", Json{
+                            {"type", "one of question_types, and the object's discriminator"},
+                            {"answer_mass", "on every answer: the declared options' share of the WHOLE "
+                                            "next-token distribution, clamped to 0..1. It is the number a "
+                                            "tolerance is tuned against, and it is NOT the probability of "
+                                            "any one option. A report, not a gate -- nothing in the server "
+                                            "compares it against a threshold, so no value of it is a refusal "
+                                            "and no floor is published for it"},
+                            {"confidence", "choice and score: the top probability, which is the abstention "
+                                           "signal. A low one is a question to restate, not a failure"},
+                            {"uncertainty", "number, scalar, point and box: how wide the digit steps left "
+                                            "the value, in the unit that field is reported in"},
+                        }},
+                        {"error_answer", "a question that failed answers as an object of type error with "
+                                         "code and message, riding INSIDE the 200 as that question's entry. "
+                                         "Its status only becomes the response's when no question in the "
+                                         "request got an answer at all"},
+                        {"usage", Json::array({"input_tokens", "output_tokens", "cached_input_tokens",
+                                               "computed_prefill_tokens"})},
+                        {"refusals", Json{
+                            // Named at questions.<id>, about the request, fixable without the server.
+                            {"bad_request_400", Json{
+                                {"thinking_unsupported", "enable_thinking was set on a decision"},
+                                {"malformed_criteria", "criteria is not what the question's type asks for: "
+                                                       "noul wants an object of true and false, choice an "
+                                                       "object of option to description, score an array of "
+                                                       "levels"},
+                                {"missing_criteria", "a choice came with no criteria, which is where its "
+                                                    "options live"},
+                                {"no_options", "a choice declared no options at all"},
+                                {"unclean_option", "an option has a blank name"},
+                                {"too_few_levels", "a score declared fewer than two levels"},
+                                {"malformed_question", "the question is not an object, or its type is not a "
+                                                      "string"},
+                                {"question_type_unsupported", "the type is a known question kind this "
+                                                             "endpoint does not serve"},
+                                {"unsupported_field", "the question carries a field the route does not "
+                                                     "know; only question_fields are read"},
+                                {"empty_instructions", "instructions is missing or empty; it must be a "
+                                                      "non-empty string, object or array"},
+                                {"criteria_unsupported", "a generated kind (number, scalar, point, box) was "
+                                                        "given criteria, which it never reads"},
+                                {"digits_unsupported", "digits was given to a question that reads one "
+                                                      "position, so nothing can honour it"},
+                                {"digits_out_of_range", "digits is not an integer in the served range"},
+                                {"too_many_options", "more options than this model's labels can name"},
+                                {"too_many_steps", "the question needs more generated steps than are served "
+                                                   "-- its digits or its axes are too wide, not the "
+                                                   "server's fault"},
+                                {"no_questions", "questions is missing, empty, or not an object of id to "
+                                                "question"},
+                                {"spatial_needs_one_image", "a point or box was asked over a state that "
+                                                           "does not carry exactly one image"},
+                            }},
+                            // The request was well formed and the run went off its own token schedule. The
+                            // 200 is the status; these are the answer. Retrying the identical bytes gets
+                            // the same error, so restate the question or narrow its digits.
+                            {"in_answer_200", Json{
+                                {"off_schedule", "the run is longer than its schedule, or a step committed "
+                                                "a token that step does not permit"},
+                                {"run_cut_short", "the engine stopped before the run closed its object or "
+                                                 "reached its cap, so its digits are the front of a number "
+                                                 "and not a number"},
+                                {"too_many_digits", "the run spells more digits than the question allowed"},
+                                {"malformed_scalar", "the digits the run spelled do not read as a number"},
+                                {"image_size_unknown", "the submitted picture's size is unknown, so a point "
+                                                      "or box has nothing to scale against"},
+                            }},
+                            // The engine's own fault, carried per question: the same request is worth
+                            // sending again. cancelled is 499 and belongs to the client hanging up, so it
+                            // is not a retry signal.
+                            {"run_499_or_500", Json{
+                                {"cancelled", "HTTP 499: the client disconnected, or the engine's finish "
+                                              "reason was cancelled. Not a server fault and not a retry "
+                                              "signal"},
+                                {"no_trace", "HTTP 500: the engine returned an incomplete trace for a "
+                                             "generated question"},
+                                {"no_readout", "HTTP 500: the engine returned no readout, or one whose "
+                                               "length does not match the question's options"},
+                                {"tokenizer_unsupported", "HTTP 500: this model's tokenizer spells a label "
+                                                          "as more than one token, and a constrained step "
+                                                          "names single tokens"},
+                                {"internal_error", "HTTP 500: anything unexpected while answering that "
+                                                   "question"},
+                            }},
+                        }}}},
+        {"endpoints", Json{{"chat_completions", "/v1/chat/completions"},
+                           {"responses", "/v1/responses"},
+                           {"messages", "/v1/messages"}}}};
+    add_image_capabilities(payload, options, image_model_id); // the image lane's own blocks: serve/image_capabilities.cpp
+    return payload.dump();
+}
+
+// PORT(ported tree): ours-only -- the picture the image route produced, addressed by its artifact id;
+// upstream serves no files. A stored job with no picture on disk yet answers its status object, and
+// the 404 below is the lane's own code.
+void HttpServer::handle_image_artifact(const httplib::Request& req, httplib::Response& res) const {
+    const std::string id             = req.matches.size() > 1 ? req.matches[1].str() : std::string();
+    const std::filesystem::path path = generated_image_path(id);
+    std::ifstream input(path, std::ios::binary);
+    if (!path.empty() && input) {
+        std::string body{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+        if (input.bad()) { body.clear(); }
+        if (!body.empty()) {
+            res.set_header("Cache-Control", "no-store");
+            res.set_content(std::move(body), "image/png");
+            return;
+        }
+    }
+    // No picture file yet (or never): a stored job still answers with its status object, so a
+    // client polling an id can watch an in-flight generation instead of seeing 404.
+    if (images_ != nullptr) {
+        if (const auto status = images_->job_status_json(id); !status.is_null()) {
+            res.set_header("Cache-Control", "no-store");
+            res.set_content(status.dump(), "application/json");
+            return;
+        }
+    }
+    write_openai_error(res, ApiError{.status  = 404,
+                                     .type    = "invalid_request_error",
+                                     .message = "image '" + id + "' not found",
+                                     .param   = "id",
+                                     .code    = "image_not_found"});
 }
 
 void HttpServer::handle_model(const httplib::Request& req, httplib::Response& res) const {
     const std::string id = req.matches.size() > 1 ? req.matches[1].str() : std::string();
+    // PORT(ported tree): ours-only addition -- the image resource is servable by name too, so it
+    // answers before upstream's chat-model lookup below. The lane's own publisher.
+    if (const std::string image_id = image_model_id(); !image_id.empty() && id == image_id) {
+        res.set_content(make_image_model_object(image_id, unix_time_now()), "application/json");
+        return;
+    }
     if (id != public_model_id_) {
         ApiError error;
         error.status  = 404;
@@ -749,6 +1007,13 @@ void HttpServer::attach(GenerationBackend& service) {
     metrics_.configure(public_model_id_, service.engine_options(), memory, baseline);
     request_jsonl_.write_server_start(options_, service.engine_options(),
                                       service.sampling_defaults(), public_model_id_, load, memory);
+}
+
+void HttpServer::attach_images(ImageGenerationService& images) {
+    if (images_ != nullptr) {
+        throw std::logic_error("HTTP image generation service is already attached");
+    }
+    images_ = &images;
 }
 
 bool HttpServer::listen() {

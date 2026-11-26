@@ -202,6 +202,35 @@ public:
     // the process starts a new one. An orderly stop() is not a failure.
     [[nodiscard]] bool has_failed() const;
 
+    // The image lane's lease API (docs/maintainer/image-integration-points.md, the lease rows), re-added
+    // by hand on this port: the fork's own hunk of this file carries unrelated chat-model work too.
+    // LLM<->image VRAM coexistence: whether the loaded model supports an image interlude (today the
+    // qwen4_exp Program). run_image_interlude suspends generation, yields physical VRAM toward the
+    // image job's `target_bytes` plus a `margin_bytes` kept below the headroom, runs `job` with the
+    // LLM unable to execute (it receives the ImageInterludeContext: the bytes actually freed and
+    // its dedicated CUDA stream, and allocates the image's scratch in the freed region), then
+    // restores the pools and resumes generation. The interlude's stream is destroyed when `job`
+    // returns or throws. `drain_deadline_ms` bounds the wait for the LLM frontier to drain before
+    // anything is moved; on a miss the job fails and the LLM keeps serving (0 waits forever).
+    // Exception-safe: a failed job with confirmed restoration rethrows the job's own exception;
+    // only an uncertain restoration parks the model Degraded (process restart is the recovery
+    // unit). One interlude at a time; a concurrent caller is told another is in flight. Success is
+    // published only after restoration is confirmed. Returns the bytes freed. Throws
+    // std::logic_error when the Engine is moved from or its model supports no interlude.
+    [[nodiscard]] bool supports_image_interlude() const noexcept;
+    std::uint64_t run_image_interlude(std::uint64_t target_bytes, std::uint64_t margin_bytes,
+                                      const std::function<bool(const ImageInterludeContext&)>& job,
+                                      std::uint64_t drain_deadline_ms = 60000);
+
+    // Whether an image job wanting `target_bytes` (plus `margin_bytes` kept below the headroom) would
+    // fit right now. Runs the same pure plan the interlude applies against the live pools, WITHOUT
+    // quiescing, draining, unmapping or resizing anything: a caller that gets `fits == false` refuses
+    // the request before the submit door closes, so a job that cannot run never stalls the LLM. Legal
+    // while the Engine is serving. Throws std::logic_error when the Engine is moved from or its model
+    // supports no interlude.
+    [[nodiscard]] ImageYieldProbe probe_image_yield(std::uint64_t target_bytes,
+                                                   std::uint64_t margin_bytes) const;
+
     void reset_memory_peaks() noexcept;
     // Restarts RuntimeStats::execution's maxima (counts and totals keep running), so they describe
     // what follows: a benchmark's measured runs, or serving after the startup warm-up.

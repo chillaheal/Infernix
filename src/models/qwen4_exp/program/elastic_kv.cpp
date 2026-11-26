@@ -14,13 +14,19 @@ namespace infernix::models::qwen4_exp::detail {
 
 bool ProgramImpl::map_kv(std::uint32_t pages) {
     const auto need = kv_chunks(plan_, pages);
-    for (std::size_t c = 0; c < need.size(); ++c) {
+    // PORT(ported tree): the image lane's injected remap fault, re-added by hand where upstream moved this
+    // function (the fork had it in program_impl.h:5868). An armed check leaves the last needed chunk unmapped,
+    // which is what a driver short of physical memory leaves behind: every chunk below the failed one is
+    // backed, no chunk above it is. Without it the lane's "KV remap fell short" branch could never be run.
+    const std::size_t chunks =
+        take_kv_remap_fault() && need.size() > 1 ? need.size() - 1 : need.size();
+    for (std::size_t c = 0; c < chunks; ++c) {
         if (!need[c] || kv_vmm_->mapped(c)) { continue; }
         if (!kv_vmm_->map(c)) { return false; }
         CUDA_CHECK(cudaMemsetAsync(static_cast<std::byte*>(kv_vmm_->base()) + c * kKvChunkBytes, 0, kKvChunkBytes,
                                    device_.stream));
     }
-    return true;
+    return chunks == need.size();
 }
 
 bool ProgramImpl::grow_kv(std::uint32_t need) {

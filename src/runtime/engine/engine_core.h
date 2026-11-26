@@ -215,6 +215,21 @@ public:
         queue_cv_.notify_all();
     }
 
+    // A Program with the image-interlude submit door (Qwen4Exp): while the door is closed the worker
+    // starts NO execution work at all -- the interlude owns the device; queued, active and cancelled
+    // work resumes at the door reopening. Tested per Program rather than assumed, because this EngineCore
+    // is shared with model families that have no interlude (Inkling 2 stays resident in VRAM) and the
+    // serving hot path must stay byte-identical for them: every branch below is an `if constexpr`, so a
+    // Program without these members compiles the door out entirely rather than binding to a stub.
+    static constexpr bool kProgramInterlude = requires(typename ModelContract::Program& program) {
+        program.submit_door_open();
+        program.interlude_degraded();
+        program.interlude_preempt_outstanding();
+        program.interlude_preempt_epoch();
+        program.signal_interlude_quiesced(std::uint64_t{});
+        program.interlude_yieldable();
+    };
+
     // Refuses new submissions. At its next unit boundary the worker ends every queued and active
     // request with an Unavailable error and runs the Program's orderly Shutdown cleanup.
     void stop() noexcept {
@@ -404,6 +419,12 @@ public:
 
     [[nodiscard]] bool is_available() const {
         std::lock_guard lock(queue_mutex_);
+        if constexpr (kProgramInterlude) {
+            // A Program parked Degraded has unproven device state and a submit door that never reopens, so
+            // the Engine is no longer a place a request can be served: ingress must stop sending rather
+            // than queue work that will only be failed. This is the same verdict the worker reaches below.
+            if (instance_.program->interlude_degraded()) { return false; }
+        }
         return !stopping_ && !failed_;
     }
 
@@ -1297,13 +1318,40 @@ private:
         if (changed) { publish_runtime_stats(); }
     }
 
+    // Whether the submit door is held closed by an image interlude. The engine then deliberately cannot
+    // admit any work at all for the whole length of a generation, which is routinely longer than the
+    // admission queue timeout, so queue deadlines must not run down meanwhile. A Degraded Program is
+    // excluded: there the door never reopens, so waiting is futile and the queue must keep expiring.
+    // Read before queue_mutex_ is taken -- the degraded check takes the Program's execution lock and the
+    // engine must not hold both at once.
+    [[nodiscard]] bool admission_door_held_by_interlude() {
+        if constexpr (!kProgramInterlude) { return false; }
+        else { return !instance_.program->submit_door_open() && !instance_.program->interlude_degraded(); }
+    }
+
     [[nodiscard]] bool expire_pending_requests() {
         std::vector<std::shared_ptr<Request>> cancelled;
         std::vector<std::shared_ptr<Request>> expired;
         bool have_pending = false;
         {
+            const bool door_held = admission_door_held_by_interlude();
             std::lock_guard lock(queue_mutex_);
             const auto now = Clock::now();
+            // Deadlines advance only while admission is possible, so a request parked behind an interlude is
+            // judged by the time it could actually have been admitted, not by the generation's wall clock.
+            if (door_held) {
+                if (interlude_door_held_since_ == Clock::time_point{}) { interlude_door_held_since_ = now; }
+            } else if (interlude_door_held_since_ != Clock::time_point{}) {
+                const auto hold_started = interlude_door_held_since_;
+                interlude_door_held_since_ = {};
+                // Each request keeps only the part of the hold that ran AFTER its own submission: one
+                // that arrives a moment before the door reopens has waited nothing, and must not be
+                // handed the whole generation as extra budget.
+                for (const auto& request : pending_) {
+                    const auto from = hold_started > request->submitted ? hold_started : request->submitted;
+                    if (now > from) { request->deadline += now - from; }
+                }
+            }
             for (auto it = pending_.begin(); it != pending_.end();) {
                 if ((*it)->cancelled.load(std::memory_order_acquire)) {
                     cancelled.push_back(*it);
@@ -1884,6 +1932,40 @@ private:
             skipped.push_back(*victim);
         }
         return false;
+    }
+
+    // The image interlude (submit door closed) asked the worker to reach a yieldable VRAM point. Pause every
+    // Prefill-phase resident lane replay-safe and commit each pause: abandoning a prefill walk is what
+    // returns the residency ring, and only the LAST prefill pause frees it (prefilling_besides), after which
+    // yield_for_image no longer freezes the expert pool. Reuses the round's commit primitive; runs under the
+    // Engine execution lock only (never the Program's), admits nothing, and never calls the waker. The
+    // preempted requests stay in paused_ and Replay when the door reopens.
+    // PORT(ported tree): unchanged in shape from the fork -- upstream's pause_resident(),
+    // progress_context_transaction() and begin_host_phase()/finish_engine_phase() pair are the same
+    // primitives the fork reused, and upstream's own start_pause() already abandons the walk and hands the
+    // residency leases back, so nothing here reaches past them into Program internals.
+    void preempt_for_interlude() {
+        std::scoped_lock execution_lock(execution_mutex_);
+        auto boundary = begin_host_phase();
+        while (instance_.program->has_context_transaction()) {
+            if (!progress_context_transaction(boundary)) { break; } // settle a transaction that raced the close
+        }
+        for (;;) {
+            if (instance_.program->interlude_yieldable()) { break; }
+            std::optional<std::uint32_t> victim;
+            for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+                if (slots_[lane] && slots_[lane]->model_state == EngineRequestState::Prefill) {
+                    victim = lane;
+                    break;
+                }
+            }
+            if (!victim) { break; }                    // no Prefill lane left; the caller re-reads yieldable
+            if (!pause_resident(*victim)) { break; }   // cannot pause; the Program soft-fails after the ack check
+            while (instance_.program->has_context_transaction()) {
+                (void)progress_context_transaction(boundary); // commit Pausing -> Paused/Replay (ring returns)
+            }
+        }
+        finish_engine_phase(boundary, EngineHostPhase::Boundary);
     }
 
     // A paused request keeps its ledger; its resume binding restores from the deepest cached
@@ -2948,6 +3030,44 @@ private:
 
     void worker_loop() noexcept {
         for (;;) {
+            if constexpr (kProgramInterlude) {
+                if (!instance_.program->submit_door_open()) {
+                    if (instance_.program->interlude_degraded()) {
+                        // Terminal: an interlude restoration failed and the device state is unproven, so
+                        // nothing may execute and the shutdown saves are skipped -- requests fail and
+                        // the process becomes the recovery unit.
+                        std::scoped_lock execution_lock(execution_mutex_);
+                        fail_all_locked(
+                            std::make_exception_ptr(RequestError(RequestErrorKind::Unavailable,
+                            "inference engine is Degraded: an image interlude restoration failed; "
+                            "restart the process")),
+                            false);
+                        return;
+                    }
+                    if (instance_.program->interlude_preempt_outstanding()) {
+                        // The image interlude needs a yieldable VRAM point: pause every Prefill lane so the
+                        // walk's residency ring returns, commit the pauses, then ack the epoch. The door stays
+                        // closed -- only the in-flight prefill is preempted; nothing new is admitted.
+                        preempt_for_interlude();
+                        if (instance_.program->interlude_yieldable()) {
+                            instance_.program->signal_interlude_quiesced(instance_.program->interlude_preempt_epoch());
+                        }
+                    }
+                    std::unique_lock lock(queue_mutex_);
+                    // This branch is the only code the loop reaches for the whole hold: the round body
+                    // below it, and with it expire_pending_requests() and the idle maintenance pass, is
+                    // skipped by the continue. The hold is therefore dated here, on the first pass through
+                    // the branch after the close, or no queue deadline would ever learn that admission was
+                    // impossible -- and no resize would ever be asked for while the interlude has the card.
+                    if (interlude_door_held_since_ == Clock::time_point{}) {
+                        interlude_door_held_since_ = Clock::now();
+                    }
+                    queue_cv_.wait_for(lock, std::chrono::milliseconds(2), [this] {
+                        return stopping_ || instance_.program->submit_door_open();
+                    });
+                    continue;
+                }
+            }
             bool maintain_busy = false;
             {
                 std::unique_lock lock(queue_mutex_);
@@ -3325,6 +3445,9 @@ private:
     mutable std::mutex stats_mutex_;
     std::condition_variable queue_cv_;
     std::deque<std::shared_ptr<Request>> pending_;
+    // Dated the first time the loop observes the submit door closed for an interlude, and cleared by the
+    // sweep that credits the queue with the hold. Only queue_mutex_ writers touch it.
+    Clock::time_point interlude_door_held_since_{};
     std::size_t outstanding_              = 0;
     std::uint64_t next_request_id_        = 1;
     std::uint64_t next_publication_order_ = 1;

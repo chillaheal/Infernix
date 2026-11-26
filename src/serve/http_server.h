@@ -9,6 +9,7 @@
 #include "serve/operational_log.h"
 #include "serve/openai_responses_store.h"
 #include "serve/reasoning_store.h"
+#include "serve/openai_images.h" // OpenAIImagesRequest and RequestJson: the image route's own types
 #include "serve/request_log.h"
 #include "serve/serve_options.h"
 
@@ -26,6 +27,7 @@
 
 namespace infernix::serve {
 
+class ImageGenerationService;
 // infernix-serve's exit status after an Engine-wide failure stopped it, so a launcher can restart
 // it; startup and other failures exit with 1.
 inline constexpr int kEngineFailureExitStatus = 2;
@@ -51,6 +53,19 @@ void handle_responses_upgrade(const httplib::Request& request, httplib::Response
 [[nodiscard]] bool matches_bearer_credential(std::string_view authorization,
                                              std::string_view api_key) noexcept;
 
+// PORT(ported tree): ours-only -- upstream tip has no capabilities surface at all (its only
+// "capabilities" text is the unrelated ChatTemplateCaps), so this lane declaration is hand-added
+// here; its definition is below in serve/http_server.cpp and the lane calls it from
+// tests/ops/test_image_joint_limits.cpp.
+// GET /v1/capabilities: what this process actually serves. The OpenAI model object has no capability
+// field, so a client that needs to know whether an image route exists (and under which id) asks here.
+// This is a documented Infernix extension, not an OpenAI or Anthropic object; clients are free to
+// ignore it. `image_model_id` is empty when the image pipeline is not attached, which reports the
+// image surface as absent rather than as an endpoint that always answers 503.
+[[nodiscard]] std::string make_capabilities_json(const ServeOptions& options,
+                                                 std::string_view chat_model_id,
+                                                 std::string_view image_model_id);
+
 // Anthropic SDKs append /v1/<endpoint> to their base URL, so a client given the OpenAI-style base
 // URL that already ends in /v1 requests /v1/v1/<endpoint>. Every API route also answers there:
 // api_route_pattern("/messages") matches /v1/messages and /v1/v1/messages without adding a capture
@@ -73,6 +88,12 @@ public:
     // Engine is ready, then listen() enters the blocking accept loop on the already-bound socket.
     bool bind();
     void attach(GenerationBackend& service);
+    // PORT(ported tree): ours-only -- upstream has no image surface, so this typed attach seam (the
+    // one public entry the lane has on this class) is hand-added here; it is called from
+    // serve/image_startup.cpp and defined below in serve/http_server.cpp.
+    // The synchronous image route serves 503 image_generation_not_configured until this is called
+    // (serve started without --image-artifact, or the pipeline is still incomplete).
+    void attach_images(ImageGenerationService& images);
     // Returns once stop() or an Engine-wide failure (engine_failed()) ends the accept loop.
     bool listen();
     // Whether listen() returned because the Engine failed: it then answers nothing but errors
@@ -84,6 +105,11 @@ public:
     void stop();
 
     [[nodiscard]] const std::string& public_model_id() const noexcept { return public_model_id_; }
+    // PORT(ported tree): ours-only -- the image resource's public id, which upstream has no notion
+    // of; read by serve/openai_images_http.cpp and serve/image_chat_hook.cpp, and defined below in
+    // serve/http_server.cpp.
+    // The image resource's public id, or empty while no image pipeline is attached.
+    [[nodiscard]] std::string image_model_id() const;
 
 private:
     // A generation request from its submission to the Engine to its terminal record; it is listed in
@@ -123,6 +149,26 @@ private:
     // server with scoring_not_enabled.
     void require_generation() const;
     void handle_chat_completions(const httplib::Request& req, httplib::Response& res);
+    // PORT(ported tree): ours-only -- upstream has no /v1/images routes at all, so these lane
+    // declarations are hand-added here; the four below are defined in serve/openai_images_http.cpp,
+    // which is the lane's own file.
+    void handle_images_generations(const httplib::Request& req, httplib::Response& res);
+    // POST /v1/images/edits: the same request as generations, and the one rule that a reference is
+    // required. Accepts application/json and multipart/form-data.
+    void handle_images_edits(const httplib::Request& req, httplib::Response& res);
+    // The two image routes, which differ only in require_reference -- everything else (parse order,
+    // the model gate, the 503 until attach_images, the response) is shared by construction.
+    void handle_images(const httplib::Request& req, httplib::Response& res, bool require_reference);
+    // THE door to a picture, and the one place one is written down. Both callers come through it -- the
+    // images route, and the hidden chat tool each protocol runs through its own generator -- so a draw
+    // is recorded exactly once whoever paid for it, and the line says which door it came in by. Before
+    // this existed an operator could not look up a refused draw at all: the request log recorded chat
+    // generations only, so the client's model was the only witness left, and it invented a cause.
+    // Throws whatever the service threw, after recording it: this is a witness, not a gatekeeper.
+    [[nodiscard]] RequestJson run_image_job(const OpenAIImagesRequest& request,
+                                            std::string_view artifact_url_base,
+                                            std::string_view source, std::string_view protocol,
+                                            std::string correlation = {});
     void handle_messages(const httplib::Request& req, httplib::Response& res);
     void handle_count_tokens(const httplib::Request& req, httplib::Response& res);
     void handle_decide(const httplib::Request& req, httplib::Response& res);
@@ -136,6 +182,10 @@ private:
     void handle_response_compact(const httplib::Request& req, httplib::Response& res);
     void handle_models(const httplib::Request& req, httplib::Response& res) const;
     void handle_model(const httplib::Request& req, httplib::Response& res) const;
+    // PORT(ported tree): ours-only -- upstream has no /v1/capabilities document and serves no
+    // picture files; both handlers are defined below in serve/http_server.cpp.
+    void handle_capabilities(const httplib::Request& req, httplib::Response& res) const;
+    void handle_image_artifact(const httplib::Request& req, httplib::Response& res) const;
 
     void record_request_start(const RequestLogContext& context);
     [[nodiscard]] infernix::GenerationSchedulingObserver
@@ -155,6 +205,10 @@ private:
     void stop_engine_watch();
 
     GenerationBackend* service_ = nullptr;
+    // PORT(ported tree): ours-only -- upstream has no image pipeline; set only by attach_images and
+    // null for a serve started without --image-artifact, which is what keeps every lane branch here
+    // off.
+    ImageGenerationService* images_ = nullptr;
     ServeOptions options_;
     std::string public_model_id_;
     infernix::ModelMetadata model_metadata_;

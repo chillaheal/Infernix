@@ -21,3 +21,6 @@ include(qwen3_5/frontend_sources.cmake)
 include(qwen3_5/execution_sources.cmake)
 include(qwen3_5/program_sources.cmake)
 include(qwen4_exp/program_sources.cmake)
+# The image lane's model layer: qwen_image owns its sources and its libraries
+# (docs/maintainer/image-integration-points.md, "Ours-only lane files").
+include(qwen_image/sources.cmake)

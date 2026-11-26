@@ -1,18 +1,30 @@
 #pragma once
 
 #include "serve/generation_service.h"
+// PORT(ported tree): the image lane's own include, re-added by hand (ours-only, docs/maintainer/
+// image-integration-points.md) -- HeartbeatTicker's stall watchdog reads the job's progress state.
+#include "serve/image_job_progress.h"
 #include "serve/request_json.h"
 
 #include <httplib.h>
 
 #include <atomic>
 #include <chrono>
+// PORT(ported tree): the image lane's own includes for HeartbeatTicker's thread (ours-only,
+// docs/maintainer/image-integration-points.md).
+#include <condition_variable>
 #include <exception>
 #include <functional>
 #include <memory>
+// PORT(ported tree): the lane's own include, re-added by hand (ours-only, docs/maintainer/
+// image-integration-points.md). SseTransport serializes its sink writes under a mutex so the image
+// round ticker may write while the handler thread is blocked in a draw.
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+// PORT(ported tree): HeartbeatTicker's thread (ours-only, docs/maintainer/image-integration-points.md).
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -58,6 +70,13 @@ public:
                           Clock::duration heartbeat_interval = kHeartbeatInterval,
                           Clock::time_point now              = Clock::now());
 
+    // PORT(ported tree): the lane's half of this class, re-added by hand (ours-only,
+    // docs/maintainer/image-integration-points.md). Upstream tip has no lock here because at its base
+    // nothing ever wrote this sink from a second thread. The image lane does: while a server-executed
+    // picture round blocks the handler (60-330 s of Engine silence), the lane's ticker thread keeps the
+    // stream alive. Every sink write and the quiet-interval clock are therefore serialized under one
+    // mutex, which is the object that owns both (this transport), not something a foreign thread may
+    // bolt on from outside. Same text as the fork's src/serve/http_transport.h:57-61.
     void write(std::string_view item, Clock::time_point now = Clock::now());
     void write(const std::vector<std::string>& items, Clock::time_point now = Clock::now());
 
@@ -73,14 +92,76 @@ public:
     // events, so it may number them; an empty result (an event not yet allowed) writes the SSE comment.
     void set_heartbeat(std::function<std::string()> event) { heartbeat_event_ = std::move(event); }
 
+    // PORT(ported tree): re-added by hand, verbatim from the fork's src/serve/http_transport.h:68-76
+    // (ours-only, docs/maintainer/image-integration-points.md). The ticker's quiet-interval heartbeat:
+    // the comment half of poll() WITHOUT the socket's writability probe -- a ticker running while the
+    // Engine loop is idle must not cancel the request on a transient !is_writable. A failed write marks
+    // the request cancelled, exactly as poll() does.
+    void beat(Clock::time_point now = Clock::now());
+
+    [[nodiscard]] bool is_cancelled() const noexcept {
+        return cancelled_.load(std::memory_order_acquire);
+    }
+
+    // How often the ticker beats: the transport's own quiet-interval bound, so a slower or faster
+    // heartbeat configuration moves the ticker with it instead of disagreeing with it.
+    [[nodiscard]] Clock::duration heartbeat_interval() const noexcept { return heartbeat_interval_; }
+
 private:
     bool mark_cancelled() noexcept;
+
+    // The sink write and the quiet-interval clock, under the caller's hold of write_mutex_. Every
+    // public entry above takes that lock and then calls this: the lock is never taken twice, so no
+    // public path may reach another public write while holding it (upstream's heartbeat_event_ is a
+    // pure render and does not). True when the sink refused the item and the request was marked
+    // cancelled -- which is what upstream's poll() returns on a failed heartbeat, and what its
+    // tests/test_http_transport.cpp asserts.
+    bool write_locked(std::string_view item, Clock::time_point now);
 
     httplib::DataSink& sink_;
     std::atomic<bool>& cancelled_;
     Clock::duration heartbeat_interval_;
     Clock::time_point last_write_;
     std::function<std::string()> heartbeat_event_;
+    std::mutex write_mutex_;
+};
+
+// PORT(ported tree): the image lane's own ticker, re-added by hand verbatim from the fork's
+// src/serve/http_transport.h:88-121 (ours-only, docs/maintainer/image-integration-points.md). Upstream
+// tip deleted it along with the transport's lock: at its base nothing blocks a streaming handler for
+// minutes, so its poll()-driven heartbeat (above) is the whole of its liveness. A server-executed
+// picture round does block one for 60-330 s with the Engine loop stopped, so no poll runs and the
+// stream would carry nothing -- a client with an idle timer sits through the whole draw. The lane owns
+// the rule of what that silence carries on the wire (serve/chat_image_tool.cpp's progress note); the
+// transport owns the sink, its quiet-interval clock and the lock this thread needs to reach them.
+// When `watch` names a job's progress, the ticker is also its stall watchdog -- see
+// serve/image_job_progress.h for what it may and may not flag.
+class HeartbeatTicker final {
+public:
+    static constexpr std::chrono::seconds kDefaultStallBound{60};
+
+    HeartbeatTicker(SseTransport& transport, std::function<std::string()> next_comment,
+                    std::function<std::shared_ptr<ImageJobProgress>()> watch = {},
+                    std::chrono::milliseconds stall_bound =
+                        std::chrono::duration_cast<std::chrono::milliseconds>(kDefaultStallBound),
+                    std::function<SseTransport::Clock::time_point()> now = SseTransport::Clock::now);
+    ~HeartbeatTicker();
+
+    HeartbeatTicker(const HeartbeatTicker&)            = delete;
+    HeartbeatTicker& operator=(const HeartbeatTicker&) = delete;
+
+private:
+    void run();
+
+    SseTransport& transport_;
+    std::function<std::string()> next_comment_;
+    std::function<std::shared_ptr<ImageJobProgress>()> watch_;
+    std::chrono::nanoseconds stall_bound_;
+    std::function<SseTransport::Clock::time_point()> now_;
+    std::mutex mutex_;
+    std::condition_variable condition_;
+    bool stopping_ = false;
+    std::thread thread_;
 };
 
 template <class Render>
@@ -94,6 +175,13 @@ void render_and_write(SseTransport& transport, Render&& render) {
 }
 
 RequestJson parse_json_body(const httplib::Request& request);
+
+// PORT(ported tree): the image lane's artifact URL builder, re-added by hand (ours-only,
+// docs/maintainer/image-integration-points.md): every route that hands out an image URL builds it
+// here, so a chat answer and an images response name the same GET.
+// The absolute prefix this request's generated-image artifacts are reachable at.
+[[nodiscard]] std::string artifact_url_base(const httplib::Request& request,
+                                           const ServeOptions& options);
 [[nodiscard]] bool client_disconnected(const httplib::Request& request);
 
 void prepare_sse_response(httplib::Response& response);

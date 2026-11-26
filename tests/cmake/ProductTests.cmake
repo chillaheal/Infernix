@@ -212,3 +212,8 @@ infernix_add_test(infernix_http_cancelled_answer_test
 infernix_add_test(infernix_http_transport_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_http_transport.cpp"
   LIBRARIES infernix_serve)
+
+# The image lane's own suites (the two routes' schemas, the job store, the service, the enhancer's
+# contract, the device-need ledger, the chat tool, the PNG writer): tests/cmake/image_lane_tests.cmake.
+# One line, appended, so this file carries no lane target of its own.
+include("${CMAKE_CURRENT_LIST_DIR}/image_lane_tests.cmake")

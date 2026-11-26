@@ -142,6 +142,25 @@ struct ServeOptions {
     std::uint32_t media_preprocess_threads = 0;
     std::size_t response_store_max_records = kDefaultResponseStoreRecords;
     std::size_t response_store_max_bytes   = kDefaultResponseStoreBytes;
+    // The image lane's four options, parsed by serve/image_serve_options.h. Re-added by hand on this
+    // port because the fork's hunk of this file is a shared struct upstream keeps rewriting.
+    // --image-artifact PATH: the .infernix image artifact served by the synchronous
+    // POST /v1/images/generations. Empty => the route answers 503 image_generation_not_configured.
+    std::string image_artifact_path;
+    // --image-text-processor PATH: the HF Qwen3-VL processor directory (tokenizer.json,
+    // tokenizer_config.json, chat_template.jinja) behind the raw-prompt text tower. Empty =>
+    // the route keeps answering 503 image_generation_not_configured.
+    std::string image_text_processor_path;
+    // --image-prompt-enhancer-url HOST:PORT: the loopback address of the family's prompt-enhancer
+    // sidecar (tools/prompt_enhancer/pe_worker.py, Qwen/Qwen-Image-2.1-PE-I2I). Empty => prompt_enhance
+    // keeps answering 503 image_prompt_enhancer_unavailable. Loopback only: the sidecar receives the
+    // request's raw pictures and wants about 20 GB of the card, so it is never reachable off this
+    // machine -- a routable host here is refused at parse rather than silently trusted.
+    std::string image_prompt_enhancer_url;
+    // --image-retention-days N: how long a generated picture stays on disk and its URL answers. The
+    // URL is the only handle a chat reply hands out, so this is the length of time a picture is
+    // promised; after it the file is swept and the route answers 404. 0 keeps every picture forever.
+    int image_retention_days = 14;
     int device                             = 0;
     KvCacheStorage kv_cache                = KvCacheStorage::BFloat16;
     LogitsDtype logits_dtype               = LogitsDtype::FP32;

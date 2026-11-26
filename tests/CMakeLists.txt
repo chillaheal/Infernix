@@ -9,6 +9,10 @@ include(cmake/BenchSupportTests.cmake)
 include(models/inkling2/tests.cmake)
 include(models/qwen3_5/tests.cmake)
 include(models/qwen4_exp/tests.cmake)
+# PORT(ported tree): the image lane's model-family suites (the DiT blocks, the VAE, the text tower, the
+# artifact's own constants, the two host oracle suites) - the family is ours-only, so this one include is
+# the whole of what upstream's file gains (docs/maintainer/image-integration-points.md, tests/CMakeLists.txt).
+include(models/qwen_image/tests.cmake)
 include(ops/tests.cmake)
 # Machine probes of the Qwen3.8-Flash-Next memory track, built beside the tests.
 include(${PROJECT_SOURCE_DIR}/tools/flash_next_probe/probes.cmake)

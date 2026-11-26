@@ -1,0 +1,322 @@
+"""Qwen-Image (diffusers pipeline) adapter: DiT + Qwen3-VL text tower to logical parameters.
+
+Qwen-Image is not a causal LM. A pipeline root holds subfolders transformer/,
+text_text/, vae/, scheduler/ (model_index.json _class_name QwenImage21Pipeline).
+This adapter opens the transformer and text-tower roots directly and maps every
+source tensor to a logical Parameter. scheduler/scheduler_config.json is not a
+weight source: it is packed verbatim as the artifact's scheduler component, and
+a root without it does not convert. It does NOT reuse the text build_model
+(no tokens/frontend/RoPE path). VAE maps every source tensor as a direct BF16
+parameter with its conv/norm rank preserved as-is from the source header.
+
+FP8 contract: rank-two DiT/text linears quantize BF16->E4M3FN row-scaled on CPU
+(fp8_row_maxabs forces host numpy); adaLN modulation, norms, QK-norm, timestep
+and img/proj in/out stay direct BF16 (default cast_direct + A16Only).
+
+The input names below (e.g. "dit/layers/0/norm1_output") are the logical
+operand contract the C++ qwen_image Program and bind_dit/bind_text_encoder must
+emit for each GEMM activation. They are chosen here as the architecture's
+naming authority; the loader binds to these exact strings.
+"""
+
+from __future__ import annotations
+
+from math import prod
+from pathlib import Path
+
+from .model import Model, Parameter
+from .recipe import Recipe
+from .sources.safetensors import SafetensorsSource, tensor_source
+
+FP8 = "fp8_e4m3fn_row_bf16"
+FP8_METHOD = "fp8_row_maxabs"
+
+
+def is_qwen_image(base: SafetensorsSource) -> bool:
+    """Detect a Qwen-Image pipeline root by its model_index.json."""
+    root = base.path if base.path.is_dir() else base.path.parent
+    index = root / "model_index.json"
+    if not index.is_file():
+        return False
+    import json
+
+    try:
+        return json.loads(index.read_text()).get("_class_name") == "QwenImage21Pipeline"
+    except (ValueError, OSError):
+        return False
+
+
+def _load_config(path: Path) -> dict:
+    import json
+
+    return json.loads(path.read_text())
+
+
+def _add(model, name, store, source_name, shape, *, inputs=(), direct="bf16",
+         source_shape=None, offset_row=0):
+    """Declare one logical parameter from a source tensor, or a row band of a wider one.
+
+    `source_shape`/`offset_row` select a band of `offset_row` whole rows from a source stored under a
+    larger shape (the fused `attn.qkv` of the vision blocks, whose Q/K/V are three separate roles).
+    """
+    shape = tuple(shape)
+    expected = shape if source_shape is None else tuple(source_shape)
+    real = tuple(store.describe(source_name).shape)
+    if real != expected:
+        raise ValueError(f"{name}: declared {expected}, source {source_name} is {real}")
+    stride = prod(expected) // expected[0]
+    source = tensor_source(store, source_name, shape, offset=offset_row * stride,
+                           source_shape=source_shape)
+    model.add(
+        Parameter(
+            name,
+            shape,
+            source,
+            None,
+            tuple(inputs),
+            direct,
+            residency=name.split("/", 1)[0],
+        )
+    )
+
+
+def _build_dit(model, store, cfg):
+    heads = cfg["num_attention_heads"]
+    head_dim = cfg["attention_head_dim"]
+    hidden = heads * head_dim
+    intermediate = hidden * cfg["mlp_ratio"]
+    image_dim = cfg["in_channels"] * cfg["patch_size"] * cfg["patch_size"]
+    out_dim = cfg["out_channels"] * cfg["patch_size"] * cfg["patch_size"]
+
+    _add(model, "dit/img_in", store, "img_in.weight", (hidden, image_dim),
+         inputs=("dit/patch_input",))
+    _add(model, "dit/proj_out", store, "proj_out.weight", (out_dim, hidden),
+         inputs=("dit/final_hidden",))
+    _add(model, "dit/modulation", store, "modulation.1.weight",
+         (4 * hidden, hidden))  # global adaLN for all blocks; stays A16Only
+    _add(model, "dit/norm_out", store, "norm_out.linear.weight", (hidden, hidden))
+    _add(model, "dit/txt_in/in", store, "txt_in.in_layer.weight", (hidden, cfg["context_in_dim"]),
+         inputs=("dit/context_input",))
+    _add(model, "dit/txt_in/out", store, "txt_in.out_layer.weight", (hidden, hidden),
+         inputs=("dit/context_activation",))
+    _add(model, "dit/txt_in/norm", store, "txt_in.text_norm.weight", (cfg["context_in_dim"],))
+    _add(model, "dit/time_embed/linear_1", store,
+         "time_text_embed.timestep_embedder.linear_1.weight", (hidden, 256),
+         inputs=("dit/timestep_sinu",))
+    _add(model, "dit/time_embed/linear_2", store,
+         "time_text_embed.timestep_embedder.linear_2.weight", (hidden, hidden),
+         inputs=("dit/time_embed/activation",))
+
+    for i in range(cfg["num_layers"]):
+        p = f"dit/layers/{i}/"
+        sp = f"transformer_blocks.{i}."
+        mixer_in = p + "norm1_output"
+        _add(model, p + "attention/query", store, sp + "attn.to_q.weight", (hidden, hidden),
+             inputs=(mixer_in,))
+        _add(model, p + "attention/key", store, sp + "attn.to_k.weight", (hidden, hidden),
+             inputs=(mixer_in,))
+        _add(model, p + "attention/value", store, sp + "attn.to_v.weight", (hidden, hidden),
+             inputs=(mixer_in,))
+        _add(model, p + "attention/query_norm", store, sp + "attn.norm_q.weight", (head_dim,))
+        _add(model, p + "attention/key_norm", store, sp + "attn.norm_k.weight", (head_dim,))
+        _add(model, p + "attention/output", store, sp + "attn.to_out.0.weight",
+             (hidden, hidden), inputs=(p + "attention_output",))
+        mlp_in = p + "norm2_output"
+        _add(model, p + "mlp/gate", store, sp + "img_mlp.gate_layer.weight",
+             (intermediate, hidden), inputs=(mlp_in,))
+        _add(model, p + "mlp/up", store, sp + "img_mlp.proj.weight",
+             (intermediate, hidden), inputs=(mlp_in,))
+        _add(model, p + "mlp/down", store, sp + "img_mlp.out.weight",
+             (hidden, intermediate), inputs=(p + "mlp_product",))
+
+
+def _build_text_encoder(model, store, cfg):
+    text = cfg["text_config"]
+    hidden = text["hidden_size"]
+    head_dim = text["head_dim"]
+    q = text["num_attention_heads"] * head_dim
+    k = text["num_key_value_heads"] * head_dim
+    intermediate = text["intermediate_size"]
+
+    _add(model, "text/embed_tokens", store, "model.language_model.embed_tokens.weight",
+         (text["vocab_size"], hidden))
+    _add(model, "text/final_norm", store, "model.language_model.norm.weight", (hidden,))
+    for i in range(text["num_hidden_layers"]):
+        p = f"text/layers/{i}/"
+        sp = f"model.language_model.layers.{i}."
+        _add(model, p + "input_norm", store, sp + "input_layernorm.weight", (hidden,))
+        _add(model, p + "post_attention_norm", store, sp + "post_attention_layernorm.weight",
+             (hidden,))
+        mixer_in = p + "norm1_output"
+        for role, field in (("query", "q_proj"), ("key", "k_proj"), ("value", "v_proj")):
+            width = q if role == "query" else k
+            _add(model, p + "attention/" + role, store, sp + "self_attn." + field + ".weight",
+                 (width, hidden), inputs=(mixer_in,))
+        for role, field in (("query_norm", "q_norm"), ("key_norm", "k_norm")):
+            _add(model, p + "attention/" + role, store, sp + "self_attn." + field + ".weight",
+                 (head_dim,))
+        _add(model, p + "attention/output", store, sp + "self_attn.o_proj.weight",
+             (hidden, q), inputs=(p + "attention_output",))
+        mlp_in = p + "norm2_output"
+        for role, field in (("gate", "gate_proj"), ("up", "up_proj")):
+            _add(model, p + "mlp/" + role, store, sp + "mlp." + field + ".weight",
+                 (intermediate, hidden), inputs=(mlp_in,))
+        _add(model, p + "mlp/down", store, sp + "mlp.down_proj.weight",
+             (hidden, intermediate), inputs=(p + "mlp_product",))
+
+
+def _build_vision(model, store, cfg):
+    """The Qwen3-VL vision tower inside the pipeline's text encoder.
+
+    Qwen-Image 2.1 conditions an edit on the condition image through this tower: the prompt template
+    puts the image's `<|image_pad|>` slots in the same sequence as the text, so the DiT's context is
+    those hidden states and `image_pad_mask` marks the image positions. Role and activation names are
+    exactly models/qwen3_5/load/vision.cpp, the shared tower the LLM route already runs.
+
+    The `deepstack_merger_list` mergers ARE converted (one per `deepstack_visual_indexes` entry): the
+    image text tower cannot reproduce the pipeline's conditioning without them. Measured on the
+    pipeline's own `_get_qwen_prompt_embeds` (stock forward vs `deepstack_features=[]`), dropping the
+    adds moves the post-drop hidden states the DiT reads by relative Frobenius 0.19 at text positions
+    and 1.03 at the image-pad positions, against the 2e-2 BF16 tolerance the text tower is qualified
+    with. Their features are tapped after the vision blocks named in `deepstack_visual_indexes` and
+    each merger is a `Qwen3VLVisionPatchMerger(use_postshuffle_norm=True)`: its LayerNorm runs on the
+    merged `spatial_merge_size**2 * hidden_size` row (not on `hidden_size` like the main merger), so
+    the norm here is `merger`-wide while fc1/fc2 keep the main merger's geometry.
+    """
+    vision = cfg["vision_config"]
+    h, intermediate = vision["hidden_size"], vision["intermediate_size"]
+    patch, temporal = vision["patch_size"], vision["temporal_patch_size"]
+    merger = vision["spatial_merge_size"] ** 2 * h
+    out_width = vision["out_hidden_size"]
+    deepstack = vision.get("deepstack_visual_indexes", ())
+
+    _add(model, "vision/patch_embedding", store, "model.visual.patch_embed.proj.weight",
+         (h, 3 * temporal * patch * patch), source_shape=(h, 3, temporal, patch, patch),
+         inputs=("vision/patch_input",))
+    _add(model, "vision/patch_embedding_bias", store, "model.visual.patch_embed.proj.bias", (h,))
+    _add(model, "vision/position_embedding", store, "model.visual.pos_embed.weight",
+         (vision["num_position_embeddings"], h))
+    for i in range(vision["depth"]):
+        p, sp = f"vision/layers/{i}/", f"model.visual.blocks.{i}."
+        for role in ("norm1", "norm2"):
+            for kind in ("weight", "bias"):
+                _add(model, p + role + "_" + kind, store, sp + role + "." + kind, (h,))
+        for number, role in enumerate(("query", "key", "value")):
+            _add(model, p + "attention/" + role, store, sp + "attn.qkv.weight", (h, h),
+                 source_shape=(3 * h, h), offset_row=number * h, inputs=(p + "attention_input",))
+            _add(model, p + "attention/" + role + "_bias", store, sp + "attn.qkv.bias", (h,),
+                 source_shape=(3 * h,), offset_row=number * h)
+        _add(model, p + "attention/output", store, sp + "attn.proj.weight", (h, h),
+             inputs=(p + "attention_output",))
+        _add(model, p + "attention/output_bias", store, sp + "attn.proj.bias", (h,))
+        _add(model, p + "mlp/fc1", store, sp + "mlp.linear_fc1.weight", (intermediate, h),
+             inputs=(p + "mlp_input",))
+        _add(model, p + "mlp/fc1_bias", store, sp + "mlp.linear_fc1.bias", (intermediate,))
+        _add(model, p + "mlp/fc2", store, sp + "mlp.linear_fc2.weight", (h, intermediate),
+             inputs=(p + "mlp_activation",))
+        _add(model, p + "mlp/fc2_bias", store, sp + "mlp.linear_fc2.bias", (h,))
+    for role, field, dims, inputs in (
+        ("norm_weight", "norm.weight", (h,), ()),
+        ("norm_bias", "norm.bias", (h,), ()),
+        ("fc1", "linear_fc1.weight", (merger, merger), ("vision/merger/input",)),
+        ("fc1_bias", "linear_fc1.bias", (merger,), ()),
+        ("fc2", "linear_fc2.weight", (out_width, merger), ("vision/merger/activation",)),
+        ("fc2_bias", "linear_fc2.bias", (out_width,), ()),
+    ):
+        _add(model, "vision/merger/" + role, store, "model.visual.merger." + field, dims,
+             inputs=inputs)
+    for i in range(len(deepstack)):
+        p, sp = f"vision/deepstack/{i}/", f"model.visual.deepstack_merger_list.{i}."
+        for role, field, dims, act_inputs in (
+            ("norm_weight", "norm.weight", (merger,), ()),
+            ("norm_bias", "norm.bias", (merger,), ()),
+            ("fc1", "linear_fc1.weight", (merger, merger), (p + "input",)),
+            ("fc1_bias", "linear_fc1.bias", (merger,), ()),
+            ("fc2", "linear_fc2.weight", (out_width, merger), (p + "activation",)),
+            ("fc2_bias", "linear_fc2.bias", (out_width,), ()),
+        ):
+            _add(model, p + role, store, sp + field, dims, inputs=act_inputs)
+
+
+def _build_vae(model, store):
+    for name in list(store.weight_map):
+        shape = tuple(store.describe(name).shape)
+        _add(model, "vae/" + name, store, name, shape)
+
+
+def build_model(base: SafetensorsSource, *, components=("dit", "text"),
+                resource_overrides=None) -> Model:
+    if base.path.is_file():
+        raise ValueError("point --model at the pipeline root directory")
+    root = base.path
+    records = {}
+    sources = {}
+    if "dit" in components:
+        index = root / "transformer" / "diffusion_pytorch_model.safetensors.index.json"
+        records["dit"] = {"config": _load_config(root / "transformer" / "config.json")}
+        sources["dit"] = SafetensorsSource(index)
+    if "text" in components:
+        records["text"] = {"config": _load_config(root / "text_encoder" / "config.json")}
+        sources["text"] = SafetensorsSource(root / "text_encoder")
+    if "vae" in components:
+        records["vae"] = {"config": _load_config(root / "vae" / "config.json")}
+        sources["vae"] = SafetensorsSource(
+            root / "vae" / "diffusion_pytorch_model.safetensors"
+        )
+    if not records:
+        raise ValueError("select at least one of dit,encoder")
+    if "vision" in components and "text" not in components:
+        # The vision tower lives in the text encoder's shards, and its geometry (and the merger's
+        # output width) is read from that component's config, so it is never converted alone.
+        raise ValueError("vision requires the text component")
+
+    # The artifact is the single source of truth for the diffusion schedule: the shipped
+    # scheduler document is packed verbatim, with no field added, dropped, renamed or coerced,
+    # and `_class_name` and `_diffusers_version` are kept for provenance only. It comes after the
+    # guards above so the metadata-only component is never the artifact's only content.
+    scheduler = root / "scheduler" / "scheduler_config.json"
+    if not scheduler.is_file():
+        raise FileNotFoundError(
+            f"{scheduler}: the pipeline root has no scheduler/scheduler_config.json. It is "
+            "required: the artifact packs it verbatim as its scheduler component, and nothing "
+            "is synthesized for it."
+        )
+    records["scheduler"] = {"config": _load_config(scheduler)}
+
+    model = Model(components=records)
+    if "dit" in components:
+        _build_dit(model, sources["dit"], records["dit"]["config"])
+    if "text" in components:
+        _build_text_encoder(model, sources["text"], records["text"]["config"])
+    if "vision" in components:
+        _build_vision(model, sources["text"], records["text"]["config"])
+    if "vae" in components:
+        _build_vae(model, sources["vae"])
+    return model
+
+
+def qwen_image_fp8(model, recipe: Recipe, sources):
+    recipe.assign(
+        [
+            "dit/layers/*/attention/query",
+            "dit/layers/*/attention/key",
+            "dit/layers/*/attention/value",
+            "dit/layers/*/attention/output",
+            "dit/layers/*/mlp/gate",
+            "dit/layers/*/mlp/up",
+            "dit/layers/*/mlp/down",
+            "dit/txt_in/in",
+            "dit/txt_in/out",
+            "text/layers/*/attention/query",
+            "text/layers/*/attention/key",
+            "text/layers/*/attention/value",
+            "text/layers/*/attention/output",
+            "text/layers/*/mlp/gate",
+            "text/layers/*/mlp/up",
+            "text/layers/*/mlp/down",
+        ],
+        format=FP8,
+        method=FP8_METHOD,
+        activation_policy="AllowA8",
+    )
+    recipe.assign("text/embed_tokens", format=FP8, method=FP8_METHOD)

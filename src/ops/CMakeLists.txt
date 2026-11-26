@@ -20,6 +20,12 @@ infernix_cuda_non_rdc_archive(infernix_nvfp4_non_rdc)
 target_link_libraries(infernix_nvfp4_non_rdc PRIVATE infernix_core infernix_cuda_runtime CUDA::cuda_driver)
 
 include(basic_sources.cmake)
+# The image lane's own ops: each directory owns its sources and its library
+# (docs/maintainer/image-integration-points.md, "Ours-only lane files").
+include("${CMAKE_CURRENT_LIST_DIR}/attn_dit_joint/sources.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/dit_adaln/sources.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/rope_c64/sources.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/vae_decoder/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/attn_input_proj/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/candidate_selector/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/context_kv_materialize/sources.cmake")

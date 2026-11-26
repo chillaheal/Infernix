@@ -28,6 +28,20 @@ constexpr std::int64_t kMaxTokenId = 1'000'000;
 constexpr std::string_view kQwenSplitPattern =
     R"qwen((?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+)qwen";
 
+// PORT(ported tree): the Qwen-Image text tower's tokenizer descriptor, re-added by hand (ours-only,
+// docs/maintainer/image-integration-points.md). The sibling of the pattern above, verbatim from the
+// fork's src/models/qwen3_5/frontend/tokenizer.cpp:36-41, where the lane reached it before upstream
+// moved the tokenizer here.
+// The Qwen3-VL text processor's tokenizer.json declares the mark-EXCLUSIVE variant (letter run
+// \p{L}+, other run [^\s\p{L}\p{N}]). Both are accepted by validate_pipeline below. They are
+// BEHAVIORALLY IDENTICAL for the Qwen vocab: no merge token contains a combining mark (the corpus
+// was NFC-normalized before BPE training -- verified: 0 of 151669 vocab tokens contain a \p{M}
+// codepoint), so a mark always falls to isolated byte-level tokens and the two word-groupings
+// yield the same ids for every input. The scanner implements the mark-inclusive form; its output is
+// provably identical to the mark-exclusive form, so loading a VL descriptor needs no encode change.
+constexpr std::string_view kQwenSplitPatternVL =
+    R"qwen((?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+)qwen";
+
 constexpr std::string_view kInklingSplitPattern =
     R"ink([^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+)ink";
 
@@ -55,8 +69,17 @@ void validate_pipeline(const Json& root, const Json& model, TokenizerPipeline pi
                 "pre_tokenizer");
         const auto& split = pre["pretokenizers"][0];
         const auto& bytes = pre["pretokenizers"][1];
-        require(type(split, "Split") && split.contains("pattern") && split["pattern"].is_object() &&
-                    split["pattern"].value("Regex", std::string{}) == split_pattern &&
+        // PORT(ported tree): the lane's half of the hunk above -- accept either the mark-inclusive
+        // (Qwen3.5-LLM) or mark-exclusive (Qwen3-VL) declared form, as the fork's
+        // src/models/qwen3_5/frontend/tokenizer.cpp:68-74 did; the image text tower loads the VL
+        // processor's own tokenizer.json, so refusing it is a lane-wide C++ throw at startup. The VL
+        // form is offered only to the Qwen pipeline: Inkling's scanner implements its own pattern.
+        const std::string split_regex =
+            (split.is_object() && split.contains("pattern") && split["pattern"].is_object())
+                ? split["pattern"].value("Regex", std::string{})
+                : std::string{};
+        require(type(split, "Split") &&
+                    (split_regex == split_pattern || (qwen && split_regex == kQwenSplitPatternVL)) &&
                     split.value("behavior", std::string{}) == "Isolated" &&
                     split.value("invert", Json(false)) == false,
                 "pre_tokenizer.Split");

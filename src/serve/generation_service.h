@@ -72,6 +72,14 @@ struct GenerationOutcome {
     // That explanation gave up somewhere, so prefix_miss holds less than the request would explain
     // (prefix_miss.h). The generation itself is unaffected; only a real failure shows as one.
     bool prefix_miss_diagnostic_failed = false;
+    // What the server-executed image tool did on the client's behalf: one entry per picture it tried
+    // to draw, with the route's own code and message when it could not. Carried already serialized
+    // because this header owns no JSON type, and carried HERE because -- like `constraint` above -- it
+    // is the serve's own observation that every protocol's response writer has to reach: the hidden
+    // tool's rounds run inside the request and are not part of the conversation, so this outcome is the
+    // only object that meets all three protocols in both its streaming and its aggregate form. Absent
+    // when no image tool ran, which is what keeps a text answer byte-for-byte what it was.
+    std::optional<std::string> image_tool_attempts_json;
 };
 
 // A transport may report an interrupted stream through a callback or is_cancelled().
@@ -260,6 +268,13 @@ public:
     void reset_execution_maxima() noexcept override { engine_->reset_execution_maxima(); }
 
     [[nodiscard]] bool is_available() const override { return engine_->is_available(); }
+
+    // PORT(ported tree): the image lane's handle on the loaded Engine, re-added by hand, verbatim from the
+    // fork's generation_service.h:167 (an accessor upstream's rewrite kept private). The interlude is
+    // Engine-owned, not protocol-owned, so the serving main reaches it through this service.
+    // The loaded Engine, for the image interlude runner the serving main attaches alongside this
+    // service.
+    [[nodiscard]] infernix::Engine& engine() noexcept { return *engine_; }
 
     [[nodiscard]] bool has_failed() const override { return engine_->has_failed(); }
 
