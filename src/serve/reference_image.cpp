@@ -360,9 +360,11 @@ ReferencePlanes prepare_reference_planes(const std::string& payload) {
 
     // The sibling of that gate, at the other end of the snap. This plane is what the vision tower is
     // later handed as a {1, target_h/16, target_w/16} patch grid, and the image VRAM ledger bills that
-    // lane for a FIXED worst legal reference plane (qi::kVisionWorstReferencePatches, derived beside the
-    // charge in models/qwen_image/image_device_need.h) because the serving layer has to price the job and
-    // yield the LLM's VRAM before anything runs. A plane above that number therefore has live device
+    // lane for the plane this route DECLARES -- the widest of the job's references, stamped from these very
+    // planes at src/serve/image_generation_service.cpp -- with qi::kVisionWorstReferencePatches (derived
+    // beside the charge in models/qwen_image/image_device_need.h) as the CEILING over it, because the
+    // serving layer has to price the job and yield the LLM's VRAM before anything runs. A plane above that
+    // number therefore has live device
     // bytes no admission decision took, and run_vision_tower refuses it -- but a std::runtime_error from
     // the model layer is not an ApiException, so handle_images never sees it and the client gets a 500.
     // Refusing here, where the route still owns the geometry and the answer is still the serve's to write,
@@ -377,8 +379,9 @@ ReferencePlanes prepare_reference_planes(const std::string& payload) {
         throw std::invalid_argument(
             "the reference image snaps to " + std::to_string(target_w) + "x" + std::to_string(target_h) +
             " = " + std::to_string(reference_patches) + " vision patches, more than the " +
-            std::to_string(qi::kVisionWorstReferencePatches) + " the image VRAM ledger bills the vision "
-            "tower for; the route's own aspect gate normally keeps a reference inside that plane, so this "
+            std::to_string(qi::kVisionWorstReferencePatches) +
+            ", the ceiling the image VRAM ledger charges the vision tower up to; the route's own aspect "
+            "gate normally keeps a reference inside that plane, so this "
             "is the reference snap and the ledger's derivation disagreeing -- not something cropping the "
             "picture fixes");
     }

@@ -374,7 +374,8 @@ int main() {
                           route_refusals.find("image_generation_failed") != std::string::npos &&
                           route_refusals.find("image_artifact_failed") != std::string::npos &&
                           route_refusals.find("image_request_unservable") != std::string::npos &&
-                          route_refusals.find("image_conditioning_inconsistent") != std::string::npos,
+                          route_refusals.find("image_conditioning_inconsistent") != std::string::npos &&
+                          route_refusals.find("image_need_unpriceable") != std::string::npos,
                       "every answer that is not the client's request to fix is named, so the four kinds of "
                       "retry are tellable without a single line of this repository");
     const Json guidance = edit.at("instruction");

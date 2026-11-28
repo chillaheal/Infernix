@@ -20,6 +20,7 @@
 // fail-closed refusal the vision tower and every other image-lane guard raises.
 #include <cstdint>
 #include <cstddef>
+#include <optional>
 #include <stdexcept>
 #include <string>
 
@@ -153,12 +154,17 @@ static_assert(kVisionWorstReferencePatches >
               "reference lands outside kReferenceTargetArea. If this fires, the derivation stopped "
               "modelling the snap.");
 
-// That number is not an estimate the caller may exceed, it is a CHARGE: the ledger below bills
-// need.vision_peak for exactly kVisionWorstReferencePatches patches, and the serving layer yields on the
-// total it bills. A caller handing run_vision_tower a bigger plane therefore holds live device bytes that
-// no admission decision priced -- the joint ceiling admits 20480 merged rows, which would be 81920 patches,
-// ten times the billed plane: ~3.0 GiB of live activations against the 325 MiB this header bills (the
-// per-patch terms at the shipped ViT's shape) -- so the resident LLM starves on a stale number. That is the exact blindness this branch exists to close, and the blindness was in the reader:
+// That number is not an estimate the caller may exceed: it is the CEILING over the charge. The ledger
+// below bills need.vision_peak for the plane the request DECLARES (ImageDeviceNeedRequest::
+// reference_patches -- the widest of the references prepare_reference_planes produced), and the serving
+// layer yields on the total it bills: never more than the tower will be handed, never less.
+// require_patches_within_vision_ledger keeps both ends honest -- run_vision_tower calls it on the count
+// its caller hands it BEFORE a single plane is sized, so a caller handing it a bigger plane than the
+// admission billed for would hold live device bytes no decision priced: the joint ceiling admits 20480
+// merged rows, which would be 81920 patches, ten times the worst legal reference -- ~3.0 GiB of live
+// activations against the ~325 MiB the ceiling itself bills (the per-patch terms at the shipped ViT's
+// shape) -- and is refused instead of starving the resident LLM on a stale number. That is the exact
+// blindness this branch exists to close, and the blindness was in the reader:
 // vision_tower.cu sized every live plane from the CALLER's count and refused only int overflow.
 //
 // The guard therefore lives beside the charge it protects, so the two cannot drift apart, and
@@ -202,6 +208,19 @@ struct ImageDeviceNeedRequest {
     // ref_tokens would count those rows twice (for a portrait reference, ~1014 rows too many).
     std::uint32_t   vision_tokens = 0;
     VisionLaneDims  vision;             // zero == no vision lane, and the vision term is then zero
+    // The edit route only, and the pair that says what the ViT lane is CHARGED for. The tower runs the
+    // references one at a time into the same live set (src/models/qwen_image/vision_tower.cu sizes every
+    // plane from the caller's count), so the lane costs the WIDEST of the planes this job will hand it --
+    // not the widest the snap could ever produce, which is what the lane used to bill and what made an
+    // ordinary photographic edit pay ~160 MiB for bytes no allocation ever occupied. `reference_patches`
+    // is that widest plane in patches ((width/16) * (height/16), which is also the reference's own latent
+    // token count -- src/serve/image_generation_service.cpp prices ref_tokens the same way), and
+    // `reference_lanes` is how many references the tower will run. Both are filled from the SAME
+    // prepare_reference_planes answer the job encodes, so the price and the work cannot disagree.
+    // require_patches_within_vision_ledger stays the ceiling over both: any plane above
+    // kVisionWorstReferencePatches is refused, admitted plane or not.
+    std::uint32_t   reference_lanes   = 0;
+    std::uint32_t   reference_patches = 0;
     // The decoder geometry the job's OWN artifact declared, read by read_vae_topology and verified against
     // every bound decoder weight by check_vae_topology (image_weights.cpp) -- the same object the CUDA
     // graph decodes from, which is why the ledger has no decoder constants of its own any more. A
@@ -296,17 +315,33 @@ struct ImageDeviceNeed {
     if (final_planes > need.vae_peak) { need.vae_peak = final_planes; }
 
     // The ViT lane runs inside the same interlude as the DiT loop, before it: peak == one block's
-    // roles + the per-item activation + one merger (vision_tower.h:15), and vision_tower.cu:197-219
+    // roles + the per-item activation + one merger (vision_tower.h:15), and vision_tower.cu:207-232
     // really does hold the whole live set across the block loop -- eleven planes at
     // [hidden, patches], one at [intermediate, patches], the patch input, three int32/float index
-    // planes and the merger output. Sized by the worst legal reference (kVisionWorstReferencePatches),
-    // not the requested one: the reference's size is the route's, independent of the output size, and
-    // the probe has to refuse before the yield rather than OOM the resident LLM. Sequential with the
-    // decode, so it is SUMMED like vae_peak, never maxed against it.
+    // planes and the merger output -- every one of them a Buf sized from the CALLER's patch count and
+    // freed by RAII before the call returns. So the lane costs the plane this job actually runs:
+    // `req.reference_patches`, the widest of the planes prepare_reference_planes produced, because the
+    // tower encodes the references one after another into that same live set (a two-reference edit pays
+    // the widest, never the sum).
+    //
+    // It used to be billed at kVisionWorstReferencePatches -- the widest plane the snap could EVER
+    // produce -- and that was wrong twice over. It charged a square 1024^2 reference (4096 patches) for
+    // the 65536x32 pathological aspect (8192) it will never run, and the yield it spends that on is the
+    // one scarce resource on this route: on the deployed engine a 1536x1536 photographic edit was refused
+    // with "needs 4915 MiB; the model can yield 5238 MiB with 329 MiB already free and 256 MiB reserved
+    // below the headroom" while the gate is need + 512 MiB margin + 256 MiB headroom -- 116 MiB short,
+    // with ~160 MiB of the shortfall bought by bytes no allocation would ever occupy.
+    // kVisionWorstReferencePatches stays exactly where it was, as the CEILING: run_vision_tower refuses
+    // any plane above it (require_patches_within_vision_ledger, called before a single allocation) and
+    // check_image_device_need_request refuses an admission that declares one, so the price can never
+    // fall under what the tower will be handed -- a serve that ran the tower over a wider plane than it
+    // admitted gets a refusal, not an OOM of the resident LLM.
+    //
+    // Sequential with the decode, so the lane is SUMMED like vae_peak, never maxed against it.
     if (req.vision.hidden != 0) {
         const std::uint64_t vh   = req.vision.hidden;
         const std::uint64_t vmlp = req.vision.intermediate;
-        const std::uint64_t p    = kVisionWorstReferencePatches;
+        const std::uint64_t p    = req.reference_patches;
         const std::uint64_t merge = req.vision.merge != 0 ? req.vision.merge : 1U;
         const std::uint64_t patch_width =
             3ULL * (req.vision.temporal != 0 ? req.vision.temporal : 1U) *
@@ -327,6 +362,51 @@ struct ImageDeviceNeed {
     need.resident_weights = req.vae.weight_resident_bytes +
                             static_cast<std::uint64_t>(req.blocks_resident) * image_block_bytes(req.dims);
     return need;
+}
+
+// The serving layer calls this BEFORE it prices a job and refuses on its words. It returns
+// std::optional<std::string> rather than std::expected because this header is compiled by translation
+// units pinned to C++20 (src/serve builds with -std:c++20, and the CUDA lane too), which is exactly why
+// check_vae_topology -- a C++23-only host gate -- lives in a different header. Same stance as that one:
+// an admission that cannot name what it is reserving for is refused, not guessed.
+//
+// image_device_need() itself stays constexpr and noexcept: pure arithmetic that charges what a request
+// declares. A request that declares a lane without saying what runs through it has to be stopped at the
+// door instead of being billed zero for a lane that then holds live bytes nobody reserved. Each branch
+// names the field it refused, because the caller is another engineer fixing an admission, not a client.
+[[nodiscard]] inline std::optional<std::string> check_image_device_need_request(
+    const ImageDeviceNeedRequest& req) {
+    if (req.vision.hidden == 0) {
+        // No lane, so nothing may name references to it: a text-to-image job that declares reference
+        // planes has lost its lane dimensions somewhere upstream, and pricing it as text-to-image would
+        // reserve nothing for a tower that then runs.
+        if (req.reference_lanes != 0 || req.reference_patches != 0) {
+            return std::string(
+                "the request declares " + std::to_string(req.reference_lanes) + " reference lane(s) at " +
+                std::to_string(req.reference_patches) +
+                " patches but carries no vision lane (vision.hidden == 0), so the reference tower that "
+                "will run has nothing reserved for it: hand the request the bound vision lane's shape");
+        }
+        return std::nullopt;
+    }
+    if (req.reference_lanes == 0 || req.reference_patches == 0) {
+        return std::string(
+            "the request declares a vision lane at " + std::to_string(req.vision.hidden) +
+            " hidden but no reference plane (reference_lanes == " + std::to_string(req.reference_lanes) +
+            ", reference_patches == " + std::to_string(req.reference_patches) +
+            "): the tower's live set is sized from the plane it is handed, so the caller must declare the "
+            "widest of the reference planes prepare_reference_planes produced, in patches");
+    }
+    // The same bound run_vision_tower enforces on the count it is handed, checked here too so an
+    // admission never reserves for a plane the lane would refuse at run time.
+    if (req.reference_patches > kVisionWorstReferencePatches) {
+        return std::string("the request declares a reference plane of " +
+                           std::to_string(req.reference_patches) +
+                           " patches, above the " + std::to_string(kVisionWorstReferencePatches) +
+                           " the worst legal reference plane produces and the ceiling the vision "
+                           "tower itself refuses");
+    }
+    return std::nullopt;
 }
 
 } // namespace infernix::models::qwen_image

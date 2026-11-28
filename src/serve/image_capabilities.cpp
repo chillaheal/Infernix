@@ -217,7 +217,13 @@ void add_image_capabilities(nlohmann::json& payload, const ServeOptions& options
                            {"a_reference_that_disagrees_with_itself",
                             "HTTP 500 image_conditioning_inconsistent: a prepared reference carries a vision "
                             "token count that contradicts its own latent size, and the same picture "
-                            "reproduces it"}}},
+                            "reproduces it"},
+                           {"a_job_the_serve_cannot_price",
+                            "HTTP 500 image_need_unpriceable: the server could not say what the job's own "
+                            "VRAM reservation is -- an edit whose reference planes it cannot hand the vision "
+                            "ledger, or a plane above the ceiling the ledger enforces. It is the server's to "
+                            "fix, the same request reproduces it, and no smaller canvas changes the answer "
+                            "for an edit that already names its references"}}},
                      // A chat request to this process is given the tool below and the picture is
                      // drawn inside that same request, so a client needs no tool call of its own.
                      {"automatic_from_chat", true},

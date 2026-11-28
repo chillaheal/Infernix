@@ -100,6 +100,12 @@ qi::ImageDeviceNeed need_struct(std::uint32_t side, std::uint32_t text, std::uin
         .blocks_resident = qi::kImageResidentBlocks,
         .vision_tokens   = vision_tokens,
         .vision          = with_vision ? test_vision() : qi::VisionLaneDims{},
+        // Every row here carries ONE reference, so the plane the tower will be handed is that reference's
+        // own patch count -- which is what ref_tokens already is (a latent token is one 16x16 tile, the
+        // same count src/serve derives it from). A multi-reference row declares its widest plane itself;
+        // see the block that prices several references.
+        .reference_lanes   = with_vision ? 1U : 0U,
+        .reference_patches = with_vision ? ref : 0U,
         .vae             = shipped_topology(),
     };
     return qi::image_device_need(req);
@@ -209,14 +215,16 @@ int main() {
               "the text stages keep the full kept length");
         check(need_struct(768, kNonPad, 0, 0, 0, false).vision_peak == 0,
               "no vision lane, no vision bytes");
-        // The bracket is the doubled charge's own arithmetic, read off vision_tower.cu's live set at the
-        // worst plane the route can hand the tower (65536x32 = 8192 patches, twice the square reference
-        // that used to be billed -- see the derivation beside the constant and the enumeration below):
-        // eleven [hidden,patches] planes 198 MiB, d_up 67 MiB, d_patches 24 MiB, the merger rows 16 MiB,
-        // the three index planes 0.3 MiB, one block's roles 19 MiB = 325 MiB, and no fudge around it.
-        check(declared.vision_peak > 300ULL * qi::kImageMiB &&
-                  declared.vision_peak < 400ULL * qi::kImageMiB,
-              "the ViT lane reserves its live set over the route's worst legal reference plane");
+        // The bracket is this job's OWN plane, read off vision_tower.cu's live set: eleven
+        // [hidden,patches] planes at the 4096 patches of a square 1024^2 reference is 104 MiB, and the
+        // d_up/d_patches/merger/index/block-role terms sit on top of that -- under twice the eleven, so
+        // the lane is charged its plane's live set and nothing padded around it. It used to be bracketed
+        // at 300-400 MiB, which was the worst plane the snap can ever produce (65536x32 = 8192 patches,
+        // 325 MiB) charged to a job that runs half of it; see the block that prices the declared plane.
+        const std::uint64_t eleven_at_ref =
+            11ULL * kRef * test_vision().hidden * qi::kImageElementBytes;
+        check(declared.vision_peak >= eleven_at_ref && declared.vision_peak < 2ULL * eleven_at_ref,
+              "the ViT lane reserves its live set over the reference plane this job declares");
         // The vision term is purely additive: the same request with NO lane, with the two joint-shaped
         // terms shrunk by exactly what declaring the pad rows saved, plus the vision term, reproduces
         // total() byte for byte. Nothing else in the ledger moved.
@@ -226,9 +234,10 @@ int main() {
                       (nolid.rope_and_tables - declared.rope_and_tables) + declared.vision_peak,
               "the vision term is summed like vae_peak, never maxed");
         // The row the plan asks for in MiB: the same 768^2 target as the certified route plus a
-        // reference and the ViT lane. Expected ~1.2-1.4 GiB above the text-only need (the 4096 extra
-        // latent tokens at ~0.2 MiB per joint row plus the ~325 MiB the lane is billed at once the snap's
-        // rounding is priced in -- this is the row whose predicted figure the controller re-certifies).
+        // reference and the ViT lane. The 4096 extra latent tokens at ~0.2 MiB per joint row plus the
+        // ~178 MiB the lane is charged for THAT reference's plane -- this is the row whose predicted
+        // figure the controller re-certifies. (Before the charge moved onto the declared plane it printed
+        // 6170 MiB with a 324 MiB lane: the same job, charged for the pathological 65536x32 aspect.)
         const auto plain = need_struct(768, kNonPad, 0, 0, 0, false);
         const std::uint64_t delta = declared.total() > plain.total()
                                         ? declared.total() - plain.total()
@@ -353,7 +362,21 @@ int main() {
             int         width;
             int         height;
         };
-        const std::uint64_t bill = need_struct(768, 32, 0, 4096, 1024, true).vision_peak;
+        // What the CEILING is stays the route's own (the derivation beside the constant and the sweep
+        // above). What a job PAYS is now its own plane, so each shipped shape is priced at the patches the
+        // snap produced for IT: the reference's latent token count IS its patch count (a latent token is
+        // one 16x16 tile), so a job with one reference hands the tower exactly that plane.
+        const auto bill_of = [&](std::uint32_t width, std::uint32_t height) {
+            const std::uint64_t patches = patches_of(width, height);
+            return need_struct(768, 32U + unsigned(patches / 4ULL), 0, unsigned(patches),
+                               unsigned(patches / 4ULL), true)
+                .vision_peak;
+        };
+        const auto live_of = [&](std::uint32_t width, std::uint32_t height) {
+            // vision_tower.cu's eleven [hidden, patches] planes: the part of the charge that scales with
+            // the plane, so a charge that tracked anything else would fall outside this bracket.
+            return 11ULL * patches_of(width, height) * test_vision().hidden * qi::kImageElementBytes;
+        };
         for (const LegalReference& row : {LegalReference{"square 1:1", 1.0, 1024, 1024},
                                           LegalReference{"4:3", 4.0 / 3.0, 1184, 896},
                                           LegalReference{"3:4", 3.0 / 4.0, 896, 1184},
@@ -364,24 +387,33 @@ int main() {
             const bool shape  = (w == row.width && h == row.height);
             check(shape, "an ordinary reference aspect still snaps to the plane the route documents");
             if (!shape) { std::printf("  %s: got %dx%d, want %dx%d\n", row.what, w, h, row.width, row.height); }
-            // Above the square target for every non-square shape: the snap's slack is real, and a charge
+            // Above the square target for every non-square shape: the snap's slack is real, and a guard
             // that ignored it (the old 4096) refused these.
             check(refused(patches_of(unsigned(row.width), unsigned(row.height))).empty(),
                   "every ordinary reference aspect is admitted by the guard that enforces the charge");
-            // The bill is the route's, not the request's: a reference of any of these shapes, and any
-            // prompt length, is priced identically -- which is why the probe can refuse before yielding.
-            const std::uint64_t priced =
-                need_struct(768, 32 + unsigned(patches_of(unsigned(row.width), unsigned(row.height)) / 4ULL),
-                            0, 4096, 1024, true)
-                    .vision_peak;
-            check(priced == bill, "the vision lane is billed at the fixed worst plane, not the reference's size");
+            const std::uint64_t priced = bill_of(unsigned(row.width), unsigned(row.height));
+            const std::uint64_t live   = live_of(unsigned(row.width), unsigned(row.height));
+            check(priced >= live && priced < 2ULL * live,
+                  "the lane is charged the plane this reference actually has, and no more");
+            // A non-square photograph pays for its extra patches; the square pays least. Under the fixed
+            // worst-plane charge every row here cost the same 325 MiB regardless of what it ran.
+            if (std::string(row.what) != "square 1:1") {
+                check(priced > bill_of(1024U, 1024U),
+                      "a reference wider than the square is charged for what it is wider by");
+            }
         }
-        // The bill covers what that plane holds live (vision_tower.cu's eleven [hidden, patches] planes
-        // alone) and is not a loose multiple of it: it prices the derived plane, nothing padded around it.
+        // The ceiling is still priced by the same arithmetic, so the bound the guard enforces and the
+        // ceiling a worst-plane job is charged remain ONE number -- the charge cannot drift below the
+        // guard and leave a served plane unpriced.
         const std::uint64_t eleven =
             11ULL * kCap * test_vision().hidden * qi::kImageElementBytes;
-        check(bill >= eleven, "the vision bill at least covers the live planes of the worst legal reference");
-        check(bill < 2ULL * eleven, "the vision bill is the worst plane's own live set, not a padded figure");
+        const std::uint64_t ceiling_bill =
+            need_struct(768, 32U + unsigned(kCap / 4ULL), 0, unsigned(kCap), unsigned(kCap / 4ULL), true)
+                .vision_peak;
+        check(ceiling_bill >= eleven, "a worst-plane job is charged at least the live planes of the worst legal reference");
+        check(ceiling_bill < 2ULL * eleven, "and is charged the worst plane's own live set, not a padded figure");
+        check(bill_of(1024U, 1024U) < ceiling_bill,
+              "an ordinary square reference is no longer charged for the pathological aspect it never runs");
 
         // ---- C. the guard enforces exactly the billed number, readably ----
         check(refused(kCap).empty(), "the worst legal reference plane the ledger bills is admitted");
@@ -470,6 +502,160 @@ int main() {
             check(refused_by_the_route,
                   "a reference past the route's aspect gate is refused as a client error, not a 500");
         }
+    }
+
+    // ---- the ViT lane is CHARGED for the planes this job hands the tower ----
+    // Everything above proves the CEILING is the route's worst legal plane and that no reference the route
+    // admits escapes it. What it deliberately did not decide is what one job PAYS. The tower encodes the
+    // references one at a time into the same live set -- src/models/qwen_image/vision_tower.cu sizes every
+    // plane from the count its caller hands it and calls require_patches_within_vision_ledger on that
+    // count -- so a job that encodes one square 1024^2 reference holds (1024/16)^2 = 4096 patches, HALF
+    // the 8192 the snap can produce at its widest admitted aspect, and therefore half the bytes.
+    //
+    // Billing the worst plane anyway is what the yield cannot afford. Measured on the deployed engine the
+    // day this charge was found: a 1536x1536 edit with a photographic reference was refused with
+    // "the image job needs 4915 MiB; the model can yield 5238 MiB with 329 MiB already free and 256 MiB
+    // reserved below the headroom" -- the gate is need + 512 MiB margin + 256 MiB headroom against the
+    // promise, so the job was 116 MiB short and the over-billed ViT alone accounted for more than that.
+    // The ceiling does not move: the same guard still refuses a plane above kVisionWorstReferencePatches,
+    // and a serve that handed the tower a wider plane than it admitted would be refused, not OOMed. Only
+    // the PRICE moves, onto the plane the request declares.
+    {
+        const std::uint32_t vh       = test_vision().hidden;
+        const std::uint32_t kWorst   = static_cast<std::uint32_t>(qi::kVisionWorstReferencePatches);
+        constexpr std::uint32_t kSquare = 4096U; // a 1024^2 reference: (1024/16)^2 patches
+        constexpr std::uint32_t kSmall  = 1024U; // a 512^2 reference: (512/16)^2 patches
+
+        // One edit job, priced the way src/serve prices it: ref_tokens is each reference's own patch count
+        // (a latent token is one 16x16 tile), its vision tokens are a quarter of that, and the rendered
+        // prompt carries those pad rows inside its kept length. `billed_patches` is what the caller
+        // DECLARES as the widest plane it will run -- the knob this whole block is about.
+        const auto job = [](std::span<const std::uint32_t> refs, std::uint32_t billed_patches) {
+            std::uint32_t ref_tokens = 0U, vision = 0U;
+            for (const std::uint32_t patches : refs) {
+                ref_tokens += patches;
+                vision     += patches / 4U;
+            }
+            const qi::ImageDeviceNeedRequest req{
+                .geometry          = qi::ImageGeometry::derive(768, 768),
+                .dims              = test_dims(),
+                .text_tokens       = 32U + vision,
+                .ref_tokens        = ref_tokens,
+                .blocks_resident   = qi::kImageResidentBlocks,
+                .vision_tokens     = vision,
+                .vision            = test_vision(),
+                .reference_lanes   = static_cast<std::uint32_t>(refs.size()),
+                .reference_patches = billed_patches,
+                .vae               = shipped_topology(),
+            };
+            return qi::image_device_need(req);
+        };
+        // The two bounds come from vision_tower.cu's OWN allocation list, not from the ledger: the lower
+        // one is its eleven [hidden, patches] Bufs (the charge can never be under what the tower holds
+        // live), the upper one is that whole inventory -- the eleven, d_up, d_patches, the three index
+        // planes, the merger rows and the one streamed block's roles (image_pipeline's CopyLane aside,
+        // the tower holds exactly these and nothing else). So the assertion is "the charge is the plane's
+        // own live set", with the constant block-role term inside the bound rather than smuggled into a
+        // multiplier -- which is what made a tight bracket wrong for the SMALL plane, where the constant
+        // is a third of the total.
+        const auto live_at = [&](std::uint32_t patches) {
+            return 11ULL * patches * vh * qi::kImageElementBytes;
+        };
+        const auto inventory_at = [&](std::uint32_t patches) {
+            const auto  v          = test_vision();
+            const std::uint64_t vh_ = v.hidden;
+            const std::uint64_t vi  = v.intermediate;
+            const std::uint64_t patch_width = 3ULL * v.temporal * v.patch * v.patch;
+            const std::uint64_t merged      = patches / (v.merge * v.merge);
+            return 11ULL * patches * vh_ * qi::kImageElementBytes +
+                   patches * vi * qi::kImageElementBytes +
+                   patches * patch_width * qi::kImageElementBytes +
+                   patches * (2ULL * 4ULL + 4ULL * 4ULL + 4ULL * 4ULL) +
+                   merged * v.out_hidden * qi::kImageElementBytes +
+                   (4ULL * vh_ * vh_ + 3ULL * vi * vh_ +
+                    2ULL * v.head_dim * qi::kImageElementBytes);
+        };
+
+        const auto one   = job(std::span<const std::uint32_t>{&kSquare, 1}, kSquare);
+        const auto small = job(std::span<const std::uint32_t>{&kSmall, 1}, kSmall);
+        // The same job, but declared as if it would run the widest plane the route can ever produce: the
+        // pre-fix behaviour, kept here as the comparison this change has to beat.
+        const auto overbilled = job(std::span<const std::uint32_t>{&kSquare, 1}, kWorst);
+
+        check(one.vision_peak < overbilled.vision_peak,
+              "a job is charged for the plane it runs, not for the widest plane the snap could produce");
+        check(overbilled.vision_peak ==
+                  need_struct(768, 32U + unsigned(kWorst / 4U), 0, kWorst, unsigned(kWorst / 4U), true)
+                      .vision_peak,
+              "a job that declares the route's worst plane is still charged the ceiling this suite pins");
+        check(one.vision_peak >= live_at(kSquare) && one.vision_peak <= inventory_at(kSquare),
+              "the charge is that plane's own live set, neither under it nor padded around it");
+        check(small.vision_peak < one.vision_peak, "a smaller reference is charged less");
+        check(small.vision_peak >= live_at(kSmall) && small.vision_peak <= inventory_at(kSmall),
+              "and stays its own plane's live set, not a scaled copy of the bigger one");
+
+        {
+            // Several references: the tower runs them sequentially into the same buffers, so the lane
+            // costs the WIDEST of them -- not their sum (which would charge a two-reference edit for
+            // double the bytes it holds) and not the first (which would under-charge the widest).
+            const std::uint32_t refs[] = {kSmall, kSquare};
+            const auto many = job(std::span<const std::uint32_t>(refs, 2), kSquare);
+            check(many.vision_peak == one.vision_peak,
+                  "several references are charged the widest plane they will run");
+            check(many.vision_peak < one.vision_peak + small.vision_peak,
+                  "the lane is never charged the sum of its references");
+            // The joint sequence DOES carry every reference, so the rest of the ledger still grows with
+            // them: only the ViT lane is a max.
+            check(many.total() > one.total(), "every reference still raises the joint sequence's terms");
+        }
+
+        // The plane the guard enforces is untouched by the price moving: the ceiling is still the route's
+        // worst legal plane, so a serve that admitted a small reference and then ran the tower over a
+        // wider one is refused rather than left holding unpriced bytes.
+        bool refused_above_ceiling = false;
+        try {
+            qi::require_patches_within_vision_ledger(static_cast<std::uint64_t>(kWorst) + 1ULL);
+        } catch (const std::exception&) {
+            refused_above_ceiling = true;
+        }
+        check(refused_above_ceiling, "the ceiling still refuses one patch above the route's worst plane");
+        bool admitted_at_ceiling = true;
+        try {
+            qi::require_patches_within_vision_ledger(kWorst);
+        } catch (const std::exception&) {
+            admitted_at_ceiling = false;
+        }
+        check(admitted_at_ceiling, "the ceiling still admits the route's worst plane");
+        check(one.vision_peak < overbilled.vision_peak,
+              "an admitted smaller plane is never charged as though it were the ceiling");
+
+        // A lane whose plane nobody named is a lane that cannot be reserved: the same fail-closed stance
+        // check_vae_topology takes against an unstamped calibration. Refused at the host boundary, with
+        // words that name what is missing.
+        const auto refused_lane = [](qi::VisionLaneDims dims, std::uint32_t patches,
+                                     std::uint32_t lanes) -> std::string {
+            const qi::ImageDeviceNeedRequest req{
+                .geometry          = qi::ImageGeometry::derive(768, 768),
+                .dims              = test_dims(),
+                .text_tokens       = 32U,
+                .blocks_resident   = qi::kImageResidentBlocks,
+                .vision            = dims,
+                .reference_lanes   = lanes,
+                .reference_patches = patches,
+                .vae               = shipped_topology(),
+            };
+            if (const auto bad = qi::check_image_device_need_request(req); bad.has_value()) {
+                return *bad;
+            }
+            return {};
+        };
+        const std::string no_plane = refused_lane(test_vision(), 0U, 0U);
+        check(!no_plane.empty() && no_plane.find("reference") != std::string::npos,
+              "a vision lane with no declared reference plane is refused, not billed as nothing");
+        check(refused_lane(qi::VisionLaneDims{}, 0U, 0U).empty(),
+              "a text-to-image job declares no lane and is refused nothing");
+        check(refused_lane(test_vision(), kSquare, 1U).empty(),
+              "a declared edit lane passes the request check");
     }
 
     // Printed before the verdict so a broken golden constant can be read off a failing run.

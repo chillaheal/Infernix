@@ -1148,8 +1148,9 @@ the constant reference block of the joint DiT sequence, while the generated imag
 `size`. The decode, budget check and resize are host work finished before the interlude yields VRAM, so an
 undecodable or oversized reference answers `400` without touching the resident model. So does a reference
 the route cannot price: a snapped side below 32 px (an aspect too extreme to draw) or a snapped plane above
-the worst reference plane the image VRAM ledger bills the vision tower for -- 8192 patches, the 65536x32
-plane above, at the shipped budget -- answers `400 image_decode_failed` before the resize, and the picture
+the ceiling the image VRAM ledger charges the vision tower up to -- 8192 patches, the 65536x32
+plane above, at the shipped budget (the lane is billed for the plane this job's own references hand the
+tower, never for that ceiling) -- answers `400 image_decode_failed` before the resize, and the picture
 is never silently cropped to fit it.
 
 Above `true_cfg_scale` 1 each step runs the DiT twice — once over `prompt`, once over `negative_prompt`,
@@ -1196,7 +1197,7 @@ Every failure names its code in the standard OpenAI error envelope:
 | 400 | `image_cfg_scale_invalid`, `image_negative_prompt_required` | `true_cfg_scale` is outside `[1, 20]`, or it is above 1 with no `negative_prompt` |
 | 400 | `image_decode_failed`, `image_too_large`, `image_url_not_supported`, `image_data_uri_not_base64`, `image_count_invalid` | the `image` payload is not a base64 PNG/JPEG inside the byte budget, is sent as a URL, is a non-base64 `data:` URI, or is more or fewer references than this build draws (see `image` above); the same code also answers a
 reference whose snapped geometry the route cannot price -- a side below the 32-grid, or a plane above the
-worst reference the VRAM ledger bills the vision tower for -- which is likewise refused before the resize.
+ceiling the VRAM ledger charges the vision tower up to -- which is likewise refused before the resize.
 The decoders' own messages are never echoed |
 | 503 | `image_generation_not_configured` | the server started without the image options |
 | 503 | `image_interlude_unsupported` | the loaded model has no image interlude (only Qwen3.8-Flash-Next does) |
@@ -1205,6 +1206,7 @@ The decoders' own messages are never echoed |
 | 429 | `image_interlude_in_flight` | another image generation is running |
 | 503 | `image_engine_degraded` | the interlude could not confirm the model's VRAM was restored |
 | 500 | `image_generation_failed` | the job started and then failed |
+| 500 | `image_need_unpriceable` | the serve could not price the reservation this job needs -- an edit whose reference planes it cannot hand the vision ledger, or a plane above the ceiling the ledger enforces; the same request reproduces it, so do not retry it as it stands |
 | 503 | `image_interlude_failed` | the interlude failed before the job started |
 | 404 | `image_not_found` | on `GET /v1/images/{id}`: that id names no job at all (wrong shape, a job the store never held, or a picture whose retention has run out) |
 

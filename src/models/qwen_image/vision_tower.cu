@@ -162,11 +162,12 @@ VisionTowerOutput run_vision_tower(artifact::Reader& reader, const VisionWeights
         throw std::runtime_error("vision tower: the grid must be positive and merge-aligned");
     }
     const std::size_t patches_count = std::size_t(grid.temporal) * grid.height * grid.width;
-    // The VRAM ledger bills this lane at a FIXED worst legal reference plane (kVisionWorstReferencePatches,
-    // image_device_need.h), and the serving layer yields on what it bills. Every plane below is sized from
-    // the CALLER's count, so a count above that number would hold live device bytes no admission decision
-    // priced and starve the resident LLM -- which is the blindness this branch exists to close. Refused
-    // here, before a single allocation, by the guard that owns the charge; the equality case stays admitted
+    // The VRAM ledger bills this lane for the plane the admission DECLARES -- the widest of the references
+    // the job hands it (ImageDeviceNeedRequest::reference_patches, image_device_need.h) -- and the serving
+    // layer yields on what it bills. Every plane below is sized from the CALLER's count, so a count above
+    // the ceiling that declared plane was checked against would hold live device bytes no admission
+    // decision priced and starve the resident LLM -- which is the blindness this branch exists to close.
+    // Refused here, before a single allocation, by the guard that owns the ceiling; the equality case stays admitted
     // because the route's widest reference it still admits lands exactly on it (the 32-grid snap of the
     // 1024^2-pixel reference target produces 65536x32 = 8192 patches), the square reference is well under
     // it, and the certified suite drives {1, 64, 64} (tests/models/qwen_image/test_image_need_ledger_real.cu).

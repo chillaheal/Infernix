@@ -110,11 +110,20 @@ enum class AutoWish : std::uint8_t { Rewrite, SkipNoReference, SkipAlreadyRewrit
 // "vae" component config and verified against every bound decoder weight. The request carries it by
 // REFERENCE and it has no default, so the bytes this admission reserves are priced from the very object
 // the CUDA graph will decode with, and a job can never be admitted on a decoder nobody read.
+// `reference_lanes` / `reference_patches` complete the edit route: how many references the vision tower
+// will run, and the WIDEST of the planes it will be handed, in patches. The tower encodes them one at a
+// time into the same Bufs (src/models/qwen_image/vision_tower.cu sizes every plane from the caller's
+// count and frees them on return), so the lane costs the widest plane -- and the serve fills both from
+// the very prepare_reference_planes answer the job encodes, so what is charged and what runs are one
+// fact. They are checked before a single byte is priced: a lane whose plane nobody named cannot be
+// reserved, and the same refusal the ledger makes against an unstamped calibration applies here.
 std::uint64_t image_need_bytes(std::int64_t width, std::int64_t height, std::size_t text_tokens,
                               std::size_t negative_tokens, std::size_t ref_tokens,
                               const qi::DiTDims& dims, const qi::VaeTopology& vae,
                               std::size_t vision_tokens = 0,
-                              const qi::VisionLaneDims& vision = {}) {
+                              const qi::VisionLaneDims& vision = {},
+                              std::size_t reference_lanes = 0,
+                              std::size_t reference_patches = 0) {
     // Aggregate-initialised in declaration order rather than field by field: the request's last member
     // is that reference, and a reference has no assignment that does not write through it.
     const qi::ImageDeviceNeedRequest req{
@@ -129,8 +138,20 @@ std::uint64_t image_need_bytes(std::int64_t width, std::int64_t height, std::siz
         .blocks_resident = qi::kImageResidentBlocks,
         .vision_tokens   = static_cast<std::uint32_t>(vision_tokens),
         .vision          = vision,
+        .reference_lanes   = static_cast<std::uint32_t>(reference_lanes),
+        .reference_patches = static_cast<std::uint32_t>(reference_patches),
         .vae             = vae,
     };
+    // Nothing is priced until the request can be priced. A lane without a declared plane, or a plane
+    // above the ceiling the tower itself enforces, is this file handing the ledger a job it cannot
+    // reserve for -- our bug, the same class as the reference that disagrees with its own token counts
+    // below, so it is a 500 named for the field rather than a 503 the client could be told to work
+    // around with a smaller canvas.
+    if (const auto refused = qi::check_image_device_need_request(req); refused.has_value()) {
+        throw ApiException{ApiError{500, "server_error",
+                                    "the image job cannot be sized: " + *refused,
+                                    "image", "image_need_unpriceable"}};
+    }
     return qi::image_device_need(req).total();
 }
 
@@ -1202,6 +1223,11 @@ RequestJson ImageGenerationService::generate(const OpenAIImagesRequest& request,
     // a 500 of our own making, raised host-side, before a single byte is yielded.
     std::size_t ref_tokens    = 0;
     std::size_t vision_tokens = 0;
+    // The widest plane the vision tower will be handed, in patches: the same (height/16) * (width/16)
+    // count as the reference's own latent tokens, because the tower encodes the references one at a time
+    // into the same Bufs. The lane is charged for THIS, not for the route's worst legal aspect, and the
+    // count run_vision_tower is later handed comes from the very same planes, so the two cannot disagree.
+    std::size_t vision_patches_widest = 0;
         std::vector<std::uint64_t> vision_per_image;  // one entry per reference, in request order
     qi::VisionLaneDims vision{};
     if (!planes.empty()) {
@@ -1227,6 +1253,7 @@ RequestJson ImageGenerationService::generate(const OpenAIImagesRequest& request,
             ref_tokens += ref;
             vision_tokens += vis;
             vision_per_image.push_back(vis);
+            if (ref > vision_patches_widest) { vision_patches_widest = ref; } // ref == that plane's patches
         }
         // Two things an edit cannot be served without, both refused for the same reason the ledger
         // refuses a guess: the render is the only prompt whose token count is the one the job will run,
@@ -1343,7 +1370,7 @@ RequestJson ImageGenerationService::generate(const OpenAIImagesRequest& request,
     const auto need_at = [&](std::uint32_t w, std::uint32_t h) {
         return image_need_bytes(w, h, prompt.tokens(), negative_prompt.tokens(), ref_tokens,
                                 read_artifact_declaration(dit_dims_, "DiT dimensions"), vae_topology,
-                                vision_tokens, vision);
+                                vision_tokens, vision, planes.size(), vision_patches_widest);
     };
     const auto step_down = [canvas_step](std::uint32_t& side) {
         side = side > kVramCanvasFloorPx + canvas_step ? side - canvas_step : kVramCanvasFloorPx;

@@ -140,16 +140,16 @@ int main() {
             // tokens) whose pad rows are the whole prompt, with the ViT encode measured in the same
             // window. This is the edit route the serving layer admits on this number.
             // The anchors are the certified row for row, with one revision that has to be stated: the
-            // reservation now bills the ViT lane for the DERIVED worst-case reference plane
-            // (kVisionWorstReferencePatches in image_device_need.h, enumerated with integer arithmetic
-            // from the serving route's own snap-to-32 target area) instead of for the plane this row
-            // happens to serve. Widening the bound raises the prediction -- from the 6010 MiB the
-            // pre-scheduler artifact was certified with to 6163 MiB -- and cannot lower it, so coverage
-            // gets strictly safer here. The measured side is untouched: this row really encodes a
-            // 1024^2 reference, so the high-water stays the certified 3634 MiB and the row still clears
-            // it by 2529 MiB.
+            // reservation bills the ViT lane for the plane THIS row hands the tower (its own 64x64
+            // reference == 4096 patches, declared through ImageDeviceNeedRequest::reference_patches)
+            // instead of for kVisionWorstReferencePatches -- the 8192-patch plane the snap could never
+            // actually exceed, which stays as the CEILING over the charge. The ceiling billed this lane
+            // 325 MiB and the row was pinned at 6163; the declared plane prices it at 172 MiB, and the
+            // row is re-certified at 6010 MiB from the sanctioned window of 2026-11-28, where the card
+            // was free and the measured high-water reproduced the certified 3634 MiB exactly.
+            // 6010 >= 3634 + 512, so the margin contract this row exists to hold still holds.
             {768, 0, 1024, 0, "the edit route: a 1024^2 reference, the ViT lane and the joint sequence", true,
-             6163, 3634},
+             6010, 3634},
             // The canvas-scaled sweep: every certified square the serving layer can be asked for, so
             // the prediction-vs-measured row exists for the exact canvases the walk and the net decide
             // on. Pure geometry (no reference, no CFG, no vision): the four canvas-scaled terms are all
@@ -232,6 +232,13 @@ int main() {
                 req.text_tokens              = static_cast<std::uint32_t>(merged);
                 req.vision_tokens            = static_cast<std::uint32_t>(merged);
                 req.vision                   = lane_of(vision.dims);
+                // The plane this row really feeds the tower: one {1,64,64} grid at the 16-wide patch is
+                // 4096 patches, which is this row's own ref_tokens (a latent token is one 16x16 tile).
+                // Declaring it is the point -- the lane is now charged for the plane the job runs, and
+                // kVisionWorstReferencePatches remains only the ceiling run_vision_tower refuses above.
+                req.reference_lanes          = 1U;
+                req.reference_patches        = static_cast<std::uint32_t>(
+                    (c.ref_side / 16U) * (c.ref_side / 16U));
             }
             const ImageDeviceNeed need = image_device_need(req);
             const std::uint64_t   predicted = need.total();
