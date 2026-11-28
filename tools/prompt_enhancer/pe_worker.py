@@ -14,9 +14,12 @@ serve side calls /load inside its image-job interlude and /unload when the batch
 is done. Nothing is cached on disk; a request carries its pictures as base64.
 
 Endpoints (all JSON, all 127.0.0.1 only):
-  GET  /health   {"state","model_dir","loaded","device","free_mib"}
+  GET  /health   {"state","model_dir","loaded","device","free_mib",
+                  "reserved_mib","allocated_mib","peak_reserved_mib","peak_allocated_mib"}
   POST /load     {"ok":true,"weight_bytes":...}      idempotent
-  POST /unload   {"ok":true,"freed_mib":...}
+  POST /unload   {"ok":true,"freed_mib":...,"reserved_mib":...,"allocated_mib":...}
+                 Releases the card whether or not the weights are in this process right now: a
+                 reservation stranded by an earlier release is what this has to reclaim too.
   POST /rewrite  {"prompt":...,"images":[b64,...],"seed":42}
               -> {"ok","rewritten_prompt","wh_ratio","ratio_follow",
                   "thinking","parse_ok","seconds","error"}
@@ -38,14 +41,17 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import gc
 import http.server
 import io
 import json
 import logging
 import os
+import subprocess
 import sys
 import threading
 import time
+import warnings
 
 # What this process costs the card is the number serve is asked to promise before it loads it, so the
 # allocator must not be what inflates it: a generate() that grows reserves a fresh block per new tensor
@@ -55,6 +61,15 @@ import time
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 MAX_IMAGES = 8            # the route caps references too; this is the worker's own ceiling
+# What a released sidecar owes the card: nothing. These bound the retry around the release, because one
+# pass is not enough -- measured, serve's /unload 0.8 s after generate() returned left 17978 MiB
+# reserved with 32 MiB allocated (the rewrite's last kernels had not retired, so the caching allocator
+# was not allowed to cudaFree any of it), and a later release reclaimed every byte. A pass per fifth of a
+# second over a couple of seconds is cheap next to the 20 s the load costs; a stranded 17.5 GiB is what
+# made every later image job refuse with image_vram_insufficient.
+RELEASE_FLOOR_MIB = 256
+RELEASE_TRIES = 24
+RELEASE_SETTLE_SEC = 0.5
 MAX_IMAGE_BYTES = 32 << 20
 MAX_PROMPT_CHARS = 8000
 # The shipped processor has NO upper bound: processor_config.json asks for
@@ -94,13 +109,28 @@ def _single_position_logits(model) -> dict:
     prepare_inputs_for_generation, this is what keeps the prefill off the head -- and
     max_positions is what proves it next time. Nothing else in this process reads the head, so the
     narrower answer is the same answer.
+
+    Returns the stats AND an undo. The undo matters for more than tidiness: the instance attribute
+    holds the closure, the closure holds ``original``, and ``original`` is a bound method of the very
+    module it was taken from -- a cycle that keeps the head's weights reachable after the last name for
+    the model goes away, so unload()'s empty_cache() finds no unused block to hand back. Deleting the
+    instance attribute is what breaks it.
     """
+    import weakref
+
     stats = {"wrapped": False, "max_positions": 0, "head_features": 0}
     head = getattr(model, "lm_head", None)
     if head is None or not callable(getattr(head, "forward", None)):
         log.warning("no lm_head on %s: the prefill pays full logits", type(model).__name__)
-        return stats
-    original = head.forward
+        return stats, None
+    # A WEAK reference to the head and the CLASS's own forward, not ``original = head.forward``: a bound
+    # method is a strong reference to the module, so the closure the patch installs on the instance kept
+    # the 248320 x 4096 lm_head weight -- 1940 MiB -- alive through unload() no matter what was deleted.
+    # Live blocks cannot be cudaFree'd, so /unload answered ok with 17978 MiB still reserved and serve
+    # was left 5216 MiB to yield for a picture that needed 4915 MiB, which is how an edit refused with
+    # image_vram_insufficient on a card that had nothing else on it.
+    head_ref = weakref.ref(head)
+    real = type(head).forward
 
     def forward(hidden_states, *args, **kwargs):
         if hidden_states.dim() == 3:
@@ -110,11 +140,21 @@ def _single_position_logits(model) -> dict:
             stats["head_features"] = int(hidden_states.shape[-1])
             if hidden_states.shape[1] > 1:
                 hidden_states = hidden_states[:, -1:, :]
-        return original(hidden_states, *args, **kwargs)
+        target = head_ref()
+        if target is None:
+            raise RuntimeError("lm_head was released before its forward ran")
+        return real(target, hidden_states, *args, **kwargs)
 
     head.forward = forward
     stats["wrapped"] = True
-    return stats
+
+    def undo():
+        try:
+            del head.forward                 # back to the class's own forward, and the cycle dies
+        except AttributeError:
+            pass
+
+    return stats, undo
 
 
 def _fused_full_attention(torch):
@@ -178,6 +218,34 @@ def _fused_full_attention(torch):
     return undo
 
 
+def _referrer_name(ref) -> str:
+    """Say what a gc referrer IS, so the release log names the owner of a tensor instead of counting it.
+
+    gc.get_referrers answers with closures, cells, frames and dicts as often as with objects, and those
+    are precisely the ones that identify a stray captured reference -- so they are named, not filtered
+    out of the report the way a first version of this filter did.
+    """
+    kind = type(ref).__name__
+    try:
+        if kind == "function":
+            code = ref.__code__
+            name = code.co_filename.replace("\\", "/").rsplit("/", 1)[-1]
+            return "func:%s@%s:%d" % (ref.__qualname__, name, code.co_firstlineno)
+        if kind == "method":
+            return "method:%s" % ref.__func__.__qualname__
+        if kind == "frame":
+            code = ref.f_code
+            name = code.co_filename.replace("\\", "/").rsplit("/", 1)[-1]
+            return "frame:%s@%s:%d" % (code.co_name, name, ref.f_lineno)
+        if kind == "module":
+            return "module:%s" % getattr(ref, "__name__", "?")
+        if kind == "builtin_function_or_method":
+            return "builtin:%s" % getattr(ref, "__name__", "?")
+    except Exception:                                           # noqa: BLE001 - diagnostics only
+        pass
+    return kind
+
+
 class Enhancer:
     """Holds the checkpoint in GPU memory, or holds nothing at all."""
 
@@ -196,6 +264,15 @@ class Enhancer:
         self._active = 0
         self.weight_bytes = 0
         self._logits_stats = {"wrapped": False, "max_positions": 0, "head_features": 0}
+        # The undo of the lm_head patch, kept for unload(): it is what breaks the reference cycle the
+        # closure forms with the module it patched. None when there was no head to patch.
+        self._undo_logits = None
+        # Set by unload() when the release could not return the card, and acted on by watch_parent(): the
+        # only proven way back is for this CUDA context to die. See _respawn_needs() below.
+        self._respawn = False
+        # The listening server, set by serve() right after it binds: the respawn path has to release the
+        # port before the successor starts.
+        self._httpd = None
         self._load_stats = {"allocated_mib": -1, "reserved_mib": -1, "param_mib": -1,
                             "buffer_mib": -1, "top_buffers": []}
 
@@ -228,6 +305,79 @@ class Enhancer:
             return int(torch.cuda.max_memory_reserved() // (1024 * 1024))
         except Exception:                                    # noqa: BLE001 - diagnostics only
             return -1
+
+    def reserved_mib(self) -> int:
+        # What the card has LOST to this process right now, weights and stranded blocks together. This
+        # is the number serve's admission is really competing with, and it is the one that lies by
+        # omission if only the peaks are reported: a released checkpoint left 18928 MiB reserved here
+        # while /health said unloaded and peak_allocated 18817, which is how a leak in this sidecar
+        # looked like a shortage on the card. -1 = no torch in this process yet.
+        torch = sys.modules.get("torch")
+        if torch is None:
+            return -1
+        try:
+            return int(torch.cuda.memory_reserved() // (1024 * 1024))
+        except Exception:                                    # noqa: BLE001 - diagnostics only
+            return -1
+
+    def allocated_mib(self) -> int:
+        # What is live this instant. reserved_mib - allocated_mib is the stranded part a release owes
+        # the card. -1 = no torch in this process yet.
+        torch = sys.modules.get("torch")
+        if torch is None:
+            return -1
+        try:
+            return int(torch.cuda.memory_allocated() // (1024 * 1024))
+        except Exception:                                    # noqa: BLE001 - diagnostics only
+            return -1
+
+    def _live_tensors(self, torch, limit: int = 6) -> str:
+        # Name the survivors instead of counting them. The shape says which subsystem owns the bytes and
+        # gc.get_referrers says which object still points at them, which is the difference between one
+        # targeted cleanup and a guess. Runs only on the branch where a release already failed, so the
+        # walk over every object in the process is affordable there and nowhere else.
+        described = []
+        own = "frame:_live_tensors"
+
+        def notable(ref):
+            label = _referrer_name(ref)
+            return label if label not in ("dict", "list", "tuple", "set") and own not in label else None
+        saved = list(warnings.filters)
+        warnings.simplefilter("ignore")           # touching torch's enum aliases warns once per object
+        try:
+            # Describe each tensor as it is walked and keep only strings: a list of the tensors would
+            # itself become a referrer of everything it reports, and the first version of this printed
+            # "list" as the owner of its own measurement.
+            for obj in gc.get_objects():
+                try:
+                    if not isinstance(obj, torch.Tensor) or not obj.is_cuda:
+                        continue
+                    size = obj.numel() * obj.element_size()
+                    if size < 64 * 2**20:
+                        continue
+                    owners = []
+                    for ref in gc.get_referrers(obj)[:4]:
+                        label = _referrer_name(ref)
+                        if label in ("dict", "list", "tuple", "set"):
+                            # A bare "list" names nobody: one more level says which real object owns that
+                            # container, which is what separates a library cache from this file's own bug.
+                            parents = sorted({name for name in (notable(parent)
+                                                                for parent in gc.get_referrers(ref)[:4])
+                                              if name})
+                            if parents:
+                                label += "<-" + ",".join(parents)
+                        owners.append(label)
+                except Exception:                                # noqa: BLE001 - one bad object, not the run
+                    continue
+                described.append((size, "%s %s %d MiB%s" % (
+                    tuple(obj.shape), str(obj.dtype).replace("torch.", ""), size // 2**20,
+                    " in " + ",".join(owners) if owners else "")))
+        except Exception:                                        # noqa: BLE001 - diagnostics only
+            return "<unavailable>"
+        finally:
+            warnings.filters = saved
+        described.sort(key=lambda item: -item[0])
+        return "; ".join(text for _, text in described[:limit]) if described else "<no cuda tensors>"
 
     # -- lifecycle --------------------------------------------------------
 
@@ -263,7 +413,7 @@ class Enhancer:
                 model = AutoModelForImageTextToText.from_pretrained(
                     self.model_dir, **load_kwargs)
             model.eval()
-            self._logits_stats = _single_position_logits(model)
+            self._logits_stats, self._undo_logits = _single_position_logits(model)
             processor = AutoProcessor.from_pretrained(self.model_dir)
             weight_bytes = sum(
                 p.numel() * p.element_size() for p in model.parameters())
@@ -317,16 +467,91 @@ class Enhancer:
                 # there as soon as nothing is in flight. ok stays true because nothing went wrong.
                 return {"ok": True, "loaded": True, "freed_mib": 0,
                         "deferred": "%d rewrite(s) in flight" % self._active}
-            if self._model is None:
-                return {"ok": True, "loaded": False, "freed_mib": 0}
+            torch = sys.modules.get("torch")
+            if torch is None:
+                # Nothing was ever loaded, so there is no CUDA context here to hand back either --
+                # importing torch to find that out would cost the card a context of its own.
+                return {"ok": True, "loaded": False, "freed_mib": 0, "reserved_mib": -1,
+                        "allocated_mib": -1, "was_loaded": False}
             before = self.free_mib()
-            import torch
+            was_loaded = self._model is not None
 
             model, processor = self._model, self._processor
             self._model, self._processor, self._system_prompt = None, None, None
+            undo, self._undo_logits = self._undo_logits, None
+            if undo is not None:
+                undo()                       # drop the lm_head closure before anything is collected
             del model, processor
-            torch.cuda.empty_cache()
-            return {"ok": True, "loaded": False, "freed_mib": self.free_mib() - before}
+            # The compile caches hold parameters by their own keys, so deleting the model does not reach
+            # them: after every cleanup above the release still reported the 248320 x 4096 lm_head weight
+            # -- 1940 MiB -- alive, referenced from a list and a dict rather than from anything this file
+            # created, and a live block cannot be cudaFree'd. torch._dynamo.reset() is the documented way
+            # to drop those caches; it runs before the collection below so the tensors it releases are
+            # gone by the time empty_cache() looks for unused segments.
+            reset = getattr(getattr(torch, "_dynamo", None), "reset", None)
+            if callable(reset):
+                try:
+                    reset()
+                except Exception:                            # noqa: BLE001 - reported by the check below
+                    log.warning("torch._dynamo.reset() failed")
+            self._logits_stats = {"wrapped": False, "max_positions": 0, "head_features": 0}
+            self._load_stats = {"allocated_mib": -1, "reserved_mib": -1, "param_mib": -1,
+                                "buffer_mib": -1, "top_buffers": []}
+            # empty_cache() only hands back blocks that NOTHING points at, and a monkeypatched forward
+            # is a cycle: the instance attribute held the closure, the closure held the bound original,
+            # the bound original held the module carrying 17.5 GiB of weights. Without a collection the
+            # weights stay live through the release and the cache has nothing to return -- measured as
+            # /unload answering ok with loaded false while this process still reserved 18928 MiB and the
+            # card had 410 MiB free, which every later image job paid for as a 503
+            # image_vram_insufficient. So: break the patches, collect, then release. And do it even when
+            # the weights are already gone -- a reservation stranded by an earlier release is exactly
+            # what this has to reclaim, which is why the "already unloaded" branch no longer returns
+            # before the release.
+            for _attempt in range(RELEASE_TRIES):
+                # Twice, not once. The last thing standing between this release and an empty card was a
+                # suspended generator -- the survivors were a 248320 x 4096 tensor referenced from a list
+                # held by a list_iterator and a dict, and CPython frees such a cycle only on the pass
+                # AFTER the one that finds it. That is also why a SECOND /unload, minutes later, took
+                # every byte back (reserved 17978 -> 32) with nothing else having changed: an ordinary
+                # collection had run in between. So the release that serve makes once has to do both
+                # passes itself instead of leaving the card to chance.
+                gc.collect()
+                gc.collect()
+                try:
+                    torch.cuda.synchronize()
+                except Exception:                            # noqa: BLE001 - a dead context cannot hold
+                    pass                                      # blocks this call is trying to return
+                torch.cuda.empty_cache()
+                if self.reserved_mib() <= RELEASE_FLOOR_MIB:
+                    break
+                # Not yet: the blocks this process handed back are still waiting on the device to retire
+                # the work that used them. Ask again shortly instead of handing serve an "ok" that left
+                # the card spoken for.
+                time.sleep(RELEASE_SETTLE_SEC)
+            if self.reserved_mib() > RELEASE_FLOOR_MIB:
+                # Nothing in this process can be trusted to hand those segments back: gc (twice), the
+                # monkeypatch undos, the weakref head and torch._dynamo.reset() were each measured and
+                # each left the same 17978 MiB reserved, with the survivors named down to the tensor --
+                # one 248320 x 4096 lm_head weight pinned by a third party's live list_iterator. A fresh
+                # process image is the release that cannot fail, so ask for one; watch_parent() carries
+                # it out once the answer that asked for it has been sent.
+                self._respawn = True
+            if self.allocated_mib() > RELEASE_FLOOR_MIB:
+                # Still live, so no cudaFree can touch those segments and the card stays spoken for. Say
+                # WHAT is holding it -- the shape names the owner, which is the difference between one
+                # targeted cleanup and a guess: a [1,kv_heads,seq,head_dim] family is the generate() KV
+                # cache the library keeps on the module, [1,3,H,W] is a processor output, [1,heads,seq,seq]
+                # is a materialised attention score. Measured here as 1972 MiB surviving the release.
+                log.warning("release left %d MiB live on the device: %s",
+                            self.allocated_mib(), self._live_tensors(torch))
+            freed = self.free_mib() - before
+            reserved = self.reserved_mib()
+            allocated = self.allocated_mib()
+            log.info("released %s: free %d -> %d MiB, reserved %d MiB, allocated %d MiB",
+                     "the weights" if was_loaded else "a stranded reservation",
+                     before, before + freed, reserved, allocated)
+            return {"ok": True, "loaded": False, "was_loaded": was_loaded, "freed_mib": freed,
+                    "reserved_mib": reserved, "allocated_mib": allocated}
 
     # -- the one thing it is for -----------------------------------------
 
@@ -599,6 +824,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                          "weight_bytes": self.enhancer.weight_bytes,
                          "device": self.enhancer._device,
                          "free_mib": self.enhancer.free_mib(),
+                         # What this process costs the card RIGHT NOW, not what it once cost: the peaks
+                         # below are history, and a worker that leaked its reservation read unloaded
+                         # beside a peak that said nothing was wrong.
+                         "reserved_mib": self.enhancer.reserved_mib(),
+                         "allocated_mib": self.enhancer.allocated_mib(),
                          "peak_reserved_mib": self.enhancer.peak_mib(),
                          "peak_allocated_mib": self.enhancer.peak_allocated_mib(),
                          "max_image_pixels": MAX_IMAGE_PIXELS,
@@ -678,6 +908,34 @@ def watch_parent(parent_pid: int, idle_unload_sec: int, enhancer: Enhancer) -> N
                                                      time.time()):
             log.info("idle past %ds; unloading", idle_unload_sec)
             enhancer.unload()
+        if enhancer._respawn and enhancer.state() != "ready" and enhancer._active == 0:
+            # Replace this process image: every byte of CUDA memory the driver still attributes to it
+            # goes with the CUDA context, which is what serve's next image job needs and what no
+            # in-process release managed. The listening socket is Python-owned and closed by exec, so the
+            # new image binds the same port. A request that finds nobody home for a couple of seconds is
+            # the documented skip for prompt_enhance auto, never a refused picture.
+            log.info("respawning to reclaim the %d MiB the release could not return",
+                     enhancer.reserved_mib())
+            enhancer._respawn = False
+            time.sleep(1.0)                                   # let the /unload answer that asked drain
+            try:
+                # Close the listening socket FIRST: a successor that finds the port taken prints
+                # "another prompt enhancer already answers" and leaves, which would leave the card with
+                # nobody able to give it back. Then spawn with a list, not os.execv -- Windows execv
+                # re-quotes the command line and split this project's own path at its space
+                # ("can't open file 'C:\\Users\\Micke\\Documents\\Kodprojekt\\Infernix'"), so the worker
+                # died instead of restarting. A new console keeps it visible to the operator, and the
+                # exiting process closes the window it came from.
+                if enhancer._httpd is not None:
+                    try:
+                        enhancer._httpd.server_close()
+                    except Exception:                          # noqa: BLE001 - best effort before exiting
+                        pass
+                subprocess.Popen([sys.executable, "-I"] + sys.argv, close_fds=True,
+                                 creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
+            except OSError as exc:
+                log.error("respawn failed (%s); exiting so the launcher can restart it", exc)
+            os._exit(0)
 
 
 def _answers_as_worker(port: int) -> bool:
@@ -732,6 +990,7 @@ def serve(argv: list) -> int:
         log.info("another prompt enhancer already answers on port %d; leaving it the port",
                  args.port)
         return 0
+    enhancer._httpd = httpd
     threading.Thread(target=watch_parent, args=(args.parent_pid, args.idle_unload_sec, enhancer),
                      daemon=True).start()
     log.info("listening on 127.0.0.1:%d for %s (state %s)", args.port, enhancer.model_dir,
